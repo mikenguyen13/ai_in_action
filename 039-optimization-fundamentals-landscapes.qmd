@@ -1,0 +1,1039 @@
+# Optimization and numerical methods
+
+````{=html}
+<!-- ```{figure} images/foundations/optimization.png
+:name: fig-optimization-bedrock
+:alt: "Illustration of a loss surface and an optimizer traversing it."
+:width: 70%
+:align: center
+
+``` -->
+````
+
+Training almost any modern AI model is, at its mathematical core, an optimization problem. We define a loss function that measures how badly the model behaves, then adjust the parameters to make that loss small. Everything from simple linear regression to very large language models fits into this pattern.
+
+This chapter develops the optimization bedrock needed to understand and implement learning algorithms in a principled way. We focus on the types of optimization that are actually used in machine learning practice, rather than on the full breadth of numerical optimization.
+
+Our goals are:
+
+-   To understand **first order methods**, especially stochastic gradient descent (SGD) and its variants.
+-   To see how **curvature** and **preconditioning** appear in second order methods.
+-   To analyze **adaptive learning rates**, such as Adam and RMSProp, and understand their tradeoffs.
+-   To introduce **line search** and **trust region** strategies in low and medium dimensional problems.
+-   To explain **mixed precision training** and basic **numerical stability** techniques.
+-   To understand **automatic differentiation** via computational graphs.
+-   To address practical issues, including exploding and vanishing gradients, gradient clipping, and checkpointing.
+
+Throughout, we alternate between mathematical definitions, conceptual explanations, and concrete Python implementations.
+
+## Optimization as empirical risk minimization
+
+From a machine learning perspective, optimization typically appears in the form
+
+$$
+\hat{L}(\theta)
+= \frac{1}{n} \sum_{i=1}^n \ell(f_\theta(x_i), y_i)
++ \lambda R(\theta),
+$$
+
+where:
+
+-   (f\_\theta) is a model with parameters (\theta \in \mathbb{R}\^d).
+-   (\ell) is a loss function for a single example.
+-   (R(\theta)) is a regularization term, for example (\tfrac{1}{2} \|\theta\|\_2\^2).
+-   (\lambda \ge 0) controls the strength of regularization.
+
+Our optimization problem is
+
+$$
+\min_{\theta \in \mathbb{R}^d} \hat{L}(\theta).
+$$
+
+In principle we might want to minimize the **population risk**
+
+$$
+L(\theta) = \mathbb{E}_{(x, y) \sim \mathcal{D}}[\ell(f_\theta(x), y)],
+$$
+
+but we only have access to a finite dataset, so we optimize the empirical risk instead and rely on statistical generalization.
+
+There are three key questions:
+
+1.  **Information**: how do we evaluate (\hat{L}(\theta)) and its derivatives from data?
+2.  **Computation**: how do we update (\theta) efficiently to reduce (\hat{L}(\theta))?
+3.  **Numerics**: how do we do this stably, given finite precision arithmetic?
+
+The rest of the chapter unpacks these questions.
+
+------------------------------------------------------------------------
+
+## First order methods
+
+First order methods use only function values and gradients, not second derivatives. They are the workhorses of large scale machine learning because they:
+
+-   scale linearly with the number of parameters, and
+-   can be implemented using **stochastic estimates** of gradients.
+
+### Gradient descent
+
+The simplest first order method is deterministic **gradient descent** on a differentiable function (f: \mathbb{R}\^d \to \mathbb{R}):
+
+$$
+\theta_{k+1} = \theta_k - \eta_k \nabla f(\theta_k),
+$$
+
+where (\eta\_k \> 0) is the step size or learning rate at iteration (k).
+
+Intuitively:
+
+-   (\nabla f(\theta\_k)) points in the direction of steepest increase.
+-   We step in the opposite direction to decrease the function.
+
+When (f) is convex and smooth, appropriately chosen step sizes ensure convergence to a global minimum {cite}`nocedal2006numerical,bubeck2015convex`.
+
+In machine learning, we apply gradient descent to the empirical risk (\hat{L}(\theta)), but computing the full gradient (\nabla \hat{L}(\theta)) exactly requires evaluating all (n) examples, which is often too expensive.
+
+### Stochastic gradient descent (SGD)
+
+To overcome this, we use **stochastic gradient descent**. Instead of computing the full gradient, we use an unbiased stochastic estimate based on a small subset of the datapoints.
+
+Let (i_k) be a random index from ({1, \dots, n}), and define
+
+$$
+g_k = \nabla_\theta \ell(f_\theta(x_{i_k}), y_{i_k}) \big\vert_{\theta = \theta_k}.
+$$
+
+Then (g_k) is an unbiased estimator of (\nabla \hat{L}(\theta\_k)):
+
+$$
+\mathbb{E}[g_k \mid \theta_k] = \nabla \hat{L}(\theta_k).
+$$
+
+The SGD update is
+
+$$
+\theta_{k+1} = \theta_k - \eta_k g_k.
+$$
+
+In practice, we use **mini batches**:
+
+-   Choose a subset (B_k \subset {1, \dots, n}) of size (m).
+
+-   Let
+
+    $$
+    g_k = \frac{1}{m} \sum_{i \in B_k} \nabla_\theta \ell(f_\theta(x_i), y_i) \big\vert_{\theta = \theta_k}.
+    $$
+
+This reduces gradient noise compared to a single data point, but still avoids the full dataset cost.
+
+### A simple SGD implementation from scratch
+
+Let us implement SGD for logistic regression on a small dataset, without using any deep learning library. This isolates the optimization logic.
+
+```{python}
+from dataclasses import dataclass
+from typing import Tuple, Callable
+
+import numpy as np
+
+
+@dataclass
+class LogisticRegressionSGD:
+    """Binary logistic regression trained with SGD."""
+    theta: np.ndarray  # shape (d,)
+
+    def predict_logits(self, X: np.ndarray) -> np.ndarray:
+        return X @ self.theta
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        z = self.predict_logits(X)
+        # Numerically stable sigmoid
+        positive_mask = (z >= 0)
+        out = np.empty_like(z)
+        out[positive_mask] = 1.0 / (1.0 + np.exp(-z[positive_mask]))
+        exp_z = np.exp(z[~positive_mask])
+        out[~positive_mask] = exp_z / (1.0 + exp_z)
+        return out
+
+    def predict_label(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+        return (self.predict_proba(X) >= threshold).astype(int)
+
+
+def logistic_loss_and_grad(
+    theta: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
+    l2_reg: float = 0.0,
+) -> Tuple[float, np.ndarray]:
+    """Compute average logistic loss and its gradient with L2 regularization."""
+    n, d = X.shape
+    z = X @ theta  # shape (n,)
+    # Stable log(1 + exp(z))
+    log_terms = np.logaddexp(0.0, z)
+    # Negative log likelihood
+    loss_vec = log_terms - y * z
+    data_loss = loss_vec.mean()
+
+    # Gradient of data term: (sigmoid(z) - y) * x
+    proba = 1.0 / (1.0 + np.exp(-z))
+    grad_data = X.T @ (proba - y) / n
+
+    # L2 regularization
+    reg_loss = 0.5 * l2_reg * float(theta @ theta)
+    grad_reg = l2_reg * theta
+
+    loss = data_loss + reg_loss
+    grad = grad_data + grad_reg
+    return loss, grad
+
+
+def sgd_train(
+    X: np.ndarray,
+    y: np.ndarray,
+    num_epochs: int = 20,
+    batch_size: int = 32,
+    learning_rate: float = 0.1,
+    l2_reg: float = 0.0,
+    callback: Callable[[int, float], None] | None = None,
+) -> LogisticRegressionSGD:
+    """Train logistic regression with mini-batch SGD."""
+    n, d = X.shape
+    theta = np.zeros(d, dtype=float)
+    rng = np.random.default_rng(0)
+
+    num_batches = int(np.ceil(n / batch_size))
+
+    for epoch in range(num_epochs):
+        # Shuffle indices each epoch
+        indices = rng.permutation(n)
+        for b in range(num_batches):
+            batch_indices = indices[b * batch_size : (b + 1) * batch_size]
+            Xb = X[batch_indices]
+            yb = y[batch_indices]
+            _, grad = logistic_loss_and_grad(theta, Xb, yb, l2_reg=l2_reg)
+            theta -= learning_rate * grad
+
+        # Optionally report full-batch loss
+        if callback is not None:
+            loss, _ = logistic_loss_and_grad(theta, X, y, l2_reg=l2_reg)
+            callback(epoch, loss)
+
+    return LogisticRegressionSGD(theta=theta)
+```
+
+Key features:
+
+-   `logistic_loss_and_grad` carefully implements both loss and gradient, with attention to numerical stability (via `np.logaddexp` and a stable sigmoid).
+-   `sgd_train` uses a shuffled mini batch loop for each epoch.
+-   The `callback` allows monitoring the full batch loss over epochs, which is good practice in experiments.
+
+You can test this with a synthetic dataset as in the previous chapter, and observe how the loss decreases as training progresses.
+
+### Momentum and Nesterov acceleration
+
+Plain SGD can be slow when the loss surface has valleys that are narrow in some directions and wide in others. In such cases, the gradient may oscillate across the valley instead of quickly moving along it.
+
+**Momentum** attempts to address this by smoothing updates over time. We introduce a velocity vector (v_k) and update
+
+$$
+v_{k+1} = \beta v_k + (1 - \beta) g_k,
+\quad
+\theta_{k+1} = \theta_k - \eta v_{k+1},
+$$
+
+where (0 \le \beta \< 1) controls how much of the previous velocity we keep. Typical values are (\beta \in [0.8, 0.99]).
+
+This can be seen as an exponential moving average of gradients, and also as a discrete approximation to a second order differential equation.
+
+**Nesterov momentum** modifies this idea by computing the gradient at the expected future position:
+
+$$
+\tilde{\theta}_k = \theta_k - \eta \beta v_k,
+\quad
+v_{k+1} = \beta v_k + (1 - \beta) \nabla f(\tilde{\theta}_k),
+\quad
+\theta_{k+1} = \theta_k - \eta v_{k+1}.
+$$
+
+This often yields better theoretical and practical convergence for convex problems {cite}`nesterov1983method`.
+
+A simple implementation of SGD with momentum, reusable for many models:
+
+```{python}
+from typing import Dict
+
+
+def sgd_with_momentum(
+    grad_fn: Callable[[np.ndarray], np.ndarray],
+    theta0: np.ndarray,
+    num_steps: int,
+    learning_rate: float = 0.1,
+    beta: float = 0.9,
+) -> Dict[str, np.ndarray]:
+    """
+    Generic SGD with momentum on a function whose gradient can be evaluated.
+    grad_fn(theta) -> gradient vector of same shape as theta.
+    """
+    theta = theta0.copy()
+    v = np.zeros_like(theta)
+    history = [theta.copy()]
+
+    for _ in range(num_steps):
+        g = grad_fn(theta)
+        v = beta * v + (1.0 - beta) * g
+        theta = theta - learning_rate * v
+        history.append(theta.copy())
+
+    return {"theta": theta, "trajectory": np.stack(history, axis=0)}
+```
+
+You can plug in a `grad_fn` corresponding to a simple 2D function and visualize the optimization trajectory over the contour plot of the function. This kind of low dimensional experiment is very useful to develop intuition for optimizer behavior.
+
+------------------------------------------------------------------------
+
+## Curvature, second order methods, and preconditioning
+
+First order methods only use gradient information. Second order methods try to use curvature to choose more informed directions and step sizes.
+
+### Hessians and curvature
+
+For a twice differentiable function (f: \mathbb{R}\^d \to \mathbb{R}), the Hessian matrix at point (\theta) is
+
+$$
+H(\theta) = \nabla^2 f(\theta)
+= \left[ \frac{\partial^2 f}{\partial \theta_i \partial \theta_j}(\theta) \right]_{i, j = 1}^d.
+$$
+
+The Hessian encodes local curvature:
+
+-   If all eigenvalues of (H(\theta)) are positive, the function curves upward and the point is locally convex.
+-   Negative eigenvalues indicate directions of downward curvature.
+-   The magnitude of eigenvalues indicates how steep or flat the curvature is along different directions.
+
+The **condition number** of the Hessian at a point is
+
+$$
+\kappa = \frac{\lambda_{\max}(H)}{\lambda_{\min}(H)},
+$$
+
+assuming (H) is positive definite. A large condition number means the landscape is stretched in some directions and squeezed in others, which can make gradient descent slow.
+
+### Newton's method
+
+In regions where the Hessian is positive definite, a quadratic approximation of (f) near (\theta\_k) suggests the **Newton step**:
+
+$$
+\theta_{k+1} = \theta_k - H(\theta_k)^{-1} \nabla f(\theta_k).
+$$
+
+This can yield very fast (often quadratic) convergence near a local minimum. However:
+
+-   Computing and storing (H(\theta\_k)) costs (O(d\^2)) memory and at least (O(d\^2)) time.
+-   Solving the linear system (H(\theta\_k) \Delta = \nabla f(\theta\_k)) costs (O(d\^3)) in general.
+
+For deep networks with millions of parameters, full Newton steps are infeasible. But in low dimensional problems, they are instructive and useful.
+
+A small 1D example comparing gradient descent and Newton's method:
+
+```{python}
+def f_scalar(theta: float) -> float:
+    """Simple convex function f(theta) = (theta - 3)^2 + 1."""
+    return (theta - 3.0) ** 2 + 1.0
+
+
+def f_scalar_grad(theta: float) -> float:
+    return 2.0 * (theta - 3.0)
+
+
+def f_scalar_hess(theta: float) -> float:
+    return 2.0
+
+
+def gradient_descent_scalar(theta0: float, eta: float, num_steps: int) -> np.ndarray:
+    theta = theta0
+    history = [theta]
+    for _ in range(num_steps):
+        theta = theta - eta * f_scalar_grad(theta)
+        history.append(theta)
+    return np.array(history)
+
+
+def newton_scalar(theta0: float, num_steps: int) -> np.ndarray:
+    theta = theta0
+    history = [theta]
+    for _ in range(num_steps):
+        theta = theta - f_scalar_grad(theta) / f_scalar_hess(theta)
+        history.append(theta)
+    return np.array(history)
+
+
+if __name__ == "__main__":
+    gd_hist = gradient_descent_scalar(theta0=0.0, eta=0.3, num_steps=10)
+    newton_hist = newton_scalar(theta0=0.0, num_steps=3)
+    print("Gradient descent trajectory:", gd_hist)
+    print("Newton trajectory:", newton_hist)
+```
+
+Here, Newton's method jumps directly to the minimizer in one step, because the function is exactly quadratic and the Hessian is constant.
+
+In higher dimensions, we can use approximate forms of second order information.
+
+### Preconditioning
+
+A key idea from second order methods that survives at scale is **preconditioning**. Instead of stepping along the raw gradient, we transform it by a symmetric positive definite matrix (P):
+
+$$
+\theta_{k+1} = \theta_k - \eta P_k \nabla f(\theta_k).
+$$
+
+If (P_k) approximates (H(\theta\_k)\^{-1}), the step direction becomes closer to a Newton step, and ill conditioning can be reduced. Even simple diagonal preconditioners can help a lot.
+
+Preconditioning appears in many guises:
+
+-   Quasi Newton methods like BFGS build an approximate inverse Hessian.
+-   Natural gradient methods approximate the inverse of a Fisher information matrix.
+-   Adaptive methods like Adam (next section) maintain per parameter scalings that resemble diagonal preconditioners.
+
+A very simple diagonal preconditioner for a convex quadratic function
+
+$$
+f(\theta) = \frac{1}{2} \theta^\top A \theta,
+$$
+
+with (A) symmetric positive definite:
+
+-   The gradient is (A \theta).
+
+-   If we use (P = \operatorname{diag}(A)\^{-1}), then the update becomes
+
+    $$
+    \theta_{k+1} = \theta_k - \eta \operatorname{diag}(A)^{-1} A \theta_k,
+    $$
+
+    which partially corrects for differences in scaling along coordinate directions.
+
+You can experiment with such preconditioning on synthetic quadratic problems to see the speedup in convergence.
+
+------------------------------------------------------------------------
+
+## Adaptive learning rates: Adagrad, RMSProp, Adam
+
+Fixed learning rates are often suboptimal. We may want:
+
+-   larger steps in directions where the gradient is usually small, and
+-   smaller steps where the gradient is often large.
+
+This motivates **adaptive learning rate** methods, which maintain per parameter state to scale the gradient.
+
+### Adagrad
+
+Adagrad {cite}`duchi2011adaptive` maintains an accumulating sum of squared gradients:
+
+$$
+G_{k} = G_{k-1} + g_k \odot g_k,
+$$
+
+where (\odot) is elementwise multiplication and the operations are understood elementwise. The update is
+
+$$
+\theta_{k+1} = \theta_k - \eta \frac{g_k}{\sqrt{G_k} + \epsilon}.
+$$
+
+This means that coordinates that have seen large gradients in the past get smaller effective learning rates.
+
+Adagrad works well for sparse problems but its learning rate decays monotonically, which can become too small over time.
+
+### RMSProp
+
+RMSProp modifies Adagrad by using an exponential moving average instead of an accumulating sum:
+
+$$
+v_k = \rho v_{k-1} + (1 - \rho) g_k \odot g_k,
+\quad
+\theta_{k+1} = \theta_k - \eta \frac{g_k}{\sqrt{v_k} + \epsilon}.
+$$
+
+Here (\rho) is typically around 0.9. This prevents the denominator from growing without bound and allows the algorithm to keep adapting.
+
+### Adam
+
+Adam {cite}`kingma2014adam` combines momentum and RMSProp style adaptive scaling.
+
+It maintains two moving averages:
+
+-   First moment (gradient) estimate:
+
+    $$
+    m_k = \beta_1 m_{k-1} + (1 - \beta_1) g_k.
+    $$
+
+-   Second moment (squared gradient) estimate:
+
+    $$
+    v_k = \beta_2 v_{k-1} + (1 - \beta_2) g_k \odot g_k.
+    $$
+
+To correct the bias introduced by starting at zero, Adam uses bias corrected estimates:
+
+$$
+\hat{m}_k = \frac{m_k}{1 - \beta_1^k},
+\quad
+\hat{v}_k = \frac{v_k}{1 - \beta_2^k},
+$$
+
+and updates
+
+$$
+\theta_{k+1} = \theta_k - \eta \frac{\hat{m}_k}{\sqrt{\hat{v}_k} + \epsilon}.
+$$
+
+Typical default hyperparameters are:
+
+-   (\beta\_1 = 0.9),
+-   (\beta\_2 = 0.999),
+-   (\epsilon = 10\^{-8}).
+
+A minimal Adam implementation for a generic differentiable function:
+
+```{python}
+def adam_optimize(
+    grad_fn: Callable[[np.ndarray], np.ndarray],
+    theta0: np.ndarray,
+    num_steps: int,
+    learning_rate: float = 1e-2,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+) -> Dict[str, np.ndarray]:
+    """
+    Minimal Adam optimizer for a function defined by grad_fn.
+    Returns final parameters and trajectory.
+    """
+    theta = theta0.copy()
+    m = np.zeros_like(theta)
+    v = np.zeros_like(theta)
+    trajectory = [theta.copy()]
+
+    for t in range(1, num_steps + 1):
+        g = grad_fn(theta)
+
+        m = beta1 * m + (1.0 - beta1) * g
+        v = beta2 * v + (1.0 - beta2) * (g * g)
+
+        m_hat = m / (1.0 - beta1**t)
+        v_hat = v / (1.0 - beta2**t)
+
+        theta = theta - learning_rate * m_hat / (np.sqrt(v_hat) + eps)
+        trajectory.append(theta.copy())
+
+    return {"theta": theta, "trajectory": np.stack(trajectory, axis=0)}
+```
+
+You can compare this to SGD with momentum on the same function. Often Adam converges in fewer steps, especially when the gradients are poorly scaled.
+
+### Tradeoffs of adaptive methods
+
+Adaptive methods are very popular in deep learning, but they come with tradeoffs:
+
+-   They often achieve lower training loss faster than SGD.
+-   For some problems, especially in computer vision, plain SGD with momentum tends to give better **generalization performance** for the same training loss {cite}`wilson2017marginal`.
+-   Certain theoretical convergence issues were identified for Adam, which led to variants such as AdamW and AMSGrad.
+
+As a practical rule of thumb:
+
+-   For quick prototyping or very ill conditioned problems, Adam is an excellent default.
+-   For final large scale training, many practitioners still prefer SGD with momentum plus a good learning rate schedule.
+
+------------------------------------------------------------------------
+
+## Line searches and trust regions
+
+So far we have taken the step size (\eta\_k) as given. For small to medium sized problems, we can afford to spend more computation choosing a good step size.
+
+### Backtracking line search
+
+Given a current iterate (\theta\_k) and a descent direction (d_k) (for example, minus the gradient), a **line search** tries to find (\alpha\_k \> 0) that approximately minimizes
+
+$$
+\phi(\alpha) = f(\theta_k + \alpha d_k)
+$$
+
+along the ray defined by (d_k).
+
+A simple and widely used procedure is **backtracking line search** with the Armijo condition:
+
+1.  Choose parameters (c \in (0, 1)) and (\tau \in (0, 1)).
+
+2.  Start with some initial step length (\alpha) (for example 1).
+
+3.  While
+
+    $$
+    f(\theta_k + \alpha d_k)
+    >
+    f(\theta_k) + c \alpha \nabla f(\theta_k)^\top d_k,
+    $$
+
+    set (\alpha \leftarrow \tau \alpha).
+
+4.  Accept (\alpha*k =\* \alpha) and set (\theta{k+1} = \theta\_k + \alpha\_k d_k).
+
+This ensures that each step makes sufficient progress along the descent direction.
+
+A simple implementation:
+
+```{python}
+def backtracking_line_search(
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    theta: np.ndarray,
+    direction: np.ndarray,
+    alpha_init: float = 1.0,
+    c: float = 1e-4,
+    tau: float = 0.5,
+    max_iter: int = 20,
+) -> float:
+    """
+    Backtracking line search with Armijo condition.
+    Returns step length alpha.
+    """
+    alpha = alpha_init
+    f_theta = f(theta)
+    grad_theta = grad(theta)
+    directional_derivative = grad_theta @ direction
+
+    for _ in range(max_iter):
+        new_theta = theta + alpha * direction
+        f_new = f(new_theta)
+        if f_new <= f_theta + c * alpha * directional_derivative:
+            return alpha
+        alpha *= tau
+
+    return alpha  # Fallback if condition not met
+```
+
+In high dimensional deep learning, full line searches are rarely used because:
+
+-   They require multiple function evaluations per step.
+-   The loss surface is noisy due to stochastic mini batching.
+
+However, line searches remain valuable for smaller problems (for example, logistic regression on medium sized datasets) and in library optimizers such as L-BFGS.
+
+### Trust region methods
+
+Trust region methods take a different approach. Rather than moving along a line, they define a local region around the current iterate where the quadratic approximation is trusted.
+
+Given a current iterate (\theta\_k), a second order model
+
+$$
+m_k(\delta) = f(\theta_k) + \nabla f(\theta_k)^\top \delta
++ \frac{1}{2} \delta^\top B_k \delta,
+$$
+
+and a trust region radius (\Delta\_k), we consider the subproblem
+
+$$
+\min_{\|\delta\| \le \Delta_k} m_k(\delta).
+$$
+
+We accept or reject the step based on how well (m_k(\delta\_k)) predicts the actual decrease in (f), and adjust (\Delta\_k) accordingly.
+
+While full trust region algorithms are beyond our scope, two points are useful to keep in mind:
+
+-   Trust region ideas justify adaptive step sizes based on local model quality.
+-   The Levenberg Marquardt algorithm and some second order methods for neural networks can be interpreted as trust region methods.
+
+For machine learning practitioners, the main takeaway is that methods that adapt the effective step size based on local curvature (explicitly or implicitly) often behave more robustly.
+
+------------------------------------------------------------------------
+
+## Mixed precision training and numerical stability
+
+Modern hardware supports a variety of floating point formats:
+
+-   FP64 (float64) - 64 bit, high precision, lower speed on GPUs.
+-   FP32 (float32) - 32 bit, standard for many deep learning workloads.
+-   FP16 (float16) and bfloat16 - 16 bit formats that allow faster computation and lower memory usage.
+-   Newer 8 bit formats are emerging in some systems.
+
+**Mixed precision training** uses low precision for some operations and higher precision for others to balance speed, memory, and numerical stability {cite}`micikevicius2017mixed`.
+
+Typical pattern:
+
+-   Parameters are stored in FP32.
+-   Forward and backward passes use FP16 or bfloat16 for compute.
+-   Gradient accumulation and optimizer state use FP32.
+
+The main numerical challenges are:
+
+-   **Underflow**: tiny values rounded to zero.
+-   **Overflow**: large values becoming infinite or NaN.
+-   **Loss of significance**: subtracting nearly equal floating point numbers.
+
+### Loss scaling
+
+To prevent gradient underflow in mixed precision, many systems use **loss scaling**:
+
+1.  Multiply the loss by a scale factor (S).
+2.  Backpropagate to compute gradients of the scaled loss, which are larger in magnitude.
+3.  Divide the resulting gradients by (S) before updating parameters.
+
+If overflow is detected (for example, NaNs appear), (S) can be reduced. If training is stable, (S) can be increased. This is known as **dynamic loss scaling**.
+
+A schematic PyTorch style snippet (non executable here, but conceptually accurate) looks like:
+
+```{python}
+# Minimal runnable example (defines model, dataloader, optimizer, then trains with AMP on CUDA)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# simple model
+model = nn.Sequential(
+    nn.Flatten(),
+    nn.Linear(28 * 28, 128),
+    nn.ReLU(),
+    nn.Linear(128, 10),
+)
+model.to(device)
+
+# dummy dataset
+X = torch.randn(256, 1, 28, 28)
+y = torch.randint(0, 10, (256,))
+dataloader = DataLoader(TensorDataset(X, y), batch_size=32, shuffle=True)
+
+optimizer = optim.SGD(model.parameters(), lr=1e-2)
+loss_fn = nn.CrossEntropyLoss()
+
+use_amp = device.type == "cuda"
+scaler = torch.amp.GradScaler("cuda") if use_amp else None  # new API
+
+for epoch in range(1):  # one epoch for demo
+    for inputs, targets in dataloader:
+        optimizer.zero_grad()
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        if use_amp:
+            # autocast only on CUDA
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(inputs)
+                loss = loss_fn(outputs, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(inputs)
+            loss = loss_fn(outputs, targets)
+            loss.backward()
+            optimizer.step()
+```
+
+The `GradScaler` handles the scaling logic. The autocast context ensures that operations run in appropriate precision.
+
+### Numerically stable primitives
+
+Even in FP32, naive implementations of some functions can be unstable. Good implementations use algebraic transformations to avoid overflow and underflow.
+
+Two important examples:
+
+1.  **Stable softmax**:
+
+    Naive:
+
+    $$
+    \operatorname{softmax}(z)_i
+    = \frac{\exp(z_i)}{\sum_j \exp(z_j)}.
+    $$
+
+    If some (z_i) are large, `exp(z_i)` overflows.
+
+    Stable form:
+
+    $$
+    \operatorname{softmax}(z)_i
+    = \frac{\exp(z_i - m)}{\sum_j \exp(z_j - m)},
+    \quad
+    m = \max_j z_j.
+    $$
+
+2.  **Log-sum-exp trick**:
+
+    Naive:
+
+    $$
+    \log \sum_{i} \exp(z_i)
+    $$
+
+    Stable version:
+
+    $$
+    \operatorname{LSE}(z)
+    = m + \log \sum_i \exp(z_i - m),
+    \quad m = \max_i z_i.
+    $$
+
+Implementation:
+
+```{python}
+def log_sum_exp(z: np.ndarray) -> float:
+    """Numerically stable log-sum-exp for a 1D array."""
+    z = np.asarray(z, dtype=float)
+    m = np.max(z)
+    return float(m + np.log(np.sum(np.exp(z - m))))
+
+
+def softmax(z: np.ndarray) -> np.ndarray:
+    """Numerically stable softmax."""
+    z = np.asarray(z, dtype=float)
+    m = np.max(z, axis=-1, keepdims=True)
+    e = np.exp(z - m)
+    return e / np.sum(e, axis=-1, keepdims=True)
+```
+
+These kinds of small numerical details make the difference between a training run that quietly produces NaNs after some epochs and one that finishes successfully.
+
+------------------------------------------------------------------------
+
+## Automatic differentiation and computational graphs
+
+Deep learning frameworks provide gradients almost magically. To understand and debug optimization, we need to know where those gradients come from.
+
+The core idea is **automatic differentiation** (autodiff), based on **computational graphs**.
+
+### Computational graphs
+
+A computational graph is a directed acyclic graph where:
+
+-   Nodes represent variables (tensors) and operations.
+-   Edges represent data dependencies.
+
+For example, consider the scalar computation
+
+$$
+u = xy, \quad
+v = x + y, \quad
+f = u + v,
+$$
+
+with inputs (x, y). The graph has nodes for (x, y, u, v, f) and edges linking them.
+
+To compute gradients of (f) with respect to (x) and (y), we can:
+
+-   Apply the chain rule manually.
+-   Or let an automatic differentiation engine propagate derivatives across the graph.
+
+### Forward mode and reverse mode
+
+There are two main modes of autodiff:
+
+-   **Forward mode**: propagate derivatives from inputs to outputs.
+-   **Reverse mode**: propagate derivatives from outputs back to inputs.
+
+For functions (f: \mathbb{R}\^d \to \mathbb{R}), reverse mode has cost roughly proportional to evaluating (f) once, regardless of (d). This is ideal for machine learning where (d) is large but the loss is scalar. Backpropagation is reverse mode autodiff applied to neural networks.
+
+To see how this works, let us build a tiny reverse mode autodiff engine for scalar operations.
+
+```{python}
+class Node:
+    """A scalar-valued node in a computational graph for reverse-mode autodiff."""
+
+    def __init__(self, value: float, parents=None, op: str | None = None):
+        self.value = float(value)
+        self.grad = 0.0
+        self.parents = parents if parents is not None else []
+        self.op = op
+
+    def __add__(self, other: "Node") -> "Node":
+        other = other if isinstance(other, Node) else Node(other)
+        out = Node(self.value + other.value, parents=[(self, 1.0), (other, 1.0)], op="add")
+        return out
+
+    def __mul__(self, other: "Node") -> "Node":
+        other = other if isinstance(other, Node) else Node(other)
+        # For multiplication, df/dx = y, df/dy = x.
+        out = Node(self.value * other.value, parents=[(self, other.value), (other, self.value)], op="mul")
+        return out
+
+    def backward(self, seed: float = 1.0):
+        """Backpropagate gradient from this node to its ancestors."""
+        # Simple reverse-mode traversal using a stack.
+        stack = [(self, seed)]
+        visited = set()
+
+        while stack:
+            node, grad = stack.pop()
+            node.grad += grad
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            for parent, local_deriv in node.parents:
+                stack.append((parent, grad * local_deriv))
+
+
+def demo_autodiff():
+    # Compute f(x, y) = x * y + x with reverse-mode autodiff.
+    x = Node(2.0)
+    y = Node(3.0)
+    f = x * y + x  # f = xy + x
+    f.backward(seed=1.0)
+    print(f"f(x, y) = {f.value}")
+    print(f"df/dx = {x.grad} (expected y + 1 = 4.0)")
+    print(f"df/dy = {y.grad} (expected x = 2.0)")
+
+
+if __name__ == "__main__":
+    demo_autodiff()
+```
+
+Explanation:
+
+-   Each `Node` stores a scalar value, a gradient accumulator, and a list of parents with local derivatives.
+-   When we compute `x * y`, we create a new node whose parents are `x` and `y`, with local derivatives `df/dx = y` and `df/dy = x`.
+-   `backward` traverses the graph in reverse, multiplying gradients by local derivatives and accumulating them in each node.
+-   This toy engine only supports addition and multiplication, but extending it to more operations follows the same pattern.
+
+Real frameworks like PyTorch, JAX, and TensorFlow:
+
+-   Work with tensors rather than scalars.
+-   Handle control flow and complex operations.
+-   Implement efficient memory reuse and graph pruning.
+
+Nevertheless, the core logic is the same: record the computation graph, then apply reverse mode autodiff to compute gradients.
+
+------------------------------------------------------------------------
+
+## Exploding and vanishing gradients, clipping, and checkpointing
+
+Optimization in deep learning is not only about choosing an algorithm. It is also about surviving the pathologies of very deep, highly nonlinear networks.
+
+### Exploding and vanishing gradients
+
+Consider a deep feedforward network where each layer applies a linear transformation followed by a nonlinearity:
+
+$$
+h^{(0)} = x,
+\quad
+h^{(\ell)} = \phi(W^{(\ell)} h^{(\ell-1)} + b^{(\ell)}),
+\quad
+\ell = 1, \dots, L.
+$$
+
+Backpropagation expresses the gradient of the loss with respect to parameters at layer (\ell) in terms of products of Jacobian matrices from deeper layers. Roughly speaking, the gradient signal at layer 1 involves products of the form
+
+$$
+J^{(L)} J^{(L-1)} \cdots J^{(2)}.
+$$
+
+If the spectral norms of these Jacobians are generally less than 1, their product can shrink exponentially with depth, causing **vanishing gradients**. If they are generally larger than 1, the product can blow up, causing **exploding gradients**.
+
+This phenomenon is particularly severe in:
+
+-   Very deep feedforward networks.
+-   Recurrent neural networks (RNNs) unrolled over many time steps.
+
+Mitigations include:
+
+-   Careful initialization (for example Xavier or He initialization).
+-   Non saturating activations (ReLU rather than sigmoid).
+-   Residual connections that create shorter gradient paths.
+-   Normalization layers (batch norm, layer norm).
+-   Gradient clipping, which we discuss next.
+
+### Gradient clipping
+
+**Gradient clipping** controls the magnitude of gradient vectors before applying the update. Common variants:
+
+-   **Norm clipping**: if (\|g\|\_2 \> c), rescale
+
+    $$
+    g \leftarrow c \frac{g}{\|g\|_2}.
+    $$
+
+-   **Value clipping**: clamp each component to a fixed range.
+
+Norm clipping is more common in modern deep learning. It is especially effective in recurrent networks and sequence models.
+
+A generic implementation:
+
+```{python}
+def clip_grad_norm(grad: np.ndarray, max_norm: float) -> np.ndarray:
+    """Scale gradient to have at most max_norm in L2 norm."""
+    norm = np.linalg.norm(grad)
+    if norm > max_norm:
+        return grad * (max_norm / (norm + 1e-12))
+    return grad
+```
+
+In deep learning frameworks, gradient clipping is usually provided as a built in utility. For example:
+
+-   In PyTorch: `torch.nn.utils.clip_grad_norm_(parameters, max_norm)`.
+-   In JAX or custom code: you manually scale gradients before the optimizer step.
+
+While clipping does not fundamentally solve exploding gradients, it makes training more robust by preventing updates that are so large they destroy learned structure.
+
+### Checkpointing
+
+The word "checkpointing" has two related meanings in deep learning practice.
+
+1.  **Model checkpointing for reliability**:
+
+    -   Periodically save model and optimizer state to disk.
+    -   If training is interrupted, you can resume from a recent checkpoint.
+    -   Useful for long runs and for preserving the best model according to a validation metric.
+
+    A PyTorch style pattern (conceptual):
+
+    ```{python}
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "rng_state": torch.random.get_rng_state(),
+    }
+    torch.save(state, "checkpoint.pt")
+    ```
+
+2.  **Gradient checkpointing for memory**:
+
+    -   In backpropagation, intermediate activations from each layer must be stored for use in the backward pass.
+    -   For deep networks, this can dominate memory usage.
+    -   Gradient checkpointing trades compute for memory by selectively **recomputing** some activations during backprop, instead of storing them all.
+
+    Basic idea:
+
+    -   Partition the network into segments.
+    -   During forward pass, store only the inputs at segment boundaries.
+    -   During backward pass, recompute intermediate activations within each segment as needed.
+
+    This can reduce memory complexity from linear in depth to roughly square root in some cases, at the price of extra forward computations {cite}`chen2016training`.
+
+For the purpose of understanding optimization, it is enough to know that gradient checkpointing changes the memory and compute tradeoff but does not change the mathematical gradients. It simply recomputes part of the computational graph during backprop.
+
+------------------------------------------------------------------------
+
+## Summary
+
+This chapter has built up a practical and conceptual foundation for optimization in machine learning:
+
+-   We framed training as empirical risk minimization and saw that optimization algorithms are responsible for navigating high dimensional loss landscapes.
+-   We studied **first order methods**, especially SGD and mini batch variants, and implemented logistic regression training from scratch.
+-   We examined **momentum** and **Nesterov acceleration**, which smooth gradients across steps and improve convergence in ill conditioned valleys.
+-   We introduced curvature through the Hessian, explored **Newton's method**, and motivated **preconditioning** as a scalable way to incorporate second order information.
+-   We covered **adaptive learning rate methods** such as Adagrad, RMSProp, and Adam, along with their strengths and weaknesses in practice.
+-   We discussed **line search** and **trust region** ideas that underlie more advanced optimizers in low and medium dimensional settings.
+-   We explained **mixed precision training**, including loss scaling and essential numerically stable primitives like log-sum-exp and stable softmax.
+-   We built a tiny **reverse mode automatic differentiation** engine to demystify backpropagation and computational graphs.
+-   Finally, we addressed practical pathologies: **exploding** and **vanishing gradients**, **gradient clipping**, and both forms of **checkpointing**.
+
+In later chapters, these ideas will appear as building blocks:
+
+-   When we design and train deep networks, we will use SGD or Adam, rely on numerically stable implementations of softmax and cross entropy, and choose initialization schemes to mitigate vanishing gradients.
+-   When we work with probabilistic models and variational inference, we will rely on reverse mode autodiff to optimize complex objectives.
+-   When we scale to large models, we will demand mixed precision support from our frameworks and use checkpointing to manage resources.
+
+A solid understanding of optimization and numerical methods is one of the main differences between simply **using** deep learning libraries and being able to **reason about, debug, and extend** learning systems. The rest of the book assumes you are comfortable with these concepts and will continue to develop them in more specialized contexts.

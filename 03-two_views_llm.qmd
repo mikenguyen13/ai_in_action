@@ -1,0 +1,583 @@
+# Two Views of Large Language Models
+
+1.  Human intuitions are systematically bad at predicting how large language models (LLMs) generalize to new queries, even when we show people rich performance data.
+2.  LLMs exhibit structured “brittleness”: small, seemingly irrelevant changes in inputs or prompts can produce large, hard-to-predict output changes.
+3.  Algorithms can succeed on many sequence tasks while holding deeply wrong “world models,” so high benchmark scores do not guarantee correct internal representations.
+
+Taken together, these results force us to rethink both how we evaluate LLMs and how we mentally model what they are doing.
+
+------------------------------------------------------------------------
+
+## Human expectations and the “generalization function”
+
+### From accuracy numbers to mental models
+
+Suppose I show you an LLM that answers 80 percent of U.S. history questions correctly, 90 percent of programming problems, but only 30 percent of moral-dilemma questions. You are then asked: “How well will it do on factual questions about international law?” or “How well will it write a proof sketch for a functional analysis theorem?”
+
+Most people have strong intuitions here. They form an implicit judgment about:
+
+-   what “kind” of task each benchmark represents,
+-   how similar the new task is to the ones they saw, and
+-   how “capable” the model is overall.
+
+The central insight of @vafa2024large is that this process is structured enough that we can model it as a *human generalization function* and learn it from data. They show that:
+
+-   People are surprisingly consistent across individuals in how they generalize from observed to unobserved tasks.
+-   This human generalization function can itself be predicted by a separate NLP model.
+-   LLMs often violate the patterns people expect: they perform better than expected on some tasks and worse on others in ways that defy human intuition.
+
+A complementary line of work in behavioral economics and psychology finds that people systematically *overestimate* the alignment between their own beliefs and model behavior. He documents a pattern of “anthropomorphic projection”: people predict that a generative model will make choices closer to their own than it actually does [@he2025human]. This effect persists even for technically sophisticated subjects and across a variety of domains.
+
+[MIT News](https://news.mit.edu/2024/large-language-models-dont-behave-like-people-0723?utm_source=chatgpt.com "Large language models don't behave like people, even ...")' coverage of this research captures the tension succinctly: people often behave as if “LLMs are like people,” yet careful experiments show that LLMs do not in fact behave like people and do not generalize along the same dimensions that humans do.
+
+### Formalizing the human generalization function
+
+Let there be $T$ tasks. For each task $t \in {1,\dots,T}$, define:
+
+-   True LLM accuracy: $a_t \in [0,1]$.
+-   Features $x_t$ describing the task (topic, format, required skills, etc.).
+
+Now imagine that we show a human an observed subset of results $O \subset {1,\dots,T}$. The human sees ${(x_t, a_t)}_{t \in O}$ and is then asked to predict model accuracy on some unobserved task $u \notin O$.
+
+We can represent a person’s belief as
+
+$$ \hat{a}u = g\big(x_u, {(x_t, a_t)}{t \in O}\big),$$
+
+where $g$ is the *human generalization function*: it takes in the tasks and accuracies they have seen and outputs beliefs about a new task. @vafa2024large show:
+
+1.  There is a stable mapping from a vector representation of the task and observed performance to these predictions.
+2.  A separate model (for example a BERT-like encoder) can approximate $g$ well using standard supervised learning.
+
+This gives us two distributions to compare:
+
+-   The *true* LLM performance vector $a = (a_1,\dots,a_T)$.
+-   The *human-expected* performance vector $\hat{a}^{(h)} = (\hat{a}_1^{(h)},\dots,\hat{a}_T^{(h)})$ for human $h$, or its average across humans.
+
+A key empirical finding is that the distance $d(a, \hat{a}^{(h)})$, for example in $L_2$ norm, can be very large even when people have seen quite informative performance summaries. People systematically mis-predict which tasks will be easy or hard for a model, and they tend to smooth over sharp discontinuities that LLMs exhibit across question formats and topics.
+
+This mismatch matters for deployment. If the human generalization function badly approximates the actual model, then people will allocate trust and attention in pathological ways, over-relying on LLMs in fragile regions and under-using them where they would in fact perform well.
+
+### Practical framework: modeling human expectations in Python
+
+In research and engineering practice, it is useful to build a small pipeline that:
+
+1.  Stores observed LLM performance on a suite of tasks.
+2.  Stores human predictions about performance on those tasks, given partial observations.
+3.  Fits a predictive model for human expectations.
+4.  Quantifies mismatch between expectations and ground truth.
+
+Below is a minimal but scalable implementation sketch, designed to work with either synthetic data or a real dataset similar in spirit to that of @vafa2024large
+
+#### Data model
+
+Assume we have a table with columns:
+
+-   `worker_id`: human identifier
+-   `task_id`: task identifier
+-   `task_features`: vector representation (for example, a sentence embedding)
+-   `observed_summary`: embedding of the performance summary the human has seen
+-   `true_accuracy`: true LLM accuracy on the task
+-   `predicted_accuracy`: human prediction
+
+We will use Polars for efficient tabular work and scikit-learn for modeling.
+
+```{python}
+#| eval: false
+import polars as pl
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+# Load data (could be parquet or csv)
+df = pl.read_parquet("human_llm_generalization.parquet")
+
+# Suppose embeddings are stored as lists of floats
+def to_numpy(mat_col: pl.Series) -> np.ndarray:
+    return np.vstack(mat_col.to_list())
+
+X_task = to_numpy(df["task_features"])
+X_summary = to_numpy(df["observed_summary"])
+
+# Concatenate task and summary representations
+X = np.hstack([X_task, X_summary])
+
+y_true = df["true_accuracy"].to_numpy()
+y_human = df["predicted_accuracy"].to_numpy()
+
+# Split by workers if you want strict generalization across people
+train_idx, test_idx = train_test_split(
+    np.arange(len(df)), test_size=0.2, random_state=0
+)
+
+X_train, X_test = X[train_idx], X[test_idx]
+y_human_train, y_human_test = y_human[train_idx], y_human[test_idx]
+y_true_train, y_true_test = y_true[train_idx], y_true[test_idx]
+
+# Model the human generalization function
+human_model = make_pipeline(
+    StandardScaler(),
+    Ridge(alpha=1.0)
+)
+human_model.fit(X_train, y_human_train)
+
+pred_human_test = human_model.predict(X_test)
+rmse_human = mean_squared_error(y_human_test, pred_human_test, squared=False)
+print(f"RMSE of model predicting human expectations: {rmse_human:.3f}")
+
+# Compare human predictions to true accuracies on the same tasks
+rmse_expectation = mean_squared_error(y_true_test, y_human_test, squared=False)
+rmse_oracle = mean_squared_error(y_true_test, pred_human_test, squared=False)
+print(f"RMSE between human expectations and reality: {rmse_expectation:.3f}")
+print(f"RMSE if we could perfectly predict human expectations: {rmse_oracle:.3f}")
+```
+
+This code plays two distinct roles:
+
+-   It evaluates how *structured* human expectations are. If the model predicts human predictions well, then human generalization is not random.
+-   It quantifies the *mismatch* between human expectations and reality by comparing `rmse_expectation` to the intrinsic noise in human predictions.
+
+In a real project you would replace `Ridge` with a more powerful architecture (for example a small transformer taking as input a natural-language summary of observed performance) and use confidence intervals or Bayesian models to capture uncertainty in human beliefs.
+
+#### Interpretation
+
+If we find that:
+
+-   $\text{RMSE}(\hat{a}^{(h)}, a)$ is large, but
+-   $\text{RMSE}(\tilde{a}, \hat{a}^{(h)})$ (where $\tilde{a}$ is the model of human expectations) is small,
+
+then we have evidence that the problem is not *noise* but *systematic miscalibration*. People share a common but wrong mental model of LLM capability. That mental model is learned, consistent, and thus can itself be studied, stress-tested, and perhaps corrected using tutorials or interface design.
+
+------------------------------------------------------------------------
+
+## Stylized examples and systematic evaluations of LLM brittleness
+
+### What is “brittleness”?
+
+Informally, a model is brittle when small, intuitively irrelevant changes in input produce large, qualitatively different outputs or performance, even though ground truth labels are unchanged.
+
+We can formalize this in the simplest classification setting. Let $f : \mathcal{X} \to \mathcal{Y}$ be the model and $y(x)$ the ground truth label. Define a family $\mathcal{T}$ of *semantics-preserving transformations* on inputs, such as:
+
+-   paraphrasing a question,
+-   translating to another language and back,
+-   reordering options in a multiple-choice question,
+-   negating and adjusting polarity in a logically equivalent way.
+
+We say that the model is brittle on input $x$ if there exists a $\tau \in \mathcal{T}$ with $y(\tau(x)) = y(x)$ but $f(\tau(x)) \ne f(x)$, or more generally if the predictive distribution shifts substantially:
+
+$\mathrm{Brittle}(x) = \max*{*\tau \in \mathcal{T}} \left| p\theta(y \mid \tau(x)) - p_\theta(y \mid x) \right|_1.$
+
+A dataset-level brittleness measure is then the expectation of this quantity, or the probability that the arg max class changes under some allowed transformation.
+
+A growing body of work builds precisely these sorts of transformations and measures brittleness across tasks:
+
+-   @min2022rethinking show that in-context learning accuracy barely changes when labels in demonstrations are randomly permuted, indicating that LLMs often ignore the intended semantics of example-label pairs and rely instead on superficial features such as format and label inventory
+-   @khashabi2022prompt uncover “prompt waywardness,” where continuous prompt tuning finds prompt vectors that solve a task but decode to arbitrary or even misleading natural-language instructions
+-   @guha2023legalbench includes pairs of legally equivalent but differently worded questions to explicitly evaluate brittleness to readability and wording changes in legal reasoning
+-   Mozes and follow-up work document adversarial brittleness of in-context learning, where innocuous-looking changes in few-shot examples can dramatically change behavior on held-out inputs [@mozes_thesis_2024]. ([UCL Discovery](https://discovery.ucl.ac.uk/id/eprint/10190224/2/mmozes_thesis.pdf?utm_source=chatgpt.com "Understanding and Guarding against Natural Language ..."))
+-   Recent evaluations of political worldviews in LLMs measure reliability under paraphrasing, negation, and translation, finding that model stances on the same underlying policy can flip with small prompt changes [@probvaa_political_worldviews_2024]. ([arXiv](https://arxiv.org/html/2402.17649v2?utm_source=chatgpt.com "Evaluating the reliability and consistency of political ..."))
+
+Together with broader analyses of prompt engineering and in-context learning [@liu_prompt_survey_2023; @chen_prompt_engineering_review_2025], these studies paint a picture of models that can appear stable on a specific benchmark but behave chaotically once we probe the local neighborhood of the input space.
+
+### 2.2 Taxonomy of brittleness
+
+For the purposes of implementation and measurement, it is helpful to distinguish several kinds of brittleness:
+
+1.  **Lexical brittleness** Sensitivity to synonym replacements, minor wording tweaks, or formatting changes (for example bullet list versus paragraph).
+
+2.  **Structural brittleness** Sensitivity to reordering of logically independent components, such as the order of options in a multiple choice list or the order of few-shot examples in a prompt.
+
+3.  **Semantic brittleness** Failures under logically equivalent paraphrases, such as negation with polarity flip or expressing the same policy stance with different rhetoric.
+
+4.  **Contextual brittleness** Sensitivity to seemingly irrelevant context additions: adding an unrelated sentence, or changing a user’s stated demographic, can alter answers that should be invariant.
+
+5.  **State / world-model brittleness** Models that act consistently under the exact training distribution but fail catastrophically when small changes alter the underlying environment (for instance closing a few roads in a navigation task). This overlaps with the world model discussion in section 3. ([MIT News](https://news.mit.edu/2024/generative-ai-lacks-coherent-world-understanding-1105?utm_source=chatgpt.com "Despite its impressive output, generative AI doesn't have a ..."))
+
+In practice, a good evaluation suite will try to measure all five.
+
+### 2.3 A small brittleness benchmarking harness in Python
+
+Here we will design a small framework to quantify brittleness for any LLM accessible through an API. The core idea:
+
+1.  Start from a dataset of base prompts and gold labels.
+2.  Generate transformed variants of each prompt using deterministic rules or another model.
+3.  Call the LLM on both base and transformed prompts.
+4.  Compute disagreement and accuracy changes.
+
+We will focus on textual transformations such as paraphrasing and negation. For illustration, we will treat model calls as a black box function `call_llm(prompt)`.
+
+``` python
+import polars as pl
+from dataclasses import dataclass
+from typing import List, Callable, Dict, Any
+
+@dataclass
+class Example:
+    example_id: str
+    prompt_base: str
+    label: str
+
+@dataclass
+class TransformedExample:
+    example_id: str
+    transform_name: str
+    prompt_variant: str
+    label: str
+
+# Step 1: load base dataset
+base_df = pl.read_csv("policy_questions.csv")  # columns: id, prompt, label
+
+base_examples = [
+    Example(row["id"], row["prompt"], row["label"])
+    for row in base_df.iter_rows(named=True)
+]
+
+# Step 2: define a library of transformations
+
+def paraphrase_prompt(text: str) -> str:
+    # In production, call a paraphrasing model; here we use a placeholder
+    return f"Please answer the following question in your own words:\n{text}"
+
+def negate_policy_stance(text: str) -> str:
+    # A toy example of flipping stance while preserving semantic core
+    return text.replace("should", "should not")
+
+TRANSFORMS: Dict[str, Callable[[str], str]] = {
+    "paraphrase": paraphrase_prompt,
+    "negation_flip": negate_policy_stance,
+}
+
+# Step 3: generate transformed variants
+def generate_transformed(examples: List[Example]) -> List[TransformedExample]:
+    transformed = []
+    for ex in examples:
+        for name, fn in TRANSFORMS.items():
+            prompt_variant = fn(ex.prompt_base)
+            transformed.append(
+                TransformedExample(
+                    example_id=ex.example_id,
+                    transform_name=name,
+                    prompt_variant=prompt_variant,
+                    label=ex.label,
+                )
+            )
+    return transformed
+
+transformed_examples = generate_transformed(base_examples)
+
+# Step 4: define a thin wrapper around your LLM API
+
+def call_llm(prompt: str, temperature: float = 0.0) -> str:
+    """
+    Replace this stub with a real call to OpenAI, Anthropic, etc.
+    It should return a short answer string that can be mapped to labels.
+    """
+    raise NotImplementedError
+
+def get_model_label(raw_output: str) -> str:
+    # For classification tasks, map the model text to a canonical label
+    text = raw_output.strip().lower()
+    if "support" in text or "yes" in text:
+        return "support"
+    if "oppose" in text or "no" in text:
+        return "oppose"
+    return "unknown"
+
+# Step 5: run the evaluation (this may take time in practice)
+records: List[Dict[str, Any]] = []
+
+for ex in base_examples:
+    raw = call_llm(ex.prompt_base)
+    pred_label = get_model_label(raw)
+    records.append(
+        {
+            "example_id": ex.example_id,
+            "transform_name": "base",
+            "pred_label": pred_label,
+            "gold_label": ex.label,
+        }
+    )
+
+for ex in transformed_examples:
+    raw = call_llm(ex.prompt_variant)
+    pred_label = get_model_label(raw)
+    records.append(
+        {
+            "example_id": ex.example_id,
+            "transform_name": ex.transform_name,
+            "pred_label": pred_label,
+            "gold_label": ex.label,
+        }
+    )
+
+results = pl.from_dicts(records)
+
+# Step 6: compute brittleness metrics
+
+# Accuracy by condition
+acc_df = (
+    results
+    .with_columns(
+        (pl.col("pred_label") == pl.col("gold_label")).alias("correct")
+    )
+    .groupby("transform_name")
+    .agg(pl.mean("correct").alias("accuracy"))
+)
+print(acc_df)
+
+# Disagreement between base and transformed prompts
+pivot = results.pivot(
+    values="pred_label",
+    index="example_id",
+    columns="transform_name"
+)
+
+for name in TRANSFORMS.keys():
+    col_base = pivot["base"]
+    col_var = pivot[name]
+    disagreement = (col_base != col_var).mean()
+    print(f"Disagreement rate for {name}: {disagreement:.3f}")
+```
+
+In an applied setting, you would expand this into:
+
+-   Multiple transformation families per taxonomy category.
+-   A richer label mapping and calibration of generative outputs.
+-   Confidence-aware metrics: not just whether the answer changes, but how much the log probability mass shifts.
+
+The key point is that once you have this harness, you can treat “brittleness score” as a first-class evaluation metric alongside accuracy or BLEU, and compare models and prompting strategies accordingly.
+
+------------------------------------------------------------------------
+
+## 3. Good performance with wrong world models
+
+The final piece of the puzzle is the observation that models can perform very well on sequence tasks while representing the underlying world in a completely wrong way.
+
+### 3.1 World models as equivalence classes over histories
+
+Consider a deterministic environment (for example a board game or road network). At any time the environment is in some state (s \in S). There is an alphabet (\Sigma) of possible observations or actions, and a transition function
+
+\[ \delta : S \times \Sigma \to S.\]
+
+The environment induces a mapping from finite sequences of symbols (histories) to states. Two histories (h_1, h_2 \in \Sigma\^\star) are *Myhill, Nerode equivalent* if, no matter what sequence of future moves (z \in \Sigma\^\star) you append, the resulting labeled path is identical:
+
+\[ h_1 \sim h_2 \quad \text{if and only if} \quad \forall z \in \Sigma\^\star:; \text{Outcome}(h_1 z) = \text{Outcome}(h_2 z).\]
+
+The equivalence classes of this relation correspond to the minimal states of a deterministic finite automaton (DFA) that exactly captures the environment. ([arXiv](https://arxiv.org/abs/2406.03689?utm_source=chatgpt.com "Evaluating the World Model Implicit in a Generative Model"))
+
+A *world model* for this environment is any mapping (f) from histories to internal representations (\phi(h)) such that:
+
+1.  If (h_1 \sim h_2) (same true state) then (\phi(h_1) = \phi(h_2)) up to small perturbations.
+2.  If (h_1 \not\sim h_2) (different true states) then (\phi(h_1)) and (\phi(h_2)) are appropriately separated.
+
+Vafa et al. propose two families of metrics to evaluate whether a sequence model has learned such a world model [@vafa_world_model_2024]:
+
+-   **Sequence compression**: how often does the model correctly merge histories that are equivalent in the true automaton?
+-   **Sequence distinction**: how often does the model keep distinct histories that lead to different future possibilities?
+
+They show empirically that transformers trained to high predictive accuracy on tasks like New York City navigation and Othello can heavily fail these world-model metrics, especially under small environment changes such as closing a fraction of streets or adding detours. ([MIT News](https://news.mit.edu/2024/generative-ai-lacks-coherent-world-understanding-1105?utm_source=chatgpt.com "Despite its impressive output, generative AI doesn't have a ..."))
+
+Subsequent work extends this perspective to pretrained learners and foundation models, emphasizing that even when an LLM transfers well to new tasks, the underlying inductive bias may capture only a crude or partial state representation [@vafa_world_models_pretrained_2025]. ([OpenReview](https://openreview.net/forum?id=QtKYYatG3Z&utm_source=chatgpt.com "Evaluating the World Models Used by Pretrained Learners"))
+
+At the same time, mechanistic interpretability studies on “Othello-GPT” and related models demonstrate cases where relatively small transformers *do* learn remarkably linear internal encodings of world state, at least for simplified games [@nanda_othello_world_2023; @hazineh_linear_world_2023]. ([Neel Nanda](https://www.neelnanda.io/mechanistic-interpretability/othello?utm_source=chatgpt.com "Actually, Othello-GPT Has A Linear Emergent World ..."))
+
+Taken together, we are left with a nuanced picture: some sequence models learn elegant world models in toy domains, while large, production-scale LLMs can achieve high prediction accuracy in complex domains without forming coherent, robust state representations.
+
+### 3.2 A toy experiment: training a sequence model on a DFA
+
+To ground these ideas, we will build a small experiment where:
+
+1.  We define a random DFA with a small number of states.
+2.  We generate training sequences by starting from an initial state and following random transitions.
+3.  We train a GRU-based model to predict the next symbol.
+4.  We inspect the model’s hidden states to estimate whether it has recovered the underlying DFA states.
+
+This is only a sketch compared to the full Myhill, Nerode-based metrics, but it illustrates the central possibility: the model may achieve very low prediction error while failing to align its hidden states with the true automaton states.
+
+``` python
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import adjusted_rand_score
+
+# 1. Build a random DFA
+class RandomDFA:
+    def __init__(self, num_states: int, alphabet_size: int, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        self.num_states = num_states
+        self.alphabet_size = alphabet_size
+        # transition[s, a] = next_state
+        self.transition = rng.integers(
+            0, num_states, size=(num_states, alphabet_size)
+        )
+        # optional: label each state with output symbol distribution
+        self.output = rng.integers(
+            0, alphabet_size, size=(num_states,)
+        )
+
+    def step(self, state: int, action: int) -> int:
+        return int(self.transition[state, action])
+
+    def emit(self, state: int) -> int:
+        return int(self.output[state])
+
+def generate_sequences(dfa: RandomDFA, num_sequences: int,
+                       seq_len: int, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    sequences = []
+    next_tokens = []
+    true_states = []
+
+    for _ in range(num_sequences):
+        state = rng.integers(0, dfa.num_states)
+        seq_states = []
+        seq_tokens = []
+        for _ in range(seq_len):
+            token = dfa.emit(state)
+            seq_tokens.append(token)
+            seq_states.append(state)
+            # take a random action for the next transition
+            action = rng.integers(0, dfa.alphabet_size)
+            state = dfa.step(state, action)
+
+        # model sees all but last token and predicts the next
+        sequences.append(seq_tokens[:-1])
+        next_tokens.append(seq_tokens[-1])
+        true_states.append(seq_states[-1])
+
+    return (
+        np.array(sequences, dtype=np.int64),
+        np.array(next_tokens, dtype=np.int64),
+        np.array(true_states, dtype=np.int64),
+    )
+
+class SequenceDataset(Dataset):
+    def __init__(self, X, y, states):
+        self.X = X
+        self.y = y
+        self.states = states
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.X[idx], dtype=torch.long),
+            torch.tensor(self.y[idx], dtype=torch.long),
+            torch.tensor(self.states[idx], dtype=torch.long),
+        )
+
+# 2. Define a simple GRU model for next-token prediction
+class GRUModel(nn.Module):
+    def __init__(self, vocab_size: int, hidden_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_dim)
+        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.out = nn.Linear(hidden_dim, vocab_size)
+
+    def forward(self, x):
+        emb = self.embed(x)
+        h_seq, h_last = self.gru(emb)
+        logits = self.out(h_last.squeeze(0))
+        return logits, h_last.squeeze(0)  # return hidden state too
+
+# 3. Create data and train the model
+dfa = RandomDFA(num_states=6, alphabet_size=4, seed=1)
+X, y, states = generate_sequences(dfa, num_sequences=5000, seq_len=20, seed=1)
+
+dataset = SequenceDataset(X, y, states)
+loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+model = GRUModel(vocab_size=4, hidden_dim=16)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for epoch in range(10):
+    total_loss = 0.0
+    total_correct = 0
+    total = 0
+    for batch_X, batch_y, _ in loader:
+        logits, _ = model(batch_X)
+        loss = criterion(logits, batch_y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        preds = logits.argmax(dim=-1)
+        total_correct += (preds == batch_y).sum().item()
+        total += batch_y.size(0)
+        total_loss += loss.item() * batch_y.size(0)
+
+    print(
+        f"Epoch {epoch:02d} | loss={total_loss/total:.3f} "
+        f"| acc={total_correct/total:.3f}"
+    )
+
+# 4. Extract hidden states for world-model evaluation
+model.eval()
+with torch.no_grad():
+    all_hidden = []
+    all_states = []
+    for batch_X, _, batch_states in loader:
+        _, h = model(batch_X)
+        all_hidden.append(h.numpy())
+        all_states.append(batch_states.numpy())
+    H = np.vstack(all_hidden)
+    S = np.concatenate(all_states)
+
+# Cluster hidden states and compare to true DFA states
+kmeans = KMeans(n_clusters=dfa.num_states, n_init=10, random_state=0)
+cluster_ids = kmeans.fit_predict(H)
+
+ari = adjusted_rand_score(S, cluster_ids)
+print(f"Adjusted Rand Index between clusters and true DFA states: {ari:.3f}")
+```
+
+This experiment yields three key numbers:
+
+-   Training loss and accuracy: how well the GRU predicts the next symbol.
+-   Adjusted Rand Index (ARI): how well the hidden-state clusters align with the true automaton states.
+-   Optionally, a compression and distinction score: you can compute how often different true states map to the same cluster and vice versa.
+
+In many random DFAs, you will observe that the model attains high accuracy but the ARI remains modest. The model has learned enough regularities to predict the next symbol but not enough to reconstruct the true state space. If you change the environment slightly (for example, alter the transition table), the model can suddenly fail, mirroring the MIT findings that navigation models can break down under minor changes even after near-perfect training accuracy. ([MIT News](https://news.mit.edu/2024/generative-ai-lacks-coherent-world-understanding-1105?utm_source=chatgpt.com "Despite its impressive output, generative AI doesn't have a ..."))
+
+### 3.3 From toy automata to large LLMs
+
+Scaling up from toy DFAs to real LLMs raises several new issues:
+
+-   The state space is enormous and not known in advance.
+-   We do not have direct access to the true Myhill, Nerode equivalence classes.
+-   Models are trained on a mix of naturalistic tasks, not a single controlled environment.
+
+Nevertheless, the same conceptual framework applies. Recent work employs *probing* methods to linearly decode world state from intermediate representations in small toy settings, and then asks whether similar probes succeed for large models on analogues of those tasks [@nanda_othello_world_2023; @hazineh_linear_world_2023]. ([Neel Nanda](https://www.neelnanda.io/mechanistic-interpretability/othello?utm_source=chatgpt.com "Actually, Othello-GPT Has A Linear Emergent World ..."))
+
+Other work, including “Evaluating the World Models Used by Pretrained Learners,” focuses on task transfer: how do models extrapolate to new tasks that depend on latent features of the state, and does this extrapolation reveal a coherent internal representation [@vafa_world_models_pretrained_2025]? ([OpenReview](https://openreview.net/forum?id=QtKYYatG3Z&utm_source=chatgpt.com "Evaluating the World Models Used by Pretrained Learners"))
+
+The emerging consensus is subtle:
+
+-   LLMs clearly store rich structural information about the world and can be probed for many kinds of latent structure.
+-   However, their world models can be locally incoherent, brittle under changes in environment dynamics, and misaligned with human conceptual boundaries, even while predicting tokens remarkably well.
+
+------------------------------------------------------------------------
+
+## 4. Putting the pieces together: two views of LLMs
+
+The three themes of this chapter point in a common direction.
+
+1.  **Human mental models are themselves learnable and often wrong.** People possess a shared but miscalibrated generalization function for LLM performance. Modeling this function explicitly can help design better interfaces, explanations, and guardrails.
+
+2.  **Top-line metrics hide brittleness.** Benchmark scores summarize behavior at specific points in input space. Systematic evaluations of perturbations reveal large, structured instabilities that contradict naive expectations of smooth, human-like behavior.
+
+3.  **Behavioral success does not imply a correct world model.** Sequence models can compress regularities in training data just enough to succeed on standard tasks, while their internal representations remain misaligned with the true state of the world. World-model metrics grounded in automata theory provide a more sensitive probe of this discrepancy.
+
+For practitioners building AI systems, these insights suggest several concrete recommendations:
+
+-   Treat user expectations and trust as *separate objects of study* alongside model accuracy. Build datasets and models of human expectations, and design interfaces that highlight where those expectations are most likely to fail.
+-   Incorporate brittleness suites in your evaluation. For every important task, construct families of paraphrases, formatting changes, and adversarial perturbations, and monitor disagreement rates as first-class metrics.
+-   When deploying models in environments with well-defined structure (navigation, games, workflow automation), go beyond predictive accuracy. Use explicit state representations where possible, probe internal representations, and consider methods that build world models with separate, explicit mechanisms rather than relying solely on next-token prediction.
+
+In the next chapter, you might expand these ideas into design principles for alignment and interpretability tooling, combining human expectation modeling, brittleness benchmarks, and world-model diagnostics into a unified evaluation pipeline for production LLM systems.
