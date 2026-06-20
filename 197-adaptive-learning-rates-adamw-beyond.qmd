@@ -1,0 +1,166 @@
+# AdamW and Beyond: Decoupled Weight Decay and the Modern Optimizer Landscape
+
+Adaptive gradient methods reshaped how deep networks are trained, but their interaction with regularization turned out to be subtler than the original formulations suggested. This chapter examines why $L_2$ regularization and weight decay diverge for adaptive optimizers, how AdamW corrects the discrepancy, and how subsequent methods such as AMSGrad, Lion, and Adafactor extend or rethink the design space.
+
+## 1. Background: Adam and Its Update Rule
+
+Adam maintains exponential moving averages of the gradient and its element wise square. Let $g_t = \nabla_\theta f_t(\theta_{t-1})$ be the stochastic gradient at step $t$. Adam computes
+
+$$
+m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t, \qquad v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2,
+$$
+
+where the square is taken element wise. Because $m_0 = v_0 = 0$, both estimates are biased toward zero early in training, so Adam applies bias correction:
+
+$$
+\hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \qquad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}.
+$$
+
+The parameter update divides the smoothed gradient by a per coordinate scale:
+
+$$
+\theta_t = \theta_{t-1} - \alpha \, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}.
+$$
+
+The quantity $\sqrt{\hat{v}_t} + \epsilon$ is the source of the adaptivity. Coordinates with large historical gradient magnitude receive small effective steps, and coordinates with small gradients receive large ones. This per coordinate rescaling is exactly what creates trouble for regularization.
+
+## 2. Why $L_2$ Regularization and Weight Decay Differ
+
+For plain stochastic gradient descent the two notions coincide. Adding an $L_2$ penalty $\frac{\lambda}{2}\|\theta\|^2$ to the loss contributes a gradient term $\lambda \theta$, so the update becomes
+
+$$
+\theta_t = \theta_{t-1} - \alpha \big( g_t + \lambda \theta_{t-1} \big) = (1 - \alpha \lambda)\,\theta_{t-1} - \alpha g_t.
+$$
+
+The factor $(1 - \alpha\lambda)$ shrinks every weight multiplicatively toward zero. This multiplicative shrinkage is what the term weight decay originally meant, and for SGD it is algebraically identical to the gradient of an $L_2$ penalty.
+
+### 2.1 The adaptive preconditioner breaks the equivalence
+
+Now insert the same penalty into Adam. The penalty gradient $\lambda \theta_{t-1}$ is folded into $g_t$, so it flows through both moving averages and, crucially, through the denominator $\sqrt{\hat{v}_t}$. The effective decay applied to coordinate $i$ is no longer $\alpha \lambda$ but approximately
+
+$$
+\frac{\alpha \lambda \, \theta_{t-1,i}}{\sqrt{\hat{v}_{t,i}} + \epsilon}.
+$$
+
+Weights whose gradients have been large, and therefore have large $\hat{v}_{t,i}$, are decayed weakly, while weights with small gradient history are decayed strongly. The intended uniform pull toward the origin becomes a non uniform one that depends on the curvature estimate. This is precisely the wrong behavior: the parameters that most need regularization, those that have grown large because their gradients were persistently large, are the ones shielded from decay.
+
+### 2.2 Coupling also entangles the penalty with adaptivity
+
+A second problem is that the $L_2$ term participates in the first moment $m_t$ and the bias correction. The regularization signal is smoothed and rescaled jointly with the data gradient, so the strength of regularization becomes implicitly coupled to the learning rate schedule and to $\beta_2$. Tuning $\alpha$ then changes the effective amount of regularization, which makes hyperparameter search awkward and non orthogonal.
+
+## 3. AdamW: Decoupled Weight Decay
+
+Loshchilov and Hutter proposed separating the decay from the gradient based update entirely. Rather than adding $\lambda \theta$ to the gradient, AdamW applies the decay directly to the parameters, outside the adaptive preconditioner:
+
+$$
+\theta_t = \theta_{t-1} - \alpha \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda\, \theta_{t-1} \right).
+$$
+
+Equivalently, and more faithfully to the original derivation, the decay is a multiplicative shrinkage applied independently of the moment based step:
+
+$$
+\theta_t = (1 - \alpha \lambda)\, \theta_{t-1} - \alpha\, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}.
+$$
+
+Because $\lambda \theta_{t-1}$ never enters $m_t$ or $v_t$, every coordinate is shrunk by the same factor $(1 - \alpha\lambda)$ regardless of its gradient history. The decay is now genuine weight decay again rather than a curvature warped approximation of it.
+
+```text
+# AdamW step, schematic
+m = b1*m + (1-b1)*g
+v = b2*v + (1-b2)*g*g
+mhat = m / (1 - b1**t)
+vhat = v / (1 - b2**t)
+theta = theta - lr * (mhat / (sqrt(vhat) + eps) + wd * theta)
+```
+
+### 3.1 Practical consequences
+
+Decoupling has two practical payoffs. First, the optimal weight decay $\lambda$ becomes far more stable across learning rates, so the two hyperparameters can be tuned more independently. Loshchilov and Hutter report that the region of good $(\alpha, \lambda)$ pairs becomes much wider and more diagonal under decoupling. Second, decoupling consistently improves generalization on image and language benchmarks, and it has become the default optimizer for training transformers. When a schedule scales $\alpha$ over training, note that the decay magnitude $\alpha\lambda$ scales with it as well, so some implementations decouple the schedule from the decay too.
+
+### 3.2 A note on the bias of the denominator
+
+The argument above also clarifies why decoupling matters more for adaptive methods than for momentum SGD. The damage comes specifically from dividing the penalty by $\sqrt{\hat{v}_t}$. Any optimizer with a per coordinate preconditioner inherits the same pathology, which is why decoupled decay is now standard not only for Adam but for related methods such as LAMB and RAdam.
+
+## 4. AMSGrad: Fixing a Convergence Gap
+
+Reddi, Kale, and Kumar identified a separate flaw in Adam, unrelated to regularization. Adam can fail to converge even on simple convex problems because the effective learning rate $\alpha / \sqrt{\hat{v}_t}$ can increase from one step to the next. When a rare but large and informative gradient is later forgotten by the exponential average, the denominator shrinks and the step grows, which can undo prior progress.
+
+AMSGrad enforces a non increasing effective step by maintaining the running maximum of the second moment:
+
+$$
+\hat{v}_t^{\max} = \max\!\big(\hat{v}_{t-1}^{\max},\, v_t\big), \qquad
+\theta_t = \theta_{t-1} - \frac{\alpha}{\sqrt{\hat{v}_t^{\max}} + \epsilon}\, m_t.
+$$
+
+Because $\hat{v}_t^{\max}$ never decreases, the per coordinate step size is monotonically non increasing, which restores the regret guarantee that the original Adam analysis claimed but did not actually achieve. In practice AMSGrad rarely improves final accuracy on large modern workloads, and the extra state and the permanently conservative steps can even hurt. Its lasting value is theoretical: it pinpointed why the original convergence proof was flawed and showed that the fix is a monotone denominator. AMSGrad combines cleanly with decoupled decay, giving an AMSGradW variant.
+
+## 5. Lion: Sign Based Updates from Symbolic Search
+
+Lion, short for Evolved Sign Momentum, was discovered by Chen and colleagues through a symbolic program search over optimizer update rules rather than designed by hand. Its update is strikingly simple and stores only a single momentum buffer, half the state of Adam.
+
+$$
+c_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t, \qquad
+\theta_t = \theta_{t-1} - \alpha \big( \operatorname{sign}(c_t) + \lambda \theta_{t-1} \big),
+$$
+
+$$
+m_t = \beta_2 m_{t-1} + (1 - \beta_2) g_t.
+$$
+
+Two design choices stand out. First, the update direction is $\operatorname{sign}(c_t)$, so every coordinate moves by the same magnitude $\alpha$, modulated only by decoupled weight decay. This is a uniform step in the $\ell_\infty$ geometry rather than the per coordinate adaptive step of Adam. Second, Lion uses two distinct momentum coefficients: the interpolation $\beta_1$ inside the sign couples the current gradient more tightly, while the buffer update $\beta_2$ tracks a longer history. The default values reverse the usual intuition, with $\beta_1$ around $0.9$ and $\beta_2$ around $0.99$.
+
+### 5.1 Why the sign matters
+
+Because the step magnitude is fixed at $\alpha$ per coordinate, Lion behaves like a normalized optimizer. The update norm is decoupled from the gradient norm, which improves robustness to gradient scale and to loss spikes. The trade off is that the effective learning rate is typically three to ten times smaller than Adam's, and the weight decay correspondingly larger, because each step is now a unit sign vector. Lion has shown strong results on large vision and language models with reduced memory, although its advantage narrows on smaller or noisier problems where the discarded magnitude information was useful. The decoupled decay term shows that the AdamW lesson carried directly into Lion's design.
+
+## 6. Adafactor: Adaptive Rates at Sublinear Memory
+
+The per coordinate second moment $v_t$ has the same shape as the parameters, so Adam roughly triples the memory of the model weights, once for $m_t$ and once for $v_t$. For very large embedding and projection matrices this overhead is prohibitive. Adafactor, by Shazeer and Stern, removes most of it.
+
+### 6.1 Factored second moments
+
+For a parameter matrix of shape $n \times m$, Adafactor does not store the full second moment matrix $V_t$. Instead it stores per row and per column sums and reconstructs a rank one approximation. Let $R_t \in \mathbb{R}^n$ accumulate row sums and $C_t \in \mathbb{R}^m$ accumulate column sums of the squared gradients. The estimate of entry $(i,j)$ is
+
+$$
+\hat{V}_{t,ij} = \frac{R_{t,i}\, C_{t,j}}{\mathbf{1}^\top R_t}.
+$$
+
+This is the minimum divergence rank one reconstruction under a generalized Kullback Leibler objective, and it reduces the second moment memory from $O(nm)$ to $O(n + m)$. Matrices keep the factored form; vectors and scalars fall back to the full per element second moment.
+
+### 6.2 Relative step sizes and update clipping
+
+Adafactor also removes the first moment by default and replaces the externally tuned learning rate with a relative step size proportional to the root mean square of the current parameters, so that the update scale tracks the parameter scale automatically. To control the rare large steps that a missing first moment can produce, it clips the update by its root mean square norm:
+
+$$
+u_t \leftarrow \frac{u_t}{\max\!\big(1, \operatorname{RMS}(u_t) / d\big)},
+$$
+
+for a threshold $d$. These choices let Adafactor train very large models, and it became a standard optimizer for T5 scale transformers. The cost is that the rank one approximation and the absent momentum can slightly degrade convergence relative to a well tuned AdamW, so the choice is usually driven by memory rather than by final quality.
+
+```text
+# Adafactor factored second moment, schematic
+R = decay*R + (1-decay)*(g*g).sum(axis=cols)
+C = decay*C + (1-decay)*(g*g).sum(axis=rows)
+V_hat = outer(R, C) / R.sum()
+update = g / sqrt(V_hat)
+```
+
+## 7. Choosing Among the Methods
+
+The four methods address different axes of the same problem. AdamW fixes how regularization interacts with adaptivity and is the safe default for most supervised and self supervised training. AMSGrad addresses a worst case convergence guarantee that rarely binds in practice but is worth understanding as a cautionary tale about proof gaps. Lion trades per coordinate adaptivity for a memory light, scale robust sign update that shines at large scale. Adafactor trades a small amount of optimization quality for dramatic memory savings on the largest models.
+
+A useful unifying view is that each method is a choice of preconditioner and a choice of how regularization enters relative to that preconditioner. Adam and AdamW share the diagonal $1/\sqrt{\hat{v}_t}$ preconditioner and differ only in whether decay passes through it. AMSGrad changes the preconditioner to a monotone variant. Lion replaces the preconditioner with a sign nonlinearity. Adafactor approximates the preconditioner with a factored estimate. In all cases the AdamW insight holds: regularization should act on the parameters directly, not be filtered through whatever adaptive scaling the optimizer applies to gradients.
+
+## 8. Summary
+
+The equivalence between $L_2$ regularization and weight decay is a property of plain gradient descent that adaptive methods quietly break, because dividing the penalty by a per coordinate curvature estimate turns uniform shrinkage into curvature dependent shrinkage. AdamW restores the intended behavior by decoupling decay from the adaptive step, which both improves generalization and makes the learning rate and decay hyperparameters more orthogonal. AMSGrad, Lion, and Adafactor then vary the preconditioner itself, for convergence guarantees, for memory and robustness, and for sublinear state respectively, while inheriting the decoupled decay lesson. Understanding which quantity a given optimizer rescales, and where regularization enters relative to that rescaling, is the key to reasoning about all of them.
+
+## References
+
+1. Kingma, D. P., and Ba, J. Adam: A Method for Stochastic Optimization. ICLR 2015. https://arxiv.org/abs/1412.6980
+2. Loshchilov, I., and Hutter, F. Decoupled Weight Decay Regularization. ICLR 2019. https://arxiv.org/abs/1711.05101
+3. Reddi, S. J., Kale, S., and Kumar, S. On the Convergence of Adam and Beyond. ICLR 2018. https://arxiv.org/abs/1904.09237
+4. Chen, X., et al. Symbolic Discovery of Optimization Algorithms (Lion). NeurIPS 2023. https://arxiv.org/abs/2302.06675
+5. Shazeer, N., and Stern, M. Adafactor: Adaptive Learning Rates with Sublinear Memory Cost. ICML 2018. https://arxiv.org/abs/1804.04235
+6. You, Y., et al. Large Batch Optimization for Deep Learning: Training BERT in 76 Minutes (LAMB). ICLR 2020. https://arxiv.org/abs/1904.00962
+7. Liu, L., et al. On the Variance of the Adaptive Learning Rate and Beyond (RAdam). ICLR 2020. https://arxiv.org/abs/1908.03265

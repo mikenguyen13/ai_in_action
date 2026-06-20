@@ -1,0 +1,196 @@
+# PCA in Practice
+
+Principal Component Analysis (PCA) is among the most widely used tools for dimensionality reduction, visualization, and preprocessing. The mathematics of PCA is elegant, but applying it to real data demands a series of practical decisions: how to center and scale the features, how many components to retain, whether to whiten the output, which algorithm to run on large or streaming data, and how to read meaning from the resulting loadings. This chapter treats PCA as an engineering practice rather than a theorem, and walks through the choices that separate a defensible analysis from a misleading one.
+
+## 1. A Compact Recap of the Mathematics
+
+Let $X \in \mathbb{R}^{n \times d}$ hold $n$ observations of $d$ features. PCA seeks an orthonormal basis $\{w_1, \dots, w_d\}$ such that projecting the data onto the leading directions captures as much variance as possible. The first principal direction solves
+
+$$
+w_1 = \arg\max_{\|w\|=1} \operatorname{Var}(Xw),
+$$
+
+and subsequent directions maximize variance subject to orthogonality with all earlier ones. If we form the covariance matrix $\Sigma = \frac{1}{n-1} X_c^\top X_c$ from the centered data $X_c$, then the principal directions are exactly the eigenvectors of $\Sigma$, and the variance captured by each is the corresponding eigenvalue $\lambda_j$.
+
+In practice we never form $\Sigma$ and diagonalize it directly. The numerically stable route is the Singular Value Decomposition (SVD) of the centered data,
+
+$$
+X_c = U S V^\top,
+$$
+
+where the columns of $V$ are the principal directions, and the singular values relate to the eigenvalues by $\lambda_j = s_j^2 / (n-1)$. The projected coordinates, called scores, are $T = X_c V = U S$. Working through the SVD avoids squaring the condition number of the data, which matters when features span very different scales.
+
+## 2. Centering and Scaling
+
+### 2.1 Why Centering Is Mandatory
+
+PCA decomposes variance around the mean. If the data are not centered, the first component will tend to point toward the mean vector rather than the direction of maximal spread, because the uncentered second moment mixes variance with the squared mean. Centering subtracts the column means,
+
+$$
+X_c = X - \mathbf{1}\bar{x}^\top, \qquad \bar{x}_j = \frac{1}{n}\sum_{i=1}^n X_{ij},
+$$
+
+so that every feature has zero mean. Essentially every PCA implementation centers by default. A subtle but important rule is that the means must be estimated on the training data and then reused on validation and test data. Re-centering each split with its own mean leaks information and breaks the geometry of the learned projection.
+
+### 2.2 To Scale or Not to Scale
+
+Whether to divide each feature by its standard deviation is the single most consequential preprocessing choice in PCA. Because PCA maximizes variance, features measured in large units dominate the result purely as an artifact of their units. A dataset with height in millimeters and weight in kilograms will produce a first component aligned almost entirely with height, not because height is more informative but because millimeters inflate its numeric variance.
+
+Standardizing each feature to unit variance,
+
+$$
+\tilde{X}_{ij} = \frac{X_{ij} - \bar{x}_j}{\sigma_j},
+$$
+
+makes PCA operate on the correlation matrix rather than the covariance matrix. The guidance is straightforward:
+
+- Scale when features are measured in different units or have heterogeneous variances that do not reflect importance. This is the common case for tabular data.
+- Consider not scaling when all features share the same unit and their relative variances are meaningful, for example pixel intensities in an image patch or spectra measured on a common axis.
+
+When features contain heavy tails or outliers, a robust scaler that uses the median and interquartile range can be safer than the standard deviation, since a few extreme points can otherwise inflate $\sigma_j$ and suppress an informative feature.
+
+```python
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import make_pipeline
+
+pipe = make_pipeline(StandardScaler(), PCA(n_components=10))
+pipe.fit(X_train)
+Z = pipe.transform(X_test)
+```
+
+Wrapping the scaler and PCA in a single pipeline guarantees that the scaling parameters are learned on the training fold and applied consistently downstream, which is exactly the discipline that prevents leakage during cross validation.
+
+## 3. Explained Variance and Scree Plots
+
+### 3.1 The Explained Variance Ratio
+
+Each component $j$ accounts for a fraction of the total variance,
+
+$$
+r_j = \frac{\lambda_j}{\sum_{k=1}^d \lambda_k}.
+$$
+
+The cumulative sum $\sum_{j \le m} r_j$ tells you how much of the data's variability is preserved when you keep the first $m$ components. This single quantity drives most decisions about dimensionality.
+
+### 3.2 Reading a Scree Plot
+
+A scree plot displays the eigenvalues $\lambda_j$ (or the ratios $r_j$) against component index. The classic heuristic looks for an elbow, the point where the curve flattens from a steep initial drop into a shallow tail. Components before the elbow capture structured signal; those after it tend to capture noise. A companion cumulative variance curve answers the practical question directly: how many components reach a target such as 90 or 95 percent.
+
+```python
+import numpy as np
+pca = PCA().fit(X_train)
+ratio = pca.explained_variance_ratio_
+cum = np.cumsum(ratio)
+k90 = np.searchsorted(cum, 0.90) + 1   # components to reach 90 percent
+```
+
+The elbow is often ambiguous, and reasonable analysts will disagree by a component or two. That ambiguity is acceptable. PCA is rarely the final answer; it is a preprocessing step whose downstream effect should be measured.
+
+## 4. Choosing the Number of Components
+
+### 4.1 Variance Thresholds
+
+The simplest rule fixes a cumulative variance target, commonly 95 percent, and keeps the smallest number of components that reach it. Many libraries let you pass the threshold directly. In scikit-learn, `PCA(n_components=0.95)` selects components until 95 percent of variance is explained, which is convenient but should be treated as a starting point rather than a law.
+
+### 4.2 The Kaiser Rule and Parallel Analysis
+
+When PCA runs on standardized data, each original feature contributes a variance of one, so the average eigenvalue is one. The Kaiser rule retains components with $\lambda_j > 1$, the reasoning being that such a component summarizes more variance than a single original feature. The rule is easy to apply but tends to overretain on wide datasets.
+
+A more defensible alternative is parallel analysis. You generate many random datasets with the same shape as yours but no real structure, compute their eigenvalues, and keep only the components whose eigenvalues exceed what random noise produces at a chosen percentile. This Monte Carlo baseline adapts to the dimensions of your problem and is markedly more reliable than a fixed cutoff.
+
+### 4.3 Cross Validated and Probabilistic Criteria
+
+The most principled approach ties the number of components to a downstream objective. If PCA feeds a classifier, treat $m$ as a hyperparameter and select it by cross validated predictive performance. For unsupervised settings, probabilistic PCA assigns a likelihood to held out data, so you can choose $m$ by maximizing validation likelihood. Minka's automatic dimensionality selection formalizes this with a Bayesian model evidence criterion, available as `n_components='mle'` in several libraries. These methods cost more compute but remove the arbitrariness of eyeballing an elbow.
+
+### 4.4 Reconstruction Error
+
+PCA with $m$ components gives the best rank $m$ linear reconstruction in squared error. The mean reconstruction error equals the variance discarded,
+
+$$
+\frac{1}{n}\sum_{i=1}^n \|x_i - \hat{x}_i\|^2 = \sum_{j>m} \lambda_j.
+$$
+
+Plotting reconstruction error against $m$ is the dual of the cumulative variance curve and is often the most intuitive framing when PCA is used for compression or denoising.
+
+## 5. Whitening
+
+Whitening rescales the principal scores so that every retained component has unit variance. Where ordinary PCA returns $T = U S$, whitened PCA returns
+
+$$
+T_{\text{white}} = U S \cdot \frac{\sqrt{n-1}}{S} = \sqrt{n-1}\, U,
+$$
+
+equivalently dividing each score column by its standard deviation. The transformed features are then uncorrelated and isotropic, with an identity covariance.
+
+Whitening helps when a downstream algorithm assumes features of comparable scale and no correlation. Distance based methods, some clustering routines, and certain neural network initializations benefit from isotropic inputs. The cost is that whitening amplifies the low variance components, which are the ones most contaminated by noise. Dividing by a tiny singular value can blow up noise dramatically, so whitening should almost always be combined with truncation to a sensible $m$, and sometimes with a small regularizer added to the singular values for stability.
+
+```python
+pca = PCA(n_components=50, whiten=True).fit(X_train)
+Zw = pca.transform(X_test)   # each column has unit variance
+```
+
+A useful mental model: ordinary PCA rotates the data, whitening rotates and then stretches each axis to unit length. Whether the stretch helps or hurts depends entirely on what consumes the output.
+
+## 6. Incremental and Randomized PCA
+
+### 6.1 The Scaling Problem
+
+The full SVD of an $n \times d$ matrix costs roughly $O(n d^2)$ time and requires the data to fit in memory. For tall datasets with millions of rows, or wide datasets with tens of thousands of features, the exact decomposition becomes impractical. Two families of methods address this.
+
+### 6.2 Randomized PCA
+
+Randomized SVD computes only the leading $m$ components by projecting the data onto a small random subspace, then refining with a few power iterations. The intuition is that a random projection of dimension slightly larger than $m$ almost surely captures the dominant subspace, after which a small exact decomposition recovers the components. The cost drops to roughly $O(n d m)$, and accuracy is excellent when the spectrum decays quickly. This is the default solver many libraries choose automatically when $m$ is much smaller than $d$.
+
+```python
+pca = PCA(n_components=20, svd_solver='randomized', random_state=0)
+pca.fit(X_large)
+```
+
+A couple of power iterations sharpen accuracy when the eigenvalue gap is small, at modest extra cost. For most applications the defaults are well tuned.
+
+### 6.3 Incremental PCA
+
+When the data do not fit in memory at all, Incremental PCA processes the data in mini batches and updates its estimate of the components after each batch, never holding more than one batch at a time. This trades a single large pass for a stream of small ones and integrates naturally with data loaders that yield chunks from disk.
+
+```python
+from sklearn.decomposition import IncrementalPCA
+ipca = IncrementalPCA(n_components=20, batch_size=2000)
+for batch in stream_batches(path, size=2000):
+    ipca.partial_fit(batch)
+```
+
+Incremental PCA's accuracy depends on the batch size being at least as large as the number of components, and it is mildly sensitive to batch ordering, so shuffling the stream when possible is advisable. For genuinely enormous data you can combine the ideas: randomized solvers for speed within memory, incremental updates for data that exceed it.
+
+## 7. Interpreting Loadings
+
+### 7.1 Loadings Versus Scores
+
+Two distinct quantities are easy to confuse. The scores are the coordinates of observations in the new space, $T = X_c V$. The loadings describe how original features combine to form each component, and they are the columns of $V$, often rescaled by $\sqrt{\lambda_j}$ so that a loading equals the correlation between a feature and a component. A large loading magnitude means the feature contributes strongly to that component; the sign indicates direction.
+
+### 7.2 Reading a Component
+
+To interpret a component, examine which features carry the largest loadings and what signs they take. A first component with uniformly positive loadings often represents an overall size or level effect, where all features rise together. A later component that pits one group of features against another with opposite signs typically captures a contrast. Naming components by their dominant loadings, such as a "socioeconomic" axis or a "shape" axis, is the standard way to turn an abstract projection into a usable summary.
+
+### 7.3 Cautions
+
+Several pitfalls deserve attention. The sign of any component is arbitrary, since negating a direction is still a valid eigenvector, so do not over interpret whether a loading is positive or negative in isolation; only the relative signs within a component matter. Loadings can be unstable across resamples when eigenvalues are close together, because the corresponding directions are nearly degenerate and small perturbations rotate them. Bootstrapping the loadings and inspecting their variability is a cheap stability check. Finally, PCA is purely linear, so a component is a weighted sum of features and cannot capture nonlinear structure. If a scree plot stays stubbornly flat or loadings refuse to cohere into a story, the data may have structure that PCA cannot represent, and a kernel or manifold method may serve better.
+
+### 7.4 Sparse and Rotated Variants
+
+When interpretability is the goal, two extensions help. Sparse PCA adds a penalty that drives most loadings to exactly zero, so each component depends on only a handful of features and reads more cleanly. Rotation methods borrowed from factor analysis, such as varimax, rotate the retained components to push each loading toward either zero or a large magnitude, simplifying the interpretation without changing the subspace spanned. Both trade a small amount of explained variance for substantially clearer components.
+
+## 8. A Practical Workflow
+
+Putting the pieces together, a disciplined PCA analysis tends to follow this sequence. Inspect feature units and distributions, then decide on centering, which is always applied, and scaling, which depends on commensurability. Fit PCA on the training split inside a pipeline so that all parameters are learned without leakage. Examine the scree and cumulative variance curves, and choose $m$ by a threshold, parallel analysis, or a cross validated downstream metric, preferring the last when a supervised objective exists. Decide on whitening only if the consumer of the output benefits from isotropic features, and always pair it with truncation. For large data, switch to randomized or incremental solvers without changing the conceptual recipe. Finally, interpret the retained components through their loadings, checking sign conventions and stability before assigning meaning. Treated this way, PCA is not a black box but a transparent and auditable step in a larger modeling pipeline.
+
+## References
+
+1. Jolliffe, I. T., and Cadima, J. "Principal component analysis: a review and recent developments." Philosophical Transactions of the Royal Society A, 2016. https://royalsocietypublishing.org/doi/10.1098/rsta.2015.0202
+2. Shlens, J. "A Tutorial on Principal Component Analysis." 2014. https://arxiv.org/abs/1404.1100
+3. Halko, N., Martinsson, P. G., and Tropp, J. A. "Finding Structure with Randomness: Probabilistic Algorithms for Constructing Approximate Matrix Decompositions." SIAM Review, 2011. https://arxiv.org/abs/0909.4061
+4. Minka, T. P. "Automatic Choice of Dimensionality for PCA." Advances in Neural Information Processing Systems, 2001. https://papers.nips.cc/paper/2000/hash/7503cfacd12053d309b6bed5c89de212-Abstract.html
+5. Tipping, M. E., and Bishop, C. M. "Probabilistic Principal Component Analysis." Journal of the Royal Statistical Society B, 1999. https://www.microsoft.com/en-us/research/publication/probabilistic-principal-component-analysis/
+6. Zou, H., Hastie, T., and Tibshirani, R. "Sparse Principal Component Analysis." Journal of Computational and Graphical Statistics, 2006. https://web.stanford.edu/~hastie/Papers/spc_jcgs.pdf
+7. scikit-learn developers. "Decomposing signals in components (matrix factorization problems)." https://scikit-learn.org/stable/modules/decomposition.html
+8. Horn, J. L. "A rationale and test for the number of factors in factor analysis." Psychometrika, 1965. https://link.springer.com/article/10.1007/BF02289447

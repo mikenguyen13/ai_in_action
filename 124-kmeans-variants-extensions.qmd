@@ -1,0 +1,173 @@
+# K-Means Variants and Extensions
+
+The standard K-Means algorithm of Lloyd is one of the most widely used clustering procedures, but its core assumptions are restrictive. It partitions data into $k$ clusters by minimizing within cluster squared Euclidean distance, which implicitly presumes isotropic, roughly spherical clusters of comparable size, full passes over the data each iteration, and a hard assignment of every point to exactly one cluster. Real workloads routinely violate these assumptions. Datasets may be too large to scan repeatedly, may contain outliers that distort means, may live in spaces where Euclidean geometry is meaningless, or may exhibit nonconvex structure that no single centroid can summarize. This chapter develops five families of variants that relax these assumptions while preserving the conceptual simplicity of centroid based clustering: mini-batch K-Means, k-medoids and k-medians, kernel K-Means, fuzzy c-means, and bisecting K-Means.
+
+## 1. Background and the Lloyd Objective
+
+Given data $X = \{x_1, \dots, x_n\}$ with $x_i \in \mathbb{R}^d$, K-Means seeks centroids $C = \{c_1, \dots, c_k\}$ and an assignment that minimizes the within cluster sum of squares,
+
+$$
+J(C) = \sum_{i=1}^{n} \min_{j \in \{1,\dots,k\}} \lVert x_i - c_j \rVert_2^2 .
+$$
+
+Lloyd's algorithm alternates two steps until convergence. The assignment step maps each point to its nearest centroid, $a_i = \arg\min_j \lVert x_i - c_j \rVert_2^2$. The update step recomputes each centroid as the mean of its assigned points, $c_j = \frac{1}{|S_j|} \sum_{i \in S_j} x_i$, where $S_j$ is the set of indices assigned to cluster $j$. Each step is nonincreasing in $J$, so the procedure converges to a local minimum. The objective is NP-hard to minimize globally, and the result depends on initialization. K-Means++ seeding, which samples initial centers with probability proportional to squared distance from the nearest chosen center, gives an $O(\log k)$ expected approximation and is the practical default. The variants below modify the distance, the centroid definition, the data access pattern, the assignment hardness, or the partition structure, while reusing this alternating optimization template.
+
+## 2. Mini-Batch K-Means
+
+Lloyd's algorithm touches every point in every iteration, costing $O(nkd)$ per pass. When $n$ reaches hundreds of millions, or when data streams arrive faster than full passes complete, this is prohibitive. Mini-batch K-Means, introduced by Sculley, replaces the full assignment and update with stochastic updates computed on small random subsets.
+
+### 2.1 Algorithm
+
+At each iteration a batch $B$ of size $b \ll n$ is sampled. Each point in the batch is assigned to its nearest current centroid. Centroids are then updated by a per center learning rate that decays with the number of points the center has absorbed so far. Let $v_j$ count the points assigned to center $j$ across all batches. For each $x \in B$ assigned to center $j$, the update is
+
+$$
+v_j \leftarrow v_j + 1, \qquad \eta = \frac{1}{v_j}, \qquad c_j \leftarrow (1 - \eta)\, c_j + \eta\, x .
+$$
+
+This is stochastic gradient descent on the K-Means objective with a per center step size that yields a running mean. Early updates move centers aggressively; as $v_j$ grows the centers stabilize.
+
+```text
+init centers with k-means++ on a sample
+v = 0 vector of length k
+repeat for t iterations:
+    sample batch B of size b
+    assign each x in B to nearest center
+    for each x in B with assignment j:
+        v[j] += 1
+        c[j] += (1/v[j]) * (x - c[j])
+```
+
+### 2.2 Trade-offs and Practice
+
+The per iteration cost falls to $O(bkd)$, independent of $n$. The convergence is noisier and the final inertia is typically a few percent worse than full Lloyd, a small price for order of magnitude speedups. Batch sizes of a few hundred to a few thousand balance gradient noise against throughput. A common refinement reassigns centers that have captured very few points, since starved centers waste capacity. Mini-batch K-Means is the standard choice for clustering large embedding tables and for building vocabularies in vector quantization, where $n$ is enormous but moderate solution quality suffices.
+
+## 3. K-Medoids and K-Medians
+
+K-Means is fragile under two conditions: heavy tailed noise, because the mean is pulled toward outliers, and abstract dissimilarities, because the mean may not be definable at all. K-medoids and k-medians address these by changing what a cluster representative is and which norm is minimized.
+
+### 3.1 K-Medoids
+
+K-medoids restricts each representative to be an actual data point, called a medoid, and minimizes a general dissimilarity $d(\cdot, \cdot)$ that need not be Euclidean or even metric. The objective is
+
+$$
+J_{\text{med}} = \sum_{i=1}^{n} \min_{m \in M} d(x_i, m), \qquad M \subseteq X, \ |M| = k .
+$$
+
+Because medoids are data points, the method works on any dissimilarity matrix, including edit distances on strings, Jaccard distances on sets, or precomputed kernels. The classic solver, Partitioning Around Medoids, alternates assignment with a swap phase that, for each medoid and each non medoid, evaluates whether swapping reduces total cost. A naive swap evaluation costs $O(k(n-k)^2)$ per iteration, which is expensive. The FastPAM algorithm reduces the swap phase to $O(n^2)$ per iteration by caching, for every point, its nearest and second nearest medoid and reusing these to compute swap deltas, giving order of magnitude speedups without changing the result. Medoids are robust to outliers because a single extreme point cannot become the representative unless it genuinely sits in a dense region.
+
+### 3.2 K-Medians
+
+K-medians keeps real valued representatives but minimizes the $L_1$ norm,
+
+$$
+J_{\text{med1}} = \sum_{i=1}^{n} \min_{j} \lVert x_i - c_j \rVert_1 .
+$$
+
+The minimizer of $L_1$ deviation along each coordinate is the per dimension median, so the update step replaces the mean with the coordinatewise median of assigned points. Since the median has a breakdown point of one half, k-medians tolerates a large fraction of corrupted coordinates before its centers degrade, making it attractive for sparse, high dimensional, or contaminated data. It does not require precomputing a dissimilarity matrix and so scales better than k-medoids, but it lacks the flexibility to use arbitrary distances.
+
+### 3.3 When to Use Which
+
+Choose k-medoids when only a dissimilarity matrix is available or representatives must be interpretable exemplars. Choose k-medians when data is vectorial but outlier resistance matters and $n$ is too large for an $O(n^2)$ matrix. Choose plain K-Means when clusters are clean and roughly Gaussian, since the mean is the maximum likelihood center under that model.
+
+## 4. Kernel K-Means
+
+Lloyd's algorithm draws linear boundaries between clusters because nearest centroid assignment in Euclidean space partitions the plane into a Voronoi diagram with hyperplane faces. Concentric rings or interlocking moons cannot be separated this way. Kernel K-Means lifts the data into a high dimensional feature space via a map $\phi$ and runs K-Means there, producing nonlinear boundaries in the original space.
+
+### 4.1 The Kernel Trick for Clustering
+
+We never compute $\phi(x)$ explicitly. Instead a kernel $\kappa(x_i, x_j) = \langle \phi(x_i), \phi(x_j) \rangle$ supplies inner products, and all centroid distances are expressed through it. The squared distance from $\phi(x_i)$ to the mean of cluster $j$ in feature space expands as
+
+$$
+\lVert \phi(x_i) - \mu_j \rVert^2 = \kappa(x_i, x_i) - \frac{2}{|S_j|} \sum_{l \in S_j} \kappa(x_i, x_l) + \frac{1}{|S_j|^2} \sum_{l, m \in S_j} \kappa(x_l, x_m) .
+$$
+
+The first term is constant across clusters and can be dropped from the $\arg\min$. The third term depends only on the cluster, so it is computed once per iteration. Assignment therefore needs only entries of the $n \times n$ kernel matrix. A Gaussian kernel $\kappa(x_i, x_j) = \exp(-\gamma \lVert x_i - x_j \rVert^2)$ is the usual choice and recovers arbitrarily curved cluster boundaries as $\gamma$ varies.
+
+### 4.2 Cost, Connections, and Caveats
+
+Storing and scanning the kernel matrix costs $O(n^2)$ memory and $O(n^2 k)$ time per iteration, so plain kernel K-Means does not scale past tens of thousands of points without approximation by Nystrom sampling or random Fourier features. There is a deep equivalence: kernel K-Means with a suitable normalization optimizes the same objective as spectral clustering and as normalized cut graph partitioning, which is why these methods produce similar results on manifold structured data. The chief practical difficulty is selecting $\gamma$, since too small a value collapses everything into one cluster and too large a value isolates individual points. Cross validation against a downstream metric or inspection of the kernel matrix eigenspectrum guides the choice.
+
+## 5. Fuzzy C-Means
+
+Hard assignment forces a point on a cluster boundary to commit entirely to one side, discarding the information that it is genuinely ambiguous. Fuzzy c-means, due to Dunn and Bezdek, replaces hard assignment with graded membership, letting each point belong partially to every cluster.
+
+### 5.1 Objective and Updates
+
+Let $u_{ij} \in [0,1]$ denote the membership of point $i$ in cluster $j$, with $\sum_{j} u_{ij} = 1$ for every $i$. A fuzziness exponent $m > 1$ controls how soft the partition is. The objective is
+
+$$
+J_m = \sum_{i=1}^{n} \sum_{j=1}^{k} u_{ij}^{\,m} \, \lVert x_i - c_j \rVert^2 .
+$$
+
+Alternating minimization with the simplex constraint gives closed form updates. Centroids become membership weighted means,
+
+$$
+c_j = \frac{\sum_{i} u_{ij}^{\,m}\, x_i}{\sum_{i} u_{ij}^{\,m}}, \qquad
+u_{ij} = \frac{1}{\sum_{l=1}^{k} \left( \dfrac{\lVert x_i - c_j \rVert}{\lVert x_i - c_l \rVert} \right)^{\frac{2}{m-1}}} .
+$$
+
+As $m \to 1^{+}$ the memberships harden toward zero or one and the method approaches K-Means. As $m$ grows the memberships flatten toward $1/k$ and clusters blur together. A value of $m = 2$ is the common default.
+
+```text
+init memberships U randomly, rows summing to 1
+repeat until ||U_new - U_old|| < tol:
+    update centroids c_j from U (weighted means)
+    update memberships u_ij from distances to all c_j
+```
+
+### 5.2 Interpretation and Use
+
+Fuzzy c-means yields a probability like profile per point, which is valuable when boundaries are inherently soft, as in image segmentation where a pixel straddles two regions, or in customer segmentation where a member exhibits traits of several segments. The membership entropy flags ambiguous points for review. The method is still sensitive to initialization and to the choice of $k$, and it inherits the spherical cluster bias of the Euclidean norm. It is closely related to a Gaussian mixture fit with tied isotropic covariances, the difference being that fuzzy memberships are a deterministic distance ratio rather than posterior probabilities from a generative model.
+
+## 6. Bisecting K-Means
+
+Flat K-Means commits to $k$ up front and offers no hierarchy. Bisecting K-Means, popularized by Steinbach, Karypis, and Kumar for document clustering, builds a hierarchy top down by repeatedly splitting clusters with ordinary 2-means.
+
+### 6.1 Algorithm
+
+Begin with all points in a single cluster. Repeatedly select a cluster to split, run 2-means on it several times keeping the split with lowest within cluster sum of squares, and replace the parent with its two children. Continue until $k$ leaves exist.
+
+```text
+clusters = { all points }
+while len(clusters) < k:
+    pick cluster S to split (largest, or highest SSE)
+    best = None
+    for trial in range(num_trials):
+        run 2-means on S
+        keep split minimizing total SSE
+    replace S with its two sub-clusters
+```
+
+### 6.2 Properties
+
+The split selection rule matters. Splitting the cluster with the largest sum of squared errors tends to equalize cluster tightness, while splitting the largest cluster equalizes sizes. Because each split solves a small 2-means problem and the divisive tree has depth about $\log k$, the overall cost is often lower than running flat K-Means for large $k$, and the result is less sensitive to initialization since each bisection has only two centers to place. The output is a dendrogram that supports choosing the number of clusters after the fact by cutting the tree at any level, which flat K-Means cannot do. Bisecting K-Means tends to produce more uniformly sized clusters than Lloyd and historically outperformed both standard K-Means and agglomerative clustering on text. Its limitation is greediness: an early split is never undone, so a poor top level cut propagates downward.
+
+## 7. Choosing Among the Variants
+
+The variants trade off along distinct axes. Mini-batch K-Means trades solution quality for scalability when $n$ is enormous. K-medoids and k-medians trade computational cost or distance flexibility for robustness to outliers and support for non Euclidean dissimilarities. Kernel K-Means trades $O(n^2)$ resources for the ability to capture nonconvex, nonlinear cluster shapes. Fuzzy c-means trades hard partitions for graded memberships that quantify assignment uncertainty. Bisecting K-Means trades a flat partition for a hierarchy and improved robustness to initialization. The table below summarizes the decision.
+
+```text
+need                         use
+----------------------------------------------------------
+massive n, speed first       mini-batch k-means
+outliers, arbitrary distance k-medoids
+outliers, vectorial data     k-medians
+nonconvex cluster shapes     kernel k-means
+soft / ambiguous boundaries  fuzzy c-means
+hierarchy, stable splits     bisecting k-means
+clean Gaussian-like clusters standard k-means
+```
+
+In practice these choices compose. One might seed a kernel method with mini-batch centers, use bisecting splits with a robust median update, or post process fuzzy memberships to detect outliers before a final hard pass. The unifying lesson is that the alternating assign and update template of K-Means is a flexible scaffold, and each extension swaps in a different notion of distance, representative, data access, assignment, or partition structure to fit the data and constraints at hand. Selecting the right variant begins with diagnosing which of Lloyd's assumptions your data breaks.
+
+## References
+
+1. Lloyd, S. P. Least squares quantization in PCM. IEEE Transactions on Information Theory, 1982. https://doi.org/10.1109/TIT.1982.1056489
+2. Arthur, D. and Vassilvitskii, S. k-means++: The advantages of careful seeding. SODA, 2007. https://dl.acm.org/doi/10.5555/1283383.1283494
+3. Sculley, D. Web-scale k-means clustering. WWW, 2010. https://doi.org/10.1145/1772690.1772862
+4. Kaufman, L. and Rousseeuw, P. J. Clustering by means of medoids. Statistical Data Analysis Based on the L1 Norm, 1987. https://wis.kuleuven.be/stat/robust/papers/publications-1987/kaufmanrousseeuw-clusteringbymedoids-l1norm-1987.pdf
+5. Schubert, E. and Rousseeuw, P. J. Fast and eager k-medoids clustering with FastPAM and FasterPAM. Information Systems, 2021. https://doi.org/10.1016/j.is.2021.101804
+6. Dhillon, I. S., Guan, Y., and Kulis, B. Kernel k-means, spectral clustering and normalized cuts. KDD, 2004. https://doi.org/10.1145/1014052.1014118
+7. Bezdek, J. C., Ehrlich, R., and Full, W. FCM: The fuzzy c-means clustering algorithm. Computers and Geosciences, 1984. https://doi.org/10.1016/0098-3004(84)90020-7
+8. Steinbach, M., Karypis, G., and Kumar, V. A comparison of document clustering techniques. KDD Workshop on Text Mining, 2000. https://www-users.cse.umn.edu/~kumar001/papers/doc_clustering.pdf
+9. Rahimi, A. and Recht, B. Random features for large-scale kernel machines. NeurIPS, 2007. https://papers.nips.cc/paper/3182-random-features-for-large-scale-kernel-machines

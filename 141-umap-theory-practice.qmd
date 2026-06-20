@@ -1,0 +1,171 @@
+# UMAP: Theory and Practice
+
+Uniform Manifold Approximation and Projection (UMAP) has become a default tool for visualizing and reducing the dimension of high dimensional data, from single cell transcriptomes to neural network embeddings. Its popularity rests on a combination of speed, scalability, and a strong tendency to preserve the coarse arrangement of clusters in a dataset. Yet UMAP is often used as a black box, with its hyperparameters tuned by trial and error and its outputs over interpreted. This chapter develops the theory that underlies UMAP, derives its objective, examines its central hyperparameters, contrasts it with t-SNE, and discusses what it does and does not preserve about global structure.
+
+## 1. The Manifold Hypothesis and the Problem Setup
+
+UMAP rests on the manifold hypothesis: that high dimensional data sampled from some process tend to lie on or near a low dimensional manifold embedded in the ambient space. If the data $X = \{x_1, \ldots, x_N\} \subset \mathbb{R}^D$ live near a $d$ dimensional manifold $\mathcal{M}$ with $d \ll D$, then a faithful embedding into $\mathbb{R}^d$ should recover the intrinsic geometry of $\mathcal{M}$ up to acceptable distortion.
+
+The difficulty is that we observe only a finite sample, not the manifold itself, and the sampling density varies across the manifold. UMAP confronts this with ideas from algebraic topology and fuzzy set theory. The high level recipe has two phases. First, construct a weighted graph that approximates the topological structure of the data on the assumed manifold. Second, find a low dimensional layout whose own graph is as close as possible to the first, where closeness is measured by a cross entropy between fuzzy memberships. The theoretical scaffolding comes from McInnes, Healy, and Melville, who frame the construction in the language of simplicial sets and fuzzy simplicial sets.
+
+## 2. Fuzzy Simplicial Sets
+
+### 2.1 Simplicial Complexes as Topological Approximations
+
+A standard way to approximate the topology of a point cloud is the Cech or Vietoris-Rips complex. Place a ball of radius $\varepsilon$ around each point; whenever a collection of balls has common overlap, add a simplex on those points. The resulting simplicial complex captures connectivity, loops, and higher order features at scale $\varepsilon$. The nerve theorem guarantees that, under mild conditions, this complex is homotopy equivalent to the union of balls, so it is a principled topological summary.
+
+This construction has a fatal practical flaw for real data: it assumes a single global scale $\varepsilon$ and a uniform sampling density. Real data are sampled unevenly, so no single radius works everywhere. A dense region needs a small radius to avoid merging distinct structures, while a sparse region needs a large radius to connect at all.
+
+### 2.2 Uniform Sampling via a Local Riemannian Metric
+
+UMAP resolves the variable density problem with a modeling assumption that is also its conceptual heart. It assumes the data are uniformly distributed on the manifold with respect to some Riemannian metric, even if they are not uniform in the ambient Euclidean metric. If a region looks sparse in $\mathbb{R}^D$, UMAP posits that the manifold is locally stretched there, and it rescales distances so that each point's nearest neighbors sit at a comparable geodesic distance. Concretely, the distance from $x_i$ is normalized so that the local notion of unit distance reaches its $k$ nearest neighbors. This is equivalent to equipping the manifold with a different Riemannian metric in the neighborhood of each point.
+
+The cost of this assumption is that the locally defined metrics disagree between neighboring points. The data are now described by a family of incompatible local metric spaces, one per point. The genius of the UMAP construction is to convert each into a fuzzy topological representation and then merge them.
+
+### 2.3 From Metric Spaces to Fuzzy Simplicial Sets
+
+A fuzzy simplicial set generalizes a simplicial complex by attaching to each simplex a membership strength in $[0, 1]$ rather than a binary present or absent label. Formally, simplicial sets are functors from the simplex category $\Delta$ to the category of sets, and fuzzy simplicial sets are functors to the category of fuzzy sets. The technical bridge is a pair of adjoint functors between finite extended pseudo metric spaces and fuzzy simplicial sets, which gives a canonical way to turn a metric space into a fuzzy topological object and back.
+
+For practice, the part that matters is the resulting edge weights. For the directed edge from $x_i$ to its neighbor $x_j$, the membership strength is
+
+$$
+w_{i \to j} = \exp\!\left( -\frac{\max(0,\, d(x_i, x_j) - \rho_i)}{\sigma_i} \right),
+$$
+
+where $d$ is the input distance, $\rho_i$ is the distance from $x_i$ to its nearest neighbor, and $\sigma_i$ is a per point scale. The subtraction of $\rho_i$ enforces local connectivity: every point is connected to its nearest neighbor with weight $1$, so no point is left isolated. The scale $\sigma_i$ is chosen by binary search so that the total membership to the $k$ nearest neighbors matches a target tied to the perplexity like quantity $\log_2 k$:
+
+$$
+\sum_{j} \exp\!\left( -\frac{\max(0,\, d(x_i, x_j) - \rho_i)}{\sigma_i} \right) = \log_2 k .
+$$
+
+This calibration is what implements the uniform distribution assumption from Section 2.2: it adapts the bandwidth to local density.
+
+### 2.4 Symmetrization by Fuzzy Union
+
+The weights $w_{i \to j}$ are asymmetric, because $x_j$ may be among the neighbors of $x_i$ while $x_i$ is not among the neighbors of $x_j$, and even when both hold the local scales differ. To merge the incompatible local representations into one global fuzzy simplicial set, UMAP takes the fuzzy union of the directed edges, which for the membership of the undirected edge between $i$ and $j$ is the probabilistic t-conorm
+
+$$
+w_{ij} = w_{i \to j} + w_{j \to i} - w_{i \to j}\, w_{j \to i}.
+$$
+
+Reading $w$ as a probability that an edge exists, this is exactly the probability that at least one of the two directed edges is present under independence. The symmetric weights $w_{ij}$ define the high dimensional graph, often called the topological representation of the data. It is sparse, since only $k$ nearest neighbor edges per point are nonzero, which is what gives UMAP its scalability.
+
+## 3. The Low Dimensional Embedding and the Cross Entropy Objective
+
+### 3.1 Membership in the Embedding Space
+
+In the target space $\mathbb{R}^d$, with $d$ usually $2$ or $3$, UMAP places points $y_1, \ldots, y_N$ and defines a second fuzzy simplicial set on them. The membership of the embedding edge between $y_i$ and $y_j$ is given by a smooth differentiable function of their distance,
+
+$$
+q_{ij} = \frac{1}{1 + a\, \lVert y_i - y_j \rVert_2^{2b}},
+$$
+
+where $a$ and $b$ are fitted constants. They are not free hyperparameters in the usual sense; they are determined by a least squares fit so that this curve approximates a piecewise function set by the user's `min_dist`. The fit makes $q_{ij} \approx 1$ when the embedding distance is below `min_dist` and lets it decay like a heavy tailed curve beyond that. The heavy tail, similar in spirit to the Student t kernel in t-SNE, prevents the crowding problem by allowing dissimilar points to sit far apart without incurring runaway penalties.
+
+### 3.2 The Cross Entropy Between Fuzzy Sets
+
+UMAP seeks an embedding whose fuzzy graph $q$ matches the input fuzzy graph $w$. Treating each edge as an independent Bernoulli membership, the natural discrepancy is the fuzzy set cross entropy summed over all pairs of points $E$:
+
+$$
+C = \sum_{(i,j) \in E} \Big[ w_{ij} \log \frac{w_{ij}}{q_{ij}} + (1 - w_{ij}) \log \frac{1 - w_{ij}}{1 - q_{ij}} \Big].
+$$
+
+Dropping terms that do not depend on the embedding, the objective separates into two competing forces:
+
+$$
+C \;\propto\; \underbrace{-\sum_{(i,j)} w_{ij} \log q_{ij}}_{\text{attraction}} \;\; \underbrace{-\sum_{(i,j)} (1 - w_{ij}) \log (1 - q_{ij})}_{\text{repulsion}}.
+$$
+
+The first term is large when a pair with high input membership $w_{ij}$ is placed far apart, since then $q_{ij}$ is small; minimizing it pulls similar points together. The second term is large when a pair with low input membership is placed close together, since then $1 - q_{ij}$ is small; minimizing it pushes dissimilar points apart. The balance of these forces shapes the layout.
+
+This is the crucial difference from t-SNE at the level of the objective. t-SNE minimizes a Kullback-Leibler divergence between two normalized joint distributions over pairs. The normalization couples all pairs through a partition function, which forces the expensive computation of repulsion across all points. UMAP's cross entropy has no global normalization; each edge contributes independently. This decoupling is what permits cheap stochastic optimization.
+
+### 3.3 Optimization by Negative Sampling
+
+Computing the full repulsion term is quadratic in $N$, so UMAP approximates it. It applies stochastic gradient descent over edges. At each step it samples an edge $(i, j)$ from the input graph with probability proportional to $w_{ij}$ and applies an attractive update that draws $y_i$ and $y_j$ together. For repulsion it uses negative sampling: it draws a small fixed number of random points $y_k$ and applies repulsive updates as if $w_{ik} = 0$. Edges are sampled in proportion to their weight, which lets UMAP drop the explicit $w_{ij}$ factors from the gradients and treat sampling frequency as the weighting. The gradients of $\log q$ and $\log(1 - q)$ with respect to the $y$ coordinates have closed forms in $a$ and $b$, and a clipping step keeps updates stable. The result is an optimizer whose cost per epoch scales with the number of edges, roughly $O(Nk)$, rather than $O(N^2)$.
+
+A short sketch of the pipeline:
+
+```text
+1. kNN graph:        find k nearest neighbors (approximate, via NN-descent)
+2. local scales:     solve for rho_i and sigma_i per point
+3. fuzzy union:       w_ij = w_i->j + w_j->i - w_i->j * w_j->i
+4. init embedding:    spectral layout of the graph Laplacian
+5. optimize:          SGD with attraction on edges + negative sampling repulsion
+```
+
+### 3.4 Initialization Matters
+
+A detail with large practical consequences is initialization. UMAP by default initializes the embedding with a spectral layout, the eigenvectors of the normalized graph Laplacian of the fuzzy graph. This is a Laplacian eigenmaps embedding, which already places globally related clusters in sensible relative positions before optimization begins. Because the cross entropy is non convex and the optimizer is local, this starting point strongly influences the final global arrangement. Much of UMAP's reputed advantage over t-SNE in preserving global structure can be traced to this informative initialization rather than to the objective alone, a point made forcefully in later analyses by Kobak and Linderman.
+
+## 4. Key Hyperparameters
+
+### 4.1 `n_neighbors`
+
+The parameter `n_neighbors`, the $k$ of Section 2.3, sets the size of the local neighborhood used to build the input graph. It is the primary knob for the trade off between local and global structure. With small `n_neighbors`, say $5$ to $15$, UMAP attends to very fine local relationships and tends to fragment the data into many small clusters, faithfully reproducing local detail while caring little about how distant regions relate. With large `n_neighbors`, say $50$ to $200$, each point's fuzzy neighborhood spans more of the manifold, the local scales $\sigma_i$ grow, and the embedding reflects broader, more global patterns at the expense of fine detail. There is no universally correct value; it encodes a prior about the scale of structure one wishes to see.
+
+### 4.2 `min_dist`
+
+The parameter `min_dist` controls how tightly UMAP is allowed to pack points in the embedding. It enters only through the fit of $a$ and $b$ in Section 3.1, setting the plateau width over which $q_{ij} \approx 1$. A small `min_dist`, near $0$, permits points to be placed almost on top of one another, producing dense, clumpy clusters that emphasize topological cluster membership. A larger `min_dist`, such as $0.5$, forces a minimum separation, spreading points more evenly and yielding embeddings that are easier to read and that better reveal the broad shape of clusters. It is essentially an aesthetic and interpretive control: it does not change the input topology, only how the layout is permitted to render it.
+
+### 4.3 `n_components`, Metric, and Others
+
+The output dimension `n_components` is usually $2$ for visualization but can be set higher when UMAP is used as a general dimension reduction step feeding a downstream model. The input `metric` selects the distance $d$ in Section 2.3 and can be Euclidean, cosine, Manhattan, or a custom function, which matters greatly for embeddings where cosine similarity is the meaningful notion. The number of training epochs trades runtime for convergence; small datasets benefit from more epochs. The `negative_sample_rate`, typically $5$, sets how many repulsive samples accompany each attractive update and influences how aggressively clusters are pushed apart.
+
+A typical call exposes these directly:
+
+```text
+reducer = UMAP(
+    n_neighbors=15,      # local vs global emphasis
+    min_dist=0.1,        # packing tightness in the layout
+    n_components=2,      # output dimension
+    metric="euclidean",  # input distance
+)
+```
+
+## 5. Comparison with t-SNE
+
+### 5.1 Shared Lineage
+
+UMAP and t-SNE share a common shape. Both build a weighted neighbor graph in the input space using a density adaptive kernel, both define a heavy tailed similarity in the embedding, and both minimize a divergence between the two by gradient descent. The similarities are deep enough that one can derive a single framework, the neighbor embedding family, that contains both as special cases distinguished mainly by their loss functions and normalization. Indeed, work by Böhm, Berens, and Kobak shows that the spectrum from t-SNE to UMAP is largely governed by the relative strength of attractive and repulsive forces, with UMAP sitting at the more attractive end and producing more compact clusters.
+
+### 5.2 Where They Differ
+
+The principal differences are the following. t-SNE normalizes its similarities into joint probability distributions $P$ and $Q$ and minimizes the KL divergence $\mathrm{KL}(P \,\Vert\, Q)$, which couples all pairs through a partition function and historically made it slow, though Barnes-Hut and FFT based variants mitigate this. UMAP uses unnormalized fuzzy memberships and a cross entropy, which decouples pairs and enables negative sampling. The asymmetry of the KL objective in t-SNE penalizes placing similar points far apart much more than the reverse, which is why t-SNE excels at separating local clusters but historically scrambled their global arrangement. UMAP's cross entropy is more symmetric in its treatment of attraction and repulsion, and combined with spectral initialization it tends to keep clusters in more sensible relative positions.
+
+In practice UMAP is usually faster, scales to millions of points more gracefully, supports embedding into more than two dimensions naturally, and provides a `transform` method to map new points into an existing embedding, which classical t-SNE lacks. t-SNE remains a strong choice when the goal is purely the cleanest possible separation of local clusters and global layout is not trusted anyway.
+
+### 5.3 A Cautionary Symmetry
+
+The two methods also share their pitfalls. In both, the size of a cluster in the plot need not reflect its true variance, the distance between two clusters need not reflect their true separation, and apparent structure can be an artifact of hyperparameters. Both should be run at several settings and read as exploratory tools rather than as ground truth geometry.
+
+## 6. Preserving Global Structure
+
+### 6.1 What "Global" Means and What UMAP Delivers
+
+UMAP is frequently praised for preserving global structure better than t-SNE. The claim deserves care. UMAP does tend to place related clusters near one another and to keep the gross topology of well separated groups, largely because of the spectral initialization and the more attractive force balance. But it does not faithfully preserve quantitative global geometry. Inter cluster distances in a UMAP plot are not metric: a gap twice as wide does not mean twice the dissimilarity. The local connectivity constraint and per point rescaling deliberately distort absolute distances in favor of local fidelity.
+
+Empirical studies make this concrete. Analyses of single cell data by Chari and Pachter argue that both UMAP and t-SNE can substantially distort both local and global relationships, and that the preserved structure is sometimes weaker than visual impressions suggest. The lesson is not that UMAP is useless for global structure, but that its global layout is a qualitative cue, not a measurement.
+
+### 6.2 Levers for More Global Fidelity
+
+When global structure is the priority, several adjustments help. Increasing `n_neighbors` widens the scale of structure UMAP attends to and pulls the embedding toward global patterns. Using an informative initialization, in particular a PCA based or spectral init rather than a random one, anchors the global frame; this is the single most effective intervention. Some practitioners apply densMAP, an extension that augments the objective with a term encouraging local density in the input to be reflected in the embedding, which restores some quantitative meaning to cluster compactness. For genuinely metric global structure, pairing UMAP with a complementary linear method such as PCA, or reporting trustworthiness and continuity scores alongside the plot, gives a more honest picture.
+
+### 6.3 Diagnostics
+
+Because the embedding can mislead, quantitative diagnostics are worthwhile. Trustworthiness measures whether points that are neighbors in the embedding were also neighbors in the input, penalizing false neighbors introduced by the projection. Continuity measures the converse, whether input neighbors remain neighbors after embedding. Comparing the $k$ nearest neighbor graph of the embedding against that of the input, or correlating pairwise distances on a subsample, quantifies how much local and global structure survived. Running these across hyperparameter settings turns UMAP from a black box into an instrument whose distortions can be characterized.
+
+## 7. Summary
+
+UMAP builds a fuzzy topological representation of data by assuming uniform sampling on a Riemannian manifold, calibrating a local kernel per point, and merging incompatible local views through a fuzzy union. It then lays out a low dimensional fuzzy graph by minimizing the fuzzy set cross entropy, an objective that decouples into attraction and repulsion and, crucially, requires no global normalization, which unlocks fast negative sampling optimization. Its two central hyperparameters separate concerns cleanly: `n_neighbors` sets the scale of structure, from local to global, while `min_dist` controls only the visual packing of the layout. Compared with t-SNE, UMAP differs mainly in its unnormalized cross entropy objective and its informative initialization, which together make it faster, more scalable, and more inclined to keep clusters in sensible relative positions. That last property is real but qualitative; UMAP preserves the arrangement of global structure better than it preserves its metric. Used with several hyperparameter settings, informative initialization, and quantitative diagnostics, UMAP is a powerful and principled tool for exploring the geometry of high dimensional data.
+
+## References
+
+1. McInnes, L., Healy, J., Melville, J. (2018). UMAP: Uniform Manifold Approximation and Projection for Dimension Reduction. https://arxiv.org/abs/1802.03426
+2. McInnes, L. UMAP documentation: How UMAP Works. https://umap-learn.readthedocs.io/en/latest/how_umap_works.html
+3. van der Maaten, L., Hinton, G. (2008). Visualizing Data using t-SNE. Journal of Machine Learning Research, 9, 2579-2605. https://www.jmlr.org/papers/v9/vandermaaten08a.html
+4. Kobak, D., Linderman, G. C. (2021). Initialization is critical for preserving global data structure in both t-SNE and UMAP. Nature Biotechnology, 39, 156-157. https://www.nature.com/articles/s41587-020-00809-z
+5. Böhm, J. N., Berens, P., Kobak, D. (2022). Attraction-Repulsion Spectrum in Neighbor Embeddings. Journal of Machine Learning Research, 23. https://www.jmlr.org/papers/v23/21-0055.html
+6. Chari, T., Pachter, L. (2023). The specious art of single-cell genomics. PLOS Computational Biology, 19(8). https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011288
+7. Narayan, A., Berger, B., Cho, H. (2021). Assessing single-cell transcriptomic variability through density-preserving data visualization (densMAP). Nature Biotechnology, 39, 765-774. https://www.nature.com/articles/s41587-020-00801-7
+8. Coenen, A., Pearce, A. Understanding UMAP. Google PAIR. https://pair-code.github.io/understanding-umap/

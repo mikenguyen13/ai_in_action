@@ -1,0 +1,170 @@
+# Group and Instance Normalization
+
+Feature normalization is one of the load bearing ideas in modern deep learning. By rescaling intermediate activations to a stable distribution, normalization layers smooth the optimization landscape, reduce sensitivity to initialization, and permit larger learning rates. Batch Normalization launched this line of work, but its reliance on batch statistics creates failure modes that motivated a family of alternatives. This chapter develops a unified view of batch, layer, group, and instance normalization, derives where each sits along a single design axis, and explains why group normalization rescues small batch vision training while instance normalization underpins style transfer.
+
+## 1. A Unified Formulation
+
+Consider the activation tensor produced by a convolutional layer, with shape $(N, C, H, W)$, where $N$ indexes examples in a mini batch, $C$ indexes feature channels, and $H, W$ index spatial positions. Write a single scalar activation as $x_{nchw}$. Every normalization scheme in this chapter can be written as
+
+$$
+\hat{x}_i = \frac{x_i - \mu_i}{\sqrt{\sigma_i^2 + \epsilon}}, \qquad y_i = \gamma\, \hat{x}_i + \beta,
+$$
+
+where $i$ is shorthand for an index tuple $(n, c, h, w)$, the constant $\epsilon$ guards against division by zero, and $\gamma, \beta$ are learnable affine parameters typically defined per channel. The mean and variance are computed over a set $\mathcal{S}_i$ of activations:
+
+$$
+\mu_i = \frac{1}{|\mathcal{S}_i|} \sum_{j \in \mathcal{S}_i} x_j, \qquad
+\sigma_i^2 = \frac{1}{|\mathcal{S}_i|} \sum_{j \in \mathcal{S}_i} (x_j - \mu_i)^2 .
+$$
+
+The only thing that distinguishes the four methods is the definition of $\mathcal{S}_i$, the pooling set over which statistics are aggregated. This is the central insight that makes the spectrum legible: each method answers the question of which activations share a normalizer.
+
+### 1.1 The Four Pooling Sets
+
+Let $i = (n, c, h, w)$. The four schemes correspond to four choices.
+
+- Batch Norm pools across the batch and spatial dimensions, holding the channel fixed: $\mathcal{S}_i = \{ j : c_j = c \}$. Statistics depend on the whole batch, so $\mu$ and $\sigma$ have shape $(C,)$.
+- Layer Norm pools across all channels and spatial positions of a single example: $\mathcal{S}_i = \{ j : n_j = n \}$. Statistics have shape $(N,)$ and are computed independently per example.
+- Instance Norm pools across spatial positions only, holding both example and channel fixed: $\mathcal{S}_i = \{ j : n_j = n,\ c_j = c \}$. Statistics have shape $(N, C)$.
+- Group Norm partitions the $C$ channels into $G$ groups and pools across spatial positions and the channels within one group: $\mathcal{S}_i = \{ j : n_j = n,\ \lfloor c_j / (C/G) \rfloor = \lfloor c / (C/G) \rfloor \}$. Statistics have shape $(N, G)$.
+
+A compact way to remember this: imagine the activation tensor as a stack of $(C, H, W)$ blocks, one per example. Batch Norm normalizes a blue slab that cuts across all examples at a fixed channel. Layer Norm normalizes an entire per example block. Instance Norm normalizes one channel within one block. Group Norm normalizes a contiguous band of channels within one block.
+
+```text
+shape (N, C, H, W); reduce over the marked axes
+BatchNorm   : reduce over (N, H, W)   per channel
+LayerNorm   : reduce over (C, H, W)   per sample
+InstanceNorm: reduce over (H, W)      per (sample, channel)
+GroupNorm   : reduce over (H, W, c/G) per (sample, group)
+```
+
+The crucial structural difference is that Batch Norm is the only one of the four whose statistics couple different examples in the batch. The other three are computed within a single example and are therefore independent of batch size. This single fact explains most of the practical behavior that follows.
+
+## 2. Why Batch Norm Breaks
+
+Batch Norm estimates per channel mean and variance from the mini batch. With batch size $m$, the standard error of the mean estimate scales as $1/\sqrt{m}$, so the statistics become noisy when $m$ is small. Two distinct problems arise.
+
+First, the normalization itself becomes inaccurate. When $m = 2$, the estimated $\sigma^2$ for a channel is computed from very few samples and fluctuates wildly from step to step. This injects noise into every downstream activation, and that noise compounds through depth.
+
+Second, there is a train and test mismatch. At training time Batch Norm uses the current batch statistics, but at inference it uses running averages $\mu_{\text{run}}, \sigma^2_{\text{run}}$ accumulated during training. If the batch statistics are noisy or if the training distribution of batch statistics differs from a single example evaluation, the running estimates are biased and accuracy degrades.
+
+These problems are acute precisely in the regimes that matter for high resolution vision. Detection, segmentation, and video models consume large inputs, so memory forces batch sizes of one or two per device. The error of Batch Norm rises sharply as $m$ falls below roughly eight. A model that trains well at $m = 32$ can lose several points of accuracy at $m = 2$ for no reason other than statistical noise in the normalizer.
+
+A further subtlety is that Batch Norm makes the loss for one example depend on the other examples that happen to share its batch. This violates the usual independence assumption, complicates theoretical analysis, and can leak information across examples in ways that matter for tasks like contrastive learning and certain sequence models.
+
+## 3. Group Normalization
+
+Group Norm, introduced by Wu and He, removes the batch dependence entirely while retaining the channel structure that vision models rely on. It divides the $C$ channels into $G$ groups and normalizes within each group, pooling over spatial locations and the channels in that group, for each example independently.
+
+### 3.1 Definition and Special Cases
+
+With $G$ groups, each group contains $C/G$ channels. The statistics for example $n$ and group $g$ are
+
+$$
+\mu_{ng} = \frac{1}{(C/G) H W} \sum_{c \in g} \sum_{h, w} x_{nchw}, \qquad
+\sigma_{ng}^2 = \frac{1}{(C/G) H W} \sum_{c \in g} \sum_{h, w} (x_{nchw} - \mu_{ng})^2 .
+$$
+
+Group Norm interpolates between the two extremes of single example normalization. When $G = 1$, all channels form one group and Group Norm reduces to Layer Norm. When $G = C$, each channel is its own group and Group Norm reduces to Instance Norm. The interesting regime is intermediate, and a default of $G = 32$ groups works well across many architectures.
+
+```text
+GroupNorm(G=1)   == LayerNorm
+GroupNorm(G=C)   == InstanceNorm
+GroupNorm(G=32)  == practical default for vision
+```
+
+### 3.2 Why Grouping Channels Is Principled
+
+Grouping is not an arbitrary trick. Channels in a convolutional layer are not independent. Classical features such as oriented edges at different frequencies, or color and texture filter banks, naturally form clusters of related responses. Group Norm respects this by sharing a normalizer within a group, which assumes that channels in the same group have comparable scale. Layer Norm goes further and assumes all channels share one distribution, which is often too strong for convolutional features because different channels can have genuinely different scales. Instance Norm goes to the opposite extreme and normalizes each channel separately, discarding all cross channel scale information. Group Norm occupies the productive middle ground.
+
+### 3.3 Empirical Behavior
+
+The defining property of Group Norm is that its accuracy is essentially flat as a function of batch size, because its computation never touches the batch axis. On ImageNet classification with a ResNet-50, Group Norm matches Batch Norm at moderate batch sizes and substantially outperforms it at $m = 2$, where Batch Norm collapses. There is no running statistic and no train and test discrepancy, since the same per example computation is used at training and inference. The cost is that at large batch sizes Batch Norm sometimes retains a small edge, because the noise it injects acts as a mild regularizer that Group Norm lacks.
+
+## 4. Instance Normalization
+
+Instance Norm normalizes each channel of each example over its spatial extent. It was introduced by Ulyanov, Vedaldi, and Lempitsky in the context of feed forward style transfer, and the reason it helps there is illuminating.
+
+### 4.1 Definition
+
+For example $n$ and channel $c$,
+
+$$
+\mu_{nc} = \frac{1}{H W} \sum_{h, w} x_{nchw}, \qquad
+\sigma_{nc}^2 = \frac{1}{H W} \sum_{h, w} (x_{nchw} - \mu_{nc})^2 .
+$$
+
+This is Group Norm with $G = C$. Each spatial feature map is individually centered and scaled.
+
+### 4.2 The Connection to Style
+
+The key observation in neural style transfer is that the artistic style of an image is captured largely by the statistics of feature activations, in particular by the means and the Gram matrices of channel responses. Two images in the same style have similar per channel feature statistics regardless of content. A style transfer network must therefore wash out the original contrast and intensity statistics of the content image so that the target style statistics can be imposed.
+
+Instance Norm does exactly this. By removing the per channel mean and variance of each feature map, it discards instance specific contrast information that would otherwise bleed through and interfere with the target style. Empirically, swapping Batch Norm for Instance Norm in a style transfer generator produces markedly sharper and more faithful stylization and removes a wash of residual content contrast. The mechanism is that normalization to zero mean and unit variance per channel makes the network invariant to the global contrast of the input, which is precisely a property we want when re-rendering content in a new style.
+
+### 4.3 Conditional Instance Norm and AdaIN
+
+Instance Norm generalizes naturally to controllable generation. Conditional Instance Norm learns a separate affine pair $(\gamma_s, \beta_s)$ for each style $s$, so a single network can render many styles by selecting the affine parameters. Adaptive Instance Norm, or AdaIN, takes this further by computing the affine parameters directly from a style input:
+
+$$
+\text{AdaIN}(x, y) = \sigma(y)\, \frac{x - \mu(x)}{\sigma(x)} + \mu(y),
+$$
+
+where $\mu(x), \sigma(x)$ are the per channel instance statistics of the content feature $x$ and $\mu(y), \sigma(y)$ are those of a style feature $y$. AdaIN normalizes the content to remove its own style and then re-imposes the style of $y$ through the affine step. This idea reappears in high quality image generators, where per layer affine parameters predicted from a latent code drive the synthesis of structure and texture at each resolution.
+
+## 5. The Spectrum and How to Choose
+
+The four methods form a clean spectrum governed by how much the normalizer shares across examples and across channels.
+
+| Method | Pooling set | Batch dependent | Cross channel pooling |
+|---|---|---|---|
+| Batch Norm | $(N, H, W)$ per channel | yes | no |
+| Layer Norm | $(C, H, W)$ per sample | no | all channels |
+| Group Norm | $(H, W, C/G)$ per group | no | within group |
+| Instance Norm | $(H, W)$ per channel | no | no |
+
+Reading the table, Group Norm with $G$ swept from $1$ to $C$ traces a continuous path from Layer Norm to Instance Norm, all of it free of batch dependence. Batch Norm stands apart as the only batch coupled scheme.
+
+Practical guidance follows directly from this structure.
+
+- Use Batch Norm when the batch is large and stable, as in standard ImageNet classification with moderate to large batches. The regularizing noise often gives a small accuracy gain.
+- Use Group Norm when the batch is small or variable, as in detection, segmentation, and video, or when you want results that do not depend on batch size or device count. It is the safe default for memory constrained vision.
+- Use Layer Norm for sequence models and transformers, where the channel or feature axis is the natural unit and there is no spatial grid. Layer Norm is Group Norm with one group.
+- Use Instance Norm for style transfer and image to image translation, where removing per sample per channel contrast is the whole point.
+
+A useful diagnostic is to ask whether the task wants to preserve or discard global per channel intensity. Classification wants to preserve discriminative scale information, which argues against Instance Norm. Stylization wants to discard input contrast, which argues for it. Group Norm gives a tunable knob between these regimes.
+
+```python
+# pseudocode: one implementation, four behaviors
+def normalize(x, axes, gamma, beta, eps=1e-5):
+    mu = x.mean(axes, keepdims=True)
+    var = x.var(axes, keepdims=True)
+    return gamma * (x - mu) / (var + eps).sqrt() + beta
+
+# x has shape (N, C, H, W)
+# BatchNorm    : axes = (0, 2, 3)
+# LayerNorm    : axes = (1, 2, 3)
+# InstanceNorm : axes = (2, 3)
+# GroupNorm    : reshape to (N, G, C//G, H, W), axes = (2, 3, 4)
+```
+
+## 6. Theoretical Notes
+
+Two properties unify the batch independent methods. First, they are invariant to per group affine transformations of the input within their pooling set, which makes them robust to shifts in input scale and offset. Second, their Jacobian has a benign structure: the centering and scaling operations bound the effective gradient scale, which is one reason normalization stabilizes training. The variance term introduces a coupling in the backward pass, since each $\hat{x}_i$ depends on all activations in $\mathcal{S}_i$ through $\mu$ and $\sigma$, and this coupling is what spreads gradient information across the pooling set.
+
+The choice of pooling set is ultimately a bias variance tradeoff in statistics estimation. Larger pooling sets give lower variance estimates of $\mu$ and $\sigma$ but impose a stronger assumption that the pooled activations are exchangeable. Batch Norm has a large pooling set but pays with batch dependence. Instance Norm has the smallest pooling set, $H W$ samples, which is fine for large feature maps but unstable for small ones. Group Norm tunes the pooling set size through $G$, trading estimation variance against the validity of the within group exchangeability assumption, which is why an intermediate $G$ tends to win.
+
+## 7. Summary
+
+Batch, layer, group, and instance normalization are one algorithm with four choices of pooling set. Batch Norm couples examples and excels with large batches but degrades when batches are small. The three single example methods are immune to batch size. Group Norm interpolates between Layer Norm and Instance Norm and is the robust default for memory limited vision tasks. Instance Norm, the extreme of per channel single example normalization, discards input contrast and is the workhorse of style transfer, generalizing to conditional and adaptive variants that drive controllable generation. Choosing among them reduces to two questions: can you afford a large stable batch, and does your task want to preserve or erase per channel intensity.
+
+## References
+
+1. Ioffe, S., and Szegedy, C. Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift. ICML, 2015. https://arxiv.org/abs/1502.03167
+2. Ba, J. L., Kiros, J. R., and Hinton, G. E. Layer Normalization. 2016. https://arxiv.org/abs/1607.06450
+3. Wu, Y., and He, K. Group Normalization. ECCV, 2018. https://arxiv.org/abs/1803.08494
+4. Ulyanov, D., Vedaldi, A., and Lempitsky, V. Instance Normalization: The Missing Ingredient for Fast Stylization. 2016. https://arxiv.org/abs/1607.08022
+5. Dumoulin, V., Shlens, J., and Kudlur, M. A Learned Representation For Artistic Style. ICLR, 2017. https://arxiv.org/abs/1610.07629
+6. Huang, X., and Belongie, S. Arbitrary Style Transfer in Real-time with Adaptive Instance Normalization. ICCV, 2017. https://arxiv.org/abs/1703.06868
+7. Karras, T., Laine, S., and Aila, T. A Style-Based Generator Architecture for Generative Adversarial Networks. CVPR, 2019. https://arxiv.org/abs/1812.04948
+8. Santurkar, S., Tsipras, D., Ilyas, A., and Madry, A. How Does Batch Normalization Help Optimization? NeurIPS, 2018. https://arxiv.org/abs/1805.11604

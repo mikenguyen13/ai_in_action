@@ -1,0 +1,164 @@
+# Hyperparameter Tuning with Grid Search
+
+Most learning algorithms expose two kinds of knobs. Parameters are fit from data during training, such as the weights of a linear model. Hyperparameters are set before training and govern the learning process itself, such as the regularization strength of a ridge regression, the depth of a decision tree, or the kernel bandwidth of a support vector machine. The model cannot learn these from the training objective, because they often control the very capacity that the objective would exploit to overfit. Grid search is the oldest and most transparent procedure for choosing them, and despite its inefficiency it remains the default mental model for tuning. This chapter develops grid search carefully, then situates it inside nested cross-validation so that the reported performance estimate is honest rather than optimistic.
+
+## 1. The Search Space
+
+### 1.1 Defining the Grid
+
+A grid is a Cartesian product of finite value sets, one set per hyperparameter. If we tune a model with hyperparameters $\lambda_1, \dots, \lambda_d$ and assign candidate values
+
+$$
+\Lambda_j = \{v_{j,1}, v_{j,2}, \dots, v_{j,k_j}\},
+$$
+
+then the search space is
+
+$$
+\mathcal{G} = \Lambda_1 \times \Lambda_2 \times \cdots \times \Lambda_d,
+\qquad |\mathcal{G}| = \prod_{j=1}^{d} k_j .
+$$
+
+Each element of $\mathcal{G}$ is a full configuration. For a support vector machine with an RBF kernel we might tune the penalty $C$ and the kernel width $\gamma$, giving a two dimensional grid whose cells are the pairs $(C, \gamma)$.
+
+### 1.2 Scaling the Axes
+
+The most common mistake is to space candidate values linearly when the hyperparameter acts multiplicatively. Regularization strengths, learning rates, and kernel widths typically matter on a logarithmic scale, because the difference between $0.001$ and $0.01$ is as consequential as the difference between $0.1$ and $1$. A sound default is a geometric sequence,
+
+$$
+v_{j,i} = v_{j,1} \cdot r^{\,i-1}, \qquad r > 1,
+$$
+
+so that the values are evenly spaced in $\log$ space. A typical choice for a penalty term is $\{10^{-3}, 10^{-2}, \dots, 10^{3}\}$. Integer valued hyperparameters such as tree depth or the number of neighbors are usually spaced linearly, but even there a coarse logarithmic spread is sensible when the plausible range spans orders of magnitude.
+
+```python
+param_grid = {
+    "C": [1e-2, 1e-1, 1e0, 1e1, 1e2],
+    "gamma": [1e-4, 1e-3, 1e-2, 1e-1],
+    "kernel": ["rbf"],
+}
+```
+
+### 1.3 Coupled and Conditional Hyperparameters
+
+Grids assume that axes are independent, but hyperparameters often interact. In an SVM the optimal $C$ depends on $\gamma$, which is exactly why a joint grid is preferable to tuning each knob in isolation. Some hyperparameters are conditional: the `degree` of a polynomial kernel is meaningless when the kernel is RBF. A plain Cartesian product wastes evaluations on such invalid combinations, so practitioners either split the grid into a list of sub-grids, one per kernel, or move to search strategies that handle conditional spaces natively.
+
+## 2. Exhaustive Grid Search
+
+### 2.1 The Procedure
+
+Exhaustive grid search evaluates every configuration in $\mathcal{G}$ and keeps the best. Performance is almost never measured on a single train and validation split, because a single split is noisy and invites tuning to the idiosyncrasies of that one partition. Instead each configuration is scored by $K$-fold cross-validation. The data is partitioned into $K$ folds; for each fold the model is trained on the other $K-1$ folds and validated on the held-out fold, and the $K$ scores are averaged.
+
+Let $\mathcal{L}(g)$ denote the cross-validated loss of configuration $g$. Grid search returns
+
+$$
+g^\star = \arg\min_{g \in \mathcal{G}} \; \mathcal{L}(g)
+= \arg\min_{g \in \mathcal{G}} \; \frac{1}{K} \sum_{k=1}^{K} \ell\big(g; \mathcal{D}_k^{\text{val}}\big),
+$$
+
+where $\ell(g; \mathcal{D}_k^{\text{val}})$ is the loss on fold $k$ for a model trained with configuration $g$ on the remaining folds.
+
+```python
+from sklearn.model_selection import GridSearchCV
+from sklearn.svm import SVC
+
+search = GridSearchCV(
+    SVC(), param_grid, scoring="accuracy",
+    cv=5, n_jobs=-1,
+)
+search.fit(X_train, y_train)
+best = search.best_estimator_
+```
+
+### 2.2 Why Exhaustiveness Helps and Hurts
+
+The appeal of the exhaustive sweep is its simplicity and reproducibility. There is no randomness in which configurations are visited, the procedure is trivially parallel because every cell is independent, and the full table of scores is informative: a flat region of the grid signals that the model is insensitive to a hyperparameter, while a sharp peak near a grid boundary is a warning that the optimum may lie outside the range and the grid should be extended.
+
+The same exhaustiveness is the source of its weakness. The cost grows multiplicatively in the number of hyperparameters, a manifestation of the curse of dimensionality that Section 4 quantifies. Grid search also spends an equal budget on every axis even though, in practice, only a few hyperparameters drive most of the performance variation. This last observation is the central argument of Bergstra and Bengio for random search [^bergstra].
+
+### 2.3 Selecting the Final Configuration
+
+Choosing the strict minimizer of $\mathcal{L}$ can be brittle, because the difference between the best and second best cell is often within the noise of cross-validation. A useful refinement is the one-standard-error rule: among all configurations whose mean score lies within one standard error of the best, prefer the simplest, meaning the most heavily regularized [^hastie]. This biases the choice toward configurations that are likely to generalize, rather than the cell that happened to win on this particular sample.
+
+## 3. Nested Cross-Validation to Avoid Optimistic Bias
+
+### 3.1 The Source of the Bias
+
+Here is the subtle error that pervades casual tuning. Suppose we run grid search with $K$-fold cross-validation, pick $g^\star$, and then report $\mathcal{L}(g^\star)$ as the model's expected performance. That number is optimistically biased. We selected $g^\star$ precisely because it minimized the cross-validated loss, so the minimum of many noisy estimates is below the true loss of the winning configuration. The act of selection turns the validation data into a quantity we have tuned against. The more configurations in the grid, the larger the bias, by the same logic that explains multiple comparisons in statistics.
+
+Formally, if each $\mathcal{L}(g)$ is an unbiased estimate of the true risk $R(g)$ with noise, then
+
+$$
+\mathbb{E}\Big[\min_{g \in \mathcal{G}} \mathcal{L}(g)\Big] \le \min_{g \in \mathcal{G}} \mathbb{E}\big[\mathcal{L}(g)\big] = \min_{g \in \mathcal{G}} R(g),
+$$
+
+so the selected score underestimates the risk of even the genuinely best configuration, and underestimates the realized risk of $g^\star$ by more still.
+
+### 3.2 The Nested Procedure
+
+Nested cross-validation separates the data used to choose hyperparameters from the data used to estimate performance. It runs two loops. The outer loop splits the data into outer folds and reserves each in turn as a test fold that the tuning process never sees. The inner loop performs the entire grid search, including its own cross-validation, using only the outer training portion. The configuration selected by the inner loop is then refit on the full outer training set and scored once on the outer test fold.
+
+The reported estimate is the average of the outer test scores,
+
+$$
+\widehat{R}_{\text{nested}} = \frac{1}{K_{\text{out}}} \sum_{i=1}^{K_{\text{out}}} \ell\big(g^\star_i; \mathcal{D}_i^{\text{test}}\big),
+$$
+
+where $g^\star_i$ is the configuration chosen by the inner search on outer fold $i$. Because each outer test fold is untouched by the selection that produced $g^\star_i$, the estimate is an honest measure of the performance of the whole tuning pipeline, not of any single configuration.
+
+```python
+from sklearn.model_selection import cross_val_score, KFold
+
+inner = KFold(n_splits=5, shuffle=True, random_state=0)
+outer = KFold(n_splits=5, shuffle=True, random_state=1)
+
+clf = GridSearchCV(SVC(), param_grid, cv=inner, n_jobs=-1)
+nested_scores = cross_val_score(clf, X, y, cv=outer)
+print(nested_scores.mean(), nested_scores.std())
+```
+
+### 3.3 What Nested Cross-Validation Estimates
+
+A frequent confusion is to expect nested cross-validation to output a single best hyperparameter setting. It does not. Different outer folds may select different configurations, and that is acceptable, because the quantity being estimated is the generalization performance of the procedure that tunes and trains the model, treated as one object [^cawley]. Once you trust that estimate, you run an ordinary grid search on the full dataset to produce the model you actually ship. The nested estimate tells you how well that shipping pipeline is expected to perform; it does not replace the final fit.
+
+### 3.4 Cost of Nesting
+
+Nesting multiplies the work. With an outer loop of $K_{\text{out}}$ folds, an inner loop of $K_{\text{in}}$ folds, and a grid of size $|\mathcal{G}|$, the total number of model fits is
+
+$$
+K_{\text{out}} \cdot K_{\text{in}} \cdot |\mathcal{G}| .
+$$
+
+For $K_{\text{out}} = K_{\text{in}} = 5$ and a grid of $100$ cells, that is $2{,}500$ fits. When this is infeasible, a defensible compromise is a single held-out test set wrapped around an inner cross-validated grid search, which preserves the separation of selection from evaluation at the price of a noisier final estimate.
+
+## 4. The Cost and Limits of Grids
+
+### 4.1 Multiplicative Blowup
+
+The defining limitation of grid search is that $|\mathcal{G}|$ grows as the product of the per-axis resolutions. Refining each of $d$ axes to $k$ values costs $k^d$ configurations, so adding one hyperparameter with $k$ candidates multiplies the budget by $k$. Tuning five hyperparameters at a modest seven values each yields $7^5 = 16{,}807$ configurations before any cross-validation factor is applied. This is the curse of dimensionality in tuning, and it makes the dense exhaustive grid impractical beyond three or four hyperparameters.
+
+### 4.2 Wasted Resolution
+
+Random search often dominates grid search at equal budget for a structural reason [^bergstra]. If only a few hyperparameters meaningfully affect performance, a grid spends most of its evaluations varying the irrelevant ones while testing only $k$ distinct values of each important one. With $n$ random draws, each important hyperparameter is sampled at $n$ distinct values, giving far finer effective coverage of the dimensions that matter. The grid, by contrast, projects many of its points onto the same few coordinates along each axis, so its effective per-axis resolution is fixed by $k$ no matter how large the total budget.
+
+### 4.3 When Grids Are Still the Right Tool
+
+Despite these limits, grid search remains the right choice in several settings. With one or two hyperparameters on well understood log scales, a coarse grid followed by a refined grid around the best region is fast, interpretable, and reproducible. Grids also produce a complete response surface that supports diagnosis: you can see directly whether the loss is flat, peaked, or still descending at the boundary. For pipelines that demand auditability or that must run identically across environments, the absence of randomness is a genuine advantage.
+
+### 4.4 Beyond Grids
+
+When the budget is fixed and the space is larger, more efficient strategies exist. Random search is the simplest upgrade and a strong baseline. Bayesian optimization builds a probabilistic surrogate of $\mathcal{L}$, often a Gaussian process, and uses an acquisition function to propose the next configuration where improvement is most likely, concentrating evaluations near promising regions [^snoek]. Bandit based methods such as Hyperband allocate a small budget to many configurations and progressively promote only the survivors, exploiting the fact that poor configurations can be identified early [^li]. These methods retain the conceptual frame developed here: the search space, an honest evaluation through nested or held-out splits, and an explicit accounting of cost. Grid search is best understood not as the final word on tuning but as the transparent baseline against which these smarter searches are measured.
+
+## References
+
+[^bergstra]: Bergstra, J. and Bengio, Y. (2012). Random Search for Hyper-Parameter Optimization. Journal of Machine Learning Research, 13, 281 to 305. https://www.jmlr.org/papers/v13/bergstra12a.html
+
+[^hastie]: Hastie, T., Tibshirani, R., and Friedman, J. (2009). The Elements of Statistical Learning, 2nd edition. Springer. https://hastie.su.domains/ElemStatLearn/
+
+[^cawley]: Cawley, G. C. and Talbot, N. L. C. (2010). On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation. Journal of Machine Learning Research, 11, 2079 to 2107. https://www.jmlr.org/papers/v11/cawley10a.html
+
+[^snoek]: Snoek, J., Larochelle, H., and Adams, R. P. (2012). Practical Bayesian Optimization of Machine Learning Algorithms. Advances in Neural Information Processing Systems, 25. https://papers.nips.cc/paper/2012/hash/05311655a15b75fab86956663e1819cd-Abstract.html
+
+[^li]: Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., and Talwalkar, A. (2018). Hyperband: A Novel Bandit-Based Approach to Hyperparameter Optimization. Journal of Machine Learning Research, 18, 1 to 52. https://www.jmlr.org/papers/v18/16-558.html
+
+[^scikit]: Pedregosa, F. et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research, 12, 2825 to 2830. https://scikit-learn.org/stable/modules/grid_search.html

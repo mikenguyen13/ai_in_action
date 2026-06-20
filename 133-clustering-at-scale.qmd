@@ -1,0 +1,146 @@
+# Clustering at Scale
+
+Classical clustering algorithms assume that the full dataset fits in memory and can be scanned many times. Lloyd's algorithm for $k$-means, agglomerative hierarchical clustering, and DBSCAN all violate this assumption once data reaches the hundreds of millions of points or arrives as an unbounded stream. This chapter develops the algorithmic ideas that make clustering tractable at scale: incremental and mini-batch updates, summary data structures such as the BIRCH feature tree, cheap blocking via canopies, distributed coordination across a cluster of machines, and approximate methods that trade a controlled amount of accuracy for large gains in throughput.
+
+## 1. The Scaling Problem
+
+Consider Lloyd's algorithm on $n$ points in $\mathbb{R}^d$ with $k$ centroids. Each iteration costs $O(nkd)$ to assign points and $O(nd)$ to recompute centroids, and convergence may require dozens of iterations. The dominant practical cost is not always arithmetic but memory traffic: every iteration reads the entire dataset. When $n$ is $10^9$ and the data lives on disk or across a network, repeated full scans are the bottleneck.
+
+Three structural constraints drive the methods below.
+
+1. **Single pass or few passes.** Streaming and out-of-core settings forbid random access. We want algorithms whose quality degrades gracefully as the number of passes shrinks toward one.
+2. **Bounded memory.** Memory must be sublinear in $n$, ideally a function of $k$, $d$, and a precision parameter only.
+3. **Parallelism.** Throughput should grow with the number of machines, which requires that most work be local and that coordination be infrequent and small.
+
+A useful organizing idea is the **cluster summary**: a small sufficient statistic that captures everything later steps need. For squared Euclidean cost, the relevant statistic is the triple of count, linear sum, and squared-norm sum, which is additive and therefore mergeable.
+
+## 2. Mini-Batch k-means
+
+Mini-batch $k$-means replaces the full-data assignment step with a stochastic update computed on a small random batch $B$ of size $b \ll n$. At each step we sample $B$, assign each point to its nearest current centroid, and move each centroid toward the batch points assigned to it using a per-centroid learning rate that decays as the inverse of the number of points it has absorbed.
+
+```text
+init centroids C (e.g. k-means++ on a sample)
+counts v[j] = 0 for each centroid j
+repeat:
+    sample batch B of size b
+    for x in B: cache nearest centroid c(x)
+    for x in B:
+        j = c(x); v[j] += 1
+        eta = 1 / v[j]
+        C[j] = (1 - eta) * C[j] + eta * x
+```
+
+The per-center step size $\eta = 1/v_j$ implements an online mean: after a centroid has seen $v_j$ points, its position equals the running average of those points, exactly as in stochastic gradient descent on the $k$-means objective with a $1/t$ schedule. Sculley's formulation showed that batches of a few thousand points reach solutions close to full-batch Lloyd at a fraction of the wall-clock cost, which is why mini-batch $k$-means is the default for large $n$ in scikit-learn and similar libraries.
+
+Two practical notes. First, initialization still matters; seeding with $k$-means++ on a modest subsample preserves the approximation guarantee while keeping seeding cheap. Second, because updates are stochastic, the objective is noisy across steps, so convergence is judged by a moving average of center displacement rather than exact stationarity.
+
+## 3. Streaming Clustering
+
+In the streaming model points arrive one at a time, memory is bounded, and we may store only a summary. The canonical guarantee comes from the **doubling or merge-and-reduce** framework: maintain a small set of weighted representatives (a coreset), and whenever the buffer fills, summarize it into a coarser level, much like binary counter carries.
+
+A **coreset** for $k$-means is a weighted subset $S$ such that for every candidate set of $k$ centers $C$,
+$$
+\left| \mathrm{cost}(S, C) - \mathrm{cost}(X, C) \right| \le \varepsilon \, \mathrm{cost}(X, C).
+$$
+Because the bound holds uniformly over all $C$, we can run any expensive clustering algorithm on $S$ and the result transfers to the full data within a $(1 \pm \varepsilon)$ factor. Coresets of size polynomial in $k$, $d$, and $1/\varepsilon$ suffice, and they compose: a coreset of coresets is again a coreset with additively combined error. This composability is what makes them ideal for streams and for distributed reduction.
+
+The classic STREAM algorithm of Guha and colleagues clusters the stream in chunks, retains the weighted centers of each chunk, and recursively re-clusters the accumulated centers, achieving a constant-factor approximation in a single pass with memory $O(n^{\delta})$ for small $\delta$. Modern systems instead maintain coresets explicitly, since the uniform error bound is stronger and the merge step is a simple union.
+
+## 4. BIRCH and the CF Tree
+
+BIRCH (Balanced Iterative Reducing and Clustering using Hierarchies) was the first method to cluster very large datasets in a single scan using a height-balanced summary tree. Its central object is the **clustering feature**, the additive triple
+$$
+\mathrm{CF} = \left( N, \; \vec{LS}, \; SS \right), \qquad \vec{LS} = \sum_{i=1}^{N} \vec{x}_i, \quad SS = \sum_{i=1}^{N} \lVert \vec{x}_i \rVert^2 .
+$$
+From this triple alone we recover the centroid $\vec{LS}/N$, the radius, and the diameter of a subcluster, and crucially CFs are additive: $\mathrm{CF}_1 + \mathrm{CF}_2$ summarizes the union of two subclusters. This is the same mergeable sufficient statistic noted in Section 1.
+
+The **CF tree** is a balanced tree with two parameters: a branching factor $B$ and a threshold $T$ on leaf-entry radius. Each leaf entry holds one CF, and each non-leaf entry holds the summed CF of its children. Insertion of a point descends the tree by choosing the closest child CF, and at the leaf it either absorbs the point into the nearest entry if doing so keeps the radius below $T$, or creates a new entry. If a leaf overflows it splits, and splits propagate upward like in a B-tree.
+
+```text
+insert(x):
+    descend from root, at each level pick child whose
+        centroid is nearest to x
+    at leaf: find nearest entry e
+        if radius(e + x) <= T: e <- e + x
+        else: add new entry; if leaf full, split
+    update CFs along path back to root
+    if tree exceeds memory: raise T, rebuild more compactly
+```
+
+BIRCH runs in roughly $O(n)$ time and constant memory because the tree size is bounded by $T$, not by $n$. When memory is exhausted, $T$ is increased and the existing tree is rebuilt by reinserting leaf CFs, a cheap operation since CFs are far fewer than points. After the scan, a global algorithm such as agglomerative clustering or $k$-means runs on the leaf CFs, and an optional refinement pass relabels original points. BIRCH handles outliers naturally as sparse leaf entries and is well suited to data that is roughly spherical in the chosen metric.
+
+## 5. Canopy Clustering
+
+Canopy clustering, due to McCallum, Nigam, and Ungar, is a preprocessing step that cheaply partitions data into overlapping subsets called canopies, so that an expensive clustering algorithm only compares points that share a canopy. It uses a cheap approximate distance and two thresholds $T_1 > T_2$.
+
+```text
+canopies = []
+pool = all points
+while pool not empty:
+    pick a random point p, remove from pool
+    start a new canopy centered at p
+    for q in pool:
+        d = cheap_distance(p, q)
+        if d < T1: add q to this canopy
+        if d < T2: remove q from pool
+```
+
+Points within the tighter radius $T_2$ are removed from further consideration, guaranteeing progress, while points within the looser radius $T_1$ join the canopy but may still seed or join others. The key invariant the method exploits is: two points that share no canopy are assumed to be in different clusters, so the costly inner algorithm (for example $k$-means with an exact metric) is only ever evaluated between points that co-occur in at least one canopy. With well chosen thresholds this turns an $O(n^2)$ all-pairs comparison into something close to linear, and it composes with $k$-means by restricting each point's candidate centroids to those whose canopy it shares. Canopy clustering is fundamentally a **blocking** technique, the same idea used in entity resolution to avoid quadratic record comparison.
+
+## 6. Distributed Clustering
+
+When data is partitioned across machines, the design goal is to do most work locally and exchange only small summaries. The additive CF triple and the composability of coresets both enable a **local summarize then global merge** pattern.
+
+For $k$-means specifically, a single MapReduce-style iteration is straightforward. Each mapper holds a partition and the current centroids, assigns its local points, and emits for each centroid a partial sum triple $(N_j, \vec{LS}_j)$. A reducer sums the partial triples per centroid and divides to produce updated centroids. The data shuffled per iteration is $O(kd)$ per mapper, independent of partition size.
+
+```text
+map(partition, centroids C):
+    local = zeros
+    for x in partition:
+        j = argmin_j ||x - C[j]||^2
+        local[j].N += 1; local[j].LS += x
+    emit each local[j]
+
+reduce(j, partials):
+    agg = sum(partials)        # additive triples
+    emit C[j] = agg.LS / agg.N
+```
+
+The weak point of naive distributed $k$-means is initialization: $k$-means++ is inherently sequential because each of the $k$ seeds depends on all previous ones. **k-means$\parallel$** (Bahmani et al.) fixes this by oversampling. Over $O(\log n)$ rounds it samples each point independently with probability proportional to its current squared distance to the chosen set, drawing about $\ell$ points per round, then reclusters the $O(\ell \log n)$ candidates down to $k$ weighted seeds. The result matches the $O(\log k)$ approximation guarantee of $k$-means++ while parallelizing cleanly. Distributed coreset construction follows the same shape: build a local coreset per partition, then merge and re-summarize on a coordinator, with total error bounded by the sum of per-level $\varepsilon$ terms.
+
+## 7. Approximate Methods
+
+Two further sources of cost remain after the data-access problem is solved: the nearest-centroid search and the all-pairs neighbor search underlying density methods.
+
+**Approximate assignment.** Each Lloyd iteration computes $\arg\min_j \lVert x - c_j \rVert^2$, which is a nearest-neighbor query against the $k$ centroids. For large $k$ this is itself expensive, and approximate nearest neighbor (ANN) structures such as hierarchical navigable small world graphs or product-quantization indices return the nearest centroid with high probability at sublinear cost. Triangle-inequality pruning, as in Elkan's and Hamerly's accelerated $k$-means, is an exact alternative: cached bounds on point-to-centroid distances let most distance computations be skipped when centroids move little between iterations.
+
+**Approximate density clustering.** DBSCAN's cost is dominated by region queries. Replacing exact $\epsilon$-neighborhood queries with grid-based or ANN-based neighbor lookups yields approximate DBSCAN variants that run in near-linear time, and grid approximations such as those analyzed by Gan and Tao recover the same clusters up to a small relative tolerance on $\epsilon$. For large-scale density clustering the practical recipe is to bucket points into a spatial grid whose cell side is $\epsilon/\sqrt{d}$, so that neighbor search only inspects adjacent cells.
+
+**Dimensionality reduction as approximation.** A Johnson-Lindenstrauss random projection to $O(\varepsilon^{-2} \log n)$ dimensions preserves pairwise squared distances within a $(1 \pm \varepsilon)$ factor, so clustering in the projected space approximately preserves the $k$-means cost. This is frequently the cheapest single intervention for high-dimensional data, since it shrinks both the assignment cost and the memory footprint before any other method runs.
+
+## 8. Choosing a Method in Practice
+
+The methods compose rather than compete. A robust large-scale pipeline often projects with random features, blocks with canopies or a spatial grid, summarizes each partition with CFs or a coreset, merges summaries on a coordinator, and finally runs an accelerated or mini-batch $k$-means on the merged summary with a $k$-means$\parallel$ seeding.
+
+Guidance by regime:
+
+- **Bounded memory, one disk pass:** BIRCH, because the CF tree gives near-linear time and constant memory in a single scan.
+- **Unbounded stream:** maintain a coreset with merge-and-reduce, then cluster the coreset offline.
+- **Many small batches, evolving data:** mini-batch $k$-means with a decaying per-center step.
+- **Data already partitioned across machines:** distributed $k$-means with additive triples and $k$-means$\parallel$ seeding, or distributed coreset merge.
+- **Quadratic comparison cost or density methods:** canopy blocking and grid or ANN neighbor search.
+
+The recurring theme is that scale is bought with a small, additive, mergeable summary and a controlled approximation factor $\varepsilon$. Once cluster statistics are reduced to mergeable sufficient statistics, single-pass, streaming, and distributed variants all become rearrangements of the same summarize then merge skeleton.
+
+## References
+
+1. Sculley, D. (2010). Web-Scale K-Means Clustering. *Proceedings of the 19th International Conference on World Wide Web (WWW)*. https://dl.acm.org/doi/10.1145/1772690.1772862
+2. Zhang, T., Ramakrishnan, R., and Livny, M. (1996). BIRCH: An Efficient Data Clustering Method for Very Large Databases. *ACM SIGMOD Record*, 25(2). https://dl.acm.org/doi/10.1145/235968.233324
+3. McCallum, A., Nigam, K., and Ungar, L. (2000). Efficient Clustering of High-Dimensional Data Sets with Application to Reference Matching. *Proceedings of the 6th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*. https://dl.acm.org/doi/10.1145/347090.347123
+4. Guha, S., Meyerson, A., Mishra, N., Motwani, R., and O'Callaghan, L. (2003). Clustering Data Streams: Theory and Practice. *IEEE Transactions on Knowledge and Data Engineering*, 15(3). https://ieeexplore.ieee.org/document/1198387
+5. Bahmani, B., Moseley, B., Vattani, A., Kumar, R., and Vassilvitskii, S. (2012). Scalable K-Means++. *Proceedings of the VLDB Endowment*, 5(7). https://www.vldb.org/pvldb/vol5/p622_bahmanbahmani_vldb2012.pdf
+6. Arthur, D., and Vassilvitskii, S. (2007). k-means++: The Advantages of Careful Seeding. *Proceedings of the 18th Annual ACM-SIAM Symposium on Discrete Algorithms (SODA)*. https://dl.acm.org/doi/10.5555/1283383.1283494
+7. Har-Peled, S., and Mazumdar, S. (2004). On Coresets for k-Means and k-Median Clustering. *Proceedings of the 36th Annual ACM Symposium on Theory of Computing (STOC)*. https://dl.acm.org/doi/10.1145/1007352.1007400
+8. Elkan, C. (2003). Using the Triangle Inequality to Accelerate k-Means. *Proceedings of the 20th International Conference on Machine Learning (ICML)*. https://cseweb.ucsd.edu/~elkan/kmeansicml03.pdf
+9. Gan, J., and Tao, Y. (2015). DBSCAN Revisited: Mis-Claim, Un-Fixability, and Approximation. *Proceedings of the 2015 ACM SIGMOD International Conference on Management of Data*. https://dl.acm.org/doi/10.1145/2723372.2737792
+10. Malkov, Y. A., and Yashunin, D. A. (2020). Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 42(4). https://ieeexplore.ieee.org/document/8594636

@@ -1,0 +1,181 @@
+# Batch Normalization
+
+Batch Normalization, introduced by Ioffe and Szegedy in 2015, is among the most consequential architectural innovations in deep learning. By inserting a normalization step between linear transformations and nonlinearities, it allowed practitioners to train deeper networks faster and with far less sensitivity to initialization and learning rate. This chapter develops the operation precisely, examines its dual behavior during training and inference, surveys the still-unsettled debate over why it works, and confronts its failure modes in the small batch regime.
+
+## 1. Motivation and Setup
+
+Consider a deep feedforward or convolutional network as a composition of layers. Each layer receives the outputs of the previous layer as input. During training, the parameters of every layer change simultaneously at each gradient step. Consequently, the distribution of inputs presented to any given layer shifts as the layers below it update. A layer that has partially adapted to one input distribution suddenly faces a different one, and it must readapt. Ioffe and Szegedy named this phenomenon internal covariate shift, and they argued that it slows convergence and forces the use of small learning rates.
+
+Before this work, careful weight initialization and small steps were the standard defenses. The proposal of Batch Normalization was to attack the problem directly: standardize the activations of each layer so that, regardless of how the lower layers evolve, the inputs to a given layer maintain a roughly stable distribution with zero mean and unit variance. The empirical payoff was dramatic. Networks trained an order of magnitude faster, tolerated higher learning rates, became robust to initialization, and in some cases needed less aggressive regularization.
+
+We will see that the original explanation has been challenged, but the operation itself remains foundational. Let us define it carefully.
+
+## 2. The Normalization Transform
+
+### 2.1 Per-feature standardization over a mini-batch
+
+Let $x$ denote a scalar activation for one feature, that is, one coordinate of a layer's pre-activation vector. Within a mini-batch of $m$ examples we observe values $x_1, \dots, x_m$ for this feature. Batch Normalization first computes the empirical mean and variance over the batch:
+
+$$
+\mu_B = \frac{1}{m} \sum_{i=1}^{m} x_i, \qquad
+\sigma_B^2 = \frac{1}{m} \sum_{i=1}^{m} (x_i - \mu_B)^2 .
+$$
+
+It then standardizes each value:
+
+$$
+\hat{x}_i = \frac{x_i - \mu_B}{\sqrt{\sigma_B^2 + \epsilon}},
+$$
+
+where $\epsilon$ is a small constant, typically $10^{-5}$, added for numerical stability so that division by a near-zero variance does not explode. After this step the feature has approximately zero mean and unit variance across the batch.
+
+Each feature is normalized independently using its own batch statistics. In a fully connected layer with $d$ pre-activation features, there are $d$ separate means and variances. In a convolutional layer the statistics are pooled across both the batch and the spatial dimensions for each channel, so a layer with $C$ channels maintains $C$ means and $C$ variances, preserving the convolutional property that the same transformation applies at every spatial location.
+
+### 2.2 The learnable scale and shift
+
+Forcing every layer's activations to zero mean and unit variance is too rigid. Such a constraint can destroy useful representational structure. For example, if the input to a sigmoid is forced to unit variance, the nonlinearity is confined to its near-linear central region, and the layer loses expressive power. To repair this, Batch Normalization introduces two learnable parameters per feature, a scale $\gamma$ and a shift $\beta$:
+
+$$
+y_i = \gamma \, \hat{x}_i + \beta .
+$$
+
+These parameters are trained by backpropagation alongside the network weights. They give the layer the freedom to undo the normalization if that is what minimizes the loss. In particular, if the optimizer sets $\gamma = \sqrt{\sigma_B^2 + \epsilon}$ and $\beta = \mu_B$, the original activations are recovered exactly. The crucial point is that the network can represent the identity transformation but is no longer required to, and it learns the appropriate scale and shift from data rather than being locked to a fixed distribution.
+
+A compact statement of the full transform:
+
+```
+mu    = mean(x, over batch)
+var   = var(x, over batch)
+xhat  = (x - mu) / sqrt(var + eps)
+y     = gamma * xhat + beta
+```
+
+The parameters $\gamma$ and $\beta$ are vectors of length equal to the feature or channel count. The mean and variance are not parameters; they are functions of the data in the current batch.
+
+## 3. Backpropagation Through the Normalization
+
+Because $\mu_B$ and $\sigma_B^2$ both depend on every element of the batch, the gradient of the loss with respect to an input $x_i$ flows through three paths: directly through $\hat{x}_i$, through the shared mean, and through the shared variance. Writing $\ell$ for the loss and letting $g_i = \partial \ell / \partial \hat{x}_i = \gamma \cdot \partial \ell / \partial y_i$, the gradient with respect to the input is
+
+$$
+\frac{\partial \ell}{\partial x_i}
+= \frac{1}{\sqrt{\sigma_B^2 + \epsilon}}
+\left(
+g_i
+- \frac{1}{m} \sum_{j=1}^{m} g_j
+- \hat{x}_i \cdot \frac{1}{m} \sum_{j=1}^{m} g_j \hat{x}_j
+\right).
+$$
+
+The structure of this expression is instructive. The incoming gradient $g_i$ is adjusted by subtracting its batch mean and by subtracting a term proportional to $\hat{x}_i$ times the correlation between the gradient and the normalized activation. In effect, backpropagation centers and decorrelates the gradient with respect to the normalized output. This coupling across the batch is exactly what makes the per-example gradient depend on the other examples, a property with consequences we revisit when batches are small.
+
+The gradients for the learnable parameters are simple sums:
+
+$$
+\frac{\partial \ell}{\partial \gamma} = \sum_{i=1}^{m} \frac{\partial \ell}{\partial y_i} \hat{x}_i,
+\qquad
+\frac{\partial \ell}{\partial \beta} = \sum_{i=1}^{m} \frac{\partial \ell}{\partial y_i} .
+$$
+
+## 4. Training Versus Inference Behavior
+
+### 4.1 The dependency problem at test time
+
+During training the normalization uses statistics computed from the current mini-batch. This makes the output for any single example a function of the other examples sharing its batch, which is acceptable, even helpful, while learning. At inference time this dependency is unacceptable. A prediction for one input should not change because of which other inputs happen to be processed alongside it, and we frequently want to predict on a single example with no batch at all.
+
+Batch Normalization resolves this by switching to fixed, population level statistics at inference. The mean and variance used at test time are estimates of the expected mean and variance over the whole training distribution, computed once and then frozen. The transform at inference becomes a deterministic affine map per feature:
+
+$$
+y = \gamma \, \frac{x - \mathbb{E}[x]}{\sqrt{\mathrm{Var}[x] + \epsilon}} + \beta,
+$$
+
+where $\mathbb{E}[x]$ and $\mathrm{Var}[x]$ are the population estimates. Because $\gamma$, $\beta$, $\mathbb{E}[x]$, and $\mathrm{Var}[x]$ are all constants at inference, the entire operation collapses into a single linear scaling and bias that can be folded into the preceding convolution or matrix multiply for efficiency.
+
+### 4.2 Estimating the population statistics
+
+Two methods are common. The original paper proposes computing, after training, the average of the batch means and an unbiased estimate of the variance over the training data. In practice almost all implementations instead maintain running estimates updated during training with an exponential moving average:
+
+$$
+\hat{\mu} \leftarrow (1 - \alpha)\, \hat{\mu} + \alpha\, \mu_B,
+\qquad
+\hat{\sigma}^2 \leftarrow (1 - \alpha)\, \hat{\sigma}^2 + \alpha\, \sigma_B^2,
+$$
+
+with a small momentum $\alpha$, often $0.1$ or smaller. These running buffers are not learned by gradient descent. They are accumulated statistics, and they are exactly the quantities used in place of the batch values when the layer is placed in evaluation mode.
+
+This train and test discrepancy is a frequent source of bugs. A model evaluated while still in training mode will normalize with batch statistics, producing noisy and batch dependent predictions. Conversely, a model whose running statistics have not converged, perhaps because it trained for too few steps or used an inappropriate momentum, can show a large gap between training accuracy and validation accuracy that has nothing to do with overfitting. The two modes must be switched explicitly, and the running statistics must be allowed to settle.
+
+```
+# pseudocode for the two regimes
+if training:
+    mu, var = batch_mean(x), batch_var(x)
+    running_mu  = (1 - a) * running_mu  + a * mu
+    running_var = (1 - a) * running_var + a * var
+else:
+    mu, var = running_mu, running_var
+y = gamma * (x - mu) / sqrt(var + eps) + beta
+```
+
+## 5. Why Does It Help?
+
+The empirical benefits are not in dispute. The mechanism behind them is. We summarize the major positions.
+
+### 5.1 The internal covariate shift hypothesis
+
+The original account holds that Batch Normalization works by reducing internal covariate shift. By keeping the distribution of each layer's inputs stable, the argument goes, lower layers do not pull the rug out from under higher layers, so each layer faces a more stationary learning problem and can use a larger step. The narrative is intuitive and it motivated the design, but it was offered with limited direct evidence that controlling distributional shift is the operative cause.
+
+### 5.2 The optimization smoothing hypothesis
+
+In 2018, Santurkar and colleagues challenged the covariate shift story directly. In a striking experiment they injected explicit, time varying random noise after Batch Normalization layers, deliberately reintroducing severe distributional shift, and found that training remained fast and stable. If reducing covariate shift were the mechanism, this manipulation should have hurt, yet it did not. They further measured covariate shift directly and found that Batch Normalization did not consistently reduce it.
+
+Their alternative explanation is that Batch Normalization improves the optimization landscape. They proved that, under their assumptions, the technique makes the loss and its gradients more Lipschitz, that is, smoother. A smoother landscape means the gradient is more predictive of the loss a short distance ahead, gradients change less abruptly, and larger learning rates remain stable. On this view the benefit is about conditioning of the optimization problem, not about the statistics of intermediate activations per se. Related theoretical work analyzing the loss surface and the effect of normalization on gradient magnitudes has reinforced the smoothing interpretation.
+
+### 5.3 Scale invariance and the effective learning rate
+
+A third strand of analysis emphasizes that Batch Normalization makes a layer's output invariant to the scale of its weights. If $W$ is scaled by a constant $c$, the pre-activations scale by $c$, but normalization divides this out, so the normalized output is unchanged. A direct consequence is that the gradient with respect to $W$ scales like $1/c$. This decoupling of weight magnitude from function means that the effective step size adapts automatically to the norm of the weights, which helps explain robustness to learning rate and to initialization, and it interacts in subtle ways with weight decay, since the regularizer now controls an effective learning rate rather than the function directly.
+
+### 5.4 A regularizing side effect
+
+Because each training example is normalized using statistics drawn from its random mini-batch, the representation of an example carries a stochastic perturbation that depends on its batch companions. This injects noise into training in a manner loosely analogous to dropout, and it is widely credited with a mild regularizing effect. It is also why networks using Batch Normalization sometimes need less explicit regularization, and why the choice of batch size influences generalization and not merely speed.
+
+The reasonable contemporary position is that these explanations are complementary rather than exclusive. Smoothing of the landscape, scale invariance, and noise injection are all genuine effects of the same operation, and the original covariate shift framing, while a useful intuition, is not by itself an adequate causal account.
+
+## 6. Quirks with Small Batches
+
+The defining weakness of Batch Normalization is its reliance on batch statistics. Everything depends on $\mu_B$ and $\sigma_B^2$ being good estimates of the population quantities, and those estimates degrade as the batch shrinks.
+
+### 6.1 Statistical noise in the estimates
+
+The sample variance computed from $m$ examples has a relative fluctuation that grows as $m$ decreases. With a batch of $256$, the per-feature mean and variance are reasonably stable. With a batch of $4$ or $2$, they are wildly noisy, and the normalization divides every activation by a quantity that jitters from step to step. This noise corrupts both the forward pass and the backward gradients, and it can dominate the useful signal. At the extreme of $m = 1$ the variance is undefined and the operation is meaningless.
+
+A second, often overlooked problem is the train and test mismatch. The running averages accumulated during training reflect the noisy small batch statistics, but they are meant to approximate population statistics. When the batch statistics are biased or high variance, the frozen estimates used at inference may not match what the network learned to expect, producing a degradation that appears only at evaluation time.
+
+### 6.2 Why this matters in practice
+
+Many important workloads are forced into small per device batches. High resolution image segmentation, video models, and 3D vision consume so much memory per example that only a handful fit on an accelerator. Distributed training spreads a nominal batch across many devices, leaving each device with a small local shard, and naive implementations compute statistics only over that local shard. In all of these settings standard Batch Normalization can underperform or destabilize.
+
+### 6.3 Mitigations and alternatives
+
+Several remedies exist. Synchronized Batch Normalization computes the mean and variance across all devices rather than per device, restoring a large effective batch at the cost of communication. This directly addresses the distributed case but not the case where even the global batch is small.
+
+The more general response has been to design normalizers that do not depend on the batch dimension at all. Layer Normalization normalizes across the features of a single example, making it independent of batch size and of the distinction between training and inference; it is the standard choice in Transformers and recurrent models. Instance Normalization normalizes each example and channel over spatial locations and is favored in style transfer. Group Normalization, proposed by Wu and He in 2018, partitions channels into groups and normalizes within each group for each example; it matches Batch Normalization accuracy on vision tasks while being insensitive to batch size, and it was introduced specifically to solve the small batch problem. Batch Renormalization is a different tactic that keeps the batch based design but corrects the train and test statistics gap with additional reparameterization terms, narrowing the gap when batches are small or non independent.
+
+The persistence of these alternatives is the clearest evidence that the batch dependence is intrinsic, not incidental. Whenever the batch cannot supply a reliable estimate of the population statistics, a batch free normalizer is preferable.
+
+## 7. Practical Guidance
+
+A few recommendations follow from the preceding analysis. Place Batch Normalization between the linear transformation and the nonlinearity, and when a layer is immediately followed by Batch Normalization, omit its bias term, since $\beta$ subsumes it and the subtraction of $\mu_B$ would cancel any added bias anyway. Always switch the model between training and evaluation modes explicitly, and verify that running statistics have stabilized before trusting validation numbers. Prefer larger batches when memory allows, and when it does not, reach for synchronized Batch Normalization in the distributed case or for Group or Layer Normalization when even the global batch is small. Finally, treat the batch size as a hyperparameter that affects both optimization and generalization, not merely throughput.
+
+## 8. Summary
+
+Batch Normalization standardizes each feature using mini-batch statistics, then restores expressive freedom through a learnable scale $\gamma$ and shift $\beta$. It behaves differently in its two regimes, using batch statistics while training and frozen population estimates at inference, and conflating these regimes is a common and costly error. Its benefits, faster and more stable training, robustness to initialization and learning rate, and a mild regularizing effect, are firmly established. The explanation for those benefits has shifted from the original internal covariate shift story toward an account centered on smoothing of the optimization landscape, scale invariance of the parameters, and stochastic regularization, with these effects best understood as complementary. Its principal limitation is dependence on the batch, which makes it fragile when batches are small or poorly distributed, and that limitation has driven a family of batch independent normalizers that now dominate in settings where Batch Normalization cannot be applied reliably.
+
+## References
+
+1. Ioffe, S. and Szegedy, C. (2015). Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift. https://arxiv.org/abs/1502.03167
+2. Santurkar, S., Tsipras, D., Ilyas, A., and Madry, A. (2018). How Does Batch Normalization Help Optimization? https://arxiv.org/abs/1805.11604
+3. Wu, Y. and He, K. (2018). Group Normalization. https://arxiv.org/abs/1803.08494
+4. Ba, J. L., Kiros, J. R., and Hinton, G. E. (2016). Layer Normalization. https://arxiv.org/abs/1607.06450
+5. Ioffe, S. (2017). Batch Renormalization: Towards Reducing Minibatch Dependence in Batch-Normalized Models. https://arxiv.org/abs/1702.03275
+6. Ulyanov, D., Vedaldi, A., and Lempitsky, V. (2016). Instance Normalization: The Missing Ingredient for Fast Stylization. https://arxiv.org/abs/1607.08022
+7. Bjorck, J., Gomes, C., Selman, B., and Weinberger, K. Q. (2018). Understanding Batch Normalization. https://arxiv.org/abs/1806.02375
+8. Goodfellow, I., Bengio, Y., and Courville, A. (2016). Deep Learning, Chapter 8. https://www.deeplearningbook.org

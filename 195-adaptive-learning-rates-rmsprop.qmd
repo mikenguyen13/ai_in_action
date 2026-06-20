@@ -1,0 +1,123 @@
+# Adaptive Learning Rates: RMSProp
+
+## 1. Introduction
+
+Gradient descent and its stochastic variants share a single, awkward hyperparameter: the learning rate. A scalar step size $\eta$ must serve every coordinate of a high dimensional parameter vector, even though different coordinates often live on wildly different scales. A weight feeding into a rarely activated feature may receive sparse, large gradients, while a weight tied to a dense feature receives small, frequent ones. A global $\eta$ that is safe for one is wasteful for the other. Adaptive methods respond by giving each coordinate its own effective step size, derived from the recent history of that coordinate's gradients.
+
+RMSProp is among the most influential of these methods. It was proposed by Geoffrey Hinton in his Coursera course on neural networks and was never published as a standalone paper, yet it became a workhorse optimizer for recurrent networks and a conceptual ancestor of Adam. This chapter develops RMSProp from the failure mode of its predecessor AdaGrad, explains the exponential moving average that fixes that failure, and examines the small but consequential epsilon term that keeps the update numerically sane.
+
+## 2. From AdaGrad to a Decay Problem
+
+### 2.1 The AdaGrad update
+
+AdaGrad accumulates the sum of squared gradients per coordinate and scales each step by the inverse square root of that accumulator. Let $g_t = \nabla_\theta \mathcal{L}_t(\theta_t)$ be the gradient at step $t$, and let $g_{t,i}$ denote its $i$-th component. AdaGrad maintains a state vector
+
+$$
+G_{t,i} = \sum_{\tau=1}^{t} g_{\tau,i}^2,
+$$
+
+and updates parameters by
+
+$$
+\theta_{t+1,i} = \theta_{t,i} - \frac{\eta}{\sqrt{G_{t,i}} + \epsilon} \, g_{t,i} .
+$$
+
+Coordinates that have seen large or frequent gradients accumulate a large $G_{t,i}$ and are therefore damped, while quiet coordinates retain large effective steps. For convex problems and sparse features this behavior is provably helpful, and AdaGrad enjoys strong regret guarantees in the online convex optimization setting.
+
+### 2.2 Why the accumulator kills learning
+
+The trouble is that $G_{t,i}$ is a sum that only grows. Because every squared gradient is non negative, $G_{t,i}$ increases monotonically with $t$. The effective learning rate $\eta / (\sqrt{G_{t,i}} + \epsilon)$ therefore decays toward zero, and it does so regardless of whether the optimizer has actually reached a good region. In a deep, non convex loss landscape where training runs for many thousands of steps, this aggressive and irreversible decay often stalls progress long before the model has converged. The optimizer effectively freezes.
+
+A useful way to see the pathology: if the gradient magnitude stays roughly constant at $|g_i|$, then $G_{t,i} \approx t \, g_i^2$, so the effective step shrinks like $1/\sqrt{t}$. That $1/\sqrt{t}$ schedule is exactly right for a convex objective, where you want steps to vanish, but it is far too rigid for the long, nonstationary trajectories of neural network training, where the appropriate scale of a coordinate can change as the model passes through different regions of parameter space.
+
+## 3. The RMSProp Fix: Exponential Moving Average
+
+### 3.1 Replacing a sum with a leaky average
+
+RMSProp keeps AdaGrad's idea of normalizing by a root mean square of recent gradients but replaces the unbounded sum with an exponential moving average (EMA). Instead of accumulating all past squared gradients with equal weight, it forms a running estimate of the second moment that forgets the distant past:
+
+$$
+v_{t,i} = \beta \, v_{t-1,i} + (1 - \beta)\, g_{t,i}^2,
+$$
+
+with $v_{0,i} = 0$ and a decay rate $\beta \in (0,1)$, commonly $\beta = 0.9$. The parameter update is then
+
+$$
+\theta_{t+1,i} = \theta_{t,i} - \frac{\eta}{\sqrt{v_{t,i}} + \epsilon}\, g_{t,i} .
+$$
+
+The quantity $\sqrt{v_{t,i}}$ is the root mean square of recent gradients along coordinate $i$, which is the origin of the name RMSProp (root mean square propagation).
+
+### 3.2 Why the EMA solves the decay problem
+
+The crucial difference from AdaGrad is that $v_{t,i}$ does not grow without bound. Unrolling the recursion gives a weighted sum with geometrically decaying weights,
+
+$$
+v_{t,i} = (1 - \beta) \sum_{\tau=1}^{t} \beta^{\,t - \tau} \, g_{\tau,i}^2,
+$$
+
+so each past squared gradient contributes with weight $(1-\beta)\beta^{t-\tau}$, which fades as $\tau$ recedes. If gradient magnitudes are roughly stationary with second moment $\mathbb{E}[g_i^2] = s_i$, then $v_{t,i}$ converges to $s_i$ rather than diverging, and the effective learning rate $\eta / \sqrt{v_{t,i}}$ settles to a stable, nonzero value $\eta / \sqrt{s_i}$. Learning no longer grinds to a halt.
+
+The decay also makes the method responsive to nonstationarity. The EMA has an effective memory horizon of roughly $1/(1-\beta)$ steps, so with $\beta = 0.9$ it averages over about the last ten gradients. When the optimizer enters a region where a coordinate's gradients suddenly grow, $v_{t,i}$ rises within a few steps and damps the step; when gradients shrink, $v_{t,i}$ relaxes and the step size recovers. This adaptivity to the local geometry is precisely what AdaGrad's frozen accumulator cannot provide.
+
+### 3.3 A geometric reading
+
+It helps to read the update as an approximate, diagonal preconditioner. The vector $1/(\sqrt{v_t} + \epsilon)$ rescales each coordinate so that, after rescaling, the gradient has roughly unit root mean square magnitude in every direction. In a ravine, where the loss is steep across the valley and shallow along it, the steep directions accumulate large $v_{t,i}$ and are shrunk, while the shallow direction keeps a larger step. The net effect is to equalize progress across coordinates and to reduce the zig zagging that plagues plain gradient descent on ill conditioned problems. RMSProp is not a true second order method, since it ignores off diagonal curvature, but the diagonal normalization captures much of the benefit at negligible cost.
+
+## 4. The Epsilon Term
+
+### 4.1 Numerical role
+
+The constant $\epsilon$ in the denominator is small, typically between $10^{-8}$ and $10^{-6}$. Its first job is to prevent division by zero. Early in training, or for a coordinate whose gradient has been near zero for many steps, $v_{t,i}$ can be extremely small, and $\sqrt{v_{t,i}}$ smaller still. Without $\epsilon$ the update could blow up or produce a NaN. Adding $\epsilon$ guarantees a finite denominator and caps the largest possible effective learning rate at $\eta / \epsilon$.
+
+### 4.2 Epsilon as a soft floor on the denominator
+
+Beyond bare numerical safety, $\epsilon$ behaves as a soft floor that sets the maximum step a coordinate can take. Consider a coordinate with a tiny but nonzero second moment. If $\sqrt{v_{t,i}} \ll \epsilon$, the denominator is dominated by $\epsilon$ and the update reduces to $-(\eta/\epsilon)\, g_{t,i}$, an ordinary gradient step with a large but bounded learning rate. If $\sqrt{v_{t,i}} \gg \epsilon$, the $\epsilon$ is negligible and the normalization is essentially pure. So $\epsilon$ smoothly interpolates between unnormalized and fully normalized regimes, and it determines how aggressively the optimizer is allowed to amplify small gradients. Setting $\epsilon$ too small can cause instability on flat regions, where a near zero $v_{t,i}$ would otherwise grant a coordinate an enormous step. Setting it too large weakens the adaptivity, since the denominator becomes dominated by a constant and the method drifts back toward plain SGD.
+
+### 4.3 Placement matters
+
+A subtle but practically important point is where $\epsilon$ sits. The common form places it outside the square root,
+
+$$
+\frac{\eta}{\sqrt{v_{t,i}} + \epsilon},
+$$
+
+but some implementations place it inside,
+
+$$
+\frac{\eta}{\sqrt{v_{t,i} + \epsilon}} .
+$$
+
+These are not equivalent, and the effective value of $\epsilon$ that produces a given behavior differs between the two forms by roughly a square root. When porting hyperparameters between frameworks it is worth checking which convention is used, since a value tuned for one placement can be badly miscalibrated for the other.
+
+## 5. Algorithm and Practical Notes
+
+The full per step procedure is compact.
+
+```
+initialize theta, v <- 0
+for t = 1, 2, ...:
+    g  <- grad(loss(theta))          # gradient at current params
+    v  <- beta * v + (1 - beta) * g * g   # EMA of squared gradient
+    theta <- theta - eta * g / (sqrt(v) + eps)
+```
+
+A few practical observations follow from the analysis above.
+
+Unlike Adam, plain RMSProp uses no bias correction for the EMA, so $v_t$ is biased toward zero during the first several steps when it is still warming up from $v_0 = 0$. This makes the very early updates somewhat larger than the steady state would suggest. In practice a short warmup of the learning rate, or simply tolerating the transient, handles this; Adam later addressed it explicitly with bias correction terms.
+
+Typical defaults are $\eta$ in the range $10^{-4}$ to $10^{-3}$, $\beta = 0.9$, and $\epsilon = 10^{-8}$. RMSProp was historically favored for recurrent neural networks, whose gradient magnitudes vary sharply across time steps and parameters, exactly the nonstationary setting the EMA is built for. A momentum variant adds a velocity term on top of the normalized gradient, and the centered variant additionally tracks an EMA of the gradient itself to normalize by an estimate of the variance rather than the raw second moment.
+
+The conceptual line to Adam is direct: Adam combines RMSProp's EMA of squared gradients with an EMA of the gradient (momentum) and adds bias correction to both. Understanding RMSProp's second moment estimate and its epsilon is therefore most of the way to understanding Adam.
+
+## 6. Summary
+
+AdaGrad introduced per coordinate adaptive learning rates by normalizing with a sum of squared gradients, but that monotone sum forces the effective step to decay toward zero and stalls deep network training. RMSProp replaces the sum with an exponential moving average of squared gradients controlled by a decay rate $\beta$, giving a bounded, forgetting estimate of the local gradient scale that adapts to nonstationary objectives. The epsilon term guarantees numerical stability and acts as a soft floor that bounds the maximum step, with its placement relative to the square root affecting its calibration. Together these choices make RMSProp a robust, low cost diagonal preconditioner and a direct foundation for Adam.
+
+## References
+
+1. Hinton, G., Srivastava, N., and Swersky, K. "Neural Networks for Machine Learning, Lecture 6e: RMSProp." University of Toronto / Coursera. https://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf
+2. Duchi, J., Hazan, E., and Singer, Y. "Adaptive Subgradient Methods for Online Learning and Stochastic Optimization." Journal of Machine Learning Research, 12:2121-2159, 2011. https://jmlr.org/papers/v12/duchi11a.html
+3. Kingma, D. P., and Ba, J. "Adam: A Method for Stochastic Optimization." International Conference on Learning Representations, 2015. https://arxiv.org/abs/1412.6980
+4. Ruder, S. "An Overview of Gradient Descent Optimization Algorithms." 2016. https://arxiv.org/abs/1609.04747
+5. Goodfellow, I., Bengio, Y., and Courville, A. "Deep Learning," Chapter 8: Optimization for Training Deep Models. MIT Press, 2016. https://www.deeplearningbook.org/

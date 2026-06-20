@@ -1,0 +1,185 @@
+# Statistical Significance in Machine Learning
+
+When one model scores 91.2 percent accuracy and another scores 90.4 percent on the same test set, is the first model genuinely better, or did it simply benefit from a fortunate draw of training data, initialization, and minibatch ordering? Answering this question is the business of statistical significance testing for learning algorithms. This chapter develops the tools needed to compare classifiers rigorously, with emphasis on paired tests, McNemar's test, the 5x2 cross-validation procedure, and the disciplined reporting of variability across random seeds.
+
+## 1. Why Point Estimates Mislead
+
+A single number reported on a single test split is a random variable. Its value depends on which examples landed in the test set, which examples landed in training, how weights were initialized, and the order in which stochastic gradient descent visited the data. Treating that number as the ground truth quality of an algorithm conflates the signal we care about with the noise of one particular experimental realization.
+
+### 1.1 Two Sources of Randomness
+
+It helps to separate two distinct sources of variation. The first is variation in the test sample. Even with a fixed trained model $h$, its measured error on a finite test set of size $n$ is a sample mean whose variance is roughly $p(1-p)/n$ for accuracy $p$. The second is variation in the training procedure itself. Reshuffle the training data, change the seed, or resample the training set, and the learned function $h$ changes. A claim about an algorithm, as opposed to a claim about one fitted model, must account for both.
+
+### 1.2 The Null Hypothesis Framing
+
+We frame comparison as a hypothesis test. Let $\mu_A$ and $\mu_B$ denote the expected generalization performance of algorithms $A$ and $B$ under the data generating distribution and the randomness of training. The null hypothesis is
+
+$$H_0: \mu_A = \mu_B,$$
+
+and we seek evidence to reject it in favor of $H_1: \mu_A \neq \mu_B$. A $p$ value is the probability, computed under $H_0$, of observing a difference at least as extreme as the one measured. Small $p$ values indicate that the observed gap is unlikely to be pure chance.
+
+## 2. The Power of Pairing
+
+The single most important idea in model comparison is pairing. Because both models are evaluated on the same examples, their errors are correlated. Hard examples tend to be missed by both models, and easy examples tend to be solved by both. Pairing removes this shared difficulty from the comparison and dramatically reduces variance.
+
+### 2.1 Unpaired Versus Paired Variance
+
+Suppose model $A$ has per example loss $X_i$ and model $B$ has per example loss $Y_i$ on the same example $i$. The quantity of interest is the mean difference $\bar{D} = \frac{1}{n}\sum_i (X_i - Y_i)$. Its variance is
+
+$$\mathrm{Var}(\bar{D}) = \frac{1}{n}\left(\sigma_X^2 + \sigma_Y^2 - 2\,\mathrm{Cov}(X,Y)\right).$$
+
+When $X$ and $Y$ are strongly positively correlated, as they almost always are for two models on shared data, the covariance term shrinks the variance substantially. Ignoring pairing and using a two sample test throws away this correlation and inflates the standard error, costing statistical power.
+
+### 2.2 The Paired t Test and Its Caveats
+
+The classical paired $t$ test computes
+
+$$t = \frac{\bar{D}}{s_D / \sqrt{n}}, \qquad s_D^2 = \frac{1}{n-1}\sum_{i=1}^{n}(D_i - \bar{D})^2,$$
+
+and compares $t$ against a Student distribution with $n-1$ degrees of freedom. This is appropriate when the $D_i$ are independent and approximately normal. The catch in machine learning is that the differences computed across cross-validation folds are not independent, because training sets overlap. Dietterich showed that the naive cross-validated paired $t$ test has badly elevated Type I error, sometimes rejecting a true null far more often than the nominal 5 percent. This motivates the specialized procedures that follow.
+
+## 3. McNemar's Test for Classifier Disagreement
+
+When you have a single held out test set and two trained classifiers, McNemar's test is the recommended tool. It examines only the examples where the two models disagree, which is exactly where the comparison lives.
+
+### 3.1 The Contingency Table
+
+Build a two by two table of counts on the test set:
+
+```
+                 B correct   B wrong
+   A correct        a            b
+   A wrong          c            d
+```
+
+The cells $a$ and $d$ reflect agreement and carry no information about which model is better. The discordant cells $b$ and $c$ are what matter. Cell $b$ counts examples that $A$ got right and $B$ got wrong, and $c$ counts the reverse.
+
+### 3.2 The Test Statistic
+
+Under $H_0$, the two models have equal error rates, so a discordant example is equally likely to fall in cell $b$ or cell $c$. Conditioned on the total number of discordant cases $b + c$, the count $b$ follows a binomial distribution with parameter $1/2$. The classical statistic, with a continuity correction, is
+
+$$\chi^2 = \frac{(|b - c| - 1)^2}{b + c},$$
+
+which under $H_0$ is approximately chi squared distributed with one degree of freedom. When $b + c$ is small, say below 25, the normal approximation is unreliable and an exact binomial test should be used instead, comparing $\min(b,c)$ against $\mathrm{Binomial}(b+c, 1/2)$.
+
+```python
+# Sketch only. Counts b and c from the disagreement table.
+stat = (abs(b - c) - 1) ** 2 / (b + c)   # chi-squared, 1 dof
+# small b + c: exact two-sided binomial test on min(b, c)
+```
+
+### 3.3 What McNemar Does and Does Not Cover
+
+McNemar's test addresses variability due to the test sample. It treats the two trained models as fixed and asks whether their disagreement pattern is consistent with equal accuracy. It says nothing about variability in the training process. If retraining model $A$ with a new seed would have changed its predictions appreciably, McNemar's test will not capture that uncertainty. For that reason it is best suited to comparing two fixed deployed models, or to the regime where training cost makes repeated retraining infeasible.
+
+## 4. The 5x2 Cross-Validation Test
+
+To account for training variability, we need to retrain. Dietterich's 5x2 cross-validation test, refined by Alpaydin into a combined $F$ form, is the standard recommendation when retraining five to ten times is affordable.
+
+### 4.1 The Procedure
+
+Perform five replications of two fold cross-validation. In each replication $i$, randomly split the data into two halves $S_1$ and $S_2$. Train both algorithms on $S_1$ and test on $S_2$ to obtain a difference in error $p_i^{(1)}$, then train on $S_2$ and test on $S_1$ to obtain $p_i^{(2)}$. This yields ten difference measurements that probe both data resampling and the swap of train and test roles.
+
+```python
+# Sketch only.
+for i in range(5):
+    S1, S2 = random_two_fold_split(data, seed=i)
+    p1 = err_A(train=S1, test=S2) - err_B(train=S1, test=S2)
+    p2 = err_A(train=S2, test=S1) - err_B(train=S2, test=S1)
+    # accumulate p1, p2 per replication
+```
+
+### 4.2 The Statistics
+
+For replication $i$, let $\bar{p}_i = (p_i^{(1)} + p_i^{(2)})/2$ and estimate the per replication variance as
+
+$$s_i^2 = \left(p_i^{(1)} - \bar{p}_i\right)^2 + \left(p_i^{(2)} - \bar{p}_i\right)^2.$$
+
+Dietterich's $5{\times}2$ cv $t$ statistic uses a single difference in the numerator and the pooled variance in the denominator,
+
+$$\tilde{t} = \frac{p_1^{(1)}}{\sqrt{\frac{1}{5}\sum_{i=1}^{5} s_i^2}},$$
+
+which is approximately $t$ distributed with five degrees of freedom under $H_0$. Alpaydin's combined $F$ test uses all ten differences for greater power,
+
+$$f = \frac{\sum_{i=1}^{5}\sum_{j=1}^{2}\left(p_i^{(j)}\right)^2}{2\sum_{i=1}^{5} s_i^2},$$
+
+which is approximately $F$ distributed with ten and five degrees of freedom. The $F$ form is generally preferred because it does not depend on the arbitrary choice of which single difference to place in the numerator.
+
+### 4.3 Why It Works
+
+The design deliberately limits the overlap between training sets. Because each replication uses non overlapping halves for its two folds, and variance is estimated within a replication where the two error differences come from complementary splits, the test sidesteps much of the dependence that wrecks the naive cross-validated $t$ test. The result is a calibrated test with acceptable Type I error and reasonable power for moderate effect sizes.
+
+### 4.4 Limitations
+
+The 5x2 procedure trains on only half the data at a time, so it evaluates the algorithm in a slightly data starved regime relative to a full training run. It also has modest power, meaning small but real differences may go undetected. For larger budgets, repeated $k$ fold cross-validation paired with the Nadeau and Bengio corrected variance estimator offers an alternative that adjusts the standard error to account for the train test overlap.
+
+## 5. The Corrected Resampled t Test
+
+Nadeau and Bengio analyzed the inflated variance of repeated random subsampling and proposed a correction. If each of $r$ runs uses a fraction $\rho = n_{\text{test}} / n_{\text{train}}$ relating test and training sizes, the corrected variance of the mean difference is
+
+$$\widehat{\mathrm{Var}}_{\text{corr}}(\bar{D}) = \left(\frac{1}{r} + \frac{n_{\text{test}}}{n_{\text{train}}}\right) s_D^2.$$
+
+The added term $n_{\text{test}}/n_{\text{train}}$ inflates the naive variance to reflect the dependence introduced by reusing data across runs. The corresponding statistic $\bar{D} / \sqrt{\widehat{\mathrm{Var}}_{\text{corr}}(\bar{D})}$ is compared against a $t$ distribution with $r-1$ degrees of freedom. This corrected resampled test is a practical default for modern pipelines that can afford ten or more retrainings.
+
+## 6. Reporting Variability Across Seeds
+
+Even a perfectly executed significance test is incomplete reporting. Readers need to see the distribution of outcomes, not just a verdict. Deep learning has made this acute, because seed variation alone can swing a benchmark by more than the gap between competing methods.
+
+### 6.1 Treat the Seed as an Experimental Factor
+
+Run each configuration with multiple seeds, ideally ten or more, varying initialization, data ordering, and any stochastic augmentation. Report the mean and the standard deviation, and where space allows show the full set of per seed scores or a box plot. A confidence interval for the mean performance is
+
+$$\bar{x} \pm t_{1-\alpha/2,\, k-1}\,\frac{s}{\sqrt{k}},$$
+
+for $k$ seeds with sample standard deviation $s$. Reporting only the maximum over seeds, a surprisingly common practice, is a form of selection bias that overstates expected performance.
+
+### 6.2 Beyond the Mean
+
+The mean over seeds answers what to expect on average, but deployment often cares about worst case behavior. Bouthillier and colleagues argue for reporting performance as a distribution and for accounting for all sources of variation, including data splits and hyperparameter draws, when estimating the variance of a benchmark result. A method whose worst seed is acceptable may be preferable to one with a higher mean but a catastrophic tail.
+
+### 6.3 A Reporting Template
+
+A defensible results table includes, for each method, the number of seeds, the mean, the standard deviation, and a confidence interval. Pairwise claims of superiority should cite the specific test used and its $p$ value.
+
+```
+Method   Seeds   Mean    Std    95% CI            Test vs base   p
+A         10     0.912   0.006  [0.908, 0.916]     5x2 cv F       0.03
+B         10     0.904   0.009  [0.898, 0.910]     baseline       --
+```
+
+## 7. Multiple Comparisons and Many Models
+
+When you compare more than two methods, or evaluate across many datasets, the probability of at least one false positive grows quickly. Testing ten independent hypotheses at $\alpha = 0.05$ yields roughly a $1 - 0.95^{10} \approx 0.40$ chance of a spurious rejection.
+
+### 7.1 Correcting the Family
+
+The Bonferroni correction tests each of $m$ hypotheses at level $\alpha/m$, controlling the family wise error rate at the cost of power. For comparing multiple classifiers over multiple datasets, Demsar recommends the Friedman test, a non parametric analog of repeated measures analysis of variance based on average ranks, followed by the Nemenyi post hoc test to identify which pairs differ. The Friedman statistic on $k$ algorithms and $N$ datasets uses the average rank $R_j$ of algorithm $j$,
+
+$$\chi_F^2 = \frac{12N}{k(k+1)}\left(\sum_{j=1}^{k} R_j^2 - \frac{k(k+1)^2}{4}\right).$$
+
+### 7.2 Critical Difference Diagrams
+
+The Nemenyi procedure declares two algorithms significantly different if their average ranks differ by more than a critical difference. Plotting these on a critical difference diagram, with methods positioned by average rank and connected by bars when their difference is not significant, gives a compact and honest visual summary of a large comparison.
+
+## 8. Effect Size and Practical Significance
+
+Statistical significance is not the same as practical importance. With a very large test set, a gap of 0.1 percent accuracy can be highly significant yet operationally meaningless. Always report the magnitude of the difference alongside its significance, and consider a standardized effect size such as Cohen's $d$,
+
+$$d = \frac{\bar{D}}{s_D},$$
+
+which expresses the difference in units of its own standard deviation. A reader can then judge whether a statistically detectable gap clears the bar of mattering for the application at hand.
+
+## 9. A Practical Checklist
+
+Bring the pieces together into a workflow. First, decide what varies. If only the test sample varies and models are fixed, use McNemar's test. If training varies and you can retrain, use the 5x2 cv $F$ test or a corrected resampled $t$ test. Second, pair whenever possible, evaluating competing models on identical examples and splits. Third, run multiple seeds and report the full distribution, not a cherry picked best. Fourth, correct for multiple comparisons when testing several methods or datasets. Fifth, report effect sizes and confidence intervals so readers can assess practical significance. Following this discipline turns a noisy leaderboard into a defensible scientific claim.
+
+## References
+
+1. Dietterich, T. G. (1998). Approximate Statistical Tests for Comparing Supervised Classification Learning Algorithms. Neural Computation, 10(7). https://doi.org/10.1162/089976698300017197
+2. Alpaydin, E. (1999). Combined 5x2 cv F Test for Comparing Supervised Classification Learning Algorithms. Neural Computation, 11(8). https://doi.org/10.1162/089976699300016007
+3. Nadeau, C., and Bengio, Y. (2003). Inference for the Generalization Error. Machine Learning, 52(3). https://doi.org/10.1023/A:1024068626366
+4. Demsar, J. (2006). Statistical Comparisons of Classifiers over Multiple Data Sets. Journal of Machine Learning Research, 7. https://www.jmlr.org/papers/v7/demsar06a.html
+5. McNemar, Q. (1947). Note on the Sampling Error of the Difference between Correlated Proportions or Percentages. Psychometrika, 12(2). https://doi.org/10.1007/BF02295996
+6. Bouthillier, X., Laurent, C., and Vincent, P. (2021). Accounting for Variance in Machine Learning Benchmarks. Proceedings of Machine Learning and Systems (MLSys). https://proceedings.mlsys.org/paper_files/paper/2021/hash/cfecdb276f634854f3ef915e2e980c31-Abstract.html
+7. Raschka, S. (2018). Model Evaluation, Model Selection, and Algorithm Selection in Machine Learning. arXiv:1811.12808. https://arxiv.org/abs/1811.12808
+8. Japkowicz, N., and Shah, M. (2011). Evaluating Learning Algorithms: A Classification Perspective. Cambridge University Press. https://doi.org/10.1017/CBO9780511921803

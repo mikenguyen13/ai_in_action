@@ -1,0 +1,178 @@
+# Model Selection Best Practices
+
+Model selection is the discipline of choosing, among a set of candidate models and configurations, the one most likely to generalize to data it has never seen. The candidates may differ in algorithm family, in hyperparameters, in feature sets, or in preprocessing. The selection question sounds simple, but it hides a deep statistical trap: every time we consult data to make a choice, we spend some of that data's capacity to tell us the truth about future performance. This chapter revisits the train-validation-test discipline, develops nested cross-validation as the principled answer to selection bias, examines how leakage corrupts selection in subtle ways, presents the one-standard-error rule as a defense against overfitting the selection process itself, and closes with a practical workflow that ties these ideas together.
+
+## 1. The Selection Problem
+
+### 1.1 What We Are Really Estimating
+
+Let a learning procedure $A$ map a training set $D$ and a configuration $\theta$ to a fitted model $A(D, \theta)$. We want to choose $\theta$ to minimize the expected risk
+
+$$R(\theta) = \mathbb{E}_{(x,y) \sim P}\,[\,L(A(D, \theta)(x),\, y)\,],$$
+
+where $P$ is the true data-generating distribution and $L$ is a loss. Because $P$ is unknown, we approximate $R(\theta)$ with an empirical estimate on held-out data. The hazard is that we use the same estimate twice: once to pick $\theta$ and again to report how good our pick is. The minimum of several noisy estimates is itself a biased estimate, biased optimistically, because the selection rule preferentially picks configurations that got lucky on the held-out sample.
+
+### 1.2 The Optimism of the Minimum
+
+Suppose we evaluate $m$ configurations whose true risks are all roughly equal, and each estimate $\hat{R}(\theta_j)$ carries noise with standard deviation $\sigma$. The expected value of the smallest of $m$ such estimates falls below the common true risk by an amount that grows with both $\sigma$ and $m$. For Gaussian noise the gap scales like $\sigma\sqrt{2 \ln m}$. The practical lesson is immediate. The more configurations you try, and the noisier your validation estimate, the more optimistically biased your selected score becomes. This is why a large hyperparameter sweep evaluated on a small validation set produces a selected model whose validation score is almost guaranteed to flatter it.
+
+## 2. Train, Validation, and Test Revisited
+
+### 2.1 Three Roles, Three Data Partitions
+
+The classical remedy assigns three distinct jobs to three disjoint partitions of the data.
+
+The training set fits model parameters. The validation set chooses among configurations, that is, it scores candidates so the selection rule can act. The test set, touched exactly once, estimates the generalization of the single final model. The cardinal rule is that the test set is not a knob. The moment you adjust anything in response to a test score, the test set has silently become a validation set, and you no longer hold an unbiased estimate of generalization.
+
+```text
+all data
+  -> train       : fit parameters
+  -> validation  : select configuration
+  -> test        : report final, used once
+```
+
+### 2.2 Why a Single Validation Split Is Fragile
+
+A single validation split gives one noisy number per configuration. With small data this number has high variance, so the selection rides on luck. Cross-validation reduces that variance by averaging the validation estimate over $k$ folds:
+
+$$\widehat{CV}(\theta) = \frac{1}{k} \sum_{i=1}^{k} \frac{1}{|F_i|} \sum_{(x,y) \in F_i} L\big(A(D \setminus F_i, \theta)(x),\, y\big).$$
+
+Here each fold $F_i$ serves once as the validation block while the remaining $k-1$ folds train the model. Averaging stabilizes the estimate, which is exactly what a selection rule needs to discriminate reliably between configurations.
+
+### 2.3 The Leakage of the Selection Step
+
+Cross-validation fixes the variance of a single configuration's estimate, but it does not by itself fix the optimism of choosing the best across many configurations. If you run $k$-fold cross-validation for each of $m$ candidates and then report the cross-validation score of the winner as your generalization estimate, you have reintroduced the optimism of Section 1.2. The cross-validation loop was consumed by selection; it can no longer serve as an honest performance report. This observation is the entire motivation for nesting.
+
+## 3. Nested Cross-Validation
+
+### 3.1 The Two-Loop Structure
+
+Nested cross-validation separates the question "which configuration is best" from the question "how well does my selection procedure generalize" by giving each question its own loop.
+
+The inner loop performs model selection. Within a given training portion it runs cross-validation across all candidate configurations and picks the winner. The outer loop performs evaluation. It repeatedly holds out a fresh block, runs the entire inner selection on the remainder, fits the selected configuration, and scores it on the held-out block. Because the outer block never participated in selection, its score is an honest estimate of how the whole selection-plus-fitting pipeline performs.
+
+```text
+for each outer fold (test block held out):
+    for each candidate config:
+        inner CV on the outer-train portion
+    pick best config by inner score
+    refit on full outer-train portion
+    score that model on the held-out test block
+report mean and spread of outer scores
+```
+
+### 3.2 What the Outer Score Means
+
+A crucial subtlety is that nested cross-validation does not evaluate a single fixed model. It evaluates a procedure. The inner loop may select different configurations on different outer folds, and that is acceptable and even informative. Disagreement across outer folds signals that the data does not strongly prefer one configuration, which is itself a result worth knowing. The reported number is the expected generalization of "run this selection procedure on a dataset of this size and deploy the winner." After estimating that number, you run the inner selection one final time on all the data to obtain the model you actually ship.
+
+### 3.3 Cost and When to Use It
+
+Nested cross-validation with $K$ outer folds, $k$ inner folds, and $m$ candidates trains on the order of $K \cdot k \cdot m$ models, so the cost can be substantial. It earns its keep when data is scarce, when the candidate space is large relative to the data, or when an unbiased performance claim matters, for example in a paper, an audit, or a regulated deployment. When data is abundant, a single large held-out test set fixed before any modeling delivers a comparable guarantee at a fraction of the cost, because abundant data makes the variance of a single split negligible.
+
+## 4. Avoiding Leakage During Selection
+
+Leakage is any flow of information from the evaluation data into the fitting or selection process. It inflates estimates during development and produces the painful gap between glowing offline numbers and disappointing production performance. Selection is an especially fertile ground for leakage because the preprocessing and tuning steps are easy to apply at the wrong scope.
+
+### 4.1 Preprocessing Inside the Fold, Not Outside
+
+The most common leak is fitting a transformer on the full dataset before splitting. Imputation values, feature scaling statistics, feature selection by univariate correlation with the target, target encoding, and dimensionality reduction all learn parameters from data. If those parameters are learned from rows that later appear in a validation or test fold, the fold is contaminated. Every data-dependent transform must be fit inside the training portion of each fold and only then applied to the held-out portion.
+
+```text
+# leaky
+X = scaler.fit_transform(X_all)
+scores = cross_val_score(model, X, y)
+
+# correct: transform fit within each fold
+pipe = make_pipeline(scaler, selector, model)
+scores = cross_val_score(pipe, X_all, y)
+```
+
+Wrapping preprocessing and the estimator in a single pipeline object is the simplest structural guard, because the cross-validation machinery then refits the entire pipeline on each fold's training portion automatically.
+
+### 4.2 Group and Temporal Structure
+
+Random splits assume rows are exchangeable. When records cluster by patient, user, device, or document, a random split can place near-duplicate rows from the same group on both sides of the partition, letting the model memorize the group rather than learn the pattern. Grouped splitting keeps every group entirely on one side. For time series, the future must never train a model that is evaluated on the past, so splits must respect chronology with a forward-chaining scheme in which each fold trains on a prefix and validates on the subsequent block.
+
+### 4.3 Target Leakage From Features
+
+A feature can leak the target directly. Examples include a column populated only after the outcome is known, an identifier correlated with label assignment, or an aggregate computed over a window that includes the prediction time. These leaks survive any splitting strategy because the contamination lives inside the feature itself. Detecting them requires domain reasoning about when each value becomes available relative to the prediction moment, not just a mechanical partition.
+
+### 4.4 Repeated Reuse of the Test Set
+
+Even a clean test set decays with use. Each time you peek at the test score and adjust your approach, you leak a bit of test information into your decisions, and across many iterations the test set quietly becomes a validation set. Treat the final test evaluation as a one-shot event, and resist the urge to iterate against it.
+
+## 5. The One-Standard-Error Rule
+
+### 5.1 Motivation
+
+Picking the configuration with the single best cross-validation score chases noise. Two configurations whose estimates differ by less than the noise in those estimates are statistically indistinguishable, yet the naive argmin will always prefer one, typically the more flexible one that happened to fit the validation folds slightly better. The result is a selection biased toward complexity and toward overfitting the selection process.
+
+### 5.2 The Rule
+
+The one-standard-error rule, popularized in the context of regularized models, formalizes a preference for parsimony. First compute, for each configuration, the mean cross-validation error and the standard error of that mean across folds:
+
+$$\mathrm{SE}(\theta) = \frac{s(\theta)}{\sqrt{k}},$$
+
+where $s(\theta)$ is the standard deviation of the per-fold errors. Let $\theta^\star$ be the configuration with the lowest mean error, with error $\widehat{CV}(\theta^\star)$. The rule then selects the simplest configuration whose mean error lies within one standard error of the best:
+
+$$\widehat{CV}(\theta) \le \widehat{CV}(\theta^\star) + \mathrm{SE}(\theta^\star).$$
+
+Among all configurations satisfying this band, choose the one with the strongest regularization or the lowest complexity. The intuition is that any model inside the band performs equivalently within the resolution of our measurement, so we break the tie in favor of simplicity, which tends to generalize better and is cheaper to serve.
+
+```text
+best   = argmin(mean_err)
+thresh = mean_err[best] + se[best]
+choice = simplest(theta for theta if mean_err[theta] <= thresh)
+```
+
+### 5.3 Caveats
+
+The rule assumes a meaningful complexity ordering, such as a regularization strength or a tree depth, along which "simpler" is defined. When candidates are not naturally ordered, for example unrelated algorithm families, the band still helps you recognize ties but the parsimony tiebreak must be replaced by another secondary criterion such as inference latency or interpretability. The standard error across folds also understates true uncertainty, because cross-validation folds overlap in their training data and are therefore correlated, so the band is a heuristic rather than a calibrated confidence interval.
+
+## 6. A Practical Model Selection Workflow
+
+The pieces above combine into a disciplined workflow that is robust on small and medium data and degrades gracefully on large data.
+
+### 6.1 Step One: Lock the Test Set First
+
+Before any exploration, set aside a test partition and do not look at it. On time-ordered or grouped data, carve this partition along the structural boundary, the latest time window or a disjoint set of groups, so that it mirrors the deployment distribution shift you expect.
+
+### 6.2 Step Two: Define the Candidate Space Deliberately
+
+Enumerate the configurations you intend to compare and resist an unbounded sweep. Recall from Section 1.2 that selection optimism grows with the number of candidates, so a focused space of well-motivated options yields a less biased and more interpretable result than an enormous grid. Prefer randomized or coarse-to-fine search over exhaustive grids when the space is large.
+
+### 6.3 Step Three: Build a Leakage-Safe Pipeline
+
+Encapsulate every data-dependent transform together with the estimator so that the entire pipeline is refit within each cross-validation fold. Choose a splitter that respects group and temporal structure. This single architectural decision prevents the majority of real-world selection leaks.
+
+### 6.4 Step Four: Select With Cross-Validation and the One-Standard-Error Rule
+
+Run cross-validation over the candidate space on the training data only. Apply the one-standard-error rule to favor the simplest configuration statistically tied with the best. If you need an unbiased estimate of the selection procedure's generalization, wrap this whole step in an outer cross-validation loop as in Section 3.
+
+### 6.5 Step Five: Refit and Evaluate Once
+
+Refit the selected configuration on all the training data, then evaluate exactly once on the locked test set. Report this number as the honest estimate. If it diverges sharply from the cross-validation estimate, suspect leakage or distribution shift rather than bad luck, and investigate before deploying.
+
+### 6.6 Step Six: Document the Decision
+
+Record the candidate space, the splitting strategy, the selection rule, the selected configuration, and both the cross-validation and test scores. This record makes the result reproducible and makes the optimism budget auditable, which is increasingly a requirement rather than a nicety.
+
+## 7. Synthesis
+
+The connective thread through this chapter is that data spent on a decision cannot also serve as an unbiased witness to that decision's quality. Training data fits, validation data selects, test data judges, and each role consumes a distinct slice of the data's informational capacity. Cross-validation stabilizes the validation estimate, nesting restores an honest report after selection has consumed the validation signal, leakage discipline keeps the partitions truly separate, and the one-standard-error rule stops the selection procedure from overfitting itself by chasing differences smaller than the noise. Mastery of model selection is less about any single trick and more about accounting honestly for where every bit of information went.
+
+## References
+
+1. Hastie, T., Tibshirani, R., and Friedman, J. (2009). The Elements of Statistical Learning, 2nd ed. Springer. https://hastie.su.domains/ElemStatLearn/
+
+2. Cawley, G. C., and Talbot, N. L. C. (2010). On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation. Journal of Machine Learning Research, 11, 2079-2107. https://www.jmlr.org/papers/v11/cawley10a.html
+
+3. Varma, S., and Simon, R. (2006). Bias in Error Estimation When Using Cross-validation for Model Selection. BMC Bioinformatics, 7, 91. https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-7-91
+
+4. Kaufman, S., Rosset, S., Perlich, C., and Stitelman, O. (2012). Leakage in Data Mining: Formulation, Detection, and Avoidance. ACM Transactions on Knowledge Discovery from Data, 6(4). https://dl.acm.org/doi/10.1145/2382577.2382579
+
+5. Breiman, L., Friedman, J., Olshen, R., and Stone, C. (1984). Classification and Regression Trees. Wadsworth. https://doi.org/10.1201/9781315139470
+
+6. Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research, 12, 2825-2830. https://jmlr.org/papers/v12/pedregosa11a.html
+
+7. Arlot, S., and Celisse, A. (2010). A Survey of Cross-validation Procedures for Model Selection. Statistics Surveys, 4, 40-79. https://projecteuclid.org/journals/statistics-surveys/volume-4/issue-none/A-survey-of-cross-validation-procedures-for-model-selection/10.1214/09-SS054.full

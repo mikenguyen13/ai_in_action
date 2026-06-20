@@ -1,0 +1,162 @@
+# Modern Activation Functions
+
+Activation functions are the source of nonlinearity in deep networks. Without them, a stack of linear layers collapses into a single linear map, and the network loses all representational power beyond affine transformations. For two decades the rectified linear unit (ReLU) dominated practice because it is cheap, sparse, and largely avoids the saturation that crippled the sigmoid and hyperbolic tangent. The modern era, driven by very deep convolutional networks and especially by transformers, has shifted toward a family of smooth, self gated activations. This chapter develops the mathematics of GELU, Swish/SiLU, Mish, and the gated linear unit family (GLU, GeGLU, SwiGLU), and explains the empirical and theoretical reasons these functions are chosen today.
+
+## 1. From ReLU to Smooth Gates
+
+The rectified linear unit is defined as
+
+$$\mathrm{ReLU}(x) = \max(0, x).$$
+
+Its appeal is computational and statistical. The gradient is exactly $1$ for positive inputs, so it does not vanish as depth grows, and it induces sparse activations because roughly half of the units output zero for centered inputs. The cost is the so called dying ReLU problem: a unit whose pre activation is pushed permanently negative receives zero gradient and never recovers, since
+
+$$\frac{d}{dx}\mathrm{ReLU}(x) = \mathbb{1}[x > 0].$$
+
+The function is also nonsmooth at the origin, and its hard cutoff discards all information about the magnitude of negative pre activations.
+
+A natural response is to make the gate soft. Rather than multiplying $x$ by a hard indicator $\mathbb{1}[x > 0]$, we multiply $x$ by a smooth function that rises from $0$ to $1$. All of the activations discussed below share this template:
+
+$$f(x) = x \cdot g(x),$$
+
+where $g$ is a smooth gate valued (mostly) in $[0, 1]$. The differences lie in the choice of $g$. This self gating idea, where the unit decides how much of its own input to pass through, is the unifying theme of modern activations.
+
+## 2. GELU
+
+The Gaussian Error Linear Unit (GELU), introduced by Hendrycks and Gimpel, defines the gate as the cumulative distribution function (CDF) of a standard normal. Let $\Phi$ denote the standard Gaussian CDF. Then
+
+$$\mathrm{GELU}(x) = x \, \Phi(x) = x \cdot \frac{1}{2}\left[1 + \mathrm{erf}\!\left(\frac{x}{\sqrt{2}}\right)\right].$$
+
+### 2.1 Probabilistic Interpretation
+
+GELU has a clean stochastic reading. Consider multiplying the input by a Bernoulli mask $m$ whose probability of being $1$ is $\Phi(x)$, that is, the probability that a standard normal variable $Z$ satisfies $Z \le x$. The expected output of this stochastic gate is
+
+$$\mathbb{E}[m \cdot x] = x \, \Phi(x) = \mathrm{GELU}(x).$$
+
+So GELU is the deterministic expectation of a data dependent dropout that keeps larger inputs more often. This connects it conceptually to both dropout and ReLU: as the input grows, the keep probability approaches $1$, and the function approaches the identity; as the input falls, the keep probability approaches $0$.
+
+### 2.2 Approximations
+
+The exact form requires the error function, which is somewhat expensive. Two common approximations appear in practice. The tanh approximation is
+
+$$\mathrm{GELU}(x) \approx 0.5\,x\left(1 + \tanh\!\left[\sqrt{\tfrac{2}{\pi}}\left(x + 0.044715\,x^3\right)\right]\right),$$
+
+and the sigmoid approximation is $\mathrm{GELU}(x) \approx x\,\sigma(1.702\,x)$, where $\sigma$ is the logistic sigmoid. Modern hardware and libraries usually compute the exact erf form efficiently, so the approximations matter mainly for reproducing specific historical checkpoints. A subtle but real consequence is that BERT and GPT-2 era models were trained with the tanh approximation, so loading those weights into an exact GELU implementation introduces tiny numerical mismatches.
+
+```text
+gelu_exact(x)   = x * 0.5 * (1 + erf(x / sqrt(2)))
+gelu_tanh(x)    = 0.5 * x * (1 + tanh(0.79788 * (x + 0.044715 * x**3)))
+gelu_sigmoid(x) = x * sigmoid(1.702 * x)
+```
+
+GELU became the default activation in the original Transformer encoder variants, BERT, and the GPT family, which is why it remains ubiquitous in the encoder and decoder blocks of large language models.
+
+## 3. Swish and SiLU
+
+The Sigmoid Linear Unit (SiLU) uses the logistic sigmoid as its gate:
+
+$$\mathrm{SiLU}(x) = x \, \sigma(x) = \frac{x}{1 + e^{-x}}.$$
+
+This function was proposed independently several times. Elfwing and colleagues described it as the SiLU in reinforcement learning, and Ramachandran, Zoph, and Le rediscovered it through an automated activation search and named it Swish, with a learnable or fixed parameter $\beta$:
+
+$$\mathrm{Swish}_\beta(x) = x \, \sigma(\beta x).$$
+
+When $\beta = 1$, Swish equals SiLU. As $\beta \to \infty$, the sigmoid approaches a step function and $\mathrm{Swish}_\beta(x) \to \mathrm{ReLU}(x)$. As $\beta \to 0$, the output tends to the linear function $x/2$. Thus $\beta$ interpolates smoothly between a linear unit and ReLU, which is part of why the search procedure favored it.
+
+### 3.1 Non-monotonicity and the Negative Dip
+
+A defining property of SiLU, Swish, GELU, and Mish is that they are not monotone. SiLU has a global minimum near $x \approx -1.278$, where the output dips slightly below zero before climbing back toward the linear regime. The derivative is
+
+$$\frac{d}{dx}\mathrm{SiLU}(x) = \sigma(x)\bigl(1 + x\,(1 - \sigma(x))\bigr).$$
+
+This small negative region is believed to help optimization by preserving a little gradient signal for moderately negative pre activations, in contrast to ReLU which zeroes them completely. The bounded below, unbounded above shape also acts as a mild self regularizer.
+
+SiLU is the activation used throughout EfficientNet and many later vision backbones, and it appears in detection and segmentation networks. In language models its gated form, discussed below, is far more common than its plain form.
+
+## 4. Mish
+
+Mish, introduced by Misra, is closely related to SiLU but uses a softplus based gate:
+
+$$\mathrm{Mish}(x) = x \, \tanh\!\bigl(\mathrm{softplus}(x)\bigr) = x \, \tanh\!\bigl(\ln(1 + e^{x})\bigr).$$
+
+Like SiLU, Mish is smooth, non-monotone, bounded below, and unbounded above. Its negative dip is slightly deeper and its transition region a little wider, which gives a marginally smoother loss landscape in some experiments. Empirically Mish showed gains on object detection benchmarks and became a popular choice in the YOLO line of detectors. The tradeoff is cost: evaluating an exponential, a logarithm, and a hyperbolic tangent makes Mish heavier than SiLU or even exact GELU, and the accuracy gains over SiLU are usually small and task dependent. For this reason Mish is common in computer vision but rare in the largest language models, where throughput pressure favors cheaper gates.
+
+```text
+mish(x) = x * tanh(softplus(x))   # softplus(x) = log(1 + exp(x))
+```
+
+## 5. The Gated Linear Unit Family
+
+The activations above are pointwise: each scalar input maps to a scalar output. The gated linear unit (GLU), introduced by Dauphin and colleagues for convolutional sequence modeling, is different. It splits a higher dimensional projection into two halves and uses one half to gate the other.
+
+### 5.1 Definition
+
+Let $x \in \mathbb{R}^{d}$ be the input to a layer, and let $W, V \in \mathbb{R}^{d \times d_f}$ with biases $b, c \in \mathbb{R}^{d_f}$. The GLU is
+
+$$\mathrm{GLU}(x) = (xW + b) \odot \sigma(xV + c),$$
+
+where $\odot$ is elementwise multiplication. The first linear branch produces content, and the second branch, squashed by a sigmoid, produces a multiplicative gate. Crucially the gate is computed from a learned projection of the whole input rather than from the content value itself, so it is a learned, input dependent mask rather than a fixed pointwise nonlinearity. This is what distinguishes a GLU from simply applying SiLU to a single projection.
+
+### 5.2 Generalized Gates: GeGLU and SwiGLU
+
+Shazeer generalized GLU by replacing the sigmoid gate with other activations, producing a family of variants. With a bilinear (identity gate), GELU gate, or Swish/SiLU gate we obtain
+
+$$\mathrm{Bilinear}(x) = (xW)\odot(xV),$$
+$$\mathrm{GeGLU}(x) = (xW)\odot \mathrm{GELU}(xV),$$
+$$\mathrm{SwiGLU}(x) = (xW)\odot \mathrm{SiLU}(xV).$$
+
+(Biases are usually dropped in transformer implementations.) In a transformer the feedforward network (FFN) normally has the form
+
+$$\mathrm{FFN}(x) = \phi(xW_1)\,W_2,$$
+
+with $\phi$ a pointwise activation such as ReLU or GELU. The gated variant replaces this with
+
+$$\mathrm{FFN}_{\mathrm{SwiGLU}}(x) = \bigl(\mathrm{SiLU}(xW_1)\odot(xV)\bigr)\,W_2,$$
+
+which now uses three weight matrices $W_1, V, W_2$ instead of two.
+
+### 5.3 The Parameter Budget Adjustment
+
+Because the gated FFN introduces a third matrix, a naive substitution increases parameters and compute by roughly fifty percent. To compare fairly at fixed cost, practitioners shrink the hidden dimension. If a standard FFN uses hidden width $d_f$, the gated FFN uses two projections of width $d_f' = \tfrac{2}{3} d_f$ so that the total parameter count of the three matrices matches the original two. Under this matched budget, SwiGLU and GeGLU consistently improve perplexity over plain ReLU or GELU FFNs in the experiments reported by Shazeer and reproduced widely since. The improvement is modest per layer but reliable, and it compounds across many layers and large training runs.
+
+### 5.4 Why Gating Helps
+
+Two informal explanations are commonly offered. First, the multiplicative interaction $(xW)\odot g(xV)$ gives the FFN a second order term in the input, increasing expressivity relative to the purely additive composition of a single projection and pointwise nonlinearity. Second, the gate can suppress or amplify individual channels conditionally, which acts as a soft, content dependent feature selector and improves gradient flow. Shazeer himself noted that the gains lack a clean theoretical justification and attributed their success, with characteristic candor, to divine benevolence. The empirical record nonetheless made these variants standard.
+
+SwiGLU is now the feedforward activation in LLaMA and its descendants, PaLM, Mistral, Qwen, and most contemporary open weight large language models. GeGLU appears in T5 variants and several Google models. The choice between them is largely a matter of lineage and minor preference, since their measured differences are small.
+
+## 6. How Activations Are Chosen Today
+
+The selection of an activation function in modern practice is governed by a few practical considerations rather than by any single dominant theory.
+
+### 6.1 Smoothness and Optimization
+
+Smooth, non-monotone gates such as GELU and SiLU produce better conditioned loss surfaces than the kinked ReLU, and they avoid dead units by always leaking a small gradient. For very deep networks trained with large batch sizes and adaptive optimizers, this smoothness translates into more stable training and slightly better final accuracy.
+
+### 6.2 Compute and Memory
+
+Throughput matters at scale. Exact GELU and SiLU are cheap and are well supported by fused kernels on GPUs and accelerators. Mish is more expensive and so is reserved for settings where its small accuracy edge justifies the cost, mostly in vision. For the gated variants, the dominant cost is the extra projection matrix, which is why the two thirds width adjustment is essential to keep comparisons honest.
+
+### 6.3 Architecture and Lineage
+
+In practice the activation is often inherited from a reference architecture. Convolutional vision backbones tend to use ReLU, SiLU, or Mish. Transformer language models almost universally use either GELU in plain FFNs or SwiGLU and GeGLU in gated FFNs. New models rarely re-derive the choice from scratch; they adopt what worked in the closest successful predecessor and tune from there.
+
+### 6.4 A Practical Default
+
+For a transformer trained today, the common recommendation is a SwiGLU feedforward block with the hidden width scaled by two thirds to hold the parameter budget fixed. For a plain pointwise activation, GELU or SiLU are safe defaults. For a convolutional vision model under tight latency budgets, ReLU or SiLU remain sensible. The marginal differences among the smooth gated families are small enough that data quality, model scale, normalization, and optimizer settings usually dominate the final result.
+
+## 7. Summary
+
+Modern activation functions are unified by the idea of soft self gating, where a unit multiplies its input by a smooth, learned, or input dependent gate instead of a hard threshold. GELU gates by the Gaussian CDF, SiLU and Swish gate by the sigmoid, and Mish gates by a softplus driven tanh. The gated linear unit family lifts this idea to the layer level, using a separate learned projection to gate a content projection, and its members GeGLU and SwiGLU now define the feedforward blocks of state of the art language models. The choice among them today is driven by smoothness for optimization, compute cost at scale, and architectural lineage, with the smooth gated variants the clear default for new work.
+
+## References
+
+1. Hendrycks, D. and Gimpel, K. "Gaussian Error Linear Units (GELUs)." 2016. https://arxiv.org/abs/1606.08415
+2. Elfwing, S., Uchibe, E., and Doya, K. "Sigmoid-Weighted Linear Units for Neural Network Function Approximation in Reinforcement Learning." 2017. https://arxiv.org/abs/1702.03118
+3. Ramachandran, P., Zoph, B., and Le, Q. V. "Searching for Activation Functions." 2017. https://arxiv.org/abs/1710.05941
+4. Misra, D. "Mish: A Self Regularized Non-Monotonic Activation Function." 2019. https://arxiv.org/abs/1908.08681
+5. Dauphin, Y. N., Fan, A., Auli, M., and Grangier, D. "Language Modeling with Gated Convolutional Networks." 2017. https://arxiv.org/abs/1612.08083
+6. Shazeer, N. "GLU Variants Improve Transformer." 2020. https://arxiv.org/abs/2002.05202
+7. Vaswani, A. et al. "Attention Is All You Need." 2017. https://arxiv.org/abs/1706.03762
+8. Touvron, H. et al. "LLaMA: Open and Efficient Foundation Language Models." 2023. https://arxiv.org/abs/2302.13971
+9. Tan, M. and Le, Q. V. "EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks." 2019. https://arxiv.org/abs/1905.11946
+10. Nair, V. and Hinton, G. E. "Rectified Linear Units Improve Restricted Boltzmann Machines." 2010. https://www.cs.toronto.edu/~hinton/absps/reluICML.pdf

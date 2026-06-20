@@ -1,0 +1,175 @@
+# Deep Anomaly Detection
+
+Anomaly detection asks a deceptively simple question: which observations do not belong? In low dimensional, well behaved data the classical answers (Gaussian models, distance based outlier scores, kernel methods such as one class support vector machines, and tree based isolation) often suffice. They break down when the data is high dimensional, structured, and rich in nuisance variation: images, network traffic, sensor streams, financial transactions, and medical scans. Deep anomaly detection addresses this regime by learning representations in which normality is compact and deviations are exposed. This chapter develops the main families of deep methods, the assumptions that make them work, and the practical tradeoffs that govern their use.
+
+## 1. Problem Setting and Assumptions
+
+Let $x \in \mathcal{X}$ be drawn from an unknown distribution. We posit a dominant "normal" distribution $p_{\text{normal}}$ and treat anomalies as samples from a different, typically unknown and under sampled, process. The goal is a scoring function $s: \mathcal{X} \to \mathbb{R}$ such that anomalous inputs receive higher scores. A threshold $\tau$ converts scores into decisions, and downstream metrics such as area under the ROC curve (AUROC) or area under the precision recall curve (AUPRC) summarize ranking quality independent of $\tau$.
+
+Three labeling regimes recur. In the **unsupervised** setting the training set is unlabeled and assumed mostly normal. In the **semi supervised** (one class) setting the training set is clean normal data only. In the **supervised** setting a few labeled anomalies are available, usually far too few to train a conventional classifier. Most deep methods target the first two regimes because anomalies are rare, diverse, and expensive to label.
+
+Two assumptions underlie nearly every method. First, normal data lies on or near a low dimensional manifold or in a compact region of representation space. Second, anomalies violate the regularities the model has internalized, so they are harder to reconstruct, fall outside the learned region, or are assigned low density. When these assumptions fail (for example when anomalies are themselves common, or when normality is multimodal and the model under fits it) detectors degrade. Keeping the assumptions explicit is the single most useful habit in applied anomaly detection.
+
+## 2. Autoencoder Reconstruction Error
+
+### 2.1 The core idea
+
+An autoencoder learns an encoder $f_\theta: \mathcal{X} \to \mathbb{R}^d$ and a decoder $g_\phi: \mathbb{R}^d \to \mathcal{X}$ trained to minimize reconstruction loss on (mostly) normal data:
+
+$$
+\mathcal{L}(\theta, \phi) = \frac{1}{n} \sum_{i=1}^{n} \lVert x_i - g_\phi(f_\theta(x_i)) \rVert^2 .
+$$
+
+The bottleneck dimension $d$ forces the network to capture the dominant factors of variation in normal data. At test time the anomaly score is the reconstruction error,
+
+$$
+s(x) = \lVert x - g_\phi(f_\theta(x)) \rVert^2,
+$$
+
+on the hypothesis that the decoder, never having seen anomalous structure, reconstructs it poorly.
+
+```python
+# Reconstruction score (PyTorch sketch, not runnable as is)
+z = encoder(x)
+x_hat = decoder(z)
+score = ((x - x_hat) ** 2).flatten(1).mean(dim=1)
+```
+
+### 2.2 Why it can fail and how to harden it
+
+The central pathology is **generalization to anomalies**: a sufficiently expressive autoencoder may reconstruct inputs it has never seen, including anomalies, by exploiting local image statistics or identity like shortcuts. Several remedies exist. A **denoising** objective trains the model to map a corrupted input $\tilde{x}$ back to the clean $x$, which discourages identity mappings and ties the model to the normal manifold. **Memory augmented** autoencoders restrict the latent code to a convex combination of a learned dictionary of normal prototypes, so anomalous codes cannot be represented and reconstruction error rises. **Sparsity** and **contractive** penalties regularize the latent geometry. Choosing $d$ matters: too large invites memorization, too small under fits normal variation and produces false alarms.
+
+Reconstruction error is also sensitive to the loss metric. Squared error in pixel space penalizes high frequency detail unevenly; perceptual or feature space distances (errors measured on activations of a pretrained network) often localize defects better, which matters for tasks such as industrial inspection where the goal is a pixel level anomaly map rather than a single score.
+
+### 2.3 Variational and probabilistic variants
+
+A variational autoencoder (VAE) places a prior $p(z)$ on the latent and maximizes the evidence lower bound,
+
+$$
+\mathcal{L}_{\text{ELBO}} = \mathbb{E}_{q_\theta(z \mid x)}[\log p_\phi(x \mid z)] - D_{\text{KL}}\big(q_\theta(z \mid x) \,\Vert\, p(z)\big) .
+$$
+
+The negative ELBO, or the reconstruction probability under the decoder, serves as a score with a probabilistic interpretation. A caution that recurs in the literature: likelihood based generative models can assign **higher** likelihood to certain out of distribution inputs than to in distribution ones, because likelihood is dominated by low level statistics such as smoothness. Raw likelihood is therefore not a reliable anomaly score on its own, and corrections such as likelihood ratios against a background model are often needed.
+
+## 3. Deep SVDD and One Class Representation Learning
+
+Deep Support Vector Data Description (Deep SVDD) learns a representation in which normal data is enclosed by a small hypersphere. Given a network $\phi_\theta$, the soft boundary objective is
+
+$$
+\min_{R, \theta} \; R^2 + \frac{1}{\nu n} \sum_{i=1}^{n} \max\!\big(0,\; \lVert \phi_\theta(x_i) - c \rVert^2 - R^2\big) + \frac{\lambda}{2}\lVert \theta \rVert^2,
+$$
+
+where $c$ is a fixed center, $R$ the radius, and $\nu \in (0,1]$ controls the fraction of points allowed outside the sphere. The common **one class** simplification drops $R$ and simply pulls representations toward $c$:
+
+$$
+\min_\theta \; \frac{1}{n} \sum_{i=1}^{n} \lVert \phi_\theta(x_i) - c \rVert^2 + \frac{\lambda}{2}\lVert \theta \rVert^2 .
+$$
+
+The anomaly score at test time is the distance to the center, $s(x) = \lVert \phi_\theta(x) - c \rVert^2$.
+
+The danger here is **representational collapse**: the trivial solution $\phi_\theta \equiv c$ achieves zero loss and is useless. Deep SVDD avoids it with architectural constraints, namely no bias terms and no bounded saturating activations that could output a constant, and by fixing $c$ to the mean of initial network outputs rather than learning it. Even so, collapse and the choice of $c$ remain practical concerns, and many practitioners initialize $\phi_\theta$ from an autoencoder encoder so that the geometry is meaningful before the compactness objective is applied.
+
+```python
+# Deep SVDD one-class loss (sketch)
+z = net(x)                 # net has no bias terms
+loss = ((z - c) ** 2).sum(dim=1).mean() + l2_penalty
+```
+
+A useful conceptual link: minimizing volume around normal data (SVDD) and minimizing reconstruction error (autoencoders) are two faces of the same goal, learning a compact description of normality. Hybrid objectives that combine reconstruction with a compactness term often outperform either alone.
+
+## 4. GAN Based Deep Anomaly Detection
+
+Generative adversarial networks (GANs) learn a generator $G$ mapping latent noise to data and a discriminator $D$ separating real from generated samples. After training $G$ on normal data only, anomalies are detected by how poorly the model can explain a test input.
+
+### 4.1 AnoGAN and its successors
+
+The original **AnoGAN** scores an input by searching the latent space for the code $z$ whose generation best matches $x$:
+
+$$
+s(x) = (1 - \lambda)\, \underbrace{\lVert x - G(z^\ast) \rVert_1}_{\text{residual}} + \lambda \, \underbrace{\lVert f_D(x) - f_D(G(z^\ast)) \rVert_1}_{\text{discrimination}},
+$$
+
+where $z^\ast$ is found by gradient descent at inference and $f_D$ denotes discriminator features. The combination of a **residual** term (pixel mismatch) and a **feature matching** term (mismatch in discriminator space) is the recurring template for GAN based scores. The crippling cost is the per sample latent optimization, which makes inference slow.
+
+Later methods remove that cost by training an encoder jointly with the GAN. **Efficient GAN based** detection and **f AnoGAN** add an encoder $E$ so that $z^\ast \approx E(x)$ is produced in a single forward pass. **GANomaly** trains an encoder, decoder, encoder pipeline and scores by the distance between the latent code of the input and the re encoded reconstruction, $\lVert E(x) - E(G(E(x))) \rVert$, which sidesteps pixel space comparison entirely.
+
+```python
+# GANomaly-style latent consistency score (sketch)
+z   = enc1(x)
+x_h = dec(z)
+z_h = enc2(x_h)
+score = (z - z_h).abs().mean(dim=1)
+```
+
+### 4.2 Practical reality
+
+GAN based detectors can capture sharp, high frequency normal structure that blurry autoencoders miss, which helps on textured images. They inherit GAN training instability, mode collapse, and sensitivity to hyperparameters, and they rarely dominate simpler reconstruction or feature based baselines once those baselines are tuned. They remain valuable when realistic generation of normal samples is itself useful, for example to synthesize plausible counterfactuals.
+
+## 5. Density Based Deep Methods
+
+Density based methods estimate $p_{\text{normal}}(x)$ (or a density in a learned feature space) and flag low density points. Doing this directly in pixel space is hopeless in high dimensions, so the deep variants estimate density on learned representations.
+
+### 5.1 Deep autoencoding Gaussian mixtures and normalizing flows
+
+**DAGMM** couples a compression network (an autoencoder) with an estimation network that fits a Gaussian mixture model over the joint of the latent code and the reconstruction error features, trained end to end so the representation is shaped to be density friendly. The energy of the mixture, the negative log likelihood, is the anomaly score.
+
+**Normalizing flows** offer exact likelihoods through an invertible map $h = T(x)$ with tractable Jacobian:
+
+$$
+\log p_X(x) = \log p_H(T(x)) + \log \left| \det \frac{\partial T}{\partial x} \right| .
+$$
+
+Flows applied to features from a pretrained backbone are among the strongest detectors for industrial image inspection, because they model the density of rich semantic features rather than raw pixels. The same out of distribution likelihood caveat from Section 2.3 applies: flows trained on one dataset can assign high likelihood to structurally simple inputs from another, so the choice of feature space and, sometimes, likelihood ratio corrections matter.
+
+### 5.2 Feature memory and nearest neighbor density
+
+A simple and remarkably strong family stores a memory bank of normal feature vectors from a frozen pretrained backbone and scores a test patch by its distance to the nearest stored normal feature. This nonparametric density estimate (the **PatchCore** approach being the prominent example, using a coreset subsampled memory bank) achieves state of the art localization on standard benchmarks with no generative training at all. The lesson is that **representation quality often matters more than the scoring mechanism**: good frozen features plus a trivial nearest neighbor rule can beat elaborate end to end models.
+
+## 6. Self Supervised Anomaly Detection
+
+Self supervised learning builds a pretext task whose solution requires understanding normal structure, then derives anomaly scores from the model's behavior on that task. The appeal is that no anomalies and no labels are needed, only the design of a task that normal data solves easily and anomalies do not.
+
+### 6.1 Geometric and transformation prediction
+
+A foundational instance trains a classifier to predict which of $K$ applied geometric transformations (rotations, flips, translations) was applied to an input. Normal data yields confident, correct predictions; anomalies, lacking the learned regularities, produce diffuse predictions. The score aggregates the model's confidence across transformations, for example
+
+$$
+s(x) = -\sum_{k=1}^{K} \log p_\theta\big(k \mid t_k(x)\big),
+$$
+
+where $t_k$ is the $k$th transformation and $p_\theta(k \mid \cdot)$ the predicted probability of the applied transformation. The principle generalizes: any auxiliary task that normal data solves through its specific structure can expose anomalies through degraded task performance.
+
+### 6.2 Contrastive and outlier exposure approaches
+
+Contrastive representation learning, which pulls augmented views of the same sample together and pushes different samples apart, produces features in which simple one class scores work well. Methods in this vein combine a contrastive objective with a compactness or distribution shifting transformation so that the learned space is both discriminative and tight around normal data.
+
+When even a small or synthetic set of anomalies is available, **outlier exposure** trains the model to produce uniform or high uncertainty outputs on auxiliary outliers while remaining confident on normal data, sharpening the decision boundary. A closely related practical trick is **synthetic anomaly generation**, cutting and pasting patches or otherwise corrupting normal images to create pseudo anomalies, which converts the one class problem into a supervised segmentation problem and yields strong, well localized detectors (the **CutPaste** style being a representative example).
+
+### 6.3 Why self supervision often wins
+
+Self supervised detectors frequently outperform reconstruction and one class baselines because the pretext task forces the network to learn discriminative, semantically meaningful features rather than the smooth, averaging representations that reconstruction objectives encourage. The cost is task design: a pretext task poorly matched to the anomalies of interest provides no signal, so domain knowledge about what makes an anomaly anomalous remains essential.
+
+## 7. Evaluation and Deployment Considerations
+
+Threshold free metrics (AUROC, AUPRC) are the standard for benchmarking, with AUPRC preferred when anomalies are extremely rare because ROC curves can look deceptively strong under heavy class imbalance. For localization tasks, pixel level AUROC and the per region overlap metric are reported alongside image level scores. Beware contaminated test protocols and information leakage; many published gains evaporate under careful, leakage free evaluation.
+
+Deployment raises issues the offline benchmark hides. **Distribution shift** moves the normal manifold over time (seasonality, sensor drift, software updates), so scores must be recalibrated and thresholds adapted rather than fixed once. **Contamination** of the assumed clean training set with undetected anomalies biases every one class method, and robust training or iterative cleaning may be needed. **Explainability** matters operationally: a reconstruction error map, the nearest normal neighbor, or the failed transformation gives an analyst something to act on, whereas a bare score does not. Finally, calibration of scores into actionable alert rates, accounting for the cost asymmetry between misses and false alarms, is usually more consequential to the deployed system than a marginal gain in AUROC.
+
+## 8. Choosing a Method
+
+No single method dominates. As a practical heuristic: when a strong pretrained backbone exists for the domain, start with frozen features plus nearest neighbor or normalizing flow density, since these are simple and competitive. When data is bespoke and unlabeled, an autoencoder (denoising or memory augmented) gives a robust, interpretable baseline. When tight one class geometry is desired and collapse can be controlled, Deep SVDD or a hybrid reconstruction plus compactness objective is attractive. When a meaningful pretext task or synthetic anomalies can be designed, self supervised approaches typically give the best accuracy. GAN based methods are a specialized tool, justified mainly when high fidelity generation of normal data is independently valuable. In every case, the governing discipline is to state the normality assumption, verify that anomalies plausibly violate it, and evaluate without leakage.
+
+## References
+
+1. Ruff, L., et al. (2021). A Unifying Review of Deep and Shallow Anomaly Detection. Proceedings of the IEEE. https://arxiv.org/abs/2009.11732
+2. Ruff, L., et al. (2018). Deep One Class Classification (Deep SVDD). ICML. https://proceedings.mlr.press/v80/ruff18a.html
+3. Schlegl, T., et al. (2017). Unsupervised Anomaly Detection with Generative Adversarial Networks to Guide Marker Discovery (AnoGAN). IPMI. https://arxiv.org/abs/1703.05921
+4. Akcay, S., Atapour-Abarghouei, A., Breckon, T. (2018). GANomaly: Semi Supervised Anomaly Detection via Adversarial Training. ACCV. https://arxiv.org/abs/1805.06725
+5. Zong, B., et al. (2018). Deep Autoencoding Gaussian Mixture Model for Unsupervised Anomaly Detection (DAGMM). ICLR. https://openreview.net/forum?id=BJJLHbb0-
+6. Gong, D., et al. (2019). Memorizing Normality to Detect Anomaly: Memory Augmented Deep Autoencoder (MemAE). ICCV. https://arxiv.org/abs/1904.02639
+7. Golan, I., El-Yaniv, R. (2018). Deep Anomaly Detection Using Geometric Transformations. NeurIPS. https://arxiv.org/abs/1805.10917
+8. Tack, J., et al. (2020). CSI: Novelty Detection via Contrastive Learning on Distributionally Shifted Instances. NeurIPS. https://arxiv.org/abs/2007.08176
+9. Li, C.-L., et al. (2021). CutPaste: Self Supervised Learning for Anomaly Detection and Localization. CVPR. https://arxiv.org/abs/2104.04015
+10. Roth, K., et al. (2022). Towards Total Recall in Industrial Anomaly Detection (PatchCore). CVPR. https://arxiv.org/abs/2106.08265
+11. Nalisnick, E., et al. (2019). Do Deep Generative Models Know What They Don't Know? ICLR. https://arxiv.org/abs/1810.09136
+12. Hendrycks, D., Mazeika, M., Dietterich, T. (2019). Deep Anomaly Detection with Outlier Exposure. ICLR. https://arxiv.org/abs/1812.04606

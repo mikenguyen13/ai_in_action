@@ -1,0 +1,204 @@
+# Loss Functions Beyond Cross-Entropy
+
+Cross-entropy is the default objective for classification, and for good reason. It is the maximum likelihood objective for a categorical model, it is convex in the logits for a fixed target, and its gradient with respect to the logits has the clean form $\hat{p} - y$. Yet a great many modern learning problems are poorly served by plain cross-entropy. Detectors must learn from images where background pixels outnumber objects by a thousand to one. Retrieval systems must place semantically similar items near one another in an embedding space without any fixed label set. Recommender systems care only about the relative order of items, not their absolute scores. This chapter develops a family of loss functions that address these regimes: focal loss for extreme class imbalance, contrastive and triplet losses for metric learning, the InfoNCE loss that underpins modern self-supervised and multimodal representation learning, and the broader class of margin and ranking losses.
+
+## 1. The Limits of Cross-Entropy
+
+For a single example with one-hot label $y$ and predicted distribution $\hat{p} = \mathrm{softmax}(z)$ over $K$ classes, cross-entropy is
+
+$$
+\mathcal{L}_{\mathrm{CE}} = -\sum_{k=1}^{K} y_k \log \hat{p}_k = -\log \hat{p}_{c},
+$$
+
+where $c$ is the true class. The objective is calibrated and well behaved, but it carries two implicit assumptions that fail in practice. First, it treats every example as equally important. Under heavy class imbalance, the aggregate loss is dominated by the majority class, and the gradient signal from rare classes is drowned out even when each rare example is individually well classified is not. Second, cross-entropy is fundamentally a per example classification objective tied to a fixed label vocabulary. It says nothing about the geometry of the representation space and cannot express a goal like "embed these two augmented views of the same image close together."
+
+The losses below relax one or both assumptions. Focal loss keeps the classification framing but reweights examples by difficulty. Metric and contrastive losses abandon the fixed label set entirely and instead shape pairwise or higher order relationships in embedding space.
+
+## 2. Focal Loss for Imbalance
+
+### 2.1 Motivation and definition
+
+Consider one sided binary detection where $p_t$ denotes the model's estimated probability of the ground truth class,
+
+$$
+p_t =
+\begin{cases}
+\hat{p} & \text{if } y = 1, \\
+1 - \hat{p} & \text{if } y = 0.
+\end{cases}
+$$
+
+Binary cross-entropy is $\mathcal{L}_{\mathrm{CE}} = -\log p_t$. The trouble in dense detection is that a flood of easy negatives, each with $p_t$ near $1$, still contributes a small but nonzero loss $-\log p_t$. Summed over tens of thousands of background anchors, these small contributions overwhelm the loss from a handful of hard, informative examples.
+
+Focal loss, introduced by Lin et al. for the RetinaNet detector, multiplies cross-entropy by a modulating factor that decays as confidence grows:
+
+$$
+\mathcal{L}_{\mathrm{FL}} = -\alpha_t (1 - p_t)^{\gamma} \log p_t .
+$$
+
+The focusing parameter $\gamma \geq 0$ controls how aggressively easy examples are down weighted, and $\alpha_t \in [0,1]$ is an optional class balancing weight analogous to a per class prior correction.
+
+### 2.2 How the modulating factor behaves
+
+When an example is misclassified and $p_t$ is small, the factor $(1 - p_t)^{\gamma}$ is close to $1$ and the loss is essentially unchanged from cross-entropy. When an example is easy and $p_t \to 1$, the factor goes to zero and the loss is sharply suppressed. With $\gamma = 2$, a confident example at $p_t = 0.9$ has its loss scaled by $(0.1)^2 = 0.01$, a hundredfold reduction, while a hard example at $p_t = 0.1$ is scaled by $(0.9)^2 \approx 0.81$, almost untouched. The net effect is to refocus training on the hard minority. Setting $\gamma = 0$ recovers ordinary weighted cross-entropy.
+
+The gradient also illuminates the mechanism. Writing $\mathcal{L}_{\mathrm{FL}}$ as a function of the logit $z$ for the positive class, one finds
+
+$$
+\frac{\partial \mathcal{L}_{\mathrm{FL}}}{\partial z}
+= \alpha_t (1 - p_t)^{\gamma}\Big( \gamma\, p_t \log p_t + p_t - 1 \Big),
+$$
+
+so the per example gradient magnitude is itself attenuated by $(1 - p_t)^{\gamma}$ for easy examples, ensuring they neither dominate the loss nor the update direction.
+
+```python
+# Binary focal loss (illustrative, not runnable)
+def focal_loss(p, y, gamma=2.0, alpha=0.25):
+    p_t = p * y + (1 - p) * (1 - y)
+    alpha_t = alpha * y + (1 - alpha) * (1 - y)
+    return -alpha_t * (1 - p_t) ** gamma * log(p_t)
+```
+
+### 2.3 Practical notes
+
+A typical RetinaNet configuration uses $\gamma = 2$ and $\alpha = 0.25$. The $\alpha$ term is set below $0.5$ because, somewhat counterintuitively, once the focusing term has down weighted easy negatives, a mild up weighting of the abundant negative class stabilizes the total loss scale. Focal loss has since been generalized: the quality focal and varifocal variants extend the idea to continuous targets and joint classification plus localization quality estimation, and class balanced focal loss combines it with an effective number of samples reweighting for long tailed recognition.
+
+## 3. Metric Learning with Contrastive and Triplet Losses
+
+When the goal is a representation in which distance encodes semantic similarity, we leave classification behind. Let $f_\theta(\cdot)$ map an input to an embedding $\mathbf{e} \in \mathbb{R}^d$, often $\ell_2$ normalized so that $\lVert \mathbf{e} \rVert = 1$. Metric learning objectives operate on pairs or triplets of embeddings.
+
+### 3.1 The contrastive (pairwise) loss
+
+The classic contrastive loss of Hadsell, Chopra and LeCun takes a pair $(\mathbf{e}_i, \mathbf{e}_j)$ with a binary label $Y = 0$ if the pair is similar and $Y = 1$ if dissimilar, and a distance $D = \lVert \mathbf{e}_i - \mathbf{e}_j \rVert_2$:
+
+$$
+\mathcal{L}_{\mathrm{contrast}} = (1 - Y)\,\tfrac{1}{2} D^2 \;+\; Y\,\tfrac{1}{2}\,\big[\max(0,\, m - D)\big]^2 .
+$$
+
+Similar pairs are simply pulled together by minimizing $D^2$. Dissimilar pairs are pushed apart, but only until their distance reaches the margin $m$; beyond that, a dissimilar pair contributes no loss and no gradient. The margin prevents the model from wasting capacity scattering already well separated negatives infinitely far apart.
+
+### 3.2 The triplet loss
+
+The triplet loss, popularized by FaceNet, replaces absolute distances with a relative comparison. Each training unit is an anchor $a$, a positive $p$ of the same class, and a negative $n$ of a different class. The objective requires the anchor to positive distance to be smaller than the anchor to negative distance by at least a margin $m$:
+
+$$
+\mathcal{L}_{\mathrm{triplet}} = \max\!\big(0,\; D(a,p)^2 - D(a,n)^2 + m \big).
+$$
+
+This relative formulation is more flexible than the pairwise loss because it never imposes an absolute target distance; it only constrains orderings, which is usually what downstream retrieval cares about.
+
+### 3.3 The central role of mining
+
+The triplet loss is only as good as the triplets fed to it. The vast majority of randomly sampled triplets already satisfy the margin and yield zero gradient, so naive sampling stalls. Define a triplet as **hard** when $D(a,n) < D(a,p)$ (the negative is closer than the positive) and **semi-hard** when
+
+$$
+D(a,p) < D(a,n) < D(a,p) + m,
+$$
+
+meaning the negative is farther than the positive but still inside the margin. Training exclusively on the hardest negatives tends to be unstable and can collapse the embedding, because the hardest negatives are often label noise or genuinely ambiguous. FaceNet therefore mines semi-hard negatives within each minibatch, a robust compromise that supplies a useful gradient without chasing pathological examples. Batch hard mining, in which one selects the hardest positive and hardest negative for each anchor within the batch, is another widely used strategy in person re identification.
+
+## 4. The InfoNCE Loss
+
+### 4.1 From pairs to a classification over a set
+
+Triplet loss uses exactly one negative per update. Modern contrastive representation learning generalizes this to many negatives at once and frames the problem as a softmax classification: given an anchor, identify its single positive among a pool of one positive and many negatives. This is the InfoNCE loss (Noise Contrastive Estimation in the information theoretic sense), introduced by van den Oord et al. for Contrastive Predictive Coding.
+
+Let $\mathbf{q}$ be a query embedding, $\mathbf{k}^{+}$ its positive key, and $\{\mathbf{k}^{-}_j\}_{j=1}^{N}$ a set of negative keys. With a similarity function $s(\cdot,\cdot)$, usually cosine similarity, and a temperature $\tau > 0$,
+
+$$
+\mathcal{L}_{\mathrm{InfoNCE}}
+= -\log
+\frac{\exp\!\big(s(\mathbf{q}, \mathbf{k}^{+})/\tau\big)}
+{\exp\!\big(s(\mathbf{q}, \mathbf{k}^{+})/\tau\big) + \sum_{j=1}^{N} \exp\!\big(s(\mathbf{q}, \mathbf{k}^{-}_j)/\tau\big)} .
+$$
+
+This is exactly the cross-entropy of an $(N+1)$ way classifier whose logits are scaled similarities and whose correct answer is always the positive. The structure unifies the earlier sections: InfoNCE is a softmax cross-entropy, but over a dynamically constructed set of candidates in embedding space rather than over a fixed label vocabulary.
+
+### 4.2 The mutual information bound
+
+InfoNCE is not just a convenient surrogate; minimizing it maximizes a lower bound on the mutual information between query and positive. Specifically,
+
+$$
+I(\mathbf{q}; \mathbf{k}^{+}) \;\geq\; \log(N+1) - \mathcal{L}_{\mathrm{InfoNCE}} .
+$$
+
+The bound tightens as the number of negatives $N$ grows, which gives a principled reason to want many negatives. This insight drove architectures that decouple the negative pool size from the gradient batch size. SimCLR uses very large batches so that all other examples serve as in batch negatives. MoCo maintains a momentum updated encoder and a queue of past keys, providing a large and consistent dictionary of negatives without the memory cost of large batches.
+
+### 4.3 Temperature and its effect
+
+The temperature $\tau$ controls the sharpness of the distribution over candidates. A small $\tau$ sharpens the softmax, concentrating gradient on the hardest negatives, those most similar to the query, which improves discrimination but risks instability. A large $\tau$ softens the distribution and treats negatives more uniformly. Empirically $\tau$ in the range $0.05$ to $0.2$ is common, and the choice materially affects the learned uniformity and separability of the embedding space.
+
+```python
+# InfoNCE for a batch of L2-normalized embeddings (illustrative)
+# q, k: (batch, dim); positives are the diagonal pairs
+logits = (q @ k.T) / tau              # (batch, batch) similarity matrix
+labels = arange(batch)                # positive for row i is column i
+loss = cross_entropy(logits, labels)  # standard softmax CE
+```
+
+### 4.4 Supervised contrastive and multimodal variants
+
+When labels are available, the supervised contrastive loss (SupCon) treats all examples sharing a label as positives for one another, generalizing InfoNCE to multiple positives per anchor and often outperforming cross-entropy on classification. In the multimodal setting, CLIP applies a symmetric InfoNCE over image and text embeddings: each image is matched against all texts in the batch and vice versa, with a learnable temperature. This single objective, scaled to hundreds of millions of pairs, yields the transferable image text representations that anchor much of contemporary multimodal modeling.
+
+## 5. Margin and Ranking Losses
+
+### 5.1 The hinge and margin principle
+
+Several losses above share a common ingredient: a margin enforced through a hinge $\max(0, \cdot)$. The canonical example is the binary hinge loss of the support vector machine. For label $y \in \{-1, +1\}$ and score $s$,
+
+$$
+\mathcal{L}_{\mathrm{hinge}} = \max(0,\; 1 - y\,s).
+$$
+
+The loss is zero once the example is on the correct side of the decision boundary by at least a unit margin, and grows linearly inside the margin. This produces sparse, robust gradients and is the discriminative counterpart to the smooth, always nonzero gradient of cross-entropy.
+
+### 5.2 Pairwise ranking losses
+
+Ranking problems care about relative order. Given a query and a pair of items, one preferred (positive) with score $s^{+}$ and one not (negative) with score $s^{-}$, the margin ranking loss enforces a gap:
+
+$$
+\mathcal{L}_{\mathrm{rank}} = \max\!\big(0,\; m - (s^{+} - s^{-})\big).
+$$
+
+A probabilistic alternative is the RankNet loss, which models the probability that the positive outranks the negative with a logistic function of the score difference and applies cross-entropy to it:
+
+$$
+\mathcal{L}_{\mathrm{RankNet}} = -\log \sigma\big(s^{+} - s^{-}\big),
+\qquad \sigma(x) = \frac{1}{1 + e^{-x}} .
+$$
+
+### 5.3 From pairs to lists
+
+Optimizing pairwise order does not directly optimize list level retrieval metrics such as normalized discounted cumulative gain, which weight the top of the ranking far more heavily than the bottom. LambdaRank addresses this by scaling each pairwise gradient by the change in the target metric that would result from swapping the two items, so that pairs whose reordering most affects the top of the list receive the strongest updates. LambdaMART instantiates this idea inside gradient boosted trees and long remained a strong baseline for learning to rank. For applications where only a single relevant item exists per query, such as entity retrieval, the multiclass softmax over candidates, which is exactly InfoNCE, can be read as a listwise objective.
+
+### 5.4 Margins on the sphere for face recognition
+
+A distinct and influential line of work injects margins directly into the softmax classifier for embedding learning. ArcFace normalizes both the weight vectors and the features, so each logit becomes the cosine of the angle between a feature and its class prototype, then adds an additive angular margin $m$ to the true class angle $\theta_y$:
+
+$$
+\mathcal{L}_{\mathrm{ArcFace}}
+= -\log
+\frac{\exp\!\big(s \cos(\theta_y + m)\big)}
+{\exp\!\big(s \cos(\theta_y + m)\big) + \sum_{j \neq y} \exp\!\big(s \cos \theta_j\big)} .
+$$
+
+The scale $s$ plays the role of an inverse temperature on the unit sphere. By demanding a geodesic margin between classes, ArcFace produces highly discriminative, well separated embeddings and became a standard for face recognition. It is a revealing synthesis: a softmax cross-entropy at heart, but reshaped by the margin and metric learning ideas of the preceding sections.
+
+## 6. Choosing an Objective
+
+The losses in this chapter are not competitors so much as tools matched to problem structure. If the task is classification with a fixed label set and roughly balanced classes, cross-entropy remains the right default. Under severe imbalance, especially dense prediction, focal loss restores a useful gradient from the rare, hard examples. When the goal is an embedding space whose geometry encodes similarity, and labels are scarce or open ended, contrastive, triplet, and InfoNCE losses shape that geometry directly, with the number and quality of negatives being the dominant practical lever. When relative order is what matters, margin and ranking losses optimize it explicitly, and listwise refinements align training with the metrics that actually govern retrieval quality. A recurring theme ties them together. Most of these objectives can be read as a softmax cross-entropy that has been reweighted by difficulty, restructured over a dynamic candidate set, or augmented with an explicit margin. Understanding that common skeleton is the surest guide to selecting and adapting a loss for a new problem.
+
+## References
+
+1. Lin, T.-Y., Goyal, P., Girshick, R., He, K., Dollar, P. "Focal Loss for Dense Object Detection." ICCV 2017. https://arxiv.org/abs/1708.02002
+2. Hadsell, R., Chopra, S., LeCun, Y. "Dimensionality Reduction by Learning an Invariant Mapping." CVPR 2006. https://ieeexplore.ieee.org/document/1640964
+3. Schroff, F., Kalenichenko, D., Philbin, J. "FaceNet: A Unified Embedding for Face Recognition and Clustering." CVPR 2015. https://arxiv.org/abs/1503.03832
+4. Hermans, A., Beyer, L., Leibe, B. "In Defense of the Triplet Loss for Person Re-Identification." 2017. https://arxiv.org/abs/1703.07737
+5. van den Oord, A., Li, Y., Vinyals, O. "Representation Learning with Contrastive Predictive Coding." 2018. https://arxiv.org/abs/1807.03748
+6. Chen, T., Kornblith, S., Norouzi, M., Hinton, G. "A Simple Framework for Contrastive Learning of Visual Representations (SimCLR)." ICML 2020. https://arxiv.org/abs/2002.05709
+7. He, K., Fan, H., Wu, Y., Xie, S., Girshick, R. "Momentum Contrast for Unsupervised Visual Representation Learning (MoCo)." CVPR 2020. https://arxiv.org/abs/1911.05722
+8. Khosla, P., et al. "Supervised Contrastive Learning." NeurIPS 2020. https://arxiv.org/abs/2004.11362
+9. Radford, A., et al. "Learning Transferable Visual Models From Natural Language Supervision (CLIP)." ICML 2021. https://arxiv.org/abs/2103.00020
+10. Burges, C., et al. "Learning to Rank using Gradient Descent (RankNet)." ICML 2005. https://www.microsoft.com/en-us/research/publication/learning-to-rank-using-gradient-descent/
+11. Burges, C. "From RankNet to LambdaRank to LambdaMART: An Overview." Microsoft Research Technical Report, 2010. https://www.microsoft.com/en-us/research/publication/from-ranknet-to-lambdarank-to-lambdamart-an-overview/
+12. Deng, J., Guo, J., Xue, N., Zafeiriou, S. "ArcFace: Additive Angular Margin Loss for Deep Face Recognition." CVPR 2019. https://arxiv.org/abs/1801.07698

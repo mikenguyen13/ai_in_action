@@ -1,0 +1,251 @@
+# Deep Learning with PyTorch
+
+PyTorch has become the dominant framework for deep learning research and a major force in production systems. It earned that position by making a single bet that turned out to be correct: that researchers and engineers want a numerical computing library that feels like ordinary Python, where models are built by running code rather than by compiling a static specification. This chapter develops the core abstractions that make PyTorch work. We begin with tensors and automatic differentiation, proceed through the module system and the canonical training loop, examine how data enters the system through datasets and dataloaders, and close by articulating the define by run philosophy that ties everything together.
+
+## 1. Tensors
+
+The tensor is the fundamental data structure in PyTorch. A tensor is a multidimensional array with a uniform element type, conceptually similar to a NumPy `ndarray` but with two crucial additions: it can live on a hardware accelerator such as a GPU, and it can participate in automatic differentiation. Everything in a PyTorch program, from input images to model parameters to gradients, is represented as a tensor.
+
+A tensor has a shape, a data type, and a device. The shape is a tuple of dimension sizes. For a batch of $N$ color images of height $H$ and width $W$, the conventional shape is $(N, C, H, W)$ where $C$ is the number of channels. The data type, or `dtype`, is commonly `torch.float32` for model weights and activations, though lower precision types like `torch.bfloat16` are now standard for large model training. The device indicates where the tensor's memory resides, such as `cpu` or `cuda:0`.
+
+```python
+import torch
+
+x = torch.randn(4, 3, 32, 32)   # a batch of 4 images
+print(x.shape)                   # torch.Size([4, 3, 32, 32])
+print(x.dtype)                   # torch.float32
+print(x.device)                  # cpu
+
+x = x.to("cuda")                 # move to the first GPU
+```
+
+Tensors support a rich algebra of operations: elementwise arithmetic, reductions, matrix multiplication, broadcasting, and reshaping. Two ideas deserve emphasis because they govern performance and correctness.
+
+The first is broadcasting. When an operation involves tensors of different shapes, PyTorch attempts to align them by stretching dimensions of size one. Adding a bias vector of shape $(C,)$ to an activation of shape $(N, C)$ works because the bias is broadcast across the batch dimension. Broadcasting avoids materializing redundant copies and keeps code concise, but it can silently produce wrong shapes when an operation aligns dimensions you did not intend, so reading shapes carefully is a habit worth cultivating.
+
+The second is the distinction between operations that share memory and operations that copy. Slicing and `view` produce a new tensor that references the same underlying storage, so writing through one alias mutates the other. `reshape` may return a view or a copy depending on memory layout, while `clone` always copies. Understanding this storage model explains why certain in place operations are fast and why others raise errors during differentiation.
+
+```python
+a = torch.arange(12)
+b = a.view(3, 4)        # shares storage with a
+b[0, 0] = 99            # also changes a[0]
+c = a.clone()           # independent copy
+```
+
+## 2. Autograd
+
+Automatic differentiation is the engine that makes gradient based learning possible, and in PyTorch it is provided by the `autograd` system. The central idea is that PyTorch records the operations you perform on tensors into a computation graph, then traverses that graph backward to compute derivatives by the chain rule.
+
+### 2.1 The computation graph
+
+Any tensor created with `requires_grad=True` becomes a leaf of a dynamically constructed graph. As operations are applied, each resulting tensor stores a reference to the function that produced it, accessible through its `grad_fn` attribute. These functions form a directed acyclic graph whose leaves are the inputs and whose root is typically a scalar loss.
+
+```python
+w = torch.randn(3, requires_grad=True)
+x = torch.tensor([1.0, 2.0, 3.0])
+y = (w * x).sum()       # y is a scalar
+print(y.grad_fn)        # <SumBackward0 object>
+```
+
+When you call `y.backward()`, autograd walks the graph from `y` back to every leaf with `requires_grad=True`, applying the chain rule at each node and accumulating the result into each leaf's `.grad` attribute. For a scalar loss $L$ and a parameter tensor $w$, the gradient is the vector of partial derivatives $\frac{\partial L}{\partial w_i}$.
+
+```python
+y.backward()
+print(w.grad)           # equals x, since dy/dw_i = x_i
+```
+
+### 2.2 What backward actually computes
+
+It helps to be precise about what `backward` does. PyTorch implements reverse mode automatic differentiation, which computes vector Jacobian products. If a function maps an input to a vector output, the full Jacobian $J$ can be large, but training only ever needs $v^\top J$ for a particular vector $v$. When the output is a scalar loss, $v$ is implicitly $1$, which is why `backward` on a scalar requires no argument. For nonscalar outputs you must supply the vector $v$ explicitly. This design is what makes backpropagation through networks with millions of parameters tractable: the cost of one backward pass is comparable to one forward pass, regardless of how many parameters there are.
+
+### 2.3 Controlling gradient flow
+
+Two mechanisms let you control differentiation. The `torch.no_grad()` context manager disables graph construction, which you want during evaluation and inference because you save memory and time when no gradients are needed. The `detach` method returns a tensor that shares storage but is severed from the graph, useful when you want to treat a computed value as a constant.
+
+```python
+with torch.no_grad():
+    predictions = model(inputs)     # no graph built
+
+frozen = features.detach()          # blocks gradient flow
+```
+
+A subtle but important detail is that gradients accumulate. Each call to `backward` adds to existing `.grad` values rather than overwriting them. This behavior is deliberate, since it allows gradients from multiple sources to be summed, but it means that an explicit reset is required between optimization steps. Forgetting to zero gradients is one of the most common bugs in PyTorch code, and it produces a model that trains slowly or diverges for no obvious reason.
+
+## 3. The Module System
+
+Raw tensors and autograd are sufficient to train any model, but managing hundreds of parameter tensors by hand quickly becomes unwieldy. The `torch.nn` package introduces the `Module`, an abstraction that bundles parameters, submodules, and a forward computation into a reusable object.
+
+### 3.1 Defining a module
+
+A module is a class that subclasses `nn.Module`. In its constructor it registers parameters and child modules as attributes, and it implements a `forward` method describing how inputs are transformed into outputs. When you call the module instance, PyTorch invokes `forward` while also running registered hooks, so you should call the module rather than calling `forward` directly.
+
+```python
+import torch.nn as nn
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, out_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+model = MLP(784, 256, 10)
+```
+
+The magic that makes this convenient lies in how `nn.Module` overrides attribute assignment. When you assign an `nn.Parameter` or another `nn.Module` to an attribute, the parent records it in an internal registry. This registry is what powers `model.parameters()`, which returns every learnable tensor in the network so it can be handed to an optimizer. It also powers recursive operations like `model.to(device)`, which moves all parameters at once, and `model.state_dict()`, which produces a serializable dictionary of all tensors for saving checkpoints.
+
+### 3.2 Composition and built in layers
+
+PyTorch ships with a large library of layers such as `nn.Linear`, `nn.Conv2d`, `nn.LayerNorm`, and `nn.MultiheadAttention`. Container modules like `nn.Sequential` and `nn.ModuleList` let you compose these into larger structures. The composition is recursive, so a transformer block is a module that contains attention and feedforward modules, and a full transformer is a module containing a list of blocks. This uniformity means the same patterns for moving, saving, and inspecting apply at every scale.
+
+### 3.3 Training and evaluation modes
+
+Some layers behave differently during training and inference. Dropout randomly zeroes activations during training but is inert at evaluation, and batch normalization uses batch statistics during training but running averages at evaluation. The `model.train()` and `model.eval()` methods flip a flag that propagates to all submodules and selects the correct behavior. This is distinct from `torch.no_grad()`: one controls layer behavior, the other controls graph construction, and a correct evaluation loop typically uses both together.
+
+## 4. The Training Loop
+
+PyTorch does not hide the training loop behind a single `fit` call. Instead it asks you to write the loop yourself, which is more verbose but gives complete control and makes the mechanics transparent. The canonical loop has a fixed structure that is worth memorizing because nearly every PyTorch program reuses it.
+
+### 4.1 The five steps
+
+For each batch of data, the loop performs five operations: a forward pass to compute predictions, a loss computation comparing predictions to targets, a backward pass to compute gradients, an optimizer step to update parameters, and a gradient reset to prepare for the next batch.
+
+```python
+import torch.nn.functional as F
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for epoch in range(num_epochs):
+    model.train()
+    for inputs, targets in train_loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        optimizer.zero_grad()              # reset gradients
+        outputs = model(inputs)            # forward pass
+        loss = F.cross_entropy(outputs, targets)  # loss
+        loss.backward()                    # backward pass
+        optimizer.step()                   # update parameters
+```
+
+The ordering matters. Gradients must be zeroed before `backward` accumulates fresh ones, and `step` must follow `backward` so that the optimizer sees current gradients. A useful mental model is that `backward` writes into the `.grad` fields and `step` reads from them, while `zero_grad` clears them.
+
+### 4.2 The optimizer
+
+An optimizer encapsulates an update rule. The simplest is stochastic gradient descent, which updates each parameter as $\theta \leftarrow \theta - \eta \nabla_\theta L$ where $\eta$ is the learning rate. Adaptive methods such as Adam maintain running estimates of the first and second moments of the gradient and scale updates per parameter, which often accelerates convergence on the loss surfaces typical of deep networks. The optimizer holds references to the parameter tensors passed at construction, so its `step` method can mutate them in place using the gradients autograd has stored.
+
+### 4.3 Validation and the full picture
+
+A complete loop interleaves training with periodic evaluation on held out data. The validation pass switches the model to evaluation mode and disables gradient tracking, since neither layer randomness nor gradient storage is wanted there.
+
+```python
+model.eval()
+correct = 0
+with torch.no_grad():
+    for inputs, targets in val_loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        preds = model(inputs).argmax(dim=1)
+        correct += (preds == targets).sum().item()
+accuracy = correct / len(val_loader.dataset)
+```
+
+Note the use of `.item()` to extract a Python number from a scalar tensor, which also detaches it from any graph, and the practice of accumulating counts as plain integers to avoid holding tensor references that would prevent memory from being freed.
+
+## 5. Datasets and DataLoaders
+
+Feeding data efficiently is as important as the model itself, since a GPU starved of input sits idle. PyTorch separates this concern into two abstractions: the `Dataset`, which knows how to retrieve a single example, and the `DataLoader`, which assembles examples into batches and manages the machinery of parallel loading.
+
+### 5.1 The Dataset interface
+
+A map style dataset implements two methods: `__len__`, which reports how many examples exist, and `__getitem__`, which returns the example at a given index. This interface is deliberately minimal. Your `__getitem__` can read a file from disk, decode an image, apply augmentation, and return a tensor, and the rest of the system neither knows nor cares about those details.
+
+```python
+from torch.utils.data import Dataset
+
+class ImageDataset(Dataset):
+    def __init__(self, paths, labels, transform):
+        self.paths = paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        image = load_image(self.paths[idx])
+        return self.transform(image), self.labels[idx]
+```
+
+### 5.2 The DataLoader
+
+The `DataLoader` wraps a dataset and turns it into an iterable of batches. It handles shuffling, batching, and crucially, parallel loading through worker processes. The key parameters are `batch_size`, which sets how many examples per batch; `shuffle`, which randomizes order each epoch and is essential for training but pointless for evaluation; and `num_workers`, which spawns subprocesses that prepare batches concurrently so loading overlaps with computation on the accelerator.
+
+```python
+from torch.utils.data import DataLoader
+
+train_loader = DataLoader(
+    dataset, batch_size=64, shuffle=True,
+    num_workers=4, pin_memory=True,
+)
+```
+
+Setting `pin_memory=True` allocates batches in page locked host memory, which speeds the transfer to a GPU. When examples have variable size, such as sentences of different lengths, a custom `collate_fn` controls how a list of examples is merged into a batch, typically by padding to a common length. The separation of concerns here is what makes PyTorch data pipelines flexible: the dataset owns per example logic, the dataloader owns batching and parallelism, and the two combine without either needing to know the internals of the other.
+
+## 6. The Define by Run Philosophy
+
+The preceding sections describe mechanisms, but they share a unifying design principle that distinguishes PyTorch from earlier frameworks. PyTorch is a define by run system, also called dynamic computation graphs or eager execution. The graph that autograd differentiates is not specified ahead of time and then compiled. It is constructed on the fly, operation by operation, as your Python code runs.
+
+### 6.1 Define by run versus define and run
+
+The contrast is with define and run frameworks, where you first build a static graph as a data structure, then execute it repeatedly by feeding values through it. In a static system, control flow such as loops and conditionals must be expressed in special graph operators, because ordinary Python control flow runs only once at graph construction time. In a dynamic system, control flow is just Python control flow, because the graph is rebuilt every forward pass.
+
+```python
+def forward(self, x, depth):
+    for _ in range(depth):          # ordinary Python loop
+        x = torch.relu(self.layer(x))
+        if x.mean() > 0:            # ordinary Python condition
+            x = x * 2
+    return x
+```
+
+Here the number of layers applied and the conditional scaling depend on runtime values, yet no special graph constructs are needed. This is the practical payoff of define by run: models with data dependent structure, such as recursive networks over parse trees or sequence models whose length varies per example, are expressed in natural code. Debugging is also direct, since you can insert a print statement or a breakpoint anywhere in `forward` and inspect concrete tensor values, rather than reasoning about an abstract graph.
+
+### 6.2 The costs and the response
+
+Dynamism has a price. A static graph can be analyzed and optimized as a whole before execution, fusing operations and planning memory, whereas a graph that is discarded after every step offers no such opportunity. For years this meant dynamic frameworks traded raw throughput for flexibility.
+
+The modern resolution is to recover optimization without surrendering the eager programming model. PyTorch's `torch.compile`, introduced in version 2.0, traces the operations executed by your eager code, captures them into an intermediate representation, and hands that to a backend compiler that fuses and optimizes the result. Crucially, this happens transparently. You write and debug ordinary define by run code, then wrap the model in a single call when you want speed.
+
+```python
+model = torch.compile(model)        # same model, optimized execution
+```
+
+When the compiler encounters Python control flow that depends on tensor values, it inserts a guard and, if the condition changes, recompiles for the new path. The programmer keeps the eager mental model while the system reclaims much of the performance that static graphs once monopolized. This synthesis, eager by default and compiled on demand, is the current state of the art and explains why the define by run philosophy no longer carries the performance penalty it once did.
+
+### 6.3 Why this philosophy won
+
+The deeper reason define by run prevailed is that it aligns the framework with how people think. A neural network, written in PyTorch, is a Python function. Its parameters are objects you can inspect, its computation is code you can step through, and its behavior is determined by execution rather than by a separate compilation phase. This conceptual economy lowers the barrier between an idea and a working implementation, which is precisely what accelerated the pace of deep learning research over the past decade. The abstractions covered in this chapter, tensors, autograd, modules, the training loop, and the data pipeline, all serve that same goal of keeping the model close to ordinary code.
+
+## 7. Summary
+
+PyTorch provides a small set of composable abstractions that together support the full lifecycle of a deep learning model. Tensors are multidimensional arrays that run on accelerators and track gradients. Autograd builds a dynamic computation graph and computes gradients by reverse mode differentiation. The module system organizes parameters and computation into reusable, recursively composable objects. The training loop is written explicitly and follows a fixed five step pattern of forward, loss, backward, step, and reset. Datasets and dataloaders separate per example retrieval from batching and parallel loading. Underlying all of it is the define by run philosophy, which treats a model as ordinary running code and which, with modern compilation, now delivers performance to match its flexibility.
+
+## References
+
+1. Paszke, A., et al. "PyTorch: An Imperative Style, High Performance Deep Learning Library." Advances in Neural Information Processing Systems 32 (NeurIPS), 2019. https://papers.nips.cc/paper/9015-pytorch-an-imperative-style-high-performance-deep-learning-library
+
+2. PyTorch Documentation. "Autograd Mechanics." https://pytorch.org/docs/stable/notes/autograd.html
+
+3. PyTorch Documentation. "torch.nn." https://pytorch.org/docs/stable/nn.html
+
+4. PyTorch Documentation. "torch.utils.data." https://pytorch.org/docs/stable/data.html
+
+5. Ansel, J., et al. "PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation." Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2024. https://pytorch.org/assets/pytorch2-2.pdf
+
+6. Paszke, A., et al. "Automatic Differentiation in PyTorch." NeurIPS Autodiff Workshop, 2017. https://openreview.net/forum?id=BJJsrmfCZ
+
+7. PyTorch Tutorials. "Learn the Basics." https://pytorch.org/tutorials/beginner/basics/intro.html
+
+8. Kingma, D. P., and Ba, J. "Adam: A Method for Stochastic Optimization." International Conference on Learning Representations (ICLR), 2015. https://arxiv.org/abs/1412.6980

@@ -1,0 +1,150 @@
+# Dropout
+
+## 1. Motivation and Setup
+
+Deep neural networks have enough capacity to memorize their training data. With millions of parameters and limited examples, a network can drive training loss toward zero while learning brittle configurations that fail to generalize. Classical regularizers such as $L_2$ weight decay penalize the magnitude of parameters, but they do not directly address a subtler failure mode: complex co-adaptations among hidden units, where a unit becomes useful only in the precise context created by several other units. Dropout, introduced by Srivastava and colleagues, attacks this failure mode by injecting multiplicative noise into the hidden activations during training.
+
+The idea is deceptively simple. On each training step, each unit is retained with probability $p$ and removed with probability $1 - p$, independently of the others. A removed unit contributes nothing to the forward pass and receives no gradient on the backward pass. Because the set of surviving units changes from step to step, the network can never rely on the presence of any particular unit. This section develops the mechanics of dropout, its two complementary interpretations, the bookkeeping required to make training and test behavior consistent, and several influential variants.
+
+## 2. The Dropout Operation
+
+Consider a hidden layer that computes a vector of activations $\mathbf{h} \in \mathbb{R}^d$. Standard dropout multiplies $\mathbf{h}$ elementwise by a random binary mask. Let $r_i$ be independent Bernoulli random variables,
+
+$$
+r_i \sim \text{Bernoulli}(p), \qquad i = 1, \dots, d,
+$$
+
+where $p$ is the retention probability (so $1 - p$ is the drop probability). The masked activation is
+
+$$
+\tilde{h}_i = r_i \, h_i,
+$$
+
+and $\tilde{\mathbf{h}}$ is passed to the next layer in place of $\mathbf{h}$. Equivalently, writing $\mathbf{r} = (r_1, \dots, r_d)$ and $\odot$ for the Hadamard product, $\tilde{\mathbf{h}} = \mathbf{r} \odot \mathbf{h}$.
+
+A small subtlety deserves emphasis. The dropped units are not simply ignored numerically; they are forced to zero, which changes the distribution of the input that downstream layers see. The expected value of a masked activation is
+
+$$
+\mathbb{E}[\tilde{h}_i] = p \, h_i,
+$$
+
+so on average the layer transmits a fraction $p$ of its signal. This shrinkage is the central accounting problem that test-time scaling, discussed in Section 5, must correct.
+
+## 3. The Ensemble Interpretation
+
+The first and most celebrated interpretation views dropout as training an exponentially large ensemble of networks with shared weights. A network with $n$ units that can be dropped admits $2^n$ distinct subnetworks, each obtained by fixing some mask $\mathbf{r}$. Every training step samples one such subnetwork and takes a gradient step on it. Because the weights are tied across all subnetworks, a single update improves many members of the ensemble at once.
+
+At test time, an ideal ensemble prediction would average over all $2^n$ subnetworks,
+
+$$
+\bar{y} = \frac{1}{2^n} \sum_{\mathbf{r}} f(\mathbf{x}; \mathbf{r}, \mathbf{W}),
+$$
+
+which is intractable to compute exactly. Dropout sidesteps this by using an approximate inference rule: run the full network once with all units present, having rescaled the weights so that the expected input to each unit matches what it saw during training. For a single linear layer followed by a softmax, this weight scaling computes the exact geometric mean of the ensemble's predicted distributions; for deeper nonlinear networks it is an approximation that works remarkably well in practice. The ensemble view explains why dropout reduces variance: averaging many high variance predictors yields a lower variance estimator, much as bagging does, but without the cost of training and storing many separate models.
+
+## 4. The Co-adaptation Interpretation
+
+The second interpretation focuses on what happens to individual units rather than to the network as a whole. Co-adaptation occurs when a feature detector becomes effective only in the presence of specific partner units. Such fragile partnerships fit the training set but generalize poorly, because the precise context that makes them useful rarely recurs in new data.
+
+Dropout disrupts these partnerships. Since any partner unit may vanish on any step, a unit cannot count on a fixed coalition and must instead learn features that are independently useful, or at least robust to the random absence of collaborators. The result is a more distributed, redundant representation. A useful analogy is sexual reproduction in evolutionary biology, which the original authors invoke: by repeatedly mixing genes from different individuals, sexual reproduction favors genes that confer fitness across many genetic backgrounds rather than genes that work only in one fixed combination. Dropout applies the same pressure to hidden units, rewarding features that are robust across the many random network configurations they find themselves in.
+
+These two interpretations are not in conflict. Discouraging co-adaptation is the mechanism; ensemble averaging is the effect. Both predict the same empirical signatures, namely lower test error, sparser and more interpretable hidden activations, and reduced sensitivity to the removal of any single unit.
+
+## 5. Inverted Dropout and Test-Time Scaling
+
+Section 2 showed that a layer with retention probability $p$ transmits only a fraction $p$ of its expected signal during training. At test time we want the full, deterministic network, so the activations must be reconciled. Two equivalent conventions exist.
+
+The original formulation keeps the mask unscaled during training and rescales the weights at test time. If a unit was retained with probability $p$ during training, its outgoing weights are multiplied by $p$ at test time:
+
+$$
+\mathbf{W}_{\text{test}} = p \, \mathbf{W}_{\text{train}}.
+$$
+
+This guarantees that the expected input to each downstream unit is identical in both regimes, since the training time expectation $p \, h_i$ now matches the deterministic test time value $p \, h_i$.
+
+The convention used in virtually all modern implementations is inverted dropout, which moves the correction into the training phase. During training, surviving activations are divided by $p$:
+
+$$
+\tilde{h}_i = \frac{r_i}{p} \, h_i, \qquad \mathbb{E}[\tilde{h}_i] = \frac{p}{p} \, h_i = h_i.
+$$
+
+Because the masked activations already have the correct expectation, no change is needed at test time: the network simply runs with all units present and no rescaling. Inverted dropout is preferred because it keeps inference code clean and fast, isolates all dropout logic in the training path, and behaves correctly even when $p$ varies across layers. A minimal training forward pass looks like this.
+
+```python
+# inverted dropout, training forward pass
+mask = (rand_like(h) < p).float() / p   # scale by 1/p
+h = h * mask
+# at test time: just use h, no mask, no rescaling
+```
+
+A common point of confusion is the direction of the scaling. We divide by $p$, not by $1 - p$, because $p$ is the retention probability and we are compensating for the fraction of units that survive. If a framework parameterizes dropout by the drop probability $q = 1 - p$, the surviving activations are divided by $1 - q$.
+
+## 6. Why Dropout Regularizes: A Closer Look
+
+Beyond the two narrative interpretations, dropout admits an analysis as a data dependent penalty on the weights. For a linear model with squared loss, marginalizing over the dropout noise yields an objective whose deterministic part is the ordinary loss and whose extra term penalizes the weights in proportion to the variance of the corresponding inputs. Concretely, for an input $\mathbf{x}$ and weights $\mathbf{w}$, the expected dropout loss contains a term proportional to
+
+$$
+\sum_i (1 - p) \, p \, x_i^2 \, w_i^2,
+$$
+
+which is a scaled, feature dependent form of $L_2$ regularization. Features that are frequently large are penalized more heavily, an adaptive behavior that plain weight decay lacks. This explains a practical observation: applying dropout to normalized inputs and pairing it with a constraint on the norm of incoming weight vectors, the so called max norm constraint $\lVert \mathbf{w} \rVert_2 \le c$, often outperforms either technique alone. The max norm constraint lets training use large learning rates without activations exploding, while dropout supplies the noise that prevents co-adaptation.
+
+The injected noise also has a gradient interpretation. Each step optimizes a different random subnetwork, so the parameter update is a stochastic estimate of the gradient of the ensemble objective. The variance of this estimate acts like an additional source of exploration in parameter space, nudging optimization toward flatter regions of the loss surface that tend to generalize better.
+
+## 7. Variants
+
+### 7.1 DropConnect
+
+DropConnect generalizes dropout by zeroing individual weights rather than entire units. Where standard dropout drops the output $h_i$, DropConnect applies an independent Bernoulli mask $\mathbf{R}$ to the weight matrix itself,
+
+$$
+\tilde{\mathbf{h}} = \sigma\big( (\mathbf{R} \odot \mathbf{W}) \, \mathbf{x} \big),
+$$
+
+with each entry $R_{ij} \sim \text{Bernoulli}(p)$. Dropout is the special case in which an entire row of $\mathbf{R}$ is forced to share a single Bernoulli draw, so that dropping a unit is equivalent to dropping all of its outgoing connections together. By masking connections independently, DropConnect defines an even larger family of subnetworks, $2^{|\mathbf{W}|}$ rather than $2^d$, and on some image benchmarks it slightly outperforms dropout. The cost is that test time inference cannot be reduced to a single rescaled forward pass as cleanly; a Gaussian moment matching approximation over the masked preactivations is typically used instead.
+
+### 7.2 Spatial Dropout
+
+Standard dropout is poorly suited to convolutional feature maps. In a convolutional layer, neighboring activations within a feature map are strongly correlated, since they are computed from overlapping receptive fields by the same filter. Dropping individual pixels independently removes little information, because a dropped activation can be reconstructed from its surviving neighbors, so the regularizing effect is weak.
+
+Spatial dropout, also called channel dropout or two dimensional dropout, addresses this by dropping entire feature maps as a unit. For a feature tensor of shape $(C, H, W)$ with $C$ channels, a single Bernoulli draw is made per channel,
+
+$$
+r_c \sim \text{Bernoulli}(p), \qquad \tilde{x}_{c, h, w} = r_c \, x_{c, h, w},
+$$
+
+so that when a channel is dropped, all $H \times W$ of its spatial positions vanish together. This forces the network to avoid relying on any single feature map and produces a regularization effect on convolutional layers comparable to what ordinary dropout achieves on fully connected layers.
+
+```python
+# spatial dropout: one Bernoulli draw per channel
+mask = (rand(C, 1, 1) < p).float() / p   # broadcast over H, W
+x = x * mask
+```
+
+### 7.3 Other Members of the Family
+
+Several further variants extend the same principle. DropBlock drops contiguous square regions of a feature map, a structured form of spatial dropout that removes correlated information more aggressively. Gaussian dropout replaces the Bernoulli mask with multiplicative Gaussian noise of matched mean and variance, which avoids forcing activations exactly to zero and can be applied without a separate test time pass. Variational dropout ties the noise mask across time steps in recurrent networks, fixing a single mask for an entire sequence so that dropout does not destroy the temporal state, and it also admits a Bayesian interpretation in which the dropout rates themselves are learned. DropPath, or stochastic depth, drops entire residual branches and is widely used in very deep residual and transformer architectures.
+
+## 8. Practical Guidance
+
+A few empirical rules organize the practice of dropout. Retention probabilities near $p = 0.5$ are a strong default for hidden layers, while input layers, which carry the raw signal, are usually dropped more gently with $p$ between $0.8$ and $1.0$. Because dropout reduces the effective capacity used on each step, networks trained with dropout often need to be wider and to train for more epochs than their undropped counterparts. Dropout interacts in subtle ways with batch normalization, since both manipulate activation statistics; a frequent recommendation is to use one or the other in convolutional backbones, or to place dropout after the normalization layer if both are present.
+
+Crucially, dropout must be disabled at test time, whether by switching the framework to evaluation mode or by ensuring the inverted scaling is applied during training. Forgetting this is among the most common sources of a mysterious gap between validation behavior during training and behavior at deployment. As architectures have grown, the role of dropout has shifted: in large transformers it is applied at modest rates to attention weights and feed forward activations and now coexists with other regularizers such as weight decay, label smoothing, and heavy data augmentation, but the core idea of training under random structural noise remains a standard tool.
+
+## References
+
+1. Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I., and Salakhutdinov, R. "Dropout: A Simple Way to Prevent Neural Networks from Overfitting." Journal of Machine Learning Research, 2014. https://jmlr.org/papers/v15/srivastava14a.html
+
+2. Hinton, G., Srivastava, N., Krizhevsky, A., Sutskever, I., and Salakhutdinov, R. "Improving neural networks by preventing co-adaptation of feature detectors." arXiv preprint arXiv:1207.0580, 2012. https://arxiv.org/abs/1207.0580
+
+3. Wan, L., Zeiler, M., Zhang, S., LeCun, Y., and Fergus, R. "Regularization of Neural Networks using DropConnect." International Conference on Machine Learning, 2013. https://proceedings.mlr.press/v28/wan13.html
+
+4. Tompson, J., Goroshin, R., Jain, A., LeCun, Y., and Bregler, C. "Efficient Object Localization Using Convolutional Networks." IEEE Conference on Computer Vision and Pattern Recognition, 2015. https://arxiv.org/abs/1411.4280
+
+5. Ghiasi, G., Lin, T.-Y., and Le, Q. V. "DropBlock: A regularization method for convolutional networks." Advances in Neural Information Processing Systems, 2018. https://arxiv.org/abs/1810.12890
+
+6. Gal, Y., and Ghahramani, Z. "A Theoretically Grounded Application of Dropout in Recurrent Neural Networks." Advances in Neural Information Processing Systems, 2016. https://arxiv.org/abs/1512.05287
+
+7. Huang, G., Sun, Y., Liu, Z., Sedra, D., and Weinberger, K. "Deep Networks with Stochastic Depth." European Conference on Computer Vision, 2016. https://arxiv.org/abs/1603.09382
+
+8. Goodfellow, I., Bengio, Y., and Courville, A. "Deep Learning," chapter 7. MIT Press, 2016. https://www.deeplearningbook.org/

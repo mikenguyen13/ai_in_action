@@ -1,0 +1,189 @@
+# Bayesian Hyperparameter Tuning
+
+Hyperparameter optimization is the outer loop that wraps every machine learning model. Learning rates, tree depths, regularization strengths, layer widths, and dropout probabilities are not learned from data by the training procedure itself. They are chosen by the practitioner, and the quality of that choice often matters more than the choice of model family. The central difficulty is that evaluating a single hyperparameter configuration requires training a model to completion, which can take minutes, hours, or days. The objective is therefore expensive, noisy, and a black box with no usable gradient. Bayesian optimization is the dominant principled response to this setting. It builds a cheap probabilistic surrogate of the expensive objective, uses that surrogate to decide where to evaluate next, and refines the surrogate as evidence accumulates. This chapter develops the theory of surrogate-based optimization, contrasts the two surrogate families that dominate practice, derives the acquisition functions that drive the search, and grounds everything in the tools practitioners actually use.
+
+## 1. The Hyperparameter Optimization Problem
+
+Let $f: \mathcal{X} \to \mathbb{R}$ denote the validation performance of a model as a function of a hyperparameter configuration $\mathbf{x}$ drawn from a search space $\mathcal{X}$. We seek
+
+$$
+\mathbf{x}^\star = \arg\min_{\mathbf{x} \in \mathcal{X}} f(\mathbf{x}),
+$$
+
+where by convention we minimize a loss such as validation error or negative log likelihood. The search space $\mathcal{X}$ is typically a mixed product of continuous dimensions (learning rate on a log scale), integer dimensions (number of layers), and categorical dimensions (optimizer choice). Several properties make this hard. First, each evaluation of $f$ is expensive, so the total budget is measured in tens or low hundreds of evaluations rather than millions. Second, $f$ is noisy because validation scores depend on random initialization, data shuffling, and stochastic optimization. Third, $f$ provides no gradient with respect to $\mathbf{x}$, since the dependence runs through an entire training run.
+
+Grid search and random search are the naive baselines. Grid search scales exponentially with dimension and wastes evaluations on unimportant axes. Random search, as Bergstra and Bengio showed, is surprisingly strong because most hyperparameters have low effective dimensionality, so random sampling explores the few important axes more efficiently than a rigid grid [1]. Bayesian optimization improves on random search by using the information from past evaluations to guide future ones, which is the defining idea of surrogate-based optimization.
+
+## 2. Surrogate-Based Optimization
+
+The core insight is to replace the expensive function $f$ with a cheap probabilistic model $\hat{f}$ called a surrogate. The surrogate is fit to the observed evaluations $\mathcal{D}_t = \{(\mathbf{x}_i, y_i)\}_{i=1}^{t}$ and provides not just a prediction but a calibrated estimate of uncertainty at every point in $\mathcal{X}$. A separate acquisition function $\alpha(\mathbf{x} \mid \mathcal{D}_t)$ converts the surrogate's predictive distribution into a scalar that scores how desirable it would be to evaluate $\mathbf{x}$ next. The optimization loop is then:
+
+```text
+1. fit surrogate to observed data D_t
+2. x_{t+1} = argmax_x  acquisition(x | D_t)
+3. evaluate y_{t+1} = f(x_{t+1})   # expensive
+4. append (x_{t+1}, y_{t+1}) to D_t
+5. repeat until budget exhausted
+```
+
+The two expensive operations of the original problem, namely searching over $\mathcal{X}$ and reasoning about uncertainty, are pushed onto the cheap surrogate. The acquisition maximization in step two is itself an optimization problem, but it runs against the cheap surrogate rather than the costly true objective, so it can use gradients, dense sampling, or evolutionary search freely. The surrogate must balance two competing pressures. It should exploit regions known to perform well, and it should explore regions of high uncertainty where a better optimum might hide. The acquisition function is precisely the device that encodes this exploration versus exploitation tradeoff.
+
+## 3. Gaussian Process Surrogates
+
+The classical surrogate is the Gaussian process (GP). A GP places a prior over functions such that any finite collection of function values is jointly Gaussian. It is specified by a mean function $m(\mathbf{x})$, usually taken to be zero or constant, and a covariance or kernel function $k(\mathbf{x}, \mathbf{x}')$ that encodes assumptions about smoothness and length scale [2].
+
+### 3.1 Posterior Predictive Distribution
+
+Given training inputs $X$ with observed values $\mathbf{y}$ and a test point $\mathbf{x}_\star$, the GP posterior is Gaussian with closed form mean and variance:
+
+$$
+\mu(\mathbf{x}_\star) = \mathbf{k}_\star^\top (K + \sigma_n^2 I)^{-1} \mathbf{y},
+$$
+
+$$
+\sigma^2(\mathbf{x}_\star) = k(\mathbf{x}_\star, \mathbf{x}_\star) - \mathbf{k}_\star^\top (K + \sigma_n^2 I)^{-1} \mathbf{k}_\star,
+$$
+
+where $K$ is the kernel matrix over training points, $\mathbf{k}_\star$ is the vector of covariances between $\mathbf{x}_\star$ and the training points, and $\sigma_n^2$ is the observation noise variance. The mean gives the surrogate prediction and the variance gives the uncertainty that acquisition functions consume. A common kernel is the Matern 5/2 kernel,
+
+$$
+k(r) = \left(1 + \frac{\sqrt{5}\,r}{\ell} + \frac{5 r^2}{3 \ell^2}\right) \exp\!\left(-\frac{\sqrt{5}\,r}{\ell}\right),
+$$
+
+with $r = \lVert \mathbf{x} - \mathbf{x}' \rVert$ and length scale $\ell$. The Matern 5/2 kernel is preferred over the smoother squared exponential because it produces functions that are twice differentiable but not infinitely smooth, a more realistic assumption for loss surfaces. Kernel hyperparameters such as $\ell$ and $\sigma_n^2$ are fit by maximizing the marginal likelihood.
+
+### 3.2 Strengths and Limitations
+
+GPs are sample efficient and offer principled, well calibrated uncertainty, which makes them the gold standard for low dimensional continuous problems with tight evaluation budgets. Their weaknesses are equally clear. The matrix inversion costs $O(t^3)$ in the number of observations, which becomes painful past a few thousand evaluations. Standard GPs assume continuous inputs and a stationary kernel, so conditional and categorical search spaces require careful kernel engineering. Performance degrades in high dimensions because distances concentrate and the kernel loses discriminative power. These limitations motivate the second major surrogate family.
+
+## 4. Tree-Structured Parzen Estimator Surrogates
+
+The tree-structured Parzen estimator (TPE) takes a different route [3]. Rather than modeling $p(y \mid \mathbf{x})$ directly as a GP does, TPE models the inverse, $p(\mathbf{x} \mid y)$, by splitting observations into a good group and a bad group.
+
+### 4.1 Density Ratio Formulation
+
+TPE chooses a quantile threshold $y^\star$, often the best 15 to 25 percent of observed scores, and defines two densities:
+
+$$
+p(\mathbf{x} \mid y) =
+\begin{cases}
+\ell(\mathbf{x}) & \text{if } y < y^\star, \\
+g(\mathbf{x}) & \text{if } y \ge y^\star,
+\end{cases}
+$$
+
+where $\ell(\mathbf{x})$ is the density of configurations that produced good (low loss) results and $g(\mathbf{x})$ is the density of configurations that produced poor results. Both densities are estimated with Parzen windows, that is mixtures of kernels placed on the observed points. It can be shown that maximizing the expected improvement acquisition under this model reduces to maximizing the density ratio
+
+$$
+\frac{\ell(\mathbf{x})}{g(\mathbf{x})}.
+$$
+
+The interpretation is direct. TPE proposes configurations that are likely under the distribution of good observations and unlikely under the distribution of poor observations. The word "tree-structured" refers to how TPE handles conditional spaces. Hyperparameters that exist only when a parent takes a certain value (the number of units in a layer that exists only if that layer is present) are naturally represented by a tree of dependencies, and TPE estimates densities along each branch.
+
+### 4.2 Why TPE Scales to Practical Search Spaces
+
+TPE handles mixed continuous, integer, and categorical dimensions without special kernels, treats conditional hyperparameters gracefully, and costs roughly linear time in the number of observations rather than cubic. It does not model correlations across dimensions as richly as a GP, so it can be less sample efficient on smooth low dimensional problems. In exchange it copes far better with the messy, high dimensional, conditional spaces that real model tuning produces, which is why it is the default in widely used libraries.
+
+## 5. Acquisition Functions
+
+The acquisition function turns the surrogate's predictive distribution into a decision. Let $f^+ = \min_i y_i$ be the best value observed so far. For a GP surrogate with posterior mean $\mu(\mathbf{x})$ and standard deviation $\sigma(\mathbf{x})$, the standard choices are the following.
+
+### 5.1 Probability of Improvement
+
+Probability of improvement (PI) scores the chance that a point beats the incumbent by a margin $\xi$:
+
+$$
+\alpha_{\text{PI}}(\mathbf{x}) = \Phi\!\left(\frac{f^+ - \mu(\mathbf{x}) - \xi}{\sigma(\mathbf{x})}\right),
+$$
+
+where $\Phi$ is the standard normal cumulative distribution function. PI is simple but tends to be greedy, since it rewards any improvement regardless of magnitude and so under explores.
+
+### 5.2 Expected Improvement
+
+Expected improvement (EI) corrects this by weighting the probability of improvement by how large the improvement is expected to be. With $z = (f^+ - \mu(\mathbf{x}) - \xi)/\sigma(\mathbf{x})$,
+
+$$
+\alpha_{\text{EI}}(\mathbf{x}) = \sigma(\mathbf{x})\left[ z\,\Phi(z) + \phi(z) \right],
+$$
+
+where $\phi$ is the standard normal density. The two terms expose the exploration versus exploitation balance cleanly. The $z\,\Phi(z)$ term rewards configurations whose mean beats the incumbent, which is exploitation, while the $\phi(z)$ term rewards high variance configurations, which is exploration. EI is the most widely used acquisition function because it requires no tuning beyond the small margin $\xi$ and behaves robustly across problems.
+
+### 5.3 Upper Confidence Bound
+
+The lower confidence bound, the minimization counterpart of the upper confidence bound (UCB), scores points by an optimistic estimate:
+
+$$
+\alpha_{\text{LCB}}(\mathbf{x}) = \mu(\mathbf{x}) - \kappa\,\sigma(\mathbf{x}).
+$$
+
+The parameter $\kappa$ explicitly controls the tradeoff. Large $\kappa$ favors uncertain regions and explores, while small $\kappa$ trusts the mean and exploits. The GP-UCB analysis of Srinivas and colleagues provides regret bounds that justify scheduling $\kappa$ to grow slowly over iterations, which yields a no regret algorithm under suitable assumptions [4].
+
+### 5.4 Entropy and Information-Theoretic Criteria
+
+A more sophisticated family targets information directly. Entropy search and predictive entropy search choose the point that most reduces the entropy of the posterior over the location of the optimum $\mathbf{x}^\star$ [5]. These criteria often need fewer evaluations than EI because they reason about the optimum itself rather than about improvement at a single point, but they are more expensive to compute and harder to implement, so they remain less common in production tooling.
+
+## 6. Practical Tools
+
+### 6.1 Optuna
+
+Optuna is the most widely adopted modern framework. Its default sampler is TPE, and it offers a define by run API where the search space is expressed in ordinary Python control flow, which makes conditional spaces natural to write.
+
+```python
+import optuna
+
+def objective(trial):
+    lr = trial.suggest_float("lr", 1e-5, 1e-1, log=True)
+    n_layers = trial.suggest_int("n_layers", 1, 5)
+    optimizer = trial.suggest_categorical("opt", ["adam", "sgd"])
+    return train_and_validate(lr, n_layers, optimizer)
+
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=100)
+```
+
+Optuna also integrates pruning, which stops unpromising trials early using intermediate validation scores, and supports multi objective search and distributed execution. Pruning composes with the sampler and often delivers larger speedups than the choice of surrogate alone.
+
+### 6.2 Hyperopt
+
+Hyperopt is the older library that popularized TPE for hyperparameter search. The space is defined declaratively rather than by run.
+
+```python
+from hyperopt import fmin, tpe, hp
+
+space = {
+    "lr": hp.loguniform("lr", -11, -2),
+    "n_layers": hp.quniform("n_layers", 1, 5, 1),
+}
+
+best = fmin(fn=objective, space=space,
+            algo=tpe.suggest, max_evals=100)
+```
+
+Hyperopt remains useful and influential, though its declarative space syntax is less ergonomic than Optuna's for deeply conditional problems, and the project sees less active development.
+
+### 6.3 GP-Based and Other Frameworks
+
+When the problem is low dimensional, continuous, and the evaluation budget is very small, a GP surrogate can be more sample efficient than TPE. Libraries such as scikit-optimize, BoTorch built on GPyTorch, and the GP backend of Ax provide GP-based Bayesian optimization with EI, LCB, and information-theoretic acquisitions. BoTorch in particular supports batch acquisition through Monte Carlo formulations, which matters when several evaluations can run in parallel.
+
+### 6.4 Selecting a Surrogate and Tool
+
+A practical rule of thumb is to use a GP surrogate when the search space is continuous, the dimension is below roughly twenty, and evaluations are extremely expensive so that sample efficiency dominates. Use TPE when the space is high dimensional, mixed type, or conditional, which describes most deep learning tuning, and when a few hundred evaluations are affordable. In both cases, combine the surrogate with early stopping or pruning of weak trials, warm start the search with a handful of random or low discrepancy Sobol points to seed the surrogate, and budget enough initial random evaluations that the surrogate is not misled by a tiny biased sample. Always log every trial, because the accumulated evaluation history is itself a valuable asset for analysis and for warm starting future searches.
+
+## 7. Practical Considerations and Pitfalls
+
+Several issues recur in deployment. Noise must be modeled rather than ignored, since treating a noisy score as exact makes the surrogate overconfident and the search brittle. Parallel evaluation breaks the strict sequential loop, so practitioners use constant liar or fantasizing heuristics that impute pending evaluations to keep proposing diverse points. Search space design matters more than algorithm choice. Putting learning rate and regularization strengths on a log scale, and bounding ranges tightly around physically plausible values, often improves results more than switching surrogates. Multi fidelity methods such as Hyperband and BOHB exploit cheap proxies, for example training for fewer epochs or on subsets of data, to discard poor configurations early and reallocate budget toward promising ones, and they frequently outperform pure Bayesian optimization under a fixed wall clock budget [6]. Finally, the benefit of Bayesian optimization over random search shrinks as dimensionality grows and as the evaluation budget grows large, so the method is most valuable precisely in the regime it was designed for, namely expensive objectives evaluated tens to low hundreds of times.
+
+## 8. Summary
+
+Bayesian hyperparameter tuning frames model configuration as the optimization of an expensive, noisy, gradient free black box. It fits a cheap probabilistic surrogate to past evaluations and uses an acquisition function to decide where to look next, balancing exploitation of good regions against exploration of uncertain ones. Gaussian process surrogates offer principled uncertainty and strong sample efficiency in low dimensional continuous spaces but scale poorly in observations and dimensions. Tree-structured Parzen estimators model the density ratio of good to bad configurations, handle conditional and mixed type spaces gracefully, and power the default samplers in Optuna and Hyperopt. Expected improvement remains the workhorse acquisition function, with upper confidence bound and information-theoretic criteria offering alternatives. In practice the right move is to match the surrogate to the search space, combine it with pruning and multi fidelity strategies, and design the search space with as much care as the optimizer.
+
+## References
+
+1. Bergstra, J. and Bengio, Y. Random Search for Hyper-Parameter Optimization. Journal of Machine Learning Research, 2012. https://www.jmlr.org/papers/v13/bergstra12a.html
+2. Rasmussen, C. E. and Williams, C. K. I. Gaussian Processes for Machine Learning. MIT Press, 2006. https://gaussianprocess.org/gpml/
+3. Bergstra, J., Bardenet, R., Bengio, Y., and Kegl, B. Algorithms for Hyper-Parameter Optimization. NeurIPS, 2011. https://papers.nips.cc/paper/2011/hash/86e8f7ab32cfd12577bc2619bc635690-Abstract.html
+4. Srinivas, N., Krause, A., Kakade, S., and Seeger, M. Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design. ICML, 2010. https://arxiv.org/abs/0912.3995
+5. Hernandez-Lobato, J. M., Hoffman, M. W., and Ghahramani, Z. Predictive Entropy Search for Efficient Global Optimization of Black-box Functions. NeurIPS, 2014. https://arxiv.org/abs/1406.2541
+6. Falkner, S., Klein, A., and Hutter, F. BOHB: Robust and Efficient Hyperparameter Optimization at Scale. ICML, 2018. https://arxiv.org/abs/1807.01774
+7. Akiba, T., Sano, S., Yanase, T., Ohta, T., and Koyama, M. Optuna: A Next-generation Hyperparameter Optimization Framework. KDD, 2019. https://arxiv.org/abs/1907.10902
+8. Shahriari, B., Swersky, K., Wang, Z., Adams, R. P., and de Freitas, N. Taking the Human Out of the Loop: A Review of Bayesian Optimization. Proceedings of the IEEE, 2016. https://ieeexplore.ieee.org/document/7352306

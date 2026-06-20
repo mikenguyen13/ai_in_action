@@ -1,0 +1,173 @@
+# Layer Normalization
+
+## 1. Introduction
+
+Normalization layers are among the quiet workhorses of modern deep learning. They do not classify, attend, or generate; instead they stabilize the statistics of intermediate activations so that the parts of the network that do those things can be trained reliably. Batch normalization was the first such method to achieve wide adoption, but its dependence on the batch dimension makes it awkward for the recurrent and attention-based architectures that dominate sequence modeling. Layer normalization, introduced by Ba, Kiros, and Hinton in 2016, removes that dependence by computing statistics across the feature dimension of a single example. This seemingly small change is what makes the technique a natural fit for transformers, where it now appears in essentially every block.
+
+This chapter develops layer normalization from first principles, explains why per-example feature normalization suits variable-length sequences, derives RMSNorm as a simplified and now dominant variant, and analyzes the consequential choice between pre-norm and post-norm placement. The treatment is mathematical where mathematics clarifies, and practical where engineering judgment matters.
+
+## 2. From Batch Norm to Layer Norm
+
+### 2.1 The internal covariate shift motivation
+
+The original argument for normalization concerned the shifting distribution of layer inputs during training. As earlier layers update their weights, the distribution of activations feeding into later layers changes, forcing those layers to continually re-adapt. Whether or not this "internal covariate shift" framing is the true mechanism (later work argues normalization mainly smooths the loss landscape), the empirical payoff is clear: normalized activations permit higher learning rates, reduce sensitivity to initialization, and accelerate convergence.
+
+### 2.2 Why the batch axis is inconvenient
+
+Batch normalization computes, for each feature channel, the mean and variance across all examples in a mini-batch. Given a batch of activations $x_{b,i}$ with batch index $b$ and feature index $i$, it normalizes using
+
+$$
+\mu_i = \frac{1}{B} \sum_{b=1}^{B} x_{b,i}, \qquad
+\sigma_i^2 = \frac{1}{B} \sum_{b=1}^{B} (x_{b,i} - \mu_i)^2 .
+$$
+
+This couples examples together. Three problems follow. First, statistics become unstable for small batches, which are common when memory is tight or sequences are long. Second, the dependence on the batch means the training-time and inference-time behavior differ, since at inference we substitute running averages for batch statistics. Third, and most important for sequence models, applying batch norm to a recurrent or autoregressive computation requires separate statistics at every time step, because the activation distribution genuinely changes along the sequence. For variable-length inputs this bookkeeping is both clumsy and brittle.
+
+### 2.3 The layer norm idea
+
+Layer normalization sidesteps all of this by normalizing across the feature dimension of each example independently. For a single activation vector $x \in \mathbb{R}^{d}$, define
+
+$$
+\mu = \frac{1}{d} \sum_{i=1}^{d} x_i, \qquad
+\sigma^2 = \frac{1}{d} \sum_{i=1}^{d} (x_i - \mu)^2 .
+$$
+
+The normalized output is
+
+$$
+\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}, \qquad
+y_i = \gamma_i \, \hat{x}_i + \beta_i,
+$$
+
+where $\gamma, \beta \in \mathbb{R}^{d}$ are learned gain and bias parameters and $\epsilon$ is a small constant (typically $10^{-5}$ or $10^{-6}$) guarding against division by zero. Crucially, $\mu$ and $\sigma^2$ depend only on the one example being processed. There is no batch axis in the computation, so a single time step of a sequence is normalized using only its own features.
+
+```text
+batch norm:  normalize each feature  across the batch
+layer norm:  normalize each example  across its features
+```
+
+## 3. Why Per-Example Normalization Suits Sequences and Transformers
+
+### 3.1 Independence from batch and length
+
+Because layer norm reads only the current feature vector, it behaves identically whether the batch holds one example or one thousand, and whether a sequence has five tokens or five hundred. Training and inference use exactly the same formula, with no running statistics to maintain. For autoregressive decoding, where tokens are produced one at a time, this property is essential: the normalization of token $t$ cannot depend on tokens that have not yet been generated, and layer norm respects that constraint automatically.
+
+### 3.2 Invariance properties
+
+Layer norm confers useful invariances on the representation. Subtracting the mean makes the output invariant to a uniform shift of all features, and dividing by the standard deviation makes it invariant to a uniform rescaling. Formally, for any scalar $a > 0$ and $b$,
+
+$$
+\mathrm{LN}(a x + b \mathbf{1}) = \mathrm{LN}(x),
+$$
+
+where $\mathbf{1}$ is the all-ones vector and the gain and bias are momentarily set aside. This means that the overall magnitude of a token's embedding, which can drift substantially as it passes through many residual additions, does not by itself perturb the downstream computation. Only the direction and relative pattern of the features carry through, which is exactly what we want from a representation that must remain stable across dozens of stacked blocks.
+
+### 3.3 Placement inside the transformer block
+
+A transformer block interleaves two sublayers, multi-head self-attention and a position-wise feed-forward network, each wrapped in a residual connection. Layer norm is applied to the $d$-dimensional token representation at the entry or exit of these sublayers. Since the operation is per token and per feature, it parallelizes trivially across the sequence and batch axes, integrating cleanly with the otherwise highly parallel attention computation. The residual stream, which is the running sum that every sublayer reads from and writes to, is precisely the quantity whose scale layer norm keeps in check.
+
+## 4. RMSNorm
+
+### 4.1 Definition
+
+RMSNorm, proposed by Zhang and Sennrich in 2019, observes that the mean-subtraction (recentering) step of layer norm may be unnecessary and that the rescaling step carries most of the benefit. It drops the mean entirely and normalizes by the root mean square of the features:
+
+$$
+\mathrm{RMS}(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}, \qquad
+y_i = \frac{x_i}{\mathrm{RMS}(x)} \, \gamma_i .
+$$
+
+There is no $\mu$ and, in the common formulation, no additive bias $\beta$. The single learned parameter vector is the gain $\gamma$.
+
+```text
+LayerNorm:  y = gamma * (x - mean) / sqrt(var + eps) + beta
+RMSNorm:    y = gamma *  x         / sqrt(mean(x^2) + eps)
+```
+
+### 4.2 Why it works and why it is cheaper
+
+The motivating hypothesis is that the rescaling invariance, not the recentering invariance, is what stabilizes training. RMSNorm preserves invariance to uniform scaling of the input but gives up invariance to uniform shifts. Empirically this trade is close to free in quality while saving computation: there is no mean to compute, no subtraction across the feature vector, and one fewer parameter vector. On long sequences and large models these savings accumulate, and because the reduction over the feature dimension is a frequent operation in the forward and backward pass, shaving it matters for throughput.
+
+A subtle benefit concerns numerical behavior. The RMS denominator is a pure scale, which interacts predictably with mixed-precision arithmetic and with the residual stream. For these reasons RMSNorm has become the default in many recent large language models, including the LLaMA family, where it replaces standard layer norm throughout.
+
+### 4.3 Gradient perspective
+
+Both layer norm and RMSNorm define a smooth, differentiable normalization whose Jacobian projects gradients in a way that decouples them from the overall scale of the activation. For RMSNorm, writing $r = \mathrm{RMS}(x)$, the derivative of $y_i$ with respect to $x_j$ has the form
+
+$$
+\frac{\partial y_i}{\partial x_j} = \frac{\gamma_i}{r}\left( \delta_{ij} - \frac{x_i x_j}{d\, r^2} \right),
+$$
+
+where $\delta_{ij}$ is the Kronecker delta. The second term removes the component of the incoming gradient that points along the activation direction, so gradients that would merely rescale $x$ are suppressed. This is the mechanism by which normalization keeps the effective learning dynamics insensitive to activation magnitude, and the analogous expression for layer norm additionally removes the component along the all-ones direction.
+
+## 5. Pre-Norm Versus Post-Norm Placement
+
+### 5.1 The two arrangements
+
+The original transformer placed layer norm after each residual addition, an arrangement now called post-norm:
+
+$$
+x_{\ell+1} = \mathrm{LN}\big( x_\ell + \mathrm{Sublayer}(x_\ell) \big).
+$$
+
+Subsequent practice moved the normalization inside the residual branch, applying it to the sublayer input rather than the block output, which is called pre-norm:
+
+$$
+x_{\ell+1} = x_\ell + \mathrm{Sublayer}\big( \mathrm{LN}(x_\ell) \big).
+$$
+
+The distinction looks minor but has large consequences for trainability at depth.
+
+```text
+post-norm:  x -> Sublayer -> add -> LN -> next block
+pre-norm:   x -> LN -> Sublayer -> add -> next block
+```
+
+### 5.2 Gradient flow and the identity path
+
+In the pre-norm arrangement the residual connection forms an unobstructed identity path from the input of the network to its output, since the normalization sits inside the branch rather than astride the skip connection. Unrolling the recurrence gives
+
+$$
+x_L = x_0 + \sum_{\ell=0}^{L-1} \mathrm{Sublayer}_\ell\big( \mathrm{LN}(x_\ell) \big),
+$$
+
+so the output is the input plus a sum of branch contributions. Gradients propagate to early layers through the identity term without being repeatedly multiplied by the Jacobian of a normalization operator. This keeps gradient magnitudes well-behaved and is why pre-norm transformers train stably to great depth, often without the learning-rate warmup that post-norm models require.
+
+Post-norm interposes a normalization on the main path at every block. The repeated application can attenuate or distort gradients flowing backward through many layers, which historically made very deep post-norm transformers difficult to optimize and made warmup and careful initialization more or less mandatory.
+
+### 5.3 Trade-offs and representational quality
+
+Pre-norm is not strictly superior. Because each block adds an unnormalized contribution to the residual stream, the magnitude of that stream grows with depth, and later blocks receive inputs of progressively larger scale before their internal layer norm rescales them. One observed effect is that deep pre-norm models can behave somewhat like shallower models, with later layers contributing diminishing marginal change. Post-norm, by normalizing the output of every block, keeps the inter-block representation at a controlled scale and is sometimes credited with stronger final-quality representations when it can be trained successfully.
+
+The community has largely settled on pre-norm for large models because trainability at scale dominates, but the residual-growth issue is real and motivates refinements. DeepNet introduced a post-norm variant with a carefully chosen residual scaling that enabled stable training of transformers thousands of layers deep, demonstrating that the placement question is not closed. Hybrid schemes that normalize both the input and the output of each branch have also appeared in recent large models, seeking the gradient-flow benefits of pre-norm together with the scale control of post-norm.
+
+### 5.4 A practical default and a final layer norm
+
+For most practitioners building or fine-tuning a transformer today, the sensible default is pre-norm with RMSNorm, paired with a single additional normalization applied to the final residual-stream output just before the prediction head. That terminal normalization matters specifically because the pre-norm residual stream is never normalized on its main path, so without it the logits would inherit the accumulated, depth-dependent scale of the stream. With warmup-free training, stable deep stacks, and cheap per-token statistics, this configuration captures most of what decades of normalization research have taught us.
+
+## 6. Implementation Notes
+
+Two details repay attention. First, the reduction that computes $\sigma^2$ or $\mathrm{RMS}$ should be performed in higher precision than the surrounding activations when training in float16 or bfloat16, because squaring and summing many feature values can lose significant bits; casting up for the statistics and back down for the output is standard. Second, the $\epsilon$ inside the square root, not added afterward, is the numerically preferred placement, since it bounds the denominator away from zero even when the activation vector is itself near zero. These choices rarely change accuracy but routinely affect whether a long training run remains stable.
+
+```text
+# schematic, not executable
+mean   = x.mean(axis=-1, keepdims=True)            # layer norm only
+var    = ((x - mean) ** 2).mean(axis=-1, keepdims=True)
+x_norm = (x - mean) / sqrt(var + eps)              # reduce in float32
+y      = gamma * x_norm + beta
+```
+
+## 7. Summary
+
+Layer normalization replaced the batch axis of batch normalization with the feature axis, yielding a per-example operation that is indifferent to batch size and sequence length and therefore ideal for recurrent and attention-based models. Its invariance to shift and scale stabilizes the residual stream that defines a transformer. RMSNorm pares the method down to its rescaling core, dropping mean subtraction for a cheaper, equally effective normalization that now serves as the default in many leading models. The placement of the normalization, pre-norm versus post-norm, controls gradient flow and representation scale: pre-norm buys trainability at depth and has become standard, while post-norm and its modern descendants preserve tighter scale control. Together these choices form a small but decisive part of the recipe behind contemporary large-scale sequence models.
+
+## References
+
+1. Ba, J. L., Kiros, J. R., and Hinton, G. E. Layer Normalization. 2016. https://arxiv.org/abs/1607.06450
+2. Ioffe, S., and Szegedy, C. Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift. 2015. https://arxiv.org/abs/1502.03167
+3. Zhang, B., and Sennrich, R. Root Mean Square Layer Normalization. 2019. https://arxiv.org/abs/1910.07467
+4. Vaswani, A., et al. Attention Is All You Need. 2017. https://arxiv.org/abs/1706.03762
+5. Xiong, R., et al. On Layer Normalization in the Transformer Architecture. 2020. https://arxiv.org/abs/2002.04745
+6. Santurkar, S., Tsipras, D., Ilyas, A., and Madry, A. How Does Batch Normalization Help Optimization? 2018. https://arxiv.org/abs/1805.11604
+7. Wang, H., et al. DeepNet: Scaling Transformers to 1,000 Layers. 2022. https://arxiv.org/abs/2203.00555
+8. Touvron, H., et al. LLaMA: Open and Efficient Foundation Language Models. 2023. https://arxiv.org/abs/2302.13971

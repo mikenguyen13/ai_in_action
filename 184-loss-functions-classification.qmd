@@ -1,0 +1,179 @@
+# Loss Functions for Classification in Neural Networks
+
+Classification is the workhorse task of modern deep learning, and the choice of loss function determines what a network actually optimizes. This chapter develops the theory and numerical practice of the loss functions that dominate classification: the softmax cross-entropy for multiclass problems, the binary cross-entropy with logits for multilabel and binary problems, and the regularization technique of label smoothing. We pay close attention to numerical stability, because the naive mathematical forms of these objectives overflow and underflow in finite precision arithmetic, and the fused implementations used in practice differ substantially from the textbook equations.
+
+## 1. From Probabilistic Modeling to Cross-Entropy
+
+A classifier with parameters $\theta$ defines a conditional distribution $p_\theta(y \mid x)$ over labels $y$ given an input $x$. Given a dataset $\mathcal{D} = \{(x_i, y_i)\}_{i=1}^N$ drawn from an unknown data distribution, maximum likelihood estimation seeks the parameters that maximize the probability of the observed labels. Taking logarithms and negating turns the product over examples into a sum to be minimized:
+
+$$
+\mathcal{L}(\theta) = -\frac{1}{N} \sum_{i=1}^{N} \log p_\theta(y_i \mid x_i).
+$$
+
+This is the average negative log likelihood, and it is identical to the empirical cross-entropy between the data distribution and the model. To see the connection, let $q_i$ denote the one-hot target distribution that places all mass on the true class $y_i$, and let $p_i$ denote the model distribution over classes. The cross-entropy is
+
+$$
+H(q_i, p_i) = -\sum_{k} q_i(k) \log p_i(k) = -\log p_i(y_i),
+$$
+
+because $q_i$ is zero everywhere except at $k = y_i$. Minimizing cross-entropy is therefore equivalent to maximum likelihood. There is a complementary information-theoretic reading. Cross-entropy decomposes as
+
+$$
+H(q, p) = H(q) + D_{\mathrm{KL}}(q \,\|\, p),
+$$
+
+where $H(q)$ is the entropy of the target distribution and $D_{\mathrm{KL}}$ is the Kullback-Leibler divergence. Since $H(q)$ does not depend on $\theta$, minimizing cross-entropy minimizes the KL divergence from the model to the targets. The optimum is reached when $p$ matches $q$, which formalizes the intuition that we want the model to reproduce the labeling.
+
+## 2. The Softmax and Multiclass Cross-Entropy
+
+### 2.1 The softmax link function
+
+A neural network for $K$ class classification produces a vector of real valued scores $z = (z_1, \dots, z_K)$, called logits, which live in $\mathbb{R}^K$ and are unconstrained. The softmax function maps logits to a probability simplex:
+
+$$
+\mathrm{softmax}(z)_k = \frac{e^{z_k}}{\sum_{j=1}^{K} e^{z_j}}.
+$$
+
+The outputs are positive and sum to one, so they constitute a valid distribution. The softmax is invariant to adding a constant to every logit, since $\mathrm{softmax}(z + c\mathbf{1}) = \mathrm{softmax}(z)$. This shift invariance is both the source of a numerical trick and a reminder that the logits are identified only up to an additive constant.
+
+### 2.2 The loss and its gradient
+
+Combining the softmax with cross-entropy, the per-example loss for true class $y$ is
+
+$$
+\ell(z, y) = -\log \mathrm{softmax}(z)_y = -z_y + \log \sum_{j=1}^{K} e^{z_j}.
+$$
+
+The second term is the log-sum-exp function, written $\mathrm{LSE}(z)$. The loss is thus the gap between the log-sum-exp of all logits and the logit of the correct class. The gradient with respect to the logits is remarkably clean. Writing $p = \mathrm{softmax}(z)$,
+
+$$
+\frac{\partial \ell}{\partial z_k} = p_k - \mathbb{1}[k = y],
+$$
+
+which in vector form is $p - q$, the difference between the predicted distribution and the one-hot target. This is the same elegant form that appears in logistic and linear regression with their canonical link functions, and it is no coincidence: the softmax is the canonical link for the categorical distribution in the exponential family, and the predicted-minus-target gradient is a general property of such models. Because the gradient is bounded in magnitude by one per coordinate and never saturates to zero when the prediction is wrong, the softmax cross-entropy supplies strong learning signal even when the model is confidently incorrect, which is one reason it is preferred over a mean squared error applied to softmax outputs.
+
+## 3. Numerical Stability of Log-Sum-Exp
+
+### 3.1 Why the naive form fails
+
+The expression $\log \sum_j e^{z_j}$ is dangerous in floating point. If any logit is large, say $z_j = 1000$, then $e^{z_j}$ overflows to infinity in IEEE 754 double precision, whose largest finite value is near $1.8 \times 10^{308}$, corresponding to an exponent argument of about $709$. In single precision the threshold is near $88$. Conversely, if all logits are very negative, every exponential underflows to zero, the sum is zero, and the logarithm returns negative infinity. Either way the result is a NaN or an infinity that poisons the backward pass.
+
+### 3.2 The shift trick
+
+The shift invariance of the softmax provides the cure. Let $m = \max_j z_j$. Then
+
+$$
+\mathrm{LSE}(z) = m + \log \sum_{j=1}^{K} e^{z_j - m}.
+$$
+
+After subtracting the maximum, the largest exponent argument is zero, so the largest term is exactly one and cannot overflow. At least one term in the sum equals one, so the sum is at least one and its logarithm is finite and well defined. Smaller terms may underflow to zero, but those terms were negligible anyway, so the relative error is tiny. This stabilized log-sum-exp is the foundation of every production softmax implementation.
+
+```text
+# stable log-sum-exp
+m = max(z)
+lse = m + log(sum(exp(z - m)))
+loss = lse - z[y]
+```
+
+### 3.3 Fused softmax cross-entropy
+
+Practitioners rarely compute softmax probabilities and then take their logarithm, because $\log(\mathrm{softmax})$ recomputes the same exponentials twice and loses precision when a probability is near zero. Instead the loss is computed directly from logits in a single fused kernel using the identity
+
+$$
+\log \mathrm{softmax}(z)_k = z_k - \mathrm{LSE}(z).
+$$
+
+This is why deep learning libraries expose an operation that consumes raw logits rather than probabilities. In PyTorch the function `torch.nn.functional.cross_entropy` expects logits and internally applies a stabilized log-softmax; passing it already-normalized probabilities is a common and silent bug. The general rule is to keep the network output in logit space for as long as possible and to fold the softmax into the loss.
+
+## 4. Binary and Multilabel Classification
+
+### 4.1 The sigmoid and binary cross-entropy
+
+When there are two classes, or when each of several labels is independently present or absent, the relevant link is the logistic sigmoid:
+
+$$
+\sigma(z) = \frac{1}{1 + e^{-z}}, \qquad \sigma(z) \in (0, 1).
+$$
+
+The sigmoid is the two class special case of the softmax applied to the logit difference. For a binary target $y \in \{0, 1\}$ with predicted probability $\hat{p} = \sigma(z)$, the binary cross-entropy loss is
+
+$$
+\ell(z, y) = -\big[\, y \log \hat{p} + (1 - y) \log (1 - \hat{p}) \,\big].
+$$
+
+Multilabel classification, where an input may carry several labels at once, treats each of the $C$ outputs as an independent Bernoulli problem and sums the binary cross-entropy over labels. This differs fundamentally from multiclass softmax, which couples the outputs through a single normalization and enforces that exactly one class is present.
+
+### 4.2 Binary cross-entropy with logits
+
+The same numerical hazards reappear. Computing $\sigma(z)$ and then its logarithm overflows when $z$ is large and negative, because $e^{-z}$ explodes, and it produces $\log 0$ when $\sigma(z)$ saturates to zero or one. The stable formulation substitutes the sigmoid and simplifies. Starting from the binary cross-entropy and writing it in terms of the logit $z$,
+
+$$
+\ell(z, y) = \max(z, 0) - z \cdot y + \log\!\big(1 + e^{-|z|}\big).
+$$
+
+This rearrangement, used by the function commonly named binary cross-entropy with logits, never exponentiates a positive number, since the argument $-|z|$ is always nonpositive, so it cannot overflow, and the $\max(z, 0)$ term carries the large magnitude behavior exactly. The derivation uses the identity $\log(1 + e^{z}) = \max(z, 0) + \log(1 + e^{-|z|})$, which is the softplus function written in a stable way.
+
+```text
+# stable binary cross-entropy from logit z and target y
+loss = max(z, 0) - z * y + log(1 + exp(-abs(z)))
+```
+
+In PyTorch this is `binary_cross_entropy_with_logits`; in TensorFlow it is `sigmoid_cross_entropy_with_logits`. As with the multiclass case, the lesson is to pass logits, not probabilities, so that the library can apply the stable form.
+
+### 4.3 Class imbalance and weighting
+
+Real classification problems are frequently imbalanced, with rare positives swamped by negatives. A standard remedy weights the positive term by a factor $w_+ > 1$:
+
+$$
+\ell(z, y) = -\big[\, w_+ \, y \log \hat{p} + (1 - y) \log (1 - \hat{p}) \,\big],
+$$
+
+which rescales the gradient contribution of positive examples. A more aggressive alternative, the focal loss, multiplies the per example loss by $(1 - \hat{p}_t)^\gamma$, where $\hat{p}_t$ is the probability assigned to the true class. This factor shrinks the loss on easy, well classified examples and focuses optimization on hard ones, and it was introduced to train dense object detectors where the foreground to background ratio is extreme.
+
+## 5. Label Smoothing
+
+### 5.1 Motivation and definition
+
+Hard one-hot targets push the model to drive the correct logit toward positive infinity relative to the others, because cross-entropy is minimized only in the limit of infinite confidence. This encourages overconfident predictions, large logit magnitudes, and poor calibration, where the predicted probability of the chosen class systematically exceeds its empirical accuracy. Label smoothing addresses this by replacing the one-hot target with a softened distribution that reserves a small amount of probability mass for the wrong classes. With smoothing parameter $\epsilon$ and $K$ classes, the smoothed target is
+
+$$
+q'(k) = (1 - \epsilon)\, \mathbb{1}[k = y] + \frac{\epsilon}{K}.
+$$
+
+The true class receives $1 - \epsilon + \epsilon/K$ and every other class receives $\epsilon/K$. A typical value is $\epsilon = 0.1$. The training objective remains cross-entropy, now taken against $q'$:
+
+$$
+\ell_{\mathrm{LS}}(z, y) = -\sum_{k=1}^{K} q'(k) \log \mathrm{softmax}(z)_k.
+$$
+
+### 5.2 Effect on the optimum and on geometry
+
+With smoothed targets the loss is no longer minimized by infinite logit gaps. Setting the gradient to zero, the optimal logits satisfy $\mathrm{softmax}(z)_k = q'(k)$, so the model is asked to predict the correct class with probability $1 - \epsilon + \epsilon/K$ rather than one, and the optimal logit gap between the correct and incorrect classes becomes a finite constant. This bounds the logit magnitudes and tends to improve calibration. Empirically, label smoothing also reshapes the learned representations: penultimate layer activations for examples of the same class cluster more tightly and at more equal distances from other class centroids, a geometric regularity that accompanies its accuracy and calibration benefits in image classification, machine translation, and speech recognition.
+
+### 5.3 A KL-divergence reading and caveats
+
+Label smoothing can be viewed as adding a penalty that pulls the model toward the uniform distribution $u$. Decomposing the smoothed cross-entropy,
+
+$$
+\ell_{\mathrm{LS}} = (1 - \epsilon)\, H(q, p) + \epsilon \, H(u, p) = (1 - \epsilon)\, H(q, p) + \epsilon \big( D_{\mathrm{KL}}(u \,\|\, p) + H(u) \big),
+$$
+
+so up to a constant the smoothing term is a KL divergence from the model to uniform, a confidence penalty that discourages peaked outputs. The technique is not universally beneficial. Because it deliberately removes information about relative incorrect class probabilities, label smoothing can degrade knowledge distillation, where a student is trained to match a teacher's full soft distribution and therefore needs the very inter-class structure that smoothing erases. As with any regularizer, the smoothing strength is a hyperparameter to be validated rather than assumed.
+
+## 6. Practical Guidance
+
+A short checklist captures the operational consequences of the theory. Keep network outputs in logit space and let the loss function apply the softmax or sigmoid internally, so that the stabilized log-sum-exp and softplus forms are used. Choose softmax cross-entropy for mutually exclusive classes and summed binary cross-entropy with logits for independent multilabel outputs. Reach for positive weighting or focal loss when the class distribution is skewed. Apply label smoothing with a small $\epsilon$ such as $0.1$ to curb overconfidence and improve calibration, but reconsider it when training teachers for distillation. Finally, when a training run produces NaNs early, suspect an unstable hand rolled softmax or a loss fed probabilities instead of logits before suspecting the data.
+
+## 7. Summary
+
+Cross-entropy is the maximum likelihood objective for classification, and its two principal forms, softmax cross-entropy for multiclass problems and binary cross-entropy with logits for binary and multilabel problems, both produce the clean predicted-minus-target gradient that drives stable learning. The mathematical expressions hide numerical landmines that the shift trick for log-sum-exp and the absolute value form of softplus defuse, which is why fused logit-consuming loss functions are the norm. Label smoothing trades a small amount of confidence for better calibration and more regular representations, at the cost of fine grained inter-class information that some downstream uses still require. Understanding these objectives at the level of their gradients and their floating point behavior is what separates a model that trains from one that diverges.
+
+## References
+
+1. Goodfellow, I., Bengio, Y., and Courville, A. Deep Learning, chapter 6. MIT Press, 2016. https://www.deeplearningbook.org/
+2. Bishop, C. M. Pattern Recognition and Machine Learning. Springer, 2006. https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+3. Szegedy, C., Vanhoucke, V., Ioffe, S., Shlens, J., and Wojna, Z. Rethinking the Inception Architecture for Computer Vision. CVPR, 2016. https://arxiv.org/abs/1512.00567
+4. Mueller, R., Kornblith, S., and Hinton, G. When Does Label Smoothing Help? NeurIPS, 2019. https://arxiv.org/abs/1906.02629
+5. Lin, T.-Y., Goyal, P., Girshick, R., He, K., and Dollar, P. Focal Loss for Dense Object Detection. ICCV, 2017. https://arxiv.org/abs/1708.02002
+6. PyTorch Documentation. torch.nn.functional.cross_entropy and binary_cross_entropy_with_logits. https://pytorch.org/docs/stable/nn.functional.html
+7. Blanchard, P., Higham, D. J., and Higham, N. J. Accurately Computing the Log-Sum-Exp and Softmax Functions. IMA Journal of Numerical Analysis, 2021. https://doi.org/10.1093/imanum/draa038

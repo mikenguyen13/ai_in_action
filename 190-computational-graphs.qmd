@@ -1,0 +1,119 @@
+# Computational Graphs
+
+A computational graph is the central data structure behind modern machine learning frameworks. It records how an output is produced from inputs through a sequence of primitive operations, and it turns differentiation, scheduling, and optimization into problems on a directed graph. Understanding computational graphs clarifies why automatic differentiation is exact rather than numerical, why some frameworks feel rigid while others feel like ordinary programming, and how compilers extract performance from a model that was written without any thought for hardware.
+
+## 1. Nodes, Edges, and the Structure of Computation
+
+A computational graph is a directed acyclic graph (DAG) $G = (V, E)$. Each node $v \in V$ represents either an input value, a constant, a parameter, or a primitive operation such as addition, matrix multiplication, or a nonlinearity. Each directed edge $(u, v) \in E$ indicates that the value produced at node $u$ is consumed as an argument by node $v$. Because data flows from producers to consumers and a value cannot depend on itself, the graph is acyclic, which guarantees that a topological order exists.
+
+Consider the scalar expression $L = (x w + b - y)^2$, a single squared error term. We decompose it into primitives:
+
+```text
+t1 = x * w      # multiply
+t2 = t1 + b     # add
+t3 = t2 - y     # subtract
+L  = t3 * t3    # square
+```
+
+The nodes are $\{x, w, b, y, t_1, t_2, t_3, L\}$ and the edges encode the dependencies, for example $x \to t_1$ and $w \to t_1$. Each intermediate node stores both the operation it performs and, at execution time, the cached value it produced. This caching matters: the same intermediate can feed several downstream nodes, and storing it once avoids recomputation.
+
+The granularity of a node is a design choice. A graph may be coarse, with a whole layer such as $\text{LayerNorm}$ as one node, or fine, with elementwise multiply and reduce-sum as separate nodes. Coarse graphs are easier to reason about and map cleanly to optimized library kernels. Fine graphs expose more structure to a compiler and allow operation fusion. Frameworks usually expose a coarse user level graph that is lowered into a finer internal representation before optimization.
+
+Two structural properties are worth naming. First, a topological order is any ordering of $V$ such that every edge points from an earlier node to a later node. Forward evaluation visits nodes in topological order. Second, the reverse topological order is what gradient computation uses, because a gradient at a node depends on gradients at all of its consumers.
+
+## 2. Static Versus Dynamic Graphs
+
+Frameworks differ in when the graph is constructed relative to when it is executed. This distinction shapes the entire developer experience.
+
+### 2.1 Static Graphs (Define-and-Run)
+
+In the static, or define-and-run, model the program first builds a complete symbolic graph and then executes it repeatedly with concrete data. TensorFlow 1.x and Theano popularized this style. The user constructs placeholder nodes, wires operations together, and only later feeds numerical arrays through a session. Control flow such as loops and conditionals must be expressed with special graph operators, for example a functional `while_loop`, because ordinary Python control flow runs only once during graph construction.
+
+The advantage is that the whole computation is known before any number is computed. The framework can analyze the graph globally, allocate memory ahead of time, schedule operations across devices, and apply aggressive compilation. The cost is expressiveness and debuggability. A model whose structure depends on the data, such as a recursive network over a parse tree of varying shape, is awkward to write, and a runtime error surfaces inside the opaque execution engine rather than at the Python line that caused it.
+
+### 2.2 Dynamic Graphs (Define-by-Run)
+
+In the dynamic, or define-by-run, model the graph is built on the fly as the forward computation executes. Every operation both computes its result and records a node. PyTorch, Chainer, and TensorFlow 2.x eager mode follow this style. Ordinary Python `if` statements and `for` loops control the shape of the graph directly, so a different input can produce a different graph on each call.
+
+```text
+h = x
+for layer in layers:          # ordinary Python loop
+    h = relu(layer(h))        # each op appends a node
+    if h.norm() > threshold:  # data dependent branch
+        h = normalize(h)
+loss = mse(h, y)
+```
+
+Define-by-run trades some global optimizability for immediacy. Errors appear at the offending operation, intermediate values can be inspected with a debugger or print statement, and dynamic architectures are expressed in plain code. The historical gap in performance has narrowed because modern frameworks add a tracing or just-in-time compilation step, discussed in Section 5, that recovers a static graph from dynamic code when the structure is stable.
+
+## 3. Define-by-Run and the Recorded Tape
+
+The mechanism that makes define-by-run support differentiation is the tape, sometimes called a Wengert list. As the forward pass runs, the framework appends to an ordered record every primitive operation, along with references to its input nodes and its output. The tape is precisely a linearized computational graph captured in execution order.
+
+Each recorded entry stores enough information to later compute a local derivative. For a primitive $y = f(x_1, \ldots, x_k)$ the framework knows a backward rule that, given the gradient of the loss with respect to $y$, returns the gradient with respect to each $x_i$. The tape does not store the symbolic form of $f$; it stores the cached inputs and outputs needed to evaluate the backward rule numerically at the current point.
+
+A subtle but important consequence is memory. Because backward rules often need the forward activations, those activations must be retained until the backward pass consumes them. This is why training memory scales with the depth of the graph and why techniques such as gradient checkpointing exist: they discard some activations and recompute them during the backward pass, trading compute for memory. In eager frameworks the tape is typically discarded after one backward pass, so a second backward call requires either retaining the graph explicitly or rebuilding it.
+
+## 4. How Graphs Enable Automatic Differentiation
+
+The computational graph is what makes automatic differentiation (AD) exact and efficient. AD is neither symbolic differentiation, which manipulates expressions and can blow up in size, nor numerical differentiation, which approximates with finite differences and suffers truncation and rounding error. Instead AD applies the chain rule mechanically along the edges of the graph, computing derivatives that are exact up to floating point.
+
+### 4.1 The Chain Rule on a Graph
+
+Let the loss be $L$ and let node $v$ have value $a_v$. The reverse mode adjoint of $v$ is defined as $\bar{a}_v = \partial L / \partial a_v$. For the output node, $\bar{a}_L = 1$. For any other node $v$, the chain rule sums contributions over all consumers $c$ of $v$:
+
+$$
+\bar{a}_v = \sum_{c \,:\, (v, c) \in E} \bar{a}_c \, \frac{\partial a_c}{\partial a_v}.
+$$
+
+The factor $\partial a_c / \partial a_v$ is the local Jacobian of the operation at node $c$ with respect to its input $v$, and it is exactly what the per primitive backward rule computes. Evaluating this recurrence in reverse topological order guarantees that every consumer's adjoint $\bar{a}_c$ is already available when $\bar{a}_v$ is needed.
+
+### 4.2 Reverse Mode and Backpropagation
+
+Reverse mode AD computes the full gradient $\nabla_\theta L$ with a single backward sweep whose cost is a small constant multiple of one forward evaluation, independent of the number of parameters. This property is the reason deep networks are trainable: a model may have billions of parameters $\theta$ but a single scalar loss $L$, so a method whose cost is independent of the parameter count and proportional to the function evaluation is essential. Backpropagation is exactly reverse mode AD specialized to neural network graphs.
+
+Forward mode AD, by contrast, propagates derivatives from inputs to outputs and costs a constant multiple per input direction. It is efficient when there are few inputs and many outputs, the opposite regime. For a function $f : \mathbb{R}^n \to \mathbb{R}^m$, reverse mode is preferred when $m \ll n$ and forward mode when $n \ll m$. Training, with $m = 1$ and $n$ enormous, sits firmly in the reverse mode regime.
+
+### 4.3 Vector Jacobian Products
+
+In practice AD frameworks never materialize a full Jacobian matrix. Reverse mode is implemented as a sequence of vector Jacobian products (VJPs): given an upstream adjoint vector $\bar{a}_c$, each backward rule returns $\bar{a}_c^\top J$ where $J = \partial a_c / \partial a_v$, without ever forming $J$ explicitly. For a linear node $y = W x$, the VJP with respect to $x$ is simply $W^\top \bar{a}_y$, a matrix vector product. Composing VJPs along the graph yields the gradient at the cost of ordinary forward style operations.
+
+## 5. Graph-Level Optimizations
+
+Once a computation is captured as a graph, it becomes a target for a compiler. Optimizations operate on the graph as a whole, transforming it into an equivalent graph that runs faster or uses less memory. Systems such as XLA, TorchInductor, TVM, and ONNX Runtime apply these passes.
+
+### 5.1 Common Optimizations
+
+**Operation fusion** merges several adjacent elementwise nodes into a single kernel. A chain such as multiply, add, then $\text{ReLU}$ would otherwise read and write intermediate arrays to memory three times. Fused into one kernel, the data is loaded once and the intermediates stay in registers, which on memory bound hardware is often the single largest speedup.
+
+**Constant folding** evaluates subgraphs whose inputs are all known at compile time and replaces them with literal values, removing work from every execution.
+
+**Common subexpression elimination** detects nodes that compute the same operation on the same inputs and shares a single node, mirroring the value caching described in Section 1.
+
+**Algebraic simplification** rewrites subgraphs using mathematical identities, for example replacing $x + 0$, collapsing redundant transposes, or fusing a batch normalization into an adjacent convolution at inference time.
+
+**Memory planning and liveness analysis** compute, from the graph topology, when each buffer is needed and reuse memory once a value is dead. Knowing the full graph in advance enables tight static allocation rather than per operation allocation.
+
+**Layout and device assignment** choose data layouts such as row major versus channel last and place nodes on specific devices, then insert the communication nodes needed when an edge crosses a device boundary.
+
+### 5.2 Tracing, Capture, and Lowering
+
+To optimize dynamic code, frameworks first capture a graph. Tracing runs the function once with example inputs and records the operations that occurred, producing a static graph valid for that input structure. Because tracing only sees one path, data dependent control flow must be handled by guards that re-trace when assumptions break, or by graph capture systems that represent control flow explicitly. The captured graph is then lowered through progressively lower level intermediate representations, where the optimizations above are applied, before code generation emits hardware specific kernels. This pipeline is what lets a user write natural define-by-run code and still obtain near static graph performance.
+
+### 5.3 Correctness Constraints
+
+Every graph transformation must preserve semantics. Two constraints dominate. First, floating point arithmetic is not associative, so reorderings and fusions can change results at the level of rounding error; reputable compilers keep these changes within documented tolerances or behind explicit flags. Second, operations with side effects, such as in place mutation, random number generation, and reads of external state, impose ordering edges that pure dataflow does not capture. Compilers add explicit dependency edges to preserve such ordering, which is why a graph intended for aggressive optimization is easiest to reason about when its operations are pure functions of their inputs.
+
+## 6. Summary
+
+A computational graph reduces a model to nodes that compute primitives and edges that carry values. The timing of graph construction separates static define-and-run frameworks, which optimize globally at the cost of flexibility, from dynamic define-by-run frameworks, which build the graph as code runs and recover performance through tracing. The graph structure is what makes reverse mode automatic differentiation possible: a single backward sweep in reverse topological order composes local vector Jacobian products into an exact gradient at a cost independent of the parameter count. The same structure is a compilation target, where fusion, constant folding, memory planning, and layout assignment turn a hardware agnostic model into efficient executable code. These ideas, graph, gradient, and compiler, are the foundation on which every modern training and inference system is built.
+
+## References
+
+1. Baydin, A. G., Pearlmutter, B. A., Radul, A. A., and Siskind, J. M. "Automatic Differentiation in Machine Learning: a Survey." Journal of Machine Learning Research, 2018. https://jmlr.org/papers/v18/17-468.html
+2. Abadi, M., et al. "TensorFlow: A System for Large-Scale Machine Learning." OSDI, 2016. https://www.usenix.org/system/files/conference/osdi16/osdi16-abadi.pdf
+3. Paszke, A., et al. "PyTorch: An Imperative Style, High-Performance Deep Learning Library." NeurIPS, 2019. https://papers.nips.cc/paper/2019/hash/bdbca288fee7f92f2bfa9f7012727740-Abstract.html
+4. Griewank, A., and Walther, A. "Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation." 2nd ed., SIAM, 2008. https://epubs.siam.org/doi/book/10.1137/1.9780898717761
+5. Chen, T., et al. "TVM: An Automated End-to-End Optimizing Compiler for Deep Learning." OSDI, 2018. https://www.usenix.org/system/files/osdi18-chen.pdf
+6. The XLA Authors. "XLA: Optimizing Compiler for Machine Learning." TensorFlow Documentation. https://www.tensorflow.org/xla
+7. Ansel, J., et al. "PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation." ASPLOS, 2024. https://pytorch.org/assets/pytorch2-2.pdf

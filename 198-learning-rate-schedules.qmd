@@ -1,0 +1,176 @@
+# Learning Rate Schedules
+
+The learning rate is the single most consequential hyperparameter in gradient-based optimization. It scales the step that each update takes along the negative gradient, and its value governs whether training converges quickly, stalls in a poor region, or diverges outright. A fixed learning rate is almost never optimal across an entire training run: early on, large steps make rapid progress through high-curvature regions, while late in training small steps are needed to settle into a sharp or flat minimum without oscillating. Learning rate schedules formalize this intuition by making the learning rate a function of the iteration or epoch count. This chapter develops the mathematics and engineering practice of the dominant schedule families: step and exponential decay, cosine annealing, warmup, cyclical learning rates, and the one-cycle policy.
+
+## 1. The Role of the Learning Rate
+
+Consider parameters $\theta \in \mathbb{R}^d$ and a loss $L(\theta)$. Stochastic gradient descent (SGD) updates
+
+$$
+\theta_{t+1} = \theta_t - \eta_t \, g_t, \qquad g_t = \nabla_\theta L(\theta_t; \mathcal{B}_t),
+$$
+
+where $g_t$ is the gradient estimated on a mini-batch $\mathcal{B}_t$ and $\eta_t > 0$ is the learning rate at step $t$. The classical Robbins-Monro conditions for almost-sure convergence of stochastic approximation require
+
+$$
+\sum_{t=1}^{\infty} \eta_t = \infty, \qquad \sum_{t=1}^{\infty} \eta_t^2 < \infty.
+$$
+
+The first condition ensures the iterates can travel arbitrarily far to reach the optimum; the second forces the noise injected by stochastic gradients to be eventually suppressed. A schedule such as $\eta_t = \eta_0 / t$ satisfies both, which historically motivated decaying schedules. In modern deep learning the assumptions of convexity and unbiased noise rarely hold, so schedules are chosen empirically, but the qualitative lesson survives: the learning rate should be large enough early to make progress and small enough late to reduce gradient noise variance, whose contribution to the parameter covariance scales roughly as $\eta_t^2$.
+
+Two competing failure modes frame the problem. If $\eta_t$ is too large relative to the local curvature, captured by the largest eigenvalue $\lambda_{\max}$ of the Hessian, updates overshoot and the loss diverges; a useful heuristic for a quadratic bowl is the stability bound $\eta < 2/\lambda_{\max}$. If $\eta_t$ is too small, training wastes compute and may stall on plateaus. Schedules navigate between these extremes over the course of training.
+
+## 2. Step and Exponential Decay
+
+### 2.1 Step Decay
+
+Step decay multiplies the learning rate by a constant factor $\gamma \in (0,1)$ at fixed milestones. With an initial rate $\eta_0$, a decay factor $\gamma$, and a step interval of $s$ epochs,
+
+$$
+\eta_t = \eta_0 \, \gamma^{\lfloor t / s \rfloor}.
+$$
+
+The piecewise-constant profile is easy to reason about and was the workhorse for training convolutional networks on ImageNet, where a common recipe drops the rate by $10\times$ (so $\gamma = 0.1$) every 30 epochs. A multi-step variant decays at an explicit list of milestones rather than a uniform interval, which lets practitioners place drops where validation loss flattens.
+
+```python
+def step_decay(epoch, eta0=0.1, gamma=0.1, step=30):
+    return eta0 * (gamma ** (epoch // step))
+```
+
+The appeal of step decay is interpretability: each drop produces a visible, often sharp improvement in validation loss as the optimizer transitions to a finer search. Its drawback is brittleness. The milestones are extra hyperparameters that interact with batch size, dataset size, and total epoch budget, and a milestone placed too early or too late can cost accuracy.
+
+### 2.2 Exponential Decay
+
+Exponential decay replaces the staircase with a smooth geometric decline,
+
+$$
+\eta_t = \eta_0 \, e^{-k t},
+$$
+
+for a decay constant $k > 0$, or equivalently $\eta_t = \eta_0 \, \gamma^{t}$ with $\gamma = e^{-k}$ applied per step rather than per milestone. Because the rate never reaches zero, the schedule keeps making small updates indefinitely, which suits very long training runs. The continuous form removes the discontinuities of step decay and avoids the transient instability that a sudden $10\times$ drop can occasionally introduce. In practice $k$ is set so the rate falls by a target ratio over the planned horizon: solving $\eta_T / \eta_0 = e^{-kT}$ for $k$ gives $k = \tfrac{1}{T}\ln(\eta_0 / \eta_T)$.
+
+A related family is inverse-time or polynomial decay, for example $\eta_t = \eta_0 / (1 + k t)$, which decays more slowly than exponential at large $t$ and aligns with the Robbins-Monro $1/t$ prescription. The choice among these forms is usually less important than getting the overall scale and horizon right.
+
+## 3. Cosine Annealing
+
+Cosine annealing, introduced by Loshchilov and Hutter, has become a default for training deep networks because it requires only the initial rate and the total horizon, with no milestones to tune. Over $T$ total steps the rate follows half a cosine wave from $\eta_{\max}$ down to a floor $\eta_{\min}$,
+
+$$
+\eta_t = \eta_{\min} + \tfrac{1}{2}\,(\eta_{\max} - \eta_{\min})\left(1 + \cos\!\frac{\pi t}{T}\right).
+$$
+
+The schedule spends comparatively long at high rates early, descends most steeply through the middle of training, and flattens as it approaches $\eta_{\min}$. The slow approach to the floor lets the optimizer settle gently, which empirically lands in flatter regions of the loss surface that generalize better.
+
+```python
+import math
+def cosine(t, T, eta_max=0.1, eta_min=0.0):
+    return eta_min + 0.5 * (eta_max - eta_min) * (1 + math.cos(math.pi * t / T))
+```
+
+### 3.1 Warm Restarts
+
+The original proposal, stochastic gradient descent with warm restarts (SGDR), runs cosine annealing over a cycle of length $T_i$, then resets the rate back to $\eta_{\max}$ and begins a new cycle, often with the cycle length geometrically increased by a factor $T_{\text{mult}}$. Within cycle $i$,
+
+$$
+\eta_t = \eta_{\min} + \tfrac{1}{2}\,(\eta_{\max} - \eta_{\min})\left(1 + \cos\!\frac{\pi \, t_{\text{cur}}}{T_i}\right),
+$$
+
+where $t_{\text{cur}}$ counts steps since the last restart. Each restart is a controlled jump in learning rate that can knock the iterate out of a sharp basin and into a wider one. Restarts also enable cheap ensembling: snapshotting the model at the end of each cycle yields a collection of diverse networks at the cost of a single training run, a technique known as snapshot ensembles.
+
+## 4. Warmup
+
+Warmup inverts the usual direction at the very start of training: instead of decaying, the learning rate is ramped up from a small value (or zero) to the target rate over the first $T_w$ steps. Linear warmup uses
+
+$$
+\eta_t = \eta_{\text{target}} \cdot \frac{t}{T_w}, \qquad t \le T_w,
+$$
+
+after which the main schedule takes over. The motivation is that the early iterations operate on freshly initialized weights where gradient estimates are noisy and the loss landscape is poorly conditioned. A large rate applied immediately can drive the parameters into a bad region from which recovery is slow or impossible, an effect pronounced in large-batch training and in architectures with adaptive optimizers.
+
+For adaptive methods such as Adam, warmup serves a more specific purpose. The second-moment estimate $v_t$ is computed from very few samples in early steps, so its variance is high and the effective step size $\eta / (\sqrt{v_t} + \epsilon)$ can be erratically large. Warmup suppresses these early steps until the running estimates stabilize; the RAdam analysis by Liu and colleagues formalizes this as rectifying the variance of the adaptive learning rate, and a short linear warmup approximates the same effect with less machinery.
+
+Warmup is essential for transformer training. The original Transformer schedule combined warmup with inverse-square-root decay,
+
+$$
+\eta_t = d_{\text{model}}^{-1/2} \cdot \min\!\left(t^{-1/2},\; t \cdot T_w^{-3/2}\right),
+$$
+
+which rises linearly during warmup and then decays as $t^{-1/2}$. In current practice warmup is almost always paired with cosine annealing: a short linear ramp followed by a cosine descent to a small floor is the standard recipe for training large language and vision models.
+
+```python
+def warmup_cosine(t, T_w, T, eta_max):
+    if t < T_w:
+        return eta_max * t / T_w
+    p = (t - T_w) / (T - T_w)
+    return 0.5 * eta_max * (1 + math.cos(math.pi * p))
+```
+
+The warmup length $T_w$ is typically a small fraction of total training, on the order of a few hundred to a few thousand steps, or expressed as a percentage such as 2 to 10 percent of the run. Longer warmup helps when the batch size or learning rate is unusually large.
+
+## 5. Cyclical Learning Rates
+
+Smith proposed cyclical learning rates (CLR) as a deliberate departure from monotone decay. Rather than always decreasing, the rate oscillates between a lower bound $\eta_{\min}$ and an upper bound $\eta_{\max}$ over a fixed cycle. The triangular policy increases linearly to $\eta_{\max}$ over a half cycle, then decreases linearly back, repeating throughout training. With cycle length $2s$ steps (a half cycle of $s$ steps called the step size), define the cycle position and a triangle wave $x \in [0,1]$; the rate is
+
+$$
+\eta_t = \eta_{\min} + (\eta_{\max} - \eta_{\min}) \cdot \max(0,\, 1 - |x|).
+$$
+
+Variants include triangular2, which halves the amplitude each cycle, and an exponential-range policy that scales the amplitude by $\gamma^t$. The rationale is twofold. Periodically raising the rate provides a built-in mechanism to escape saddle points and sharp local minima, where the gradient is small and a small rate would stall. And cycling removes the need to guess a single optimal rate, since the schedule sweeps through a useful range on every cycle.
+
+### 5.1 The Learning Rate Range Test
+
+A practical contribution accompanying CLR is the range test for choosing the bounds. Train for a few epochs while increasing the learning rate from a very small value to a large one, either linearly or exponentially, and record the loss at each rate. Plotting loss against learning rate reveals a region where the loss falls steeply, a minimum, and then a sharp rise where training diverges. A good $\eta_{\max}$ sits just before the divergence point, and $\eta_{\min}$ is commonly chosen as $\eta_{\max}$ divided by a factor of 3 to 10. The range test turns learning rate selection from blind search into a single cheap diagnostic and underpins the bound selection for the one-cycle policy below.
+
+```python
+# Sketch of a range test
+lr = lr_min
+while lr < lr_max:
+    loss = train_one_batch(lr)
+    record(lr, loss)
+    lr *= multiplier   # exponential sweep
+```
+
+## 6. The One-Cycle Policy
+
+The one-cycle policy, also due to Smith, takes the cyclical idea and uses exactly one cycle for the entire training run. The learning rate rises from a low value to a maximum $\eta_{\max}$ over the first portion of training, then descends back well below the starting value over the remainder, with a short final annihilation phase that drives it toward zero. Crucially, the momentum is cycled in antiphase: as the learning rate climbs, momentum falls from a high value such as 0.95 to around 0.85, and as the rate descends, momentum rises back. High learning rate with reduced momentum keeps the large mid-training steps from compounding into divergence, while restoring momentum during the descent accelerates the final convergence.
+
+$$
+\eta_t = \begin{cases}
+\text{ramp up to } \eta_{\max} & 0 \le t \le t_1, \\
+\text{ramp down to } \eta_{\min} & t_1 < t \le t_2, \\
+\text{anneal toward } 0 & t_2 < t \le T.
+\end{cases}
+$$
+
+The transitions are usually cosine-shaped rather than strictly linear in modern implementations. The headline empirical claim is super-convergence: on some datasets and architectures, one-cycle training reaches a target accuracy in an order of magnitude fewer iterations than a conventional decaying schedule, because the extended high-rate phase acts as a strong regularizer and accelerator simultaneously. The large rate discourages the optimizer from settling into sharp minima early, and the policy as a whole tends to find flatter solutions.
+
+```python
+def one_cycle(t, T, eta_max, eta_min, peak=0.3):
+    t1 = peak * T
+    if t <= t1:                       # warmup leg
+        return eta_min + (eta_max - eta_min) * (t / t1)
+    p = (t - t1) / (T - t1)           # descent leg
+    return eta_min + 0.5 * (eta_max - eta_min) * (1 + math.cos(math.pi * p))
+```
+
+In practice one-cycle is configured by setting $\eta_{\max}$ from a range test, choosing the fraction of training spent ramping up (often 25 to 30 percent), and setting the initial and final rates one to two orders of magnitude below $\eta_{\max}$. Because it bundles warmup, a high-rate regularizing phase, and aggressive final decay into a single schedule, one-cycle is a strong default when the total iteration budget is fixed in advance.
+
+## 7. Choosing and Combining Schedules
+
+Several practical principles emerge. First, the peak learning rate matters more than the precise shape of the schedule; a range test to locate the largest stable rate is worth running before committing to any policy. Second, warmup is nearly always beneficial for large batches, adaptive optimizers, and transformer-style architectures, and rarely harmful, so a short linear warmup is a safe default. Third, the appropriate horizon depends on the total compute budget, and schedules tied to that budget (cosine, one-cycle) avoid the milestone-tuning fragility of step decay.
+
+There is also a well-documented interaction between learning rate and batch size. Empirically, scaling the learning rate linearly with batch size preserves training dynamics up to a point, so $\eta \propto B$; beyond a critical batch size the linear rule breaks down and warmup becomes necessary to maintain stability. This coupling means a schedule tuned for one batch size must be rescaled, not copied, when the batch size changes.
+
+Finally, the schedule should be matched to the optimizer. Adaptive methods already adjust per-parameter step sizes, so they tolerate cruder global schedules but still benefit from warmup and a cosine decay. Plain SGD with momentum is more sensitive to the global rate and gains the most from carefully shaped schedules such as one-cycle. In all cases the schedule is a hyperparameter to validate, not a fixed prescription, and a brief sweep over peak rate and horizon usually pays for itself in final accuracy and training time.
+
+## References
+
+1. Robbins, H., and Monro, S. "A Stochastic Approximation Method." Annals of Mathematical Statistics, 1951. https://doi.org/10.1214/aoms/1177729586
+2. Loshchilov, I., and Hutter, F. "SGDR: Stochastic Gradient Descent with Warm Restarts." ICLR 2017. https://arxiv.org/abs/1608.03983
+3. Smith, L. N. "Cyclical Learning Rates for Training Neural Networks." WACV 2017. https://arxiv.org/abs/1506.01186
+4. Smith, L. N., and Topin, N. "Super-Convergence: Very Fast Training of Neural Networks Using Large Learning Rates." 2018. https://arxiv.org/abs/1708.07120
+5. Vaswani, A., et al. "Attention Is All You Need." NeurIPS 2017. https://arxiv.org/abs/1706.03762
+6. Goyal, P., et al. "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour." 2017. https://arxiv.org/abs/1706.02677
+7. Liu, L., et al. "On the Variance of the Adaptive Learning Rate and Beyond." ICLR 2020. https://arxiv.org/abs/1908.03265
+8. Huang, G., et al. "Snapshot Ensembles: Train 1, Get M for Free." ICLR 2017. https://arxiv.org/abs/1704.00109
+9. Smith, S. L., Kindermans, P.-J., Ying, C., and Le, Q. V. "Don't Decay the Learning Rate, Increase the Batch Size." ICLR 2018. https://arxiv.org/abs/1711.00489

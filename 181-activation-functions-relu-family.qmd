@@ -1,0 +1,178 @@
+# The ReLU Family of Activation Functions
+
+Activation functions inject the nonlinearity that lets deep networks approximate functions beyond linear maps. Among the many candidates proposed over the decades, the rectified linear unit and its descendants reshaped how practitioners train deep networks. This chapter develops the rectified linear unit (ReLU), explains precisely why it improves gradient flow relative to saturating alternatives, diagnoses the dying ReLU pathology, and then surveys the principal repairs: leaky ReLU, parametric ReLU (PReLU), and the exponential linear unit (ELU). Throughout, the emphasis is on the mathematical properties that govern training dynamics and on the tradeoffs that guide a practical choice.
+
+## 1. Motivation: Saturation and the Vanishing Gradient
+
+Before ReLU became standard, the sigmoid and hyperbolic tangent functions dominated. The logistic sigmoid is
+$$
+\sigma(x) = \frac{1}{1 + e^{-x}}, \qquad \sigma'(x) = \sigma(x)\bigl(1 - \sigma(x)\bigr).
+$$
+Its derivative attains a maximum of $0.25$ at $x = 0$ and decays toward zero as $|x|$ grows. The tanh function behaves similarly with a maximum derivative of $1$ at the origin but the same two sided saturation.
+
+Consider a deep feedforward network with $L$ layers. By the chain rule, the gradient of the loss with respect to an early layer weight contains a product of Jacobians, and the magnitude of that product scales roughly as
+$$
+\left\lVert \frac{\partial \mathcal{L}}{\partial \mathbf{w}^{(1)}} \right\rVert
+\;\propto\;
+\prod_{\ell=1}^{L} \bigl\lVert \mathbf{W}^{(\ell)} \bigr\rVert \cdot \bigl| f'(z^{(\ell)}) \bigr|.
+$$
+When each $|f'(z^{(\ell)})| \le 0.25$, the product shrinks geometrically with depth. A ten layer sigmoid network can attenuate gradients by a factor on the order of $0.25^{10} \approx 10^{-6}$ even before the weight norms are considered. This is the vanishing gradient problem, and it makes early layers learn agonizingly slowly. The root cause is saturation: once a unit operates in the flat tail of the sigmoid, its local derivative is nearly zero and almost no error signal propagates backward through it.
+
+## 2. The Rectified Linear Unit
+
+The rectified linear unit replaces smooth saturation with a piecewise linear hinge,
+$$
+\mathrm{ReLU}(x) = \max(0, x) =
+\begin{cases}
+x & x > 0, \\
+0 & x \le 0.
+\end{cases}
+$$
+Its derivative is the Heaviside step,
+$$
+\mathrm{ReLU}'(x) =
+\begin{cases}
+1 & x > 0, \\
+0 & x < 0,
+\end{cases}
+$$
+with the subgradient at $x = 0$ conventionally taken to be $0$ or any value in $[0, 1]$. In code the forward and backward passes are trivial.
+
+```python
+def relu(x):
+    return np.maximum(0.0, x)
+
+def relu_grad(x):
+    return (x > 0).astype(x.dtype)
+```
+
+### 2.1 Why ReLU Helps Gradients
+
+The decisive property is that for any active unit, where $x > 0$, the local derivative is exactly $1$. Substituting into the depthwise product above, an active path contributes a factor of $1$ rather than a factor bounded by $0.25$. Gradients therefore neither shrink nor swell purely because of the activation, and the error signal can traverse many layers without the geometric decay that plagues sigmoids. The network instead relies on careful weight initialization, such as the He scheme that sets the weight variance to $2 / n_{\text{in}}$, to keep the magnitude of forward activations and backward gradients stable across depth.
+
+Three further properties matter in practice. First, ReLU induces sparsity: roughly half of the units in a randomly initialized layer output exactly zero, which yields representations that are sparse and often more linearly separable. Second, the function and its gradient cost a single comparison, so it is computationally cheaper than evaluating an exponential. Third, ReLU is scale equivariant for positive scaling, since $\mathrm{ReLU}(\alpha x) = \alpha\,\mathrm{ReLU}(x)$ for $\alpha > 0$, which interacts cleanly with normalization layers.
+
+It is worth being precise about what ReLU does and does not solve. It mitigates the vanishing gradient that arises from activation saturation, but it does not by itself prevent exploding gradients from large weight norms, nor does it remove the need for normalization in very deep networks. The benefit is local: each active unit passes its gradient through undistorted.
+
+## 3. The Dying ReLU Problem
+
+The same hard threshold that prevents saturation on the positive side creates a failure mode on the negative side. When a unit's pre-activation $z$ is negative, both the output and the derivative are zero. If, over the course of training, a unit's weights move so that $z < 0$ for essentially every input in the data distribution, then the gradient flowing back through that unit is zero for every example. With no gradient, the weights feeding the unit never update, and the unit is permanently stuck at zero. This is the dying ReLU problem, and a unit in this state is called a dead unit.
+
+Formally, unit $i$ in layer $\ell$ is dead if
+$$
+\mathbf{w}_i^\top \mathbf{x} + b_i \le 0 \quad \text{for almost all } \mathbf{x} \sim \mathcal{D}.
+$$
+Because the gradient with respect to $\mathbf{w}_i$ and $b_i$ is proportional to $\mathrm{ReLU}'(z_i) = 0$ on this region, the parameters receive no learning signal and the condition is self perpetuating.
+
+Two mechanisms commonly trigger dying units. A large learning rate can push a weight update so far that the unit's pre-activation becomes negative across the whole dataset in a single step, often after a large gradient is back propagated. A large negative bias has the same effect more directly. Empirically, networks can lose a substantial fraction of their ReLU units to this state, which reduces effective capacity and wastes parameters. The risk grows with learning rate and with depth.
+
+The structural cause is that ReLU has exactly zero derivative on the entire negative half line. Every repair in the rest of this chapter works by giving the function a nonzero response, and therefore a nonzero gradient, for negative inputs so that a struggling unit retains a path back to life.
+
+## 4. Leaky ReLU
+
+The simplest fix introduces a small fixed slope $\alpha$ on the negative side,
+$$
+\mathrm{LReLU}(x) =
+\begin{cases}
+x & x > 0, \\
+\alpha x & x \le 0,
+\end{cases}
+\qquad
+\mathrm{LReLU}'(x) =
+\begin{cases}
+1 & x > 0, \\
+\alpha & x < 0,
+\end{cases}
+$$
+with $\alpha$ a small positive constant, typically $0.01$. Because the derivative on the negative side is $\alpha > 0$ rather than $0$, a unit with negative pre-activation still receives a gradient and can be nudged back toward the active region. Dead units therefore cannot become permanently inert under leaky ReLU.
+
+```python
+def leaky_relu(x, alpha=0.01):
+    return np.where(x > 0, x, alpha * x)
+```
+
+The cost of this insurance is small. With $\alpha = 0.01$ the negative branch is nearly flat, so the function behaves almost like ReLU on typical inputs while retaining a trickle of gradient where it matters. The price is the loss of exact sparsity, since negative pre-activations now produce small nonzero outputs, and the introduction of a hyperparameter that must be chosen. In practice $\alpha$ is rarely tuned with care, and the default value works adequately across many architectures. The empirical gains over ReLU are often modest, which is part of why plain ReLU remains a common default despite its known pathology.
+
+## 5. Parametric ReLU
+
+Parametric ReLU removes the guesswork by treating the negative slope as a learnable parameter rather than a fixed constant. The form is identical to leaky ReLU,
+$$
+\mathrm{PReLU}(x) =
+\begin{cases}
+x & x > 0, \\
+a\, x & x \le 0,
+\end{cases}
+$$
+but $a$ is learned by gradient descent jointly with the weights. The gradient of the loss with respect to the slope, accumulated over the units that share it, is
+$$
+\frac{\partial \mathcal{L}}{\partial a}
+= \sum_{x \le 0} \frac{\partial \mathcal{L}}{\partial \mathrm{PReLU}(x)} \cdot x,
+$$
+since $\partial\,\mathrm{PReLU}(x) / \partial a = x$ on the negative branch and $0$ on the positive branch. The slope can be shared across an entire channel, giving one parameter per feature map, or shared across the whole layer, giving a single scalar. The number of added parameters is negligible relative to the weight matrices, so PReLU introduces essentially no risk of overfitting on large datasets.
+
+```python
+# a is a learnable parameter, updated by the optimizer
+def prelu(x, a):
+    return np.where(x > 0, x, a * x)
+```
+
+The advantage of PReLU is adaptivity: each channel can discover the negative slope that best fits its role, and in the original work this raised accuracy on large scale image classification at near zero cost. Learned slopes are sometimes substantially larger than the leaky default, which suggests that a single hand picked constant is not optimal everywhere. The tradeoffs are that the extra parameters interact with weight decay, so practitioners usually exclude $a$ from regularization, and that on small datasets the added flexibility can slightly increase variance. PReLU is best viewed as leaky ReLU with the slope handed to the optimizer.
+
+## 6. Exponential Linear Unit
+
+The exponential linear unit takes a different stance. Rather than a linear negative branch, it uses a saturating exponential that pulls negative inputs toward a bounded floor,
+$$
+\mathrm{ELU}(x) =
+\begin{cases}
+x & x > 0, \\
+\alpha\bigl(e^{x} - 1\bigr) & x \le 0,
+\end{cases}
+\qquad
+\mathrm{ELU}'(x) =
+\begin{cases}
+1 & x > 0, \\
+\alpha e^{x} & x \le 0,
+\end{cases}
+$$
+where $\alpha > 0$ controls the saturation level for large negative inputs, with $\alpha = 1$ the common choice. As $x \to -\infty$ the output approaches $-\alpha$, so the negative branch is bounded below.
+
+```python
+def elu(x, alpha=1.0):
+    return np.where(x > 0, x, alpha * (np.exp(x) - 1.0))
+```
+
+ELU offers two properties that the linear leak families lack. First, with $\alpha = 1$ the function is continuously differentiable, including at the origin where the left and right derivatives both equal $1$, which yields smoother optimization than the kinked ReLU variants. Second, ELU produces negative outputs, so the mean activation of a layer can sit closer to zero. This near zero mean reduces the bias shift that accumulates when every unit emits only nonnegative values, and it pushes the unit closer to its natural gradient, which can accelerate learning. Because the negative branch saturates, ELU is also somewhat robust to noise in the negative regime, since large negative pre-activations all map to roughly $-\alpha$.
+
+The tradeoffs are real. Evaluating $e^{x}$ is more expensive than a comparison, so ELU layers are slower than ReLU layers, a difference that can matter at scale. The saturation that helps with robustness also means the negative gradient $\alpha e^{x}$ shrinks toward zero for very negative inputs, so ELU partially reintroduces the saturation that ReLU was designed to avoid, though only on one side and only in the deep negative tail. A self normalizing variant, the scaled ELU or SELU, fixes $\alpha$ and a scale constant to specific values so that activations converge to zero mean and unit variance under suitable conditions, which can replace explicit normalization in certain fully connected architectures.
+
+## 7. Comparative Tradeoffs
+
+The members of the ReLU family trade off along a few consistent axes. The table below summarizes the central distinctions.
+
+| Property | ReLU | Leaky ReLU | PReLU | ELU |
+| --- | --- | --- | --- | --- |
+| Negative slope | $0$ | fixed $\alpha$ | learned $a$ | saturating |
+| Gradient for $x < 0$ | $0$ | $\alpha$ | $a$ | $\alpha e^{x}$ |
+| Can units die | yes | no | no | no |
+| Output mean | positive | near positive | near positive | near zero |
+| Smooth at $0$ | no | no | no | yes ($\alpha = 1$) |
+| Extra parameters | none | none | few | none |
+| Cost | lowest | low | low | higher |
+
+Several principles follow. ReLU remains a strong default because of its speed, simplicity, and effectiveness when paired with He initialization and a normalization layer such as batch normalization, which itself counteracts the bias shift and reduces the practical incidence of dead units. Leaky ReLU and PReLU are inexpensive hedges against dying units and are sensible when training without normalization or when a nontrivial fraction of units is observed to die. ELU is attractive when its near zero mean and smoothness yield faster or more stable convergence and when the added compute is acceptable. No single member dominates across all tasks, and the differences in final accuracy are frequently small once the network is well initialized and normalized.
+
+A useful way to organize the choice is to ask what problem each variant solves. ReLU solves saturation driven vanishing gradients. The leaky and parametric variants solve the dying unit problem that ReLU introduces, with PReLU additionally removing the slope hyperparameter. ELU solves both the dying unit problem and the bias shift problem at once, at the cost of an exponential evaluation and mild one sided saturation. Selecting an activation is therefore less about finding a universally best function and more about matching the function to the architecture, the initialization, and the normalization already in use.
+
+## 8. Summary
+
+The rectified linear unit improves gradient flow because every active unit passes its backward signal through with a derivative of exactly one, which eliminates the geometric attenuation that saturating activations impose on deep networks. The same hard threshold creates the dying ReLU problem, where units pushed into the negative region lose all gradient and become permanently inactive. Leaky ReLU and parametric ReLU repair this by adding a small or learned negative slope, guaranteeing a nonzero gradient everywhere, while the exponential linear unit adds a smooth, saturating, mean centering negative branch that also reduces bias shift. Each repair carries a modest cost in sparsity, parameters, or compute, and the right choice depends on the surrounding initialization and normalization rather than on any single function being best in isolation.
+
+## References
+
+1. Nair, V., and Hinton, G. E. "Rectified Linear Units Improve Restricted Boltzmann Machines." ICML, 2010. https://www.cs.toronto.edu/~fritz/absps/reluICML.pdf
+2. Glorot, X., Bordes, A., and Bengio, Y. "Deep Sparse Rectifier Neural Networks." AISTATS, 2011. https://proceedings.mlr.press/v15/glorot11a.html
+3. Maas, A. L., Hannun, A. Y., and Ng, A. Y. "Rectifier Nonlinearities Improve Neural Network Acoustic Models." ICML Workshop on Deep Learning for Audio, Speech and Language Processing, 2013. https://ai.stanford.edu/~amaas/papers/relu_hybrid_icml2013_final.pdf
+4. He, K., Zhang, X., Ren, S., and Sun, J. "Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification." ICCV, 2015. https://arxiv.org/abs/1502.01852
+5. Clevert, D.-A., Unterthiner, T., and Hochreiter, S. "Fast and Accurate Deep Network Learning by Exponential Linear Units (ELUs)." ICLR, 2016. https://arxiv.org/abs/1511.07289
+6. Klambauer, G., Unterthiner, T., Mayr, A., and Hochreiter, S. "Self-Normalizing Neural Networks." NeurIPS, 2017. https://arxiv.org/abs/1706.02515
+7. Lu, L., Shin, Y., Su, Y., and Karniadakis, G. E. "Dying ReLU and Initialization: Theory and Numerical Examples." Communications in Computational Physics, 2020. https://arxiv.org/abs/1903.06733

@@ -1,0 +1,182 @@
+# AutoML and Automated Model Selection
+
+Machine learning practice involves a long chain of decisions. An engineer must select a preprocessing strategy, encode categorical variables, impute missing values, choose a learning algorithm, and then tune the hyperparameters of every component in that chain. Each decision interacts with the others, and the right choice depends on the dataset at hand. Automated machine learning, usually shortened to AutoML, is the research program that treats this whole chain of decisions as a single optimization problem and solves it with general purpose search. This chapter develops the formal core of AutoML, the algorithms that make it tractable, and an honest account of what it can and cannot deliver.
+
+## 1. The Combined Algorithm Selection and Hyperparameter Optimization Problem
+
+### 1.1 From hyperparameter tuning to CASH
+
+Classical hyperparameter optimization fixes a learning algorithm $A$ and searches its hyperparameter space $\Lambda$ for a configuration $\lambda$ that minimizes validation loss. AutoML generalizes this in two directions. First, the algorithm itself becomes a choice variable. Second, the object being configured is not a single estimator but an entire pipeline.
+
+The canonical formulation is the Combined Algorithm Selection and Hyperparameter optimization problem, abbreviated CASH and introduced with the Auto-WEKA system. Given a set of candidate algorithms $\mathcal{A} = \{A^{(1)}, \dots, A^{(k)}\}$, where each $A^{(j)}$ has its own hyperparameter space $\Lambda^{(j)}$, and given a dataset split into $K$ cross validation folds, CASH seeks
+
+$$
+A^\star, \lambda^\star \in \arg\min_{A^{(j)} \in \mathcal{A},\ \lambda \in \Lambda^{(j)}} \frac{1}{K} \sum_{i=1}^{K} \mathcal{L}\left(A^{(j)}_\lambda,\ D_{\text{train}}^{(i)},\ D_{\text{valid}}^{(i)}\right).
+$$
+
+Here $\mathcal{L}$ is a loss such as one minus accuracy or root mean squared error, and $A^{(j)}_\lambda$ is the model produced by training algorithm $A^{(j)}$ with hyperparameters $\lambda$.
+
+### 1.2 Why CASH is hard
+
+The trick that makes CASH a single optimization problem is to introduce a top level categorical variable that selects the algorithm. The combined search space becomes a hierarchical, conditional space: the hyperparameters of a random forest are only active when the algorithm choice is random forest, and the choice of a kernel in a support vector machine activates a further set of kernel specific parameters. This structure has three properties that defeat naive optimizers.
+
+It is high dimensional. A realistic space spans dozens of algorithms and hundreds of conditional hyperparameters.
+
+It is mixed. Variables can be continuous (a learning rate), integer valued (tree depth), categorical (a kernel type), or conditional (active only when a parent takes a given value).
+
+It is expensive and noisy. Each evaluation requires training and validating a model, which can take seconds to hours, and the cross validation estimate is itself a noisy sample of generalization error.
+
+Grid search and random search ignore this structure. Grid search scales exponentially with dimension and wastes effort on unimportant axes. Random search is a stronger baseline than its reputation suggests, because it concentrates samples along whichever dimensions matter, but it cannot exploit information gathered during the run. The methods that follow do exploit that information.
+
+## 2. Pipeline Search
+
+### 2.1 Pipelines as structured objects
+
+A machine learning pipeline is a directed sequence of operators. A common template is preprocessing, then feature transformation, then an estimator, for example
+
+```
+impute -> one_hot_encode -> standard_scale -> select_k_best -> gradient_boosting
+```
+
+Searching over pipelines means searching over which operators occupy each slot, in addition to the hyperparameters of each chosen operator. Two design philosophies dominate.
+
+Fixed template search constrains the pipeline to a known shape and searches the operator choices and hyperparameters within it. Auto-sklearn takes this route, which keeps the search space manageable and lets the optimizer reason about a single structured configuration vector.
+
+Open ended structure search allows the pipeline graph itself to grow and branch. TPOT represents pipelines as trees and evolves them with genetic programming, applying crossover and mutation to recombine subpipelines. This explores richer structures, including stacked and parallel branches, at the cost of a far larger and less constrained space.
+
+### 2.2 Meta learning for warm starts
+
+A powerful idea in pipeline search is to avoid starting from scratch on every new dataset. Meta learning records, for a library of prior datasets, which configurations performed well, and characterizes each dataset by meta features such as the number of samples, the number of features, class imbalance, and statistics of the feature distributions. When a new dataset arrives, the system computes its meta features, finds the nearest prior datasets, and seeds the search with the configurations that won there. Auto-sklearn uses exactly this scheme to produce strong configurations before the main optimizer has spent any budget, which matters most under tight time limits.
+
+## 3. Bayesian Optimization and Auto-sklearn
+
+### 3.1 Sequential model based optimization
+
+The workhorse of CASH solvers is Bayesian optimization, also called sequential model based optimization. It maintains a probabilistic surrogate model $\hat{p}(\mathcal{L} \mid \lambda)$ that predicts validation loss from a configuration, then uses an acquisition function to decide where to evaluate next. A standard choice is Expected Improvement,
+
+$$
+\mathrm{EI}(\lambda) = \mathbb{E}\left[\max\left(0,\ \mathcal{L}_{\text{best}} - \mathcal{L}(\lambda)\right)\right],
+$$
+
+which balances exploitation of regions the surrogate predicts to be good against exploration of regions where the surrogate is uncertain. The loop is: fit the surrogate to all evaluations so far, maximize the acquisition function to propose a configuration, evaluate it, and repeat.
+
+Gaussian processes are the textbook surrogate, but they assume smooth, continuous spaces and scale poorly with the number of evaluations. CASH spaces are neither smooth nor purely continuous. For this reason Auto-WEKA and Auto-sklearn use random forest surrogates through the SMAC algorithm. Random forests handle conditional and categorical variables natively, give a usable uncertainty estimate from the variance across trees, and remain cheap to update as evaluations accumulate.
+
+### 3.2 The Auto-sklearn system
+
+Auto-sklearn assembles these ingredients into a complete CASH solver built on top of scikit-learn. Its design has four pillars.
+
+It defines a structured search space covering many scikit-learn classifiers, regressors, preprocessors, and feature transformers, with their conditional hyperparameters.
+
+It warm starts the SMAC search using meta learning over a large repository of prior datasets, so good configurations are tried early.
+
+It builds an ensemble rather than returning a single winner. During the search, many models are trained and evaluated. Rather than discard all but the best, Auto-sklearn keeps them and constructs a weighted ensemble using greedy ensemble selection. This reuses computation that would otherwise be wasted and reliably outperforms the single best configuration, because the ensemble averages away the variance of individual model choices.
+
+A sketch of the user facing interface:
+
+```
+from autosklearn.classification import AutoSklearnClassifier
+clf = AutoSklearnClassifier(
+    time_left_for_this_task=3600,
+    per_run_time_limit=300,
+    ensemble_size=50,
+)
+clf.fit(X_train, y_train)
+predictions = clf.predict(X_test)
+```
+
+The budget is specified in wall clock time, which reflects the practical reality that the user has a fixed compute budget rather than a fixed number of evaluations. The successor Auto-sklearn 2.0 adds automated policy selection over budget allocation and model selection strategies, further reducing the need for human tuning of the tuner.
+
+## 4. Multi Fidelity Optimization: Successive Halving and Hyperband
+
+### 4.1 The motivation for cheap evaluations
+
+Bayesian optimization reduces the number of configurations evaluated, but each evaluation remains expensive because it trains a model to completion. Multi fidelity methods attack the cost of the evaluation itself. The key observation is that a cheap, low fidelity proxy often predicts the full fidelity outcome well enough to make decisions. Fidelity can be controlled by the number of training epochs, the size of a data subsample, the number of trees in an ensemble, or image resolution. A poor configuration usually reveals itself after a fraction of the full budget.
+
+### 4.2 Successive halving
+
+Successive halving turns this observation into an allocation strategy. Begin with $n$ configurations and a small per configuration budget $r$. Train all of them at budget $r$, evaluate, keep the top fraction $1/\eta$, and multiply the budget of the survivors by $\eta$. Repeat until one configuration remains or the budget is exhausted. With $\eta = 3$, each round discards two thirds of the candidates and triples the resources of the survivors, so total resource use stays roughly constant per round while quality concentrates.
+
+```
+configs = sample(n)
+budget = r
+while len(configs) > 1:
+    scores = [evaluate(c, budget) for c in configs]
+    keep = top_fraction(configs, scores, 1/eta)
+    configs = keep
+    budget = budget * eta
+```
+
+The weakness is the choice of $n$. For a fixed total budget $B$, a large $n$ gives each configuration little time before the first cut, which risks discarding a slow starter that would have won at full fidelity. A small $n$ gives generous early budgets but explores few configurations. This is the $n$ versus $B/n$ tradeoff, and there is no single right answer because it depends on how informative low fidelity scores are for the problem at hand.
+
+### 4.3 Hyperband
+
+Hyperband resolves the tradeoff by refusing to commit to one value of $n$. It runs successive halving as a subroutine across several brackets, each with a different starting $n$ and initial budget $r$, hedging across the full spectrum from aggressive early stopping to conservative full training. The most aggressive bracket starts many configurations with tiny budgets, the most conservative starts few configurations near full budget, and intermediate brackets interpolate. Because Hyperband only needs the ability to evaluate at reduced fidelity and a single parameter $\eta$, it is simple to deploy and provides strong anytime performance, meaning it returns a good answer whenever it is stopped.
+
+The complementary strengths of Bayesian optimization and Hyperband led to their combination. BOHB replaces Hyperband's random sampling of configurations with a model based proposal using a Tree Parzen Estimator, while keeping Hyperband's bracket structure. The result samples promising configurations rather than random ones, yet still cuts losers early, and it converges faster than either method alone.
+
+## 5. Neural Architecture Search
+
+### 5.1 The search problem
+
+Neural Architecture Search, abbreviated NAS, applies the AutoML philosophy to the design of neural network architectures. Instead of selecting an algorithm and its hyperparameters, NAS searches over the topology of a network: how many layers, which operations such as convolutions or attention blocks, what connectivity, and what widths. A NAS method is characterized by three components: the search space that defines admissible architectures, the search strategy that explores it, and the performance estimation strategy that scores a candidate.
+
+### 5.2 Search strategies and their cost
+
+Early NAS used reinforcement learning, with a controller network that proposes architectures and receives validation accuracy as reward, and evolutionary methods that mutate and recombine architectures. Both produced state of the art image classifiers but at staggering cost, often thousands of GPU days, because each candidate had to be trained to score it. Two ideas brought the cost down by orders of magnitude.
+
+Weight sharing trains a single large supernet that contains every candidate architecture as a subnetwork. Individual architectures are evaluated by inheriting the supernet weights rather than training from scratch, which removes the dominant cost. ENAS pioneered this approach.
+
+Differentiable relaxation, introduced by DARTS, replaces the discrete choice of operation on each edge with a continuous mixture weighted by a softmax over architecture parameters $\alpha$. The architecture and the weights are then optimized jointly with gradient descent on a bilevel objective,
+
+$$
+\min_{\alpha}\ \mathcal{L}_{\text{val}}\left(w^\star(\alpha),\ \alpha\right) \quad \text{subject to} \quad w^\star(\alpha) = \arg\min_w\ \mathcal{L}_{\text{train}}(w, \alpha).
+$$
+
+After optimization the continuous mixture is discretized by keeping the highest weighted operation on each edge. This reduces search from thousands of GPU days to single digit GPU days.
+
+### 5.3 Caveats specific to NAS
+
+NAS results have been hard to reproduce and to compare fairly, because reported gains often come from the training protocol rather than the architecture. Studies found that random architectures from a well designed search space, trained with the same protocol, frequently match searched ones, which implies that the search space design carries much of the credit. Differentiable methods also suffer instability, tending to collapse toward parameter free operations such as skip connections that lower training loss without improving the final discretized model. Benchmark suites such as NAS-Bench-101 and NAS-Bench-201, which tabulate the trained accuracy of every architecture in a fixed space, were created so that search strategies can be compared without confounding training tricks.
+
+## 6. The Promise and the Limits of AutoML
+
+### 6.1 What AutoML delivers
+
+AutoML reliably automates the tedious and error prone parts of the modeling workflow. It democratizes access by letting non specialists obtain competitive models on tabular data. It improves reproducibility by replacing undocumented manual tuning with a logged, repeatable search. On the well scoped problem of supervised learning over fixed tabular datasets, systems like Auto-sklearn and modern gradient boosting AutoML frameworks routinely match or exceed a competent practitioner working under the same time budget, and they free that practitioner to spend effort where it has higher leverage.
+
+### 6.2 Where AutoML falls short
+
+The limits are as important as the strengths, and most of them lie outside the optimization loop.
+
+The search optimizes a fixed objective on a fixed dataset, so it inherits every flaw in the problem framing. Leakage between training and validation, a mislabeled target, a metric that does not reflect business value, or a distribution shift between training and deployment are all invisible to the optimizer, which will happily produce a model that is excellent by the stated criterion and useless in practice.
+
+Feature engineering and problem formulation, which often determine success more than model choice, remain largely human work. Deciding what to predict, assembling the right data, and constructing informative features require domain knowledge that no current system supplies.
+
+Cost is real. A thorough CASH or NAS search can consume large amounts of compute and energy, which raises both budget and sustainability concerns and can make the search more expensive than the human effort it replaces.
+
+Interpretability often suffers. The ensembles that drive Auto-sklearn's accuracy are harder to explain than a single model a human would have chosen, which matters in regulated or high stakes settings.
+
+Finally there is a regress: AutoML systems have their own hyperparameters, such as the time budget, the cross validation scheme, and the ensemble size, and choosing them well still takes judgment. The goal of fully removing the human is not reached, and arguably should not be, because the human's comparative advantage is precisely the parts the optimizer cannot see.
+
+### 6.3 Practical guidance
+
+Use AutoML as a strong baseline generator and an accelerator, not as an oracle. Invest human effort in the problem framing, the data, the features, and the choice of evaluation metric, then let the system search the parts that are genuinely a numerical optimization. Validate the result on a held out split that reflects deployment conditions, inspect the chosen pipeline for leakage and for plausibility, and budget compute deliberately. Treated this way, AutoML is a force multiplier that shifts human attention up the stack toward the decisions that actually require it.
+
+## References
+
+1. Thornton, C., Hutter, F., Hoos, H. H., and Leyton-Brown, K. Auto-WEKA: Combined Selection and Hyperparameter Optimization of Classification Algorithms. KDD 2013. https://arxiv.org/abs/1208.3719
+2. Feurer, M., Klein, A., Eggensperger, K., Springenberg, J., Blum, M., and Hutter, F. Efficient and Robust Automated Machine Learning. NeurIPS 2015. https://papers.nips.cc/paper/5872-efficient-and-robust-automated-machine-learning
+3. Feurer, M., Eggensperger, K., Falkner, S., Lindauer, M., and Hutter, F. Auto-sklearn 2.0: Hands-free AutoML via Meta-Learning. JMLR 2022. https://arxiv.org/abs/2007.04074
+4. Hutter, F., Hoos, H. H., and Leyton-Brown, K. Sequential Model-Based Optimization for General Algorithm Configuration (SMAC). LION 2011. https://link.springer.com/chapter/10.1007/978-3-642-25566-3_40
+5. Jamieson, K. and Talwalkar, A. Non-stochastic Best Arm Identification and Hyperparameter Optimization. AISTATS 2016. https://arxiv.org/abs/1502.07943
+6. Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., and Talwalkar, A. Hyperband: A Novel Bandit-Based Approach to Hyperparameter Optimization. JMLR 2018. https://arxiv.org/abs/1603.06560
+7. Falkner, S., Klein, A., and Hutter, F. BOHB: Robust and Efficient Hyperparameter Optimization at Scale. ICML 2018. https://arxiv.org/abs/1807.01774
+8. Olson, R. S. and Moore, J. H. TPOT: A Tree-Based Pipeline Optimization Tool for Automating Machine Learning. AutoML Workshop, ICML 2016. https://proceedings.mlr.press/v64/olson_tpot_2016.html
+9. Zoph, B. and Le, Q. V. Neural Architecture Search with Reinforcement Learning. ICLR 2017. https://arxiv.org/abs/1611.01578
+10. Pham, H., Guan, M. Y., Zoph, B., Le, Q. V., and Dean, J. Efficient Neural Architecture Search via Parameter Sharing (ENAS). ICML 2018. https://arxiv.org/abs/1802.03268
+11. Liu, H., Simonyan, K., and Yang, Y. DARTS: Differentiable Architecture Search. ICLR 2019. https://arxiv.org/abs/1806.09055
+12. Elsken, T., Metzen, J. H., and Hutter, F. Neural Architecture Search: A Survey. JMLR 2019. https://arxiv.org/abs/1808.05377
+13. Ying, C., Klein, A., Christiansen, E., Real, E., Murphy, K., and Hutter, F. NAS-Bench-101: Towards Reproducible Neural Architecture Search. ICML 2019. https://arxiv.org/abs/1902.09635
+14. Bergstra, J. and Bengio, Y. Random Search for Hyper-Parameter Optimization. JMLR 2012. https://www.jmlr.org/papers/v13/bergstra12a.html
+15. Hutter, F., Kotthoff, L., and Vanschoren, J. (eds). Automated Machine Learning: Methods, Systems, Challenges. Springer, 2019. https://www.automl.org/book/
