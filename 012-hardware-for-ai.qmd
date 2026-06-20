@@ -1,0 +1,202 @@
+# Hardware for AI
+
+Modern machine learning is, at its core, a story about hardware. The algorithms that define deep learning (backpropagation, attention, convolution) were known long before they became practical. What changed was the arrival of processors capable of executing the dense linear algebra these algorithms demand at enormous scale. Understanding the hardware substrate is therefore not an optional luxury for the machine learning practitioner. It governs which models are feasible to train, how much they cost to serve, and which research directions are even worth pursuing. This chapter develops a conceptual but accurate picture of why graphics processing units (GPUs) came to dominate, how they are built, what alternatives exist, and the physical constraints (chiefly memory bandwidth) that shape the entire field.
+
+## 1. Why GPUs Dominate
+
+### 1.1 Throughput Versus Latency
+
+Central processing units (CPUs) and GPUs represent two distinct design philosophies. A CPU is a latency-optimized device. It dedicates a large fraction of its silicon to control logic, branch predictors, out-of-order execution engines, and deep cache hierarchies, all in service of finishing a single thread of instructions as quickly as possible. A GPU is a throughput-optimized device. It spends comparatively little silicon on control and caching and instead packs in thousands of arithmetic units. The goal is not to finish any one operation quickly but to keep an enormous number of operations in flight so that aggregate work per second is maximized.
+
+Deep learning workloads are dominated by matrix multiplication and related tensor contractions. A single forward pass through a transformer layer applies the same multiply-accumulate pattern across millions of elements, and crucially these operations are largely independent of one another. This property, data parallelism, maps almost perfectly onto a throughput machine. When you have ten thousand independent multiply-accumulates to perform, you do not care that each takes a few hundred cycles of latency. You care that you can issue thousands of them simultaneously.
+
+### 1.2 Single Instruction, Multiple Threads
+
+GPUs execute under a model NVIDIA calls SIMT (single instruction, multiple threads). Threads are grouped into bundles (a "warp" of 32 threads on NVIDIA hardware) that execute the same instruction in lockstep on different data. This amortizes the cost of instruction fetch and decode across many lanes of arithmetic. The model also hides memory latency through massive oversubscription: when one warp stalls waiting on memory, the scheduler swaps in another warp that is ready to compute. With enough warps resident, the arithmetic units stay busy even though any individual memory access is slow. This is fundamentally different from a CPU, which fights latency with caches and prefetchers rather than by hiding it behind a sea of concurrent work.
+
+The practical consequence is a large gap in peak arithmetic throughput. A high-end data-center GPU delivers on the order of a thousand teraFLOP/s (floating-point operations per second) in reduced precision, while a server CPU delivers a couple of orders of magnitude less for the same dense linear algebra. For workloads that fit the throughput model, the GPU wins decisively.
+
+## 2. Anatomy of a Modern GPU
+
+### 2.1 Streaming Multiprocessors
+
+The fundamental compute building block of an NVIDIA GPU is the streaming multiprocessor (SM). A modern data-center GPU contains roughly one hundred or more SMs. Each SM contains its own set of arithmetic units (often called CUDA cores for general floating-point and integer work), a register file, a shared memory and L1 cache region, warp schedulers, and specialized units. The SMs operate independently and in parallel, and the chip's total throughput is essentially the per-SM throughput multiplied by the SM count. AMD's equivalent building block is the compute unit (CU), and the architectural ideas carry over closely.
+
+### 2.2 Tensor Cores
+
+The single most important innovation for deep learning was the tensor core, introduced with NVIDIA's Volta architecture in 2017 and refined in every generation since. A tensor core is a hardware unit that performs a small matrix multiply-accumulate operation, for example computing D = A times B plus C over small tiles (such as 4 by 4 or 16 by 16 blocks), in a single fused instruction. Rather than issuing many scalar multiply and add instructions, the SM issues one tensor-core instruction that consumes an entire tile per clock.
+
+This matters because matrix multiplication has a fixed, regular structure. By baking that structure into silicon, the tensor core achieves far higher arithmetic density than general-purpose lanes. The result is that the reduced-precision matrix throughput of a GPU is often five to ten times its general FP32 throughput. Tensor cores are the reason that BF16 and FP8 training, discussed below, deliver such dramatic speedups: those formats exist largely to feed the tensor cores efficiently.
+
+### 2.3 The Memory Hierarchy
+
+A GPU has a layered memory system, and reasoning about where data lives is essential to reasoning about performance. From fastest and smallest to slowest and largest:
+
+```
+        +-------------------------------------------------+
+        |                  Registers                      |   ~ tens of KB / SM
+        |          (per-thread, ~1 cycle access)          |   fastest
+        +-------------------------------------------------+
+                          |
+        +-------------------------------------------------+
+        |        Shared memory / L1 cache (per SM)        |   ~ hundreds of KB / SM
+        |        (programmer-managed scratchpad)          |
+        +-------------------------------------------------+
+                          |
+        +-------------------------------------------------+
+        |                L2 cache (shared)                |   ~ tens of MB
+        +-------------------------------------------------+
+                          |
+        +-------------------------------------------------+
+        |          HBM (high bandwidth memory)            |   ~ tens to ~200 GB
+        |        (global device memory, off-die)          |   slowest, largest
+        +-------------------------------------------------+
+                          |
+        +-------------------------------------------------+
+        |     Host DRAM (over PCIe / NVLink-C2C)          |   hundreds of GB+
+        +-------------------------------------------------+
+```
+
+Registers are private to a thread and offer single-cycle access, but there are only so many per SM, and register pressure limits how many warps can be resident. Shared memory is a fast on-chip scratchpad that the programmer manages explicitly. It is the staging area where tiles of a matrix are loaded so that tensor cores can reuse them many times without re-reading from far away. The L2 cache is shared across all SMs. Finally, HBM is the large off-die device memory, and host DRAM sits across the system bus.
+
+### 2.4 High Bandwidth Memory
+
+HBM is the technology that supplies a GPU's main working memory. Instead of placing memory chips on a circuit board and connecting them over a narrow bus, HBM stacks DRAM dies vertically and connects them to the GPU through a silicon interposer using an extremely wide interface (thousands of bits). This yields bandwidth measured in terabytes per second, far beyond conventional DDR memory. Recent generations such as HBM3 and HBM3E push aggregate bandwidth into the multiple-terabyte-per-second range on a single accelerator. HBM is expensive, power-hungry, and capacity-limited, which is precisely why memory bandwidth and capacity, rather than raw arithmetic, are usually the binding constraints in practice.
+
+## 3. TPUs and Other Accelerators
+
+GPUs are general-purpose parallel processors that happen to excel at deep learning. A different strategy is to build a chip specifically for neural network math. Google's Tensor Processing Unit (TPU) is the canonical example. The defining feature of the TPU is a large systolic array: a two-dimensional grid of multiply-accumulate cells through which data flows rhythmically. Operands enter at the edges, and partial sums propagate through the array, so that a single load of weights is reused across many cycles of computation. This dataflow design minimizes the number of times each value must be fetched from memory, attacking the same bottleneck that shared memory and tiling address on a GPU, but in hardware. TPUs are deployed in large "pods" with a custom high-speed interconnect, and they are tightly integrated with Google's software stack (originally TensorFlow, now also JAX).
+
+Beyond GPUs and TPUs, a varied ecosystem of accelerators has emerged. AWS offers Trainium and Inferentia for training and inference respectively. Several startups pursue wafer-scale or dataflow architectures: Cerebras builds a single enormous chip the size of a wafer to keep an entire model on-die, Graphcore built an "intelligence processing unit" emphasizing on-chip memory and fine-grained parallelism, and Groq targets deterministic low-latency inference. Field-programmable gate arrays (FPGAs) occupy a niche for reconfigurable, low-latency inference. The common thread across all of these is an attempt to reduce data movement and to specialize silicon for the multiply-accumulate-heavy structure of neural networks. The reason GPUs nevertheless retain dominance is largely the maturity of their software ecosystem (CUDA and the libraries built atop it) and their flexibility across rapidly changing model architectures.
+
+## 4. The Memory Wall and Arithmetic Intensity
+
+### 4.1 Compute Has Outpaced Memory
+
+For several decades, the rate at which processors can compute has grown faster than the rate at which memory can supply data. This widening gap is known as the memory wall. On modern accelerators the imbalance is stark: a chip may be able to perform hundreds of floating-point operations in the time it takes to fetch a single number from HBM. As a result, many workloads are not limited by how fast the arithmetic units can run. They are limited by how fast data can be delivered to those units. Such workloads are called memory-bound, in contrast to compute-bound workloads that genuinely saturate the arithmetic units.
+
+### 4.2 Defining Arithmetic Intensity
+
+The concept that makes this precise is arithmetic intensity, defined as the ratio of arithmetic operations performed to bytes of memory traffic required:
+
+```
+                    floating-point operations (FLOPs)
+  arithmetic        ---------------------------------
+  intensity   =        bytes moved to / from memory
+```
+
+An operation with high arithmetic intensity does a lot of math per byte read, so it can keep the arithmetic units busy. An operation with low arithmetic intensity reads many bytes per unit of math, so the memory system becomes the bottleneck.
+
+Consider two contrasting cases. A large dense matrix multiplication of two N by N matrices performs on the order of N cubed operations while moving on the order of N squared bytes, giving an arithmetic intensity that grows with N. This is why large matrix multiplies are compute-bound and run near peak throughput. By contrast, an elementwise operation such as adding a bias or applying an activation function reads each element, does one or two operations, and writes it back. Its arithmetic intensity is roughly constant and very low, so it is firmly memory-bound. Attention over long sequences, and the autoregressive decoding step of a language model that processes one token at a time, also tend to be memory-bound, because they move large key-value tensors while performing relatively little arithmetic per byte. This is the central reason that techniques like FlashAttention (which restructures attention to avoid writing the large intermediate matrix to HBM) and operator fusion (which combines several memory-bound elementwise steps so data is read once) yield such large real-world speedups.
+
+## 5. Numerical Formats
+
+The choice of numerical format trades precision and dynamic range against speed, memory footprint, and energy. Because tensor cores run much faster on narrower formats, and because narrower values consume less precious memory bandwidth and capacity, the industry has moved steadily toward lower precision.
+
+### 5.1 The Anatomy of a Floating-Point Number
+
+A floating-point number is stored as a sign bit, a set of exponent bits, and a set of mantissa (or significand) bits. The exponent bits determine dynamic range (how large or small a value can be represented), and the mantissa bits determine precision (how finely values near a given magnitude are resolved). The art of low-precision formats lies in how the available bits are split between exponent and mantissa.
+
+### 5.2 The Major Formats
+
+```
+  Format   Bits   Sign  Exponent  Mantissa   Notes
+  ------   ----   ----  --------  --------    ---------------------------
+  FP32      32     1       8         23       baseline, high precision
+  TF32      19*    1       8         10       FP32 range, reduced mantissa
+  FP16      16     1       5         10       narrow range, needs care
+  BF16      16     1       8          7       FP32-like range, low precision
+  FP8 E4M3   8     1       4          3       inference and some training
+  FP8 E5M2   8     1       5          2       wider range, less precision
+  FP4 E2M1   4     1       2          1       experimental, very low prec.
+```
+
+\* TF32 occupies a 32-bit register internally but computes with a 19-bit effective format.
+
+FP32 (single precision) is the long-standing baseline and remains useful for numerically sensitive accumulations. FP16 (half precision) halves memory traffic and runs fast on tensor cores, but its narrow 5-bit exponent means values can easily overflow or underflow during training, which historically required loss scaling to keep gradients in range.
+
+BF16 (brain floating point) was the key insight that simplified mixed-precision training. It keeps the full 8-bit exponent of FP32, preserving dynamic range, and sacrifices mantissa bits instead. Because deep learning tolerates low precision far better than it tolerates overflow, BF16 trains stably with minimal special handling and has become the default for large-model training. TF32 is a related compromise used implicitly inside NVIDIA tensor cores: it keeps FP32 range with a reduced mantissa so that legacy FP32 code runs faster with little code change.
+
+FP8 pushes further, and modern training pipelines for frontier models increasingly use it for the bulk of matrix multiplications while keeping a few sensitive operations in higher precision. Two FP8 variants exist: E4M3 favors precision and is common for forward activations and weights, while E5M2 favors range and is often used for gradients. FP4 is the frontier of this trend, providing extreme compression for inference and emerging training recipes at the cost of needing sophisticated scaling and outlier handling to remain usable. The general lesson is that each halving of bit width roughly doubles tensor-core throughput and halves memory pressure, which is why the relentless march toward fewer bits continues.
+
+## 6. Interconnect and Multi-GPU Scaling
+
+### 6.1 Why a Single Device Is Not Enough
+
+Frontier models have hundreds of billions or trillions of parameters. The parameters alone, plus optimizer state and activations, vastly exceed the few tens to ~200 gigabytes of HBM on a single accelerator. Training and serving such models therefore requires spreading the work across many devices, and the speed at which those devices communicate becomes a first-class performance concern. When a model is partitioned across chips, every step may require exchanging gradients or activation tensors, and if the interconnect is slow the expensive accelerators sit idle waiting for data.
+
+### 6.2 Intra-Node and Inter-Node Links
+
+There is a hierarchy of interconnect, mirroring the memory hierarchy. Within a single server, NVIDIA's NVLink provides direct high-bandwidth GPU-to-GPU links (hundreds of gigabytes per second per device in recent generations), and an NVSwitch fabric lets all GPUs in a node talk to each other at full bandwidth. This is far faster than the standard PCIe bus that connects a GPU to the host. Across servers, clusters use a high-speed network, most commonly InfiniBand (or high-performance Ethernet variants), delivering hundreds of gigabits per second per link with low latency and support for remote direct memory access (RDMA), which lets one machine read another's memory without involving the CPU.
+
+### 6.3 Parallelism Strategies and Collectives
+
+Distributing a model uses several complementary strategies. Data parallelism replicates the model on each device and splits the batch, then averages gradients with an all-reduce collective operation. Tensor parallelism splits individual matrix multiplications across devices, requiring frequent communication and so best confined to the fast intra-node NVLink domain. Pipeline parallelism assigns different layers to different devices and streams micro-batches through them. Expert parallelism distributes the experts of a mixture-of-experts model. Real systems combine these into 3D or 4D parallelism schemes, carefully matching the communication pattern of each strategy to the bandwidth tier that can sustain it: chatty tensor parallelism stays on NVLink, while less frequent data-parallel all-reduces can tolerate the slower inter-node network. The efficiency of the whole training run hinges on overlapping this communication with computation so that the network traffic hides behind useful work.
+
+## 7. The Roofline Model
+
+### 7.1 Construction
+
+The roofline model is a simple visual tool that ties together arithmetic intensity, memory bandwidth, and peak compute to predict the achievable performance of a kernel. Performance (in FLOP/s) is plotted against arithmetic intensity (in FLOP/byte) on logarithmic axes. Two ceilings bound the attainable performance:
+
+```
+  performance
+  (FLOP/s, log)
+      ^
+ peak |..................________________________
+ FLOP |              ./        compute-bound
+      |           ./          (flat roof = peak FLOP/s)
+      |        ./
+      |     ./   slope = memory bandwidth
+      |  ./    (memory-bound region)
+      |./
+      +------------------+-----------------------> arithmetic
+                     ridge point                    intensity
+                                                   (FLOP/byte, log)
+```
+
+The sloped portion on the left is the memory-bound region: here performance is capped by memory bandwidth multiplied by arithmetic intensity, so the more math you do per byte, the faster you go. The flat portion on the right is the compute-bound region, where performance is capped by the peak arithmetic throughput regardless of intensity. The two lines meet at the ridge point, whose intensity equals peak FLOP/s divided by peak bandwidth.
+
+### 7.2 Using the Model
+
+To use the roofline, you compute a kernel's arithmetic intensity and locate it on the horizontal axis. If it falls left of the ridge point, the kernel is memory-bound, and no amount of faster arithmetic will help. The remedies are to move less data: fuse operations, cache and reuse tiles in shared memory, or use lower-precision formats that shrink every transfer. If it falls right of the ridge point, the kernel is compute-bound, and the remedies are to use faster arithmetic units such as tensor cores or lower-precision math. The roofline also exposes a sobering fact: because modern accelerators have ridge points at fairly high arithmetic intensity (often tens of FLOP/byte), many common operations land in the memory-bound region and run at a small fraction of the advertised peak. The headline FLOP/s number on a spec sheet is achievable only for high-intensity kernels like large matrix multiplies.
+
+## 8. Practical Implications for Training and Inference Cost
+
+### 8.1 Training Economics
+
+Training cost is driven by the total arithmetic required, the achievable hardware utilization, and the price and power of the accelerators. A useful planning heuristic, attributable to scaling-law analyses, is that training a dense transformer takes roughly six FLOPs per parameter per training token. Multiplying parameters by tokens by six gives the total compute, and dividing by the realistically achievable throughput of the cluster (not the peak, but the fraction actually attained, often called model FLOPs utilization) gives wall-clock device time. Because utilization is frequently in the range of a third to one half of peak, the gap between theoretical and real cost is large, and much engineering effort goes into closing it through better kernels, fusion, communication overlap, and precision reduction. Memory capacity also constrains training: the optimizer states for methods like Adam multiply the per-parameter memory footprint several-fold, which is why techniques such as sharded optimizers, activation checkpointing, and offloading exist.
+
+### 8.2 Inference Economics
+
+Inference has a different cost structure, and for autoregressive language models it splits into two phases. The prefill phase processes the entire prompt at once. It is highly parallel and compute-bound, since many tokens are handled together with high arithmetic intensity. The decode phase generates output tokens one at a time. Each step must read the entire set of model weights and the growing key-value cache from HBM to produce a single token, giving very low arithmetic intensity, so decode is memory-bound. This asymmetry explains much of inference engineering. Batching many requests together raises the arithmetic intensity of decode by reusing each weight read across multiple sequences, which is why throughput-oriented serving systems wait to assemble large batches. The key-value cache, which grows with sequence length and batch size, consumes scarce HBM and bandwidth, motivating techniques like paged attention for efficient cache management, multi-query and grouped-query attention to shrink the cache, and quantization to compress both weights and cache. The economic upshot is that serving cost per token is governed largely by memory bandwidth and capacity rather than by peak arithmetic, and that hardware with more and faster HBM directly lowers the cost of running large models.
+
+### 8.3 The Unifying Lesson
+
+Across training and inference, the recurring theme is that data movement, not arithmetic, is usually the limiting resource and the dominant cost. The processor designs (tensor cores, systolic arrays), the memory technology (HBM), the numerical formats (BF16, FP8, FP4), the interconnects (NVLink, InfiniBand), and the analytical tools (arithmetic intensity, the roofline) all converge on the same objective: do more useful computation for every byte moved. A practitioner who internalizes this single principle will correctly anticipate why a given model is slow, which optimization will help, and how much a workload will ultimately cost to run.
+
+## References
+
+1. Jouppi, N. P., et al. "In-Datacenter Performance Analysis of a Tensor Processing Unit." Proceedings of the 44th International Symposium on Computer Architecture (ISCA), 2017. https://arxiv.org/abs/1704.04760
+
+2. Williams, S., Waterman, A., and Patterson, D. "Roofline: An Insightful Visual Performance Model for Multicore Architectures." Communications of the ACM, 52(4), 2009. https://dl.acm.org/doi/10.1145/1498765.1498785
+
+3. NVIDIA. "NVIDIA H100 Tensor Core GPU Architecture Whitepaper." 2022. https://resources.nvidia.com/en-us-tensor-core
+
+4. Micikevicius, P., et al. "Mixed Precision Training." International Conference on Learning Representations (ICLR), 2018. https://arxiv.org/abs/1710.03740
+
+5. Micikevicius, P., et al. "FP8 Formats for Deep Learning." 2022. https://arxiv.org/abs/2209.05433
+
+6. Dao, T., et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." Advances in Neural Information Processing Systems (NeurIPS), 2022. https://arxiv.org/abs/2205.14135
+
+7. Kaplan, J., et al. "Scaling Laws for Neural Language Models." 2020. https://arxiv.org/abs/2001.08361
+
+8. Hoffmann, J., et al. "Training Compute-Optimal Large Language Models." 2022. https://arxiv.org/abs/2203.15556
+
+9. Shoeybi, M., et al. "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism." 2019. https://arxiv.org/abs/1909.08053
+
+10. Kwon, W., et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." Symposium on Operating Systems Principles (SOSP), 2023. https://arxiv.org/abs/2309.06180
+
+11. JEDEC Solid State Technology Association. "High Bandwidth Memory (HBM3) DRAM Standard, JESD238." 2022. https://www.jedec.org/standards-documents/docs/jesd238a
+
+12. NVIDIA. "NVLink and NVSwitch: The Building Blocks of Advanced Multi-GPU Communication." https://www.nvidia.com/en-us/data-center/nvlink/

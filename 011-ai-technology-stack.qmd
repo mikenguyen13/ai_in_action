@@ -1,0 +1,175 @@
+# The AI Technology Stack
+
+Modern artificial intelligence is not a single technology but a deep, layered stack of cooperating systems. A trained model that classifies images or generates text is the visible tip of a pyramid whose base reaches down through orchestration frameworks, serving runtimes, deep learning libraries, numerical kernels, device drivers, and finally the silicon that performs the arithmetic. Understanding AI in practice means understanding how these layers fit together, where the abstractions leak, and which tradeoffs dominate at each boundary. This chapter surveys the stack from the bottom up, treating each layer as an engineering subsystem with its own constraints, vendors, and design decisions.
+
+## 1. Why Think in Layers
+
+The layered view borrows its logic from operating systems and networking. Each layer exposes an interface to the one above it and hides implementation detail below it. A researcher writing a training loop in PyTorch rarely thinks about warp scheduling on a streaming multiprocessor, just as a web developer rarely thinks about TCP retransmission. The abstraction is what makes productivity possible at scale.
+
+The catch is that AI abstractions are unusually leaky. Performance, which is the dominant currency of the field, depends on details that cross many layers at once. A model that runs in milliseconds or in seconds, that fits in memory or overflows it, that costs cents or dollars per query, is determined jointly by the choice of accelerator, the memory layout of the tensors, the kernel implementation, the framework's execution mode, and the serving strategy. Practitioners therefore need at least a working mental model of the whole stack even when they operate primarily at one level.
+
+A second reason to think in layers is portability versus performance. The higher you write your code, the more portable it is and the less control you have. The lower you write it, the faster it can run and the more it locks you to a vendor. Every serious AI decision sits somewhere on this spectrum, and naming the layers makes the spectrum legible.
+
+The figure below shows the canonical stack as a vertical diagram. Read it from the bottom, where electrons move, to the top, where users interact.
+
+```
++---------------------------------------------------------------+
+|  8. APPLICATION LAYER                                         |
+|     chatbots, copilots, RAG apps, agents, recommenders       |
++---------------------------------------------------------------+
+|  7. ORCHESTRATION & MLOPS                                     |
+|     Kubernetes, Ray, Airflow, MLflow, Kubeflow, W&B          |
++---------------------------------------------------------------+
+|  6. MODEL HUBS & SERVING                                      |
+|     Hugging Face Hub, vLLM, TGI, Triton, TorchServe, KServe  |
++---------------------------------------------------------------+
+|  5. DATA & PIPELINE TOOLING                                   |
+|     Parquet, Arrow, Spark, Ray Data, DALI, tf.data, Dask     |
++---------------------------------------------------------------+
+|  4. DEEP LEARNING FRAMEWORKS                                  |
+|     PyTorch, JAX, TensorFlow, Keras                          |
++---------------------------------------------------------------+
+|  3. NUMERICAL & TENSOR LIBRARIES                             |
+|     cuBLAS, cuDNN, NCCL, MKL, oneDNN, BLAS/LAPACK, NumPy     |
++---------------------------------------------------------------+
+|  2. SYSTEMS & DRIVERS                                         |
+|     CUDA, ROCm, oneAPI, drivers, compilers (NVCC, XLA, LLVM) |
++---------------------------------------------------------------+
+|  1. HARDWARE (ACCELERATORS)                                  |
+|     GPUs, TPUs, CPUs, NPUs, interconnect (NVLink, InfiniBand)|
++---------------------------------------------------------------+
+```
+
+The arrows of dependency point upward: each layer assumes the correctness and availability of everything beneath it. The arrows of demand point downward: each layer makes requests that ultimately resolve into floating-point operations on silicon.
+
+## 2. Layer 1: Hardware and Accelerators
+
+At the foundation sits the physical machinery that executes arithmetic. The central fact of modern AI is that deep learning is dominated by dense linear algebra, principally matrix multiplication, and that this workload maps poorly onto the general-purpose CPU and beautifully onto massively parallel accelerators.
+
+### 2.1 GPUs, TPUs, and NPUs
+
+The graphics processing unit (GPU) became the workhorse of deep learning because it offers thousands of arithmetic units operating in parallel, very high memory bandwidth, and specialized matrix engines. NVIDIA's data center GPUs, the A100, H100, and the Blackwell generation, include tensor cores that perform fused multiply-accumulate operations on small matrix tiles at very low precision, which is exactly the operation that dominates transformer training and inference (1). High-bandwidth memory (HBM) sits beside the compute die and feeds it at terabytes per second, because the binding constraint for many AI kernels is memory bandwidth rather than raw arithmetic throughput.
+
+The tensor processing unit (TPU), designed by Google, is an application-specific integrated circuit built around a large systolic array for matrix multiplication (2). Where a GPU is a flexible parallel processor, a TPU is a more specialized device that trades generality for efficiency on the narrow workload of neural network math. Neural processing units (NPUs) bring similar ideas to edge and mobile devices, prioritizing energy efficiency for on-device inference.
+
+### 2.2 Interconnect and Scale
+
+A single accelerator is rarely enough for frontier models. Training a large language model requires hundreds or thousands of devices cooperating, which makes the interconnect a first-class part of the hardware layer. NVLink connects GPUs within a server at high bandwidth, while InfiniBand or specialized Ethernet fabrics connect servers within a cluster. The efficiency of distributed training depends heavily on how fast gradients can be exchanged across this fabric, so interconnect topology is as important as per-chip throughput.
+
+### 2.3 Tradeoffs at the Hardware Layer
+
+The dominant tradeoff is generality versus efficiency. CPUs are the most general and the least efficient per watt for dense linear algebra. GPUs occupy a productive middle ground, flexible enough to run arbitrary research code yet fast enough for production. TPUs and other ASICs push toward maximum efficiency at the cost of flexibility and ecosystem breadth. A second tradeoff is capital versus operating cost: owning accelerators is expensive up front but can be cheaper at scale than renting from a cloud provider, while renting offers elasticity at a premium. Memory capacity is the constraint practitioners feel most acutely, because a model that does not fit on a device forces either smaller batches, model parallelism, or quantization.
+
+## 3. Layer 2: Systems and Drivers
+
+Silicon is useless without software to drive it. The systems layer comprises the device drivers, low-level runtimes, and compilers that let higher software issue work to accelerators.
+
+### 3.1 CUDA and the NVIDIA Moat
+
+CUDA is NVIDIA's parallel computing platform and programming model, and it is arguably the single most important reason the company dominates AI (3). CUDA exposes the GPU as a programmable device through a C-like language, a runtime, and a vast ecosystem of optimized libraries. Crucially, nearly every deep learning framework targets CUDA first and best. This creates a powerful network effect: researchers write for CUDA because the tooling is mature, and the tooling is mature because researchers write for CUDA. The result is a software moat that is harder to cross than any hardware advantage.
+
+### 3.2 ROCm, oneAPI, and the Challengers
+
+AMD's answer is ROCm, an open-source platform that aims for CUDA parity and offers HIP, a portability layer that lets CUDA code be translated to run on AMD hardware (4). Intel's oneAPI pursues a similar goal of a unified, cross-vendor programming model. These efforts have narrowed the gap, particularly for inference and for the most common operations, but they still lag CUDA in breadth of optimized kernels and in the long tail of community support. The strategic stakes are high, because a credible open alternative would loosen NVIDIA's grip on pricing and supply.
+
+### 3.3 Compilers as a Battleground
+
+Increasingly, the systems layer includes domain-specific compilers that transform high-level tensor programs into optimized device code. XLA compiles computations from JAX and TensorFlow, fusing operations and tuning memory layout for the target accelerator. Triton, a Python-embedded language from OpenAI, lets developers write custom GPU kernels at a higher level than raw CUDA while approaching hand-tuned performance. These compilers matter because the gap between a naive kernel and a fused, well-tiled one can be an order of magnitude in speed.
+
+## 4. Layer 3: Numerical and Tensor Libraries
+
+Above the driver sit the numerical libraries that implement the actual mathematical primitives. Frameworks do not reimplement matrix multiplication; they call into these libraries.
+
+On NVIDIA hardware, cuBLAS provides dense linear algebra, cuDNN provides tuned implementations of convolution, attention, and other neural network primitives, and NCCL provides the collective communication operations (all-reduce, all-gather) that distributed training depends on (5). On CPUs, the long lineage of BLAS and LAPACK, accelerated by vendor libraries such as Intel MKL and oneDNN, plays the analogous role. NumPy, although usually thought of as a Python convenience, is itself a thin and elegant wrapper over these CPU kernels and established the n-dimensional array as the lingua franca of scientific computing in Python (6).
+
+The tradeoff at this layer is invisible to most users by design, but it is enormous in effect. These libraries are written and maintained by performance specialists who exploit cache hierarchies, vector instructions, and accelerator microarchitecture in ways that ordinary application code never could. The cost is that they are closed or semi-closed, vendor-specific, and slow to support new hardware. A new accelerator is only as useful as its cuDNN-equivalent, which is why building these kernels is one of the hardest parts of bringing new silicon to market.
+
+## 5. Layer 4: Deep Learning Frameworks
+
+The framework layer is where most practitioners spend their time. A framework provides three things: an n-dimensional tensor type with operations that dispatch to the numerical libraries below, automatic differentiation so that gradients need not be derived by hand, and a set of building blocks for constructing and training models.
+
+### 5.1 PyTorch
+
+PyTorch has become the dominant research framework and is increasingly dominant in production as well (7). Its defining design choice was eager, define-by-run execution: the computational graph is built dynamically as Python executes, which makes models feel like ordinary imperative programs and makes debugging natural. This came at a historical cost in performance and deployment, which the project has addressed with `torch.compile`, a graph-capture and compilation system that recovers much of the speed of static graphs without sacrificing the eager programming model.
+
+### 5.2 JAX
+
+JAX takes a different philosophy rooted in functional programming (8). It offers composable function transformations: `grad` for automatic differentiation, `jit` for just-in-time compilation through XLA, `vmap` for automatic vectorization, and `pmap` or its successors for parallelism across devices. JAX favors pure functions and explicit state, which suits large-scale, highly parallel research, and it has become the framework of choice for much frontier model work, particularly inside Google and in the academic community studying scaling.
+
+### 5.3 TensorFlow and Keras
+
+TensorFlow, the framework that catalyzed the deep learning industry, pioneered the static-graph approach in which the full computation is defined before execution, enabling aggressive optimization and straightforward deployment to servers, mobile, and the browser (9). Keras, now a multi-backend high-level API, provides an accessible, layer-oriented interface and runs atop TensorFlow, JAX, or PyTorch. While TensorFlow's share of new research has declined, its production tooling and deployment story remain strong.
+
+### 5.4 Framework Tradeoffs
+
+The core tension is eager flexibility versus compiled performance, and the field has largely converged on a synthesis: write in an eager, Pythonic style, then compile hot paths for speed. The remaining differentiators are ecosystem (PyTorch's library breadth is unmatched), parallelism model (JAX's transformations are uniquely composable), and deployment maturity. Lock-in is real but softening, since interchange formats and multi-backend tools let models move between frameworks more easily than before.
+
+## 6. Layer 5: Data and Pipeline Tooling
+
+Models are only as good as the data fed to them, and at scale, getting bytes from storage to the accelerator without starving it becomes a serious engineering problem. The data layer handles storage formats, transformation, and high-throughput loading.
+
+Columnar formats such as Apache Parquet and the in-memory Apache Arrow standard allow efficient storage and zero-copy sharing of large tabular datasets (10). Distributed processing engines such as Apache Spark, Dask, and Ray Data transform and clean data across clusters before it ever reaches training. At the boundary with the accelerator, loaders such as PyTorch's `DataLoader`, `tf.data`, and NVIDIA DALI overlap data preparation with computation so that the expensive GPU is never idle waiting for the next batch.
+
+The governing principle here is that the pipeline must keep the accelerator saturated. An accelerator costing many dollars per hour that sits idle waiting for data is pure waste, so the data layer is engineered around throughput, prefetching, and parallel decoding. The tradeoff is complexity: sophisticated pipelines with sharding, caching, and augmentation are powerful but brittle, and a surprising fraction of real-world training failures trace to the data path rather than the model.
+
+## 7. Layer 6: Model Hubs and Serving
+
+Once a model exists, it must be distributed and then executed on behalf of users. These are distinct concerns, and the stack provides distinct tooling for each.
+
+### 7.1 Model Hubs
+
+The Hugging Face Hub has become the de facto registry for sharing pretrained models, datasets, and demos, hosting hundreds of thousands of models with versioning, model cards, and a standardized loading interface (11). The companion `transformers` library turned the use of a state-of-the-art model into a few lines of code, which dramatically lowered the barrier to applied AI. The hub model mirrors the package registries of software engineering, bringing the same benefits of reuse and the same risks around provenance, licensing, and supply-chain trust.
+
+### 7.2 Serving Runtimes
+
+Serving a large model efficiently is a specialized problem, particularly for autoregressive language models whose generation is memory-bound and sequential. Purpose-built inference servers address this. vLLM introduced PagedAttention, which manages the key-value cache like virtual memory and sharply raises throughput by allowing many requests to share GPU memory efficiently (12). Hugging Face Text Generation Inference, NVIDIA Triton Inference Server, TorchServe, and KServe provide production features such as dynamic batching, multi-model hosting, and standardized inference protocols. The dominant tradeoffs are latency versus throughput (batching more requests raises throughput but can raise per-request latency) and cost versus quality (quantization and smaller models cut cost at some risk to accuracy).
+
+## 8. Layer 7: Orchestration and MLOps
+
+Production AI is a continuous process, not a one-time artifact, and the orchestration layer manages that process across teams and time. This is the domain of MLOps, the application of DevOps discipline to machine learning.
+
+Kubernetes provides the general substrate for running containerized workloads across clusters, and Ray offers a Python-native framework for scaling training, tuning, and serving (13). Workflow engines such as Apache Airflow, Kubeflow Pipelines, and Metaflow schedule the multi-step pipelines that ingest data, train, evaluate, and deploy. Experiment tracking and registry tools such as MLflow and Weights and Biases record the parameters, metrics, and artifacts of every run so that results are reproducible and models are governed (14). Feature stores and monitoring systems close the loop by serving consistent features and detecting drift once a model is live.
+
+The central insight of this layer is that machine learning systems decay. Data distributions shift, dependencies change, and yesterday's accurate model degrades silently. The orchestration layer exists to make training reproducible, deployment repeatable, and degradation observable. Its tradeoff is the familiar one of platform engineering: heavyweight, integrated MLOps platforms reduce operational toil but impose process and lock-in, while lightweight, composed tooling stays flexible at the cost of more glue code and more discipline.
+
+## 9. Layer 8: The Application Layer
+
+At the top sits the layer that delivers value to people: the chatbots, coding copilots, retrieval-augmented question answering systems, autonomous agents, recommendation engines, and search experiences that constitute the product. With the rise of capable foundation models served behind APIs, a great deal of application development now happens here without any direct contact with the lower layers at all.
+
+This layer has developed its own emerging stack. Orchestration libraries such as LangChain and LlamaIndex compose model calls, tool use, and memory. Vector databases such as Pinecone, Weaviate, and the open-source FAISS library store embeddings for semantic retrieval, the backbone of retrieval-augmented generation. Protocols such as the Model Context Protocol are beginning to standardize how applications connect models to external tools and data sources. The tradeoff at the application layer is build versus buy taken to its logical end: a team can call a hosted model and own almost nothing of the stack below, gaining speed and giving up control, cost predictability, and data sovereignty, or it can self-host and own everything, inverting every term of that bargain.
+
+## 10. How the Layers Fit Together
+
+The power of the stack comes from its composition, and a single inference request illustrates the cooperation. A user types a question into a chat application at layer 8. The application embeds the query and retrieves context from a vector store at the application layer, then issues a request to a serving runtime at layer 6. The runtime, perhaps vLLM, schedules the request, manages its key-value cache, and invokes a model defined in a framework at layer 4. The framework dispatches the model's matrix multiplications and attention operations to numerical libraries at layer 3, such as cuBLAS and cuDNN. Those libraries issue work through the CUDA runtime at layer 2, which drives the GPU at layer 1, where tensor cores finally multiply the numbers. The generated tokens travel back up the same chain. Meanwhile, layer 7 has provisioned the hardware, deployed the model, and is recording metrics for the whole transaction.
+
+Two cross-cutting principles govern the whole edifice. First, the binding constraint is usually memory, not arithmetic, which is why so much engineering at every layer (quantization, paged attention, HBM, prefetching pipelines) targets the movement and storage of data rather than the speed of computation. Second, abstractions leak in the direction of performance: a practitioner can ignore the lower layers right up until performance, cost, or memory forces them to look down, at which point a working model of the entire stack becomes indispensable. The stack is therefore best understood not as a set of independent choices but as a coupled system in which decisions at one layer ripple through all the others.
+
+## References
+
+1. NVIDIA. "NVIDIA H100 Tensor Core GPU Architecture." NVIDIA Corporation. https://www.nvidia.com/en-us/data-center/h100/
+
+2. Jouppi, N. P., et al. "In-Datacenter Performance Analysis of a Tensor Processing Unit." Proceedings of the 44th Annual International Symposium on Computer Architecture (ISCA), 2017. https://arxiv.org/abs/1704.04760
+
+3. NVIDIA. "CUDA Toolkit Documentation." NVIDIA Corporation. https://docs.nvidia.com/cuda/
+
+4. AMD. "ROCm Open Software Platform Documentation." Advanced Micro Devices. https://rocm.docs.amd.com/
+
+5. NVIDIA. "cuDNN, cuBLAS, and NCCL Developer Libraries." NVIDIA Corporation. https://developer.nvidia.com/cudnn
+
+6. Harris, C. R., et al. "Array Programming with NumPy." Nature, vol. 585, 2020, pp. 357-362. https://www.nature.com/articles/s41586-020-2649-2
+
+7. Paszke, A., et al. "PyTorch: An Imperative Style, High-Performance Deep Learning Library." Advances in Neural Information Processing Systems (NeurIPS), 2019. https://arxiv.org/abs/1912.01703
+
+8. Bradbury, J., et al. "JAX: Composable Transformations of Python and NumPy Programs." Google Research. https://github.com/jax-ml/jax
+
+9. Abadi, M., et al. "TensorFlow: A System for Large-Scale Machine Learning." Proceedings of the 12th USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2016. https://www.tensorflow.org/
+
+10. Apache Software Foundation. "Apache Arrow: A Cross-Language Development Platform for In-Memory Data." https://arrow.apache.org/
+
+11. Wolf, T., et al. "Transformers: State-of-the-Art Natural Language Processing." Proceedings of EMNLP: System Demonstrations, 2020. https://huggingface.co/docs/hub/
+
+12. Kwon, W., et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP), 2023. https://arxiv.org/abs/2309.06180
+
+13. Moritz, P., et al. "Ray: A Distributed Framework for Emerging AI Applications." Proceedings of the 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2018. https://arxiv.org/abs/1712.05889
+
+14. Zaharia, M., et al. "Accelerating the Machine Learning Lifecycle with MLflow." IEEE Data Engineering Bulletin, vol. 41, no. 4, 2018. https://mlflow.org/
