@@ -1,0 +1,269 @@
+# Cross-Entropy and the Cross-Entropy Loss
+
+Cross-entropy is one of the load-bearing ideas of modern machine learning. It measures the cost of encoding data drawn from one distribution using a code optimized for another, and through that lens it becomes the natural objective for training classifiers and language models. This chapter develops cross-entropy from its information-theoretic roots, shows how it decomposes into entropy plus the Kullback-Leibler divergence, derives the cross-entropy loss as the maximum likelihood estimator for categorical data, and works through the practical machinery that makes it usable: the softmax function, its numerically stable implementation, and label smoothing.
+
+## 1. Entropy and the Cost of Encoding
+
+### 1.1 Shannon entropy
+
+Let $p$ be a probability distribution over a finite set of outcomes $\mathcal{X} = \{x_1, \dots, x_K\}$. The Shannon entropy of $p$ is
+
+$$
+H(p) = -\sum_{k=1}^{K} p(x_k) \log p(x_k).
+$$
+
+When the logarithm is base 2 the result is measured in bits, and when it is the natural logarithm the unit is nats. Machine learning almost always uses the natural logarithm because it composes cleanly with gradient based optimization, so we adopt $\log = \ln$ throughout unless stated otherwise.
+
+Entropy quantifies the average uncertainty in $p$. By Shannon's source coding theorem, $H(p)$ is also the minimum expected number of nats per symbol needed to encode a stream of independent draws from $p$, achievable in the limit by an optimal code that assigns roughly $-\log p(x_k)$ nats to outcome $x_k$. Rare events get long codewords, common events get short ones, and the entropy is the weighted average codeword length.
+
+### 1.2 Cross-entropy between two distributions
+
+Suppose the data truly follow $p$, but we build our code as though they followed a different distribution $q$. We then spend $-\log q(x_k)$ nats on outcome $x_k$ instead of the optimal $-\log p(x_k)$. The expected cost under the true distribution is the cross-entropy
+
+$$
+H(p, q) = -\sum_{k=1}^{K} p(x_k) \log q(x_k) = \mathbb{E}_{x \sim p}\!\left[-\log q(x)\right].
+$$
+
+The cross-entropy is the average code length we actually pay when reality is $p$ and our beliefs are $q$. Three properties matter immediately. First, $H(p, q)$ is not symmetric; in general $H(p, q) \neq H(q, p)$. Second, if $q(x_k) = 0$ for some $x_k$ with $p(x_k) > 0$, the cross-entropy is infinite, which encodes the intuition that a model assigning zero probability to an event that actually occurs is infinitely surprised. Third, $H(p, p) = H(p)$, so cross-entropy reduces to ordinary entropy when the code matches the source.
+
+For continuous distributions with densities the sums become integrals, $H(p, q) = -\int p(x) \log q(x)\, dx$, but the discrete case is what classification needs.
+
+## 2. Cross-Entropy, Entropy, and KL Divergence
+
+### 2.1 The decomposition
+
+The central identity of this chapter relates cross-entropy to entropy and the Kullback-Leibler divergence. The KL divergence from $q$ to $p$ is
+
+$$
+D_{\mathrm{KL}}(p \parallel q) = \sum_{k=1}^{K} p(x_k) \log \frac{p(x_k)}{q(x_k)}.
+$$
+
+Expanding the logarithm of the ratio,
+
+$$
+D_{\mathrm{KL}}(p \parallel q) = \sum_k p(x_k) \log p(x_k) - \sum_k p(x_k) \log q(x_k) = -H(p) + H(p, q).
+$$
+
+Rearranging gives the decomposition
+
+$$
+H(p, q) = H(p) + D_{\mathrm{KL}}(p \parallel q).
+$$
+
+In words, the total cost of encoding $p$ with a code built for $q$ splits into two parts: the irreducible cost $H(p)$ of the source itself, plus the penalty $D_{\mathrm{KL}}(p \parallel q)$ for the mismatch between $q$ and $p$. The KL term is the excess number of nats incurred by using the wrong code.
+
+### 2.2 Why the penalty is nonnegative
+
+Gibbs' inequality states that $D_{\mathrm{KL}}(p \parallel q) \geq 0$, with equality if and only if $p = q$. The cleanest proof uses the concavity of the logarithm. Since $\log$ is concave, Jensen's inequality gives
+
+$$
+-D_{\mathrm{KL}}(p \parallel q) = \sum_k p(x_k) \log \frac{q(x_k)}{p(x_k)} \leq \log \sum_k p(x_k) \frac{q(x_k)}{p(x_k)} = \log \sum_k q(x_k) = \log 1 = 0.
+$$
+
+Multiplying by $-1$ yields $D_{\mathrm{KL}}(p \parallel q) \geq 0$. Because $\log$ is strictly concave, equality holds only when the ratio $q(x_k)/p(x_k)$ is constant across all $k$, which forces $q = p$.
+
+A consequence relevant to optimization follows immediately. Since $H(p)$ does not depend on $q$,
+
+$$
+\arg\min_q H(p, q) = \arg\min_q D_{\mathrm{KL}}(p \parallel q) = p.
+$$
+
+Minimizing cross-entropy over the model distribution $q$ is exactly equivalent to minimizing the KL divergence to the data distribution $p$. The entropy term $H(p)$ is a constant offset that the optimizer never sees. This is why we can speak of cross-entropy and KL divergence almost interchangeably when discussing training objectives, even though they differ by the fixed quantity $H(p)$.
+
+## 3. The Cross-Entropy Loss from Maximum Likelihood
+
+### 3.1 Setup
+
+Consider a supervised classification problem. We observe a dataset $\mathcal{D} = \{(x^{(i)}, y^{(i)})\}_{i=1}^{N}$ where each $x^{(i)}$ is an input and each $y^{(i)} \in \{1, \dots, K\}$ is a class label. A model with parameters $\theta$ produces a conditional distribution $q_\theta(y \mid x)$ over the $K$ classes. The standard estimation principle is maximum likelihood: choose $\theta$ to maximize the probability the model assigns to the observed labels.
+
+### 3.2 From likelihood to loss
+
+Assuming the examples are independent, the likelihood is the product of per example probabilities, and the log likelihood is the sum
+
+$$
+\ell(\theta) = \sum_{i=1}^{N} \log q_\theta\!\left(y^{(i)} \mid x^{(i)}\right).
+$$
+
+Maximizing $\ell(\theta)$ is the same as minimizing its negative, scaled by $1/N$ to make it an average rather than a sum. Define the average negative log likelihood
+
+$$
+\mathcal{L}(\theta) = -\frac{1}{N} \sum_{i=1}^{N} \log q_\theta\!\left(y^{(i)} \mid x^{(i)}\right).
+$$
+
+This is the cross-entropy loss. To see why it deserves the name, encode each label as a one-hot vector $\mathbf{p}^{(i)}$ whose components are $p^{(i)}_k = \mathbb{1}[y^{(i)} = k]$. The per example cross-entropy between this empirical one-hot target and the model prediction is
+
+$$
+H\!\left(\mathbf{p}^{(i)}, q_\theta(\cdot \mid x^{(i)})\right) = -\sum_{k=1}^{K} p^{(i)}_k \log q_\theta\!\left(k \mid x^{(i)}\right) = -\log q_\theta\!\left(y^{(i)} \mid x^{(i)}\right),
+$$
+
+because the one-hot vector zeroes out every term except the one for the true class. Averaging over the dataset recovers $\mathcal{L}(\theta)$ exactly. So minimizing the cross-entropy loss is minimizing maximum likelihood, and equivalently minimizing the average KL divergence between the empirical label distributions and the model.
+
+### 3.3 The distributional reading
+
+There is a tidy way to view the whole dataset at once. Let $\hat{p}$ denote the empirical distribution that places mass $1/N$ on each observed pair. Then
+
+$$
+\mathcal{L}(\theta) = \mathbb{E}_{(x, y) \sim \hat{p}}\!\left[-\log q_\theta(y \mid x)\right] = H\!\left(\hat{p}, q_\theta\right).
+$$
+
+Training drives $q_\theta$ toward $\hat{p}$ in the KL sense. Because the empirical distribution converges to the true data distribution as $N$ grows, minimizing cross-entropy is a consistent way to approximate the true conditional distribution, subject to the capacity and inductive biases of the model class.
+
+## 4. Binary and Categorical Cross-Entropy
+
+### 4.1 Binary cross-entropy
+
+When $K = 2$ the model needs only a single scalar output. Let the model produce $\hat{y} = q_\theta(y = 1 \mid x) \in (0, 1)$, the predicted probability of the positive class, and let $y \in \{0, 1\}$ be the label. The per example binary cross-entropy is
+
+$$
+\mathrm{BCE}(y, \hat{y}) = -\big[\, y \log \hat{y} + (1 - y) \log (1 - \hat{y}) \,\big].
+$$
+
+This is the cross-entropy between the Bernoulli target distribution $(1 - y, y)$ and the predicted Bernoulli $(1 - \hat{y}, \hat{y})$. When $y = 1$ the loss is $-\log \hat{y}$, which vanishes as $\hat{y} \to 1$ and blows up as $\hat{y} \to 0$. The symmetric statement holds for $y = 0$.
+
+The probability $\hat{y}$ is typically produced from a real valued logit $z$ by the logistic sigmoid $\sigma(z) = 1 / (1 + e^{-z})$. Substituting and simplifying gives a form expressed directly in the logit,
+
+$$
+\mathrm{BCE}(y, z) = \log\!\left(1 + e^{-z}\right) + (1 - y)\, z,
+$$
+
+which is more numerically stable than computing $\sigma(z)$ first and then taking its logarithm, for the same reasons discussed in the next section. Many libraries expose this fused logit form as a single primitive, often named something like `binary_cross_entropy_with_logits`.
+
+### 4.2 Categorical cross-entropy
+
+For $K > 2$ classes the model outputs a full probability vector $\hat{\mathbf{y}} = (\hat{y}_1, \dots, \hat{y}_K)$ with $\sum_k \hat{y}_k = 1$. Against a one-hot target $\mathbf{y}$, the categorical cross-entropy is
+
+$$
+\mathrm{CCE}(\mathbf{y}, \hat{\mathbf{y}}) = -\sum_{k=1}^{K} y_k \log \hat{y}_k = -\log \hat{y}_c,
+$$
+
+where $c$ is the index of the true class. If labels are stored as integers rather than one-hot vectors, the loss is often called sparse categorical cross-entropy, but the arithmetic is identical: gather the predicted probability of the correct class and take its negative logarithm. Binary cross-entropy is the special case $K = 2$ when the two class probabilities are written as $\hat{y}$ and $1 - \hat{y}$.
+
+## 5. The Softmax Function
+
+### 5.1 Definition and role
+
+The model's penultimate layer produces a vector of real valued logits $\mathbf{z} = (z_1, \dots, z_K)$ that range over all of $\mathbb{R}$. To interpret these as a probability distribution we apply the softmax function
+
+$$
+\mathrm{softmax}(\mathbf{z})_k = \frac{e^{z_k}}{\sum_{j=1}^{K} e^{z_j}}.
+$$
+
+Each output lies in $(0, 1)$ and the outputs sum to one, so softmax maps an unconstrained logit vector onto the probability simplex. It is the multiclass generalization of the logistic sigmoid, and it is shift invariant: adding the same constant $c$ to every logit leaves the output unchanged, since the factor $e^c$ cancels between numerator and denominator. This invariance is both a modeling fact and, as we will see, the key to a stable implementation.
+
+### 5.2 The softmax cross-entropy gradient
+
+Pairing softmax with cross-entropy yields a gradient of unusual simplicity, which is a large part of why the combination dominates classification. Let $\hat{y}_k = \mathrm{softmax}(\mathbf{z})_k$ and let the loss for a single example with true class $c$ be $L = -\log \hat{y}_c$. The derivative with respect to logit $z_k$ is
+
+$$
+\frac{\partial L}{\partial z_k} = \hat{y}_k - y_k,
+$$
+
+where $y_k = \mathbb{1}[k = c]$. The gradient is simply the difference between the predicted distribution and the one-hot target. To derive it, note that
+
+$$
+\frac{\partial \hat{y}_i}{\partial z_k} = \hat{y}_i (\delta_{ik} - \hat{y}_k),
+$$
+
+with $\delta_{ik}$ the Kronecker delta. Then
+
+$$
+\frac{\partial L}{\partial z_k} = -\frac{1}{\hat{y}_c} \frac{\partial \hat{y}_c}{\partial z_k} = -\frac{1}{\hat{y}_c} \hat{y}_c (\delta_{ck} - \hat{y}_k) = \hat{y}_k - \delta_{ck} = \hat{y}_k - y_k.
+$$
+
+The clean linear form means the error signal injected at the logits is exactly the residual between prediction and target, and there is no awkward division or saturating factor to weaken the gradient when the model is badly wrong. This is the property that makes softmax cross-entropy train reliably where a squared error on softmax outputs would suffer from vanishing gradients.
+
+## 6. Numerically Stable Softmax and Log-Softmax
+
+### 6.1 The overflow problem
+
+The naive softmax computes $e^{z_k}$ for each logit. If any logit is large, say $z_k = 1000$, then $e^{z_k}$ overflows to infinity in floating point, and the ratio becomes the indeterminate $\infty / \infty$. If all logits are very negative, every exponential underflows to zero and the denominator becomes zero. Either way the result is a `NaN` or `Inf` that corrupts the rest of the computation.
+
+### 6.2 The max subtraction trick
+
+The shift invariance of softmax provides the fix. Let $m = \max_j z_j$ and subtract it from every logit before exponentiating:
+
+$$
+\mathrm{softmax}(\mathbf{z})_k = \frac{e^{z_k - m}}{\sum_{j=1}^{K} e^{z_j - m}}.
+$$
+
+This is algebraically identical to the original because the common factor $e^{-m}$ cancels. Numerically it is far better behaved: the largest exponent is now $z_k - m = 0$, so the largest term is $e^0 = 1$ and nothing overflows. The smaller terms may underflow to zero, but that is harmless because they contribute negligibly to the sum.
+
+### 6.3 Log-softmax and the log-sum-exp identity
+
+In practice we never want the probability followed by a logarithm, because computing $\log(\hat{y}_c)$ as a separate step reintroduces precision loss when $\hat{y}_c$ is tiny. Instead we compute the log probability directly. Taking the logarithm of the stable softmax,
+
+$$
+\log \mathrm{softmax}(\mathbf{z})_k = z_k - m - \log \sum_{j=1}^{K} e^{z_j - m}.
+$$
+
+The term $m + \log \sum_j e^{z_j - m}$ is the numerically stable log-sum-exp of the logits. Because the cross-entropy loss for the true class is just $-\log \mathrm{softmax}(\mathbf{z})_c$, the entire loss can be computed with one stable expression and no intermediate probabilities. This is why deep learning libraries provide fused operations such as `log_softmax` and `cross_entropy` that take raw logits rather than probabilities, and why feeding already softmaxed values into such a loss is a common and subtle bug.
+
+```python
+# Stable cross-entropy from logits, single true class c
+def cross_entropy_from_logits(z, c):
+    m = max(z)                       # shift for stability
+    shifted = [zi - m for zi in z]
+    lse = m + log(sum(exp(s) for s in shifted))
+    log_prob_c = z[c] - lse          # log softmax at the true class
+    return -log_prob_c
+```
+
+The pattern generalizes to batches by computing the per row maximum and applying the same subtraction along the class axis.
+
+## 7. Label Smoothing
+
+### 7.1 Motivation
+
+The one-hot target asks the model to drive the true class probability to exactly one and all others to exactly zero. Achieving that requires the correct logit to grow without bound relative to the others, because softmax only reaches a hard zero or one in the limit of infinite logits. This pushes the model toward extreme, overconfident outputs, encourages large weight magnitudes, and tends to widen the gap between the largest logit and the rest in a way that generalizes poorly. The model becomes confidently wrong on inputs near the decision boundary and its predicted probabilities stop being well calibrated.
+
+### 7.2 The smoothed target
+
+Label smoothing, introduced in the context of the Inception architecture, replaces the hard one-hot target with a softened distribution. With smoothing parameter $\epsilon \in (0, 1)$, the target for class $k$ becomes
+
+$$
+y_k^{\mathrm{LS}} = (1 - \epsilon)\, y_k + \frac{\epsilon}{K},
+$$
+
+which assigns probability $1 - \epsilon + \epsilon/K$ to the true class and $\epsilon/K$ to each of the others. The loss is the cross-entropy against this softened target,
+
+$$
+\mathcal{L}^{\mathrm{LS}} = -\sum_{k=1}^{K} y_k^{\mathrm{LS}} \log \hat{y}_k.
+$$
+
+A useful way to read this is as a mixture. The smoothed target is a convex combination of the one-hot label and the uniform distribution $u_k = 1/K$, so the loss splits into the ordinary cross-entropy plus a term that pulls the prediction toward uniform:
+
+$$
+\mathcal{L}^{\mathrm{LS}} = (1 - \epsilon)\, H(\mathbf{y}, \hat{\mathbf{y}}) + \epsilon\, H(\mathbf{u}, \hat{\mathbf{y}}).
+$$
+
+The second term is, up to an additive constant, a KL divergence from the prediction to the uniform distribution, so label smoothing acts as a regularizer that penalizes overconfidence.
+
+### 7.3 Effects and trade-offs
+
+Empirically, label smoothing improves generalization and produces better calibrated probabilities across image classification, machine translation, and speech recognition. With a smoothed target the optimal logits are finite rather than divergent, which curbs the runaway growth of the correct logit and keeps representations more compact. Analysis of the learned representations shows that smoothing encourages examples of the same class to cluster tightly and at roughly equal distances from other class clusters, a geometric regularity that the hard target does not impose.
+
+There are costs. Because label smoothing erases some of the fine grained information about relative similarities between the wrong classes, it can hurt when the softened teacher is then distilled into a student network, since the student loses the very dark knowledge that distillation relies on. A typical value is $\epsilon = 0.1$, and like any regularizer its strength should be tuned to the dataset and model. When calibration and clean generalization matter more than transferring inter class structure, a small amount of smoothing is usually a cheap and effective improvement.
+
+## 8. Summary
+
+Cross-entropy measures the expected cost of encoding data from $p$ using a code optimized for $q$, and it decomposes exactly as $H(p, q) = H(p) + D_{\mathrm{KL}}(p \parallel q)$. Because the entropy term is constant in the model, minimizing cross-entropy is minimizing KL divergence to the data. The cross-entropy loss is precisely the average negative log likelihood, so training a classifier by cross-entropy is maximum likelihood estimation. Binary and categorical cross-entropy are the Bernoulli and categorical instances of the same quantity. Softmax turns logits into probabilities with a gradient that reduces to the prediction minus the target, the max subtraction trick and the log-sum-exp identity make that computation numerically safe, and label smoothing softens the targets to curb overconfidence and improve calibration. Together these pieces form the default training objective for classification and language modeling.
+
+## References
+
+1. Shannon, C. E. (1948). A Mathematical Theory of Communication. Bell System Technical Journal, 27(3), 379-423. https://doi.org/10.1002/j.1538-7305.1948.tb01338.x
+
+2. Cover, T. M., and Thomas, J. A. (2006). Elements of Information Theory (2nd ed.). Wiley. https://onlinelibrary.wiley.com/doi/book/10.1002/047174882X
+
+3. Goodfellow, I., Bengio, Y., and Courville, A. (2016). Deep Learning. MIT Press. Chapters 3 and 5. https://www.deeplearningbook.org/
+
+4. Bishop, C. M. (2006). Pattern Recognition and Machine Learning. Springer. Chapter 4. https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+
+5. Murphy, K. P. (2022). Probabilistic Machine Learning: An Introduction. MIT Press. https://probml.github.io/pml-book/book1.html
+
+6. Kullback, S., and Leibler, R. A. (1951). On Information and Sufficiency. Annals of Mathematical Statistics, 22(1), 79-86. https://doi.org/10.1214/aoms/1177729694
+
+7. Szegedy, C., Vanhoucke, V., Ioffe, S., Shlens, J., and Wojna, Z. (2016). Rethinking the Inception Architecture for Computer Vision. CVPR. https://arxiv.org/abs/1512.00567
+
+8. Müller, R., Kornblith, S., and Hinton, G. (2019). When Does Label Smoothing Help? NeurIPS. https://arxiv.org/abs/1906.02629
+
+9. Blanchard, P., Higham, D. J., and Higham, N. J. (2021). Accurately Computing the Log-Sum-Exp and Softmax Functions. IMA Journal of Numerical Analysis, 41(4), 2311-2330. https://doi.org/10.1093/imanum/draa038
