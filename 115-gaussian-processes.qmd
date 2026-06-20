@@ -119,7 +119,27 @@ $$
 
 The prediction is a weighted sum of kernel functions centered at the training points. This is the representer theorem in action and connects GP regression to kernel ridge regression, whose solution coincides exactly with the GP posterior mean. The probabilistic framing adds the variance, which kernel ridge regression lacks.
 
-### 3.4 A practical recipe
+### 3.4 A worked scalar example
+
+Take the smallest nontrivial case with a single training point. Let $k_{xx} = k(\mathbf{x}_1, \mathbf{x}_1)$, $k_{\ast x} = k(\mathbf{x}_\ast, \mathbf{x}_1)$, and $k_{\ast\ast} = k(\mathbf{x}_\ast, \mathbf{x}_\ast)$. The $2 \times 2$ joint covariance is
+
+$$
+\begin{bmatrix} y \\ f_\ast \end{bmatrix}
+\sim \mathcal{N}\!\left( 0,
+\begin{bmatrix} k_{xx} + \sigma_n^2 & k_{\ast x} \\ k_{\ast x} & k_{\ast\ast} \end{bmatrix}
+\right).
+$$
+
+Applying the Schur complement to this scalar block yields the posterior in closed form,
+
+$$
+\bar{f}_\ast = \frac{k_{\ast x}}{k_{xx} + \sigma_n^2}\, y, \qquad
+\operatorname{var}(f_\ast) = k_{\ast\ast} - \frac{k_{\ast x}^2}{k_{xx} + \sigma_n^2}.
+$$
+
+The mean is the observation $y$ shrunk by the correlation ratio between test and training point, and the variance is the prior variance minus the explained portion. The executable cell below confirms these expressions agree with the full matrix code to machine precision using SymPy.
+
+### 3.5 A practical recipe
 
 Direct inversion is numerically fragile. The stable implementation uses the Cholesky factorization of the symmetric positive definite matrix $K_{XX} + \sigma_n^2 I = LL^\top$.
 
@@ -187,7 +207,210 @@ A complementary route avoids approximation and instead exploits structure. When 
 
 The right tool depends on the regime. For up to a few thousand points, exact GP regression with Cholesky is simplest and best calibrated. For tens of thousands, iterative conjugate gradient methods on a GPU keep inference exact. For hundreds of thousands or more, or for non Gaussian likelihoods, stochastic variational inducing point methods are the standard choice. Gridded or spatial data should exploit Kronecker or interpolation structure. In every case the modeling decisions, especially the kernel, matter more than the inference engine, since a misspecified kernel will produce confident and wrong predictions no matter how exactly the posterior is computed.
 
-## 6. Why Gaussian Processes Matter
+## 6. Computation in Practice
+
+The flow from kernel to calibrated prediction is a short pipeline of Gaussian operations.
+
+```{mermaid}
+flowchart TD
+    A[Training inputs X and targets y] --> B[Build K_XX with chosen kernel]
+    B --> C[Add noise sigma_n squared I]
+    C --> D[Cholesky factor L L transpose]
+    D --> E[Solve for alpha and log marginal likelihood]
+    E --> F{Optimize hyperparameters}
+    F -->|gradient ascent on log ml| B
+    F -->|converged| G[Predict mean and covariance at X star]
+    G --> H[Posterior mean plus uncertainty band]
+```
+
+### 6.1 Executable example
+
+The following cell draws prior samples, conditions on six noisy observations, sweeps kernel hyperparameters against the marginal likelihood, and verifies the scalar posterior formula symbolically.
+
+```{python}
+import numpy as np
+import pandas as pd
+import sympy as sp
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(42)
+
+def rbf_kernel(X1, X2, length_scale=1.0, signal_var=1.0):
+    X1 = np.atleast_2d(X1).reshape(-1, 1)
+    X2 = np.atleast_2d(X2).reshape(-1, 1)
+    sqdist = (X1 - X2.T) ** 2
+    return signal_var * np.exp(-0.5 * sqdist / length_scale ** 2)
+
+# Prior samples on a grid
+Xs = np.linspace(-5, 5, 200)
+Kss = rbf_kernel(Xs, Xs, length_scale=1.0, signal_var=1.0)
+Lp = np.linalg.cholesky(Kss + 1e-9 * np.eye(len(Xs)))
+prior_samples = Lp @ rng.standard_normal((len(Xs), 5))
+
+fig1, ax1 = plt.subplots(figsize=(7, 4))
+for i in range(5):
+    ax1.plot(Xs, prior_samples[:, i], lw=1.5)
+ax1.fill_between(Xs, -2 * np.sqrt(np.diag(Kss)), 2 * np.sqrt(np.diag(Kss)),
+                 color="gray", alpha=0.2, label="95% prior band")
+ax1.set_title("Samples from the GP prior (RBF kernel)")
+ax1.set_xlabel("x"); ax1.set_ylabel("f(x)"); ax1.legend()
+plt.show()
+
+# Condition on noisy observations
+def f_true(x):
+    return np.sin(x) + 0.3 * x
+
+Xtr = np.array([-4.0, -3.0, -1.0, 0.5, 2.0, 3.5])
+sigma_n = 0.1
+ytr = f_true(Xtr) + sigma_n * rng.standard_normal(len(Xtr))
+
+def gp_posterior(Xtr, ytr, Xs, length_scale, signal_var, sigma_n):
+    K = rbf_kernel(Xtr, Xtr, length_scale, signal_var) + sigma_n ** 2 * np.eye(len(Xtr))
+    Ks = rbf_kernel(Xtr, Xs, length_scale, signal_var)
+    Kss = rbf_kernel(Xs, Xs, length_scale, signal_var)
+    L = np.linalg.cholesky(K)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, ytr))
+    mean = Ks.T @ alpha
+    v = np.linalg.solve(L, Ks)
+    cov = Kss - v.T @ v
+    log_ml = (-0.5 * ytr @ alpha - np.sum(np.log(np.diag(L)))
+              - 0.5 * len(Xtr) * np.log(2 * np.pi))
+    return mean, cov, log_ml
+
+mean, cov, _ = gp_posterior(Xtr, ytr, Xs, 1.0, 1.0, sigma_n)
+std = np.sqrt(np.clip(np.diag(cov), 0, None))
+
+fig2, ax2 = plt.subplots(figsize=(7, 4))
+ax2.plot(Xs, f_true(Xs), "k--", lw=1, label="true function")
+ax2.plot(Xs, mean, "b", lw=2, label="posterior mean")
+ax2.fill_between(Xs, mean - 2 * std, mean + 2 * std, color="b", alpha=0.2,
+                 label="95% band")
+ax2.plot(Xtr, ytr, "ro", ms=7, label="observations")
+ax2.set_title("GP posterior after conditioning")
+ax2.set_xlabel("x"); ax2.set_ylabel("f(x)"); ax2.legend()
+plt.show()
+
+# Hyperparameter sweep against the marginal likelihood
+rows = []
+for ls in [0.2, 0.5, 1.0, 2.0, 4.0]:
+    for sv in [0.5, 1.0, 2.0]:
+        _, _, lml = gp_posterior(Xtr, ytr, Xs, ls, sv, sigma_n)
+        rows.append({"length_scale": ls, "signal_var": sv,
+                     "log_marginal_likelihood": round(lml, 3)})
+df = pd.DataFrame(rows)
+best = df.loc[df["log_marginal_likelihood"].idxmax()]
+print("Hyperparameter sweep (RBF):")
+print(df.to_string(index=False))
+print(f"\nBest: length_scale={best.length_scale}, signal_var={best.signal_var}, "
+      f"log_ml={best.log_marginal_likelihood}")
+
+# Symbolic check of the scalar posterior via the Schur complement
+kxx, ksx, kss, sn2, y = sp.symbols("k_xx k_sx k_ss sigma_n2 y", real=True)
+Ky = kxx + sn2
+post_mean = ksx * (1 / Ky) * y
+post_var = kss - ksx * (1 / Ky) * ksx
+print("\nSymbolic scalar posterior (Schur complement):")
+print("  mean =", sp.simplify(post_mean))
+print("  var  =", sp.simplify(post_var))
+
+xt, xq, ls, sv, yt = 0.0, 1.0, 1.0, 1.0, 0.7
+ksx_n = sv * np.exp(-0.5 * (xt - xq) ** 2 / ls ** 2)
+sym_mean = float(post_mean.subs({ksx: ksx_n, kxx: sv, sn2: sigma_n ** 2, y: yt}))
+sym_var = float(post_var.subs({ksx: ksx_n, kss: sv, kxx: sv, sn2: sigma_n ** 2}))
+m_n, c_n, _ = gp_posterior(np.array([xt]), np.array([yt]), np.array([xq]), ls, sv, sigma_n)
+print(f"\nClosed-form mean {sym_mean:.6f} vs numeric {m_n[0]:.6f}")
+print(f"Closed-form var  {sym_var:.6f} vs numeric {c_n[0, 0]:.6f}")
+print("Agreement:", np.isclose(sym_mean, m_n[0]) and np.isclose(sym_var, c_n[0, 0]))
+```
+
+The sweep shows the marginal likelihood peaking at an intermediate length scale, with the over smooth setting punished heavily by the data fit term. The symbolic and numeric posteriors agree exactly, confirming the conditioning algebra.
+
+### 6.2 The same model in three languages
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+
+def rbf(a, b, ls=1.0, sv=1.0):
+    d2 = (a[:, None] - b[None, :]) ** 2
+    return sv * np.exp(-0.5 * d2 / ls ** 2)
+
+Xtr = np.array([-2.0, 0.0, 1.5]); ytr = np.array([-0.5, 0.2, 0.9])
+Xs = np.array([0.5]); sn = 0.1
+K = rbf(Xtr, Xtr) + sn ** 2 * np.eye(3)
+L = np.linalg.cholesky(K)
+alpha = np.linalg.solve(L.T, np.linalg.solve(L, ytr))
+ks = rbf(Xs, Xtr)
+print("posterior mean:", float(ks @ alpha))
+```
+
+## Julia
+
+```julia
+using LinearAlgebra
+
+rbf(a, b; ls=1.0, sv=1.0) = sv .* exp.(-0.5 .* (a .- b').^2 ./ ls^2)
+
+Xtr = [-2.0, 0.0, 1.5]; ytr = [-0.5, 0.2, 0.9]
+Xs = [0.5]; sn = 0.1
+K = rbf(Xtr, Xtr) + sn^2 * I
+L = cholesky(K).L
+alpha = L' \ (L \ ytr)
+ks = rbf(Xs, Xtr)
+println("posterior mean: ", (ks * alpha)[1])
+```
+
+## Rust
+
+```rust
+// Single test point GP mean with a 3 by 3 training kernel.
+// Uses a small dense solve via Gaussian elimination.
+fn rbf(a: f64, b: f64, ls: f64, sv: f64) -> f64 {
+    sv * (-0.5 * (a - b).powi(2) / (ls * ls)).exp()
+}
+
+fn main() {
+    let xtr = [-2.0, 0.0, 1.5];
+    let ytr = [-0.5, 0.2, 0.9];
+    let xs = 0.5;
+    let sn2 = 0.01_f64;
+    // Build K + noise.
+    let mut k = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            k[i][j] = rbf(xtr[i], xtr[j], 1.0, 1.0)
+                + if i == j { sn2 } else { 0.0 };
+        }
+    }
+    // Solve K alpha = y by Gaussian elimination.
+    let mut a = k;
+    let mut b = ytr;
+    for c in 0..3 {
+        let piv = a[c][c];
+        for r in (c + 1)..3 {
+            let f = a[r][c] / piv;
+            for col in 0..3 { a[r][col] -= f * a[c][col]; }
+            b[r] -= f * b[c];
+        }
+    }
+    let mut alpha = [0.0_f64; 3];
+    for r in (0..3).rev() {
+        let mut s = b[r];
+        for col in (r + 1)..3 { s -= a[r][col] * alpha[col]; }
+        alpha[r] = s / a[r][r];
+    }
+    let mut mean = 0.0;
+    for i in 0..3 { mean += rbf(xs, xtr[i], 1.0, 1.0) * alpha[i]; }
+    println!("posterior mean: {mean}");
+}
+```
+
+:::
+
+## 7. Why Gaussian Processes Matter
 
 Gaussian processes occupy a distinctive place in machine learning. They are nonparametric, so model capacity grows gracefully with data. They are probabilistic, so every prediction comes with calibrated uncertainty that downstream decisions can use. They are interpretable, since the kernel exposes our smoothness, periodicity, and relevance assumptions explicitly. And they support principled model selection through the marginal likelihood, with no validation set required. These properties make GPs the workhorse of Bayesian optimization, where the uncertainty drives where to sample next, and of spatial statistics, active learning, and surrogate modeling for expensive simulations. The cost is computational, but the toolkit of sparse, variational, and iterative methods has steadily widened the range of problems where GPs are not only elegant but practical.
 
