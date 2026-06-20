@@ -111,6 +111,26 @@ $$
 
 The MAP rule combines the prior belief about each class with the evidence supplied by the features. When the prior is uniform, meaning all classes are equally likely a priori, MAP reduces to maximum likelihood classification, in which we pick the class whose conditional likelihood best explains the observed features.
 
+It is worth assembling the full chain of reasoning in one place, since every step is either an exact identity or the single naive assumption. Starting from the definition of the posterior and applying Bayes' theorem, the conditional independence factorization, and the fact that the evidence is constant in $y$, we obtain
+
+$$
+\begin{aligned}
+\hat{y}
+&= \arg\max_{y} \; P(y \mid \mathbf{x})
+&&\text{(MAP objective)} \\
+&= \arg\max_{y} \; \frac{P(\mathbf{x} \mid y)\, P(y)}{P(\mathbf{x})}
+&&\text{(Bayes' theorem)} \\
+&= \arg\max_{y} \; P(\mathbf{x} \mid y)\, P(y)
+&&\text{(drop evidence }P(\mathbf{x})\text{)} \\
+&= \arg\max_{y} \; P(y) \prod_{j=1}^{d} P(x_j \mid y)
+&&\text{(conditional independence)} \\
+&= \arg\max_{y} \left[ \log P(y) + \sum_{j=1}^{d} \log P(x_j \mid y) \right].
+&&\text{(monotone }\log\text{)}
+\end{aligned}
+$$
+
+Only the fourth line uses an approximation; the rest are exact. This makes precise where the model's strength and its fragility both live: a single factorization step buys the entire reduction in complexity, and any error the method commits enters through that one line.
+
 ### 4.2 Working in Log Space
 
 The product of many probabilities, each less than one, quickly underflows to zero in floating point arithmetic. For a document with hundreds of words, $\prod_j P(x_j \mid y)$ may be smaller than the smallest representable positive number. The standard remedy is to maximize the logarithm of the posterior, which turns the product into a sum and is monotonic so it does not change the arg max:
@@ -216,16 +236,264 @@ def train_loglik(word_counts, vocab, alpha=1.0):
     return log_likelihood
 ```
 
+### 6.5 A Worked Example End to End
+
+A small numeric example ties the pieces together. Suppose we classify one-sentence messages as $\text{spam}$ or $\text{ham}$ with a vocabulary of three words, $V = \{\text{free}, \text{money}, \text{lunch}\}$. The training set has six spam and six ham messages. Pooling word counts within each class gives the totals in the table.
+
+| count | free | money | lunch | class total |
+|-------|------|-------|-------|-------------|
+| spam  | 8    | 6     | 0     | 14          |
+| ham   | 1    | 2     | 9     | 12          |
+
+The priors are equal, $\hat{P}(\text{spam}) = \hat{P}(\text{ham}) = \tfrac{6}{12} = 0.5$. Now classify the new message "free lunch", that is the count vector with one occurrence each of "free" and "lunch". The raw maximum likelihood estimate gives $\hat{\theta}_{\text{lunch}, \text{spam}} = 0/14 = 0$, so the spam score collapses to zero no matter how strongly "free" leans spam. This is the zero frequency problem in action.
+
+Apply Laplace smoothing with $\alpha = 1$ and $V = 3$. The smoothed likelihoods for the two relevant words are
+
+$$
+\hat{\theta}_{\text{free}, \text{spam}} = \frac{8 + 1}{14 + 3} = \frac{9}{17}, \qquad
+\hat{\theta}_{\text{lunch}, \text{spam}} = \frac{0 + 1}{14 + 3} = \frac{1}{17},
+$$
+
+$$
+\hat{\theta}_{\text{free}, \text{ham}} = \frac{1 + 1}{12 + 3} = \frac{2}{15}, \qquad
+\hat{\theta}_{\text{lunch}, \text{ham}} = \frac{9 + 1}{12 + 3} = \frac{10}{15}.
+$$
+
+The log posterior scores, up to the shared evidence term, are
+
+$$
+\begin{aligned}
+s_{\text{spam}} &= \log 0.5 + \log \tfrac{9}{17} + \log \tfrac{1}{17} \approx -0.693 - 0.636 - 2.833 = -4.162, \\
+s_{\text{ham}} &= \log 0.5 + \log \tfrac{2}{15} + \log \tfrac{10}{15} \approx -0.693 - 2.015 - 0.405 = -3.113.
+\end{aligned}
+$$
+
+Since $s_{\text{ham}} > s_{\text{spam}}$, the message is classified as ham, driven by the decisive "lunch" evidence. Normalizing with the softmax of section 4.3 gives $P(\text{ham} \mid \mathbf{x}) = \tfrac{e^{s_{\text{ham}}}}{e^{s_{\text{spam}}} + e^{s_{\text{ham}}}} \approx 0.74$. Without smoothing the spam score would have been $-\infty$, an unwarranted certainty produced by one unobserved word. The smoothed model reaches a sensible, finite decision.
+
+### 6.6 Computational Illustration
+
+The example below makes the theory concrete with runnable code. It fits a Gaussian Naive Bayes model to a synthetic three-class problem and plots its decision regions, then trains a Multinomial Naive Bayes text classifier on a generated bag-of-words corpus while sweeping the Laplace pseudocount $\alpha$, printing a results table of accuracy and macro F1. A short SymPy block symbolically confirms the posterior proportionality, the conditional independence log factorization, and that smoothing reduces to the maximum likelihood estimate as $\alpha \to 0$. The Python tab runs here with a fixed seed; the Julia and Rust tabs are idiomatic illustrations of the same Gaussian Naive Bayes fit.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sympy as sp
+from sklearn.datasets import make_blobs
+from sklearn.naive_bayes import GaussianNB, MultinomialNB
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(42)
+
+# --- SymPy: posterior proportionality and smoothing as Dirichlet mean ---
+Px_given_y, Py, Px = sp.symbols("P_x_given_y P_y P_x", positive=True)
+print("posterior * P(x) =", sp.simplify((Px_given_y * Py / Px) * Px),
+      " (= P(x|y) P(y))")
+p1, p2, p3, pri = sp.symbols("p1 p2 p3 pi_y", positive=True)
+print("log P(y, x) =", sp.expand_log(sp.log(pri * p1 * p2 * p3), force=True))
+N_wy, total, a, V = sp.symbols("N_wy N_total alpha V", positive=True)
+smoothed = (N_wy + a) / (total + a * V)
+print("smoothed theta =", smoothed, " limit(alpha->0) =",
+      sp.limit(smoothed, a, 0))
+
+# --- Gaussian NB decision boundary on three blobs ---
+X, y = make_blobs(n_samples=600, centers=3, cluster_std=1.8, random_state=42)
+gnb = GaussianNB().fit(X, y)
+xx, yy = np.meshgrid(
+    np.linspace(X[:, 0].min() - 1, X[:, 0].max() + 1, 300),
+    np.linspace(X[:, 1].min() - 1, X[:, 1].max() + 1, 300),
+)
+Z = gnb.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+print(f"\nGaussian NB training accuracy: "
+      f"{accuracy_score(y, gnb.predict(X)):.3f}")
+
+# --- Synthetic bag-of-words corpus: three overlapping topics ---
+vocab_size, n_topics, docs_per_topic = 60, 3, 300
+topic_word = np.full((n_topics, vocab_size), 1.0)
+for t in range(n_topics):
+    topic_word[t, t * 16: t * 16 + 22] += 1.5
+topic_word /= topic_word.sum(axis=1, keepdims=True)
+
+X_txt, y_txt = [], []
+for t in range(n_topics):
+    for _ in range(docs_per_topic):
+        length = rng.integers(8, 18)   # short, noisy documents
+        X_txt.append(rng.multinomial(length, topic_word[t]))
+        y_txt.append(t)
+X_txt, y_txt = np.array(X_txt), np.array(y_txt)
+Xtr, Xte, ytr, yte = train_test_split(
+    X_txt, y_txt, test_size=0.3, random_state=42, stratify=y_txt)
+
+# --- Multinomial NB: sweep the Laplace pseudocount ---
+rows = []
+for alpha in [0.001, 0.01, 0.1, 0.5, 1.0, 5.0]:
+    clf = MultinomialNB(alpha=alpha).fit(Xtr, ytr)
+    pred = clf.predict(Xte)
+    rows.append({"alpha": alpha,
+                 "test_accuracy": accuracy_score(yte, pred),
+                 "macro_f1": f1_score(yte, pred, average="macro")})
+results = pd.DataFrame(rows)
+print("\nMultinomial NB: Laplace smoothing sweep (synthetic 3-topic corpus)")
+print(results.to_string(index=False, float_format=lambda v: f"{v:0.4f}"))
+
+# --- Figures ---
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.2))
+ax[0].contourf(xx, yy, Z, alpha=0.25, cmap="viridis", levels=2)
+ax[0].scatter(X[:, 0], X[:, 1], c=y, s=12, cmap="viridis",
+              edgecolor="k", linewidth=0.2)
+ax[0].set_title("Gaussian NB decision regions")
+ax[0].set_xlabel("feature 1"); ax[0].set_ylabel("feature 2")
+ax[1].plot(results["alpha"], results["test_accuracy"], marker="o", label="accuracy")
+ax[1].plot(results["alpha"], results["macro_f1"], marker="s", label="macro F1")
+ax[1].set_xscale("log")
+ax[1].set_title("Multinomial NB vs. Laplace alpha")
+ax[1].set_xlabel("smoothing alpha (log)"); ax[1].set_ylabel("score")
+ax[1].legend()
+fig.tight_layout()
+plt.show()
+```
+
+## Julia
+
+```julia
+using Random, Statistics, Printf
+
+Random.seed!(42)
+
+# Three Gaussian blobs in 2D, one per class.
+function make_blobs(n, centers, sd)
+    d = size(centers, 2)
+    X = zeros(n * size(centers, 1), d)
+    y = zeros(Int, n * size(centers, 1))
+    r = 1
+    for (c, mu) in enumerate(eachrow(centers))
+        for _ in 1:n
+            X[r, :] = mu .+ sd .* randn(d)
+            y[r] = c
+            r += 1
+        end
+    end
+    return X, y
+end
+
+centers = [0.0 0.0; 6.0 6.0; -6.0 6.0]
+X, y = make_blobs(200, centers, 1.8)
+
+# Fit Gaussian NB: per-class mean, variance, and prior.
+classes = sort(unique(y))
+means = Dict(c => vec(mean(X[y .== c, :], dims=1)) for c in classes)
+vars  = Dict(c => vec(var(X[y .== c, :], dims=1)) for c in classes)
+priors = Dict(c => mean(y .== c) for c in classes)
+
+# Log Gaussian likelihood summed over independent features, plus log prior.
+function logscore(x, c)
+    mu, v = means[c], vars[c]
+    s = log(priors[c])
+    for j in eachindex(x)
+        s += -0.5 * (log(2pi * v[j]) + (x[j] - mu[j])^2 / v[j])
+    end
+    return s
+end
+
+predict(x) = classes[argmax([logscore(x, c) for c in classes])]
+acc = mean(predict(X[i, :]) == y[i] for i in 1:length(y))
+@printf("Gaussian NB training accuracy: %.3f\n", acc)
+```
+
+## Rust
+
+```rust
+// Cargo.toml: rand = "0.8", rand_distr = "0.4"
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+use rand_distr::StandardNormal;
+
+// Fit Gaussian NB and return per-class (mean, var, log_prior).
+fn fit(x: &[[f64; 2]], y: &[usize], k: usize)
+    -> Vec<([f64; 2], [f64; 2], f64)> {
+    let n = x.len() as f64;
+    (0..k).map(|c| {
+        let idx: Vec<usize> = (0..x.len()).filter(|&i| y[i] == c).collect();
+        let m = idx.len() as f64;
+        let mut mu = [0.0; 2];
+        for &i in &idx { for j in 0..2 { mu[j] += x[i][j] / m; } }
+        let mut var = [0.0; 2];
+        for &i in &idx { for j in 0..2 { var[j] += (x[i][j] - mu[j]).powi(2) / m; } }
+        (mu, var, (m / n).ln())
+    }).collect()
+}
+
+fn log_score(xi: &[f64; 2], p: &([f64; 2], [f64; 2], f64)) -> f64 {
+    let (mu, var, lp) = p;
+    let mut s = *lp;
+    for j in 0..2 {
+        // Log Gaussian likelihood for independent feature j.
+        s += -0.5 * ((2.0 * std::f64::consts::PI * var[j]).ln()
+                     + (xi[j] - mu[j]).powi(2) / var[j]);
+    }
+    s
+}
+
+fn main() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let centers = [[0.0, 0.0], [6.0, 6.0], [-6.0, 6.0]];
+    let mut x = Vec::new();
+    let mut y = Vec::new();
+    for (c, ctr) in centers.iter().enumerate() {
+        for _ in 0..200 {
+            let a: f64 = rng.sample(StandardNormal);
+            let b: f64 = rng.sample(StandardNormal);
+            x.push([ctr[0] + 1.8 * a, ctr[1] + 1.8 * b]);
+            y.push(c);
+        }
+    }
+    let params = fit(&x, &y, centers.len());
+    let correct = x.iter().zip(&y).filter(|(xi, &yi)| {
+        let scores: Vec<f64> = params.iter().map(|p| log_score(xi, p)).collect();
+        let pred = scores.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        pred == yi
+    }).count();
+    println!("Gaussian NB training accuracy: {:.3}",
+             correct as f64 / x.len() as f64);
+}
+```
+
+:::
+
+### 6.7 The Pipeline at a Glance
+
+The diagram summarizes the flow from raw counts to a smoothed prediction.
+
+```{mermaid}
+flowchart TD
+    A[Training data: features and labels] --> B[Estimate priors P of y from class frequencies]
+    A --> C[Accumulate per-class feature counts]
+    C --> D[Apply Laplace smoothing: add alpha to every count]
+    D --> E[Store log likelihoods log P of x_j given y]
+    B --> F[New input x]
+    E --> F
+    F --> G[Score each class: log prior plus sum of log likelihoods]
+    G --> H[Predict argmax class]
+    G --> I[Softmax of scores gives posterior probabilities]
+```
+
 ## 7. Summary
 
 Naive Bayes begins from the exact identity of Bayes' theorem and then makes one bold simplification: features are conditionally independent given the class. This assumption reduces an intractable joint distribution to a product of simple univariate distributions, turns training into counting, and makes inference a sum of logarithms. The generative model it defines lets us classify by the MAP rule, choosing the class whose prior and likelihood best explain the data. Although the independence assumption is almost always false, the method works because correct classification needs only the right argmax, not accurate probabilities, and because the strong assumption acts as a regularizer that wins on variance in small data settings. Laplace smoothing completes the picture, replacing brittle zero probabilities with a principled Dirichlet posterior mean that keeps the model robust to unseen feature values. The result is a classifier that is fast, frugal with data, easy to implement, and a durable baseline across decades of machine learning practice.
 
 ## References
 
-1. Domingos, P., and Pazzani, M. "On the Optimality of the Simple Bayesian Classifier under Zero-One Loss." Machine Learning, 1997. https://link.springer.com/article/10.1023/A:1007413511361
+1. Domingos, P., and Pazzani, M. "On the Optimality of the Simple Bayesian Classifier under Zero-One Loss." Machine Learning, 1997. DOI: 10.1023/A:1007413511361. https://doi.org/10.1023/A:1007413511361
 2. Rish, I. "An Empirical Study of the Naive Bayes Classifier." IJCAI Workshop on Empirical Methods in AI, 2001. https://www.cc.gatech.edu/~isbell/reading/papers/Rish.pdf
-3. Manning, C. D., Raghavan, P., and Schutze, H. "Introduction to Information Retrieval," Chapter 13: Text Classification and Naive Bayes. Cambridge University Press, 2008. https://nlp.stanford.edu/IR-book/html/htmledition/naive-bayes-text-classification-1.html
+3. Manning, C. D., Raghavan, P., and Schutze, H. "Introduction to Information Retrieval," Chapter 13: Text Classification and Naive Bayes. Cambridge University Press, 2008. DOI: 10.1017/CBO9780511809071. https://doi.org/10.1017/CBO9780511809071
 4. Ng, A. Y., and Jordan, M. I. "On Discriminative vs. Generative Classifiers: A Comparison of Logistic Regression and Naive Bayes." NeurIPS, 2001. https://papers.nips.cc/paper/2020-on-discriminative-vs-generative-classifiers-a-comparison-of-logistic-regression-and-naive-bayes
 5. Zhang, H. "The Optimality of Naive Bayes." FLAIRS Conference, 2004. https://www.cs.unb.ca/~hzhang/publications/FLAIRS04ZhangH.pdf
-6. Hastie, T., Tibshirani, R., and Friedman, J. "The Elements of Statistical Learning," Section 6.6.3. Springer, 2009. https://hastie.su.domains/ElemStatLearn/
-7. scikit-learn developers. "Naive Bayes." scikit-learn User Guide. https://scikit-learn.org/stable/modules/naive_bayes.html
+6. Hastie, T., Tibshirani, R., and Friedman, J. "The Elements of Statistical Learning." Springer, 2009. DOI: 10.1007/978-0-387-84858-7. https://doi.org/10.1007/978-0-387-84858-7
+7. Lidstone, G. J. "Note on the General Case of the Bayes-Laplace Formula for Inductive or A Posteriori Probabilities." Transactions of the Faculty of Actuaries, 1920. https://doi.org/10.1017/S2049221700004137
+8. scikit-learn developers. "Naive Bayes." scikit-learn User Guide. https://scikit-learn.org/stable/modules/naive_bayes.html
