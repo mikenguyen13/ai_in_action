@@ -59,6 +59,8 @@ Catastrophic cancellation is the most counterintuitive numerical hazard because 
 
 Consider computing $1 - \cos x$ for small $x$. Both $1$ and $\cos x$ are close to one, so their difference loses most of its significant digits. A numerically superior approach uses the identity $1 - \cos x = 2 \sin^2(x/2)$, which computes the small quantity directly rather than as a difference of two large ones.
 
+A concrete worked example makes the loss visible. Take $a = 1.0000000054321$ and $b = 1.0000000012345$, two numbers that agree in their first nine significant digits. Each is stored in FP64 with a relative error near machine epsilon, roughly $10^{-16}$. The exact difference is $a - b = 4.1976 \times 10^{-9}$. The subtraction itself is computed without rounding, since the operands are close enough that their difference is exactly representable. But the absolute error of about $10^{-16}$ that was already present in each operand now sits on top of a result of magnitude $10^{-9}$, so the relative error of the difference has been amplified from $10^{-16}$ to roughly $10^{-16} / 10^{-9} = 10^{-7}$. Nine digits of accuracy entered the subtraction and only about seven came out. We can frame this with the condition number of subtraction. For $f(a, b) = a - b$ the relative condition number is $|a| + |b|$ over $|a - b|$, which here is about $2 / (4.2 \times 10^{-9}) \approx 4.8 \times 10^{8}$. A condition number of nearly half a billion means that relative input errors are magnified by that factor, and the worked Python cell below confirms the predicted digit loss numerically.
+
 ### 3.2 The quadratic formula
 
 The standard textbook example is the quadratic formula. When $b^2 \gg 4ac$, the square root $\sqrt{b^2 - 4ac}$ is close to $|b|$, so one of the two roots is computed as the difference of two nearly equal numbers and loses precision. The stable remedy computes the root with the larger magnitude first using the form that adds rather than subtracts,
@@ -107,7 +109,19 @@ $$
 \log \sum_{i} e^{x_i} = c + \log \sum_{i} e^{x_i - c}.
 $$
 
-You can verify this by factoring $e^c$ out of the sum. The trick is to choose $c = \max_i x_i$. After the shift, the largest exponent becomes exactly zero, so the largest term in the sum is $e^0 = 1$ and overflow is impossible. Every other term lies in $(0, 1]$, and any terms that underflow to zero were genuinely negligible relative to the maximum, so the result is unaffected. The stable computation is
+You can derive this directly. Factor $e^{c}$ out of every term inside the sum,
+
+$$
+\sum_i e^{x_i} = \sum_i e^{c} e^{x_i - c} = e^{c} \sum_i e^{x_i - c},
+$$
+
+then take the logarithm of both sides and use $\log(e^c \cdot S) = c + \log S$,
+
+$$
+\log \sum_i e^{x_i} = \log\!\left(e^{c} \sum_i e^{x_i - c}\right) = c + \log \sum_i e^{x_i - c}.
+$$
+
+The identity holds for any real $c$, which is the freedom we exploit. The trick is to choose $c = \max_i x_i$. After the shift, the largest exponent becomes exactly zero, so the largest term in the sum is $e^0 = 1$ and overflow is impossible. Every other term lies in $(0, 1]$, and any terms that underflow to zero were genuinely negligible relative to the maximum, so the result is unaffected. The stable computation is
 
 ```python
 c = max(x)
@@ -205,14 +219,122 @@ Dynamic loss scaling automates the choice of $S$. It raises the scale when train
 
 The final piece is keeping a high precision copy of the parameters. Weight updates are often tiny relative to the weights themselves, so adding an update to a 16 bit weight can be absorbed entirely, the same vanishing problem from Section 2.2. Mixed-precision training therefore maintains a master copy of the weights in FP32. The forward and backward passes run in 16 bit for speed, but the optimizer applies its update to the FP32 master copy, which is then rounded back to 16 bit for the next iteration. This keeps the slow accumulation of many small updates from being lost to absorption while still reaping the throughput of low precision arithmetic. The recurring theme of the whole chapter is visible here in miniature: compute fast where you can, accumulate carefully where you must, and always keep the critical reductions in the precision the mathematics demands.
 
+## 9. Worked Examples in Code
+
+The three hazards above are easiest to believe once you watch them happen. The following cell is executable. It demonstrates catastrophic cancellation against its condition number, the overflow of naive softmax against the stable shifted form, and the error amplification of an ill conditioned linear solve. The random seed is fixed so the output is reproducible.
+
+```{python}
+import numpy as np
+
+rng = np.random.default_rng(0)
+
+# 1. Catastrophic cancellation
+a = np.float64(1.0000000054321)
+b = np.float64(1.0000000012345)
+exact = 4.1976e-9
+diff = a - b
+rel_err = abs(diff - exact) / exact
+cond = (abs(a) + abs(b)) / abs(diff)
+print("Catastrophic cancellation")
+print(f"  a - b            = {diff:.6e}")
+print(f"  relative error   = {rel_err:.2e}")
+print(f"  condition number = {cond:.2e}")
+
+# stable 1 - cos x via 2 sin^2(x/2)
+x = 1e-8
+naive_c = 1.0 - np.cos(x)
+stable_c = 2.0 * np.sin(x / 2.0) ** 2
+print(f"  1-cos(1e-8) naive  = {naive_c:.3e}")
+print(f"  1-cos(1e-8) stable = {stable_c:.3e}")
+
+# 2. Naive vs stable softmax
+logits = np.array([1000.0, 1001.0, 1002.0])
+with np.errstate(over="ignore", invalid="ignore"):
+    naive_sm = np.exp(logits) / np.sum(np.exp(logits))
+c = np.max(logits)
+stable_sm = np.exp(logits - c) / np.sum(np.exp(logits - c))
+print("\nSoftmax overflow")
+print(f"  naive  = {naive_sm}")
+print(f"  stable = {stable_sm}")
+
+# fused cross-entropy via log-sum-exp
+y = 2
+lse = c + np.log(np.sum(np.exp(logits - c)))
+loss = lse - logits[y]
+print(f"  fused cross-entropy loss = {loss:.6f}")
+
+# 3. Conditioning of a linear solve
+A = np.array([[1.0, 1.0], [1.0, 1.0 + 1e-10]])
+b_vec = np.array([2.0, 2.0])
+x_sol = np.linalg.solve(A, b_vec)
+x_pert = np.linalg.solve(A, b_vec + np.array([0.0, 1e-8]))
+print("\nConditioning")
+print(f"  kappa(A)            = {np.linalg.cond(A):.2e}")
+print(f"  solution            = {x_sol}")
+print(f"  perturbed solution  = {x_pert}")
+```
+
+The naive softmax returns `NaN` because $e^{1002}$ overflows FP64, while the shifted version returns a clean distribution. The linear solve shows a relative input change near $10^{-9}$ producing a relative output change of order $10$, exactly the amplification its condition number of $4 \times 10^{10}$ predicts.
+
+## 10. The Stable Softmax Across Languages
+
+The shifted softmax is the same algorithm in any language. The pattern is always subtract the maximum, exponentiate, then normalize. Below the Python version is executable and the others are illustrative.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+
+def softmax(x):
+    x = np.asarray(x, dtype=np.float64)
+    z = x - np.max(x)        # shift for stability
+    e = np.exp(z)
+    return e / np.sum(e)
+
+print(softmax([1000.0, 1001.0, 1002.0]))
+```
+
+## Julia
+
+```julia
+function softmax(x::AbstractVector{<:Real})
+    c = maximum(x)            # shift for stability
+    e = exp.(x .- c)
+    return e ./ sum(e)
+end
+
+println(softmax([1000.0, 1001.0, 1002.0]))
+```
+
+## Rust
+
+```rust
+fn softmax(x: &[f64]) -> Vec<f64> {
+    let c = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = x.iter().map(|&v| (v - c).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    exps.iter().map(|&e| e / sum).collect()
+}
+
+fn main() {
+    let p = softmax(&[1000.0, 1001.0, 1002.0]);
+    println!("{:?}", p);
+}
+```
+
+:::
+
 ## References
 
-1. IEEE. *IEEE Standard for Floating-Point Arithmetic (IEEE 754-2019)*. IEEE, 2019. https://standards.ieee.org/ieee/754/6210/
-2. Goldberg, D. "What Every Computer Scientist Should Know About Floating-Point Arithmetic." *ACM Computing Surveys*, 23(1), 1991. https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
-3. Higham, N. J. *Accuracy and Stability of Numerical Algorithms*, 2nd ed. SIAM, 2002. https://epubs.siam.org/doi/book/10.1137/1.9780898718027
-4. Trefethen, L. N., and Bau, D. *Numerical Linear Algebra*. SIAM, 1997. https://epubs.siam.org/doi/book/10.1137/1.9780898719574
+1. IEEE. *IEEE Standard for Floating-Point Arithmetic (IEEE 754-2019)*. IEEE, 2019. https://doi.org/10.1109/IEEESTD.2019.8766229
+2. Goldberg, D. "What Every Computer Scientist Should Know About Floating-Point Arithmetic." *ACM Computing Surveys*, 23(1), 5 to 48, 1991. https://doi.org/10.1145/103162.103163
+3. Higham, N. J. *Accuracy and Stability of Numerical Algorithms*, 2nd ed. SIAM, 2002. https://doi.org/10.1137/1.9780898718027
+4. Trefethen, L. N., and Bau, D. *Numerical Linear Algebra*. SIAM, 1997. https://doi.org/10.1137/1.9780898719574
 5. Goodfellow, I., Bengio, Y., and Courville, A. *Deep Learning*, Chapter 4: Numerical Computation. MIT Press, 2016. https://www.deeplearningbook.org/contents/numerical.html
-6. Micikevicius, P., et al. "Mixed Precision Training." *International Conference on Learning Representations (ICLR)*, 2018. https://arxiv.org/abs/1710.03740
-7. Kalamkar, D., et al. "A Study of BFLOAT16 for Deep Learning Training." arXiv preprint, 2019. https://arxiv.org/abs/1905.12322
-8. Pascanu, R., Mikolov, T., and Bengio, Y. "On the Difficulty of Training Recurrent Neural Networks." *International Conference on Machine Learning (ICML)*, 2013. https://arxiv.org/abs/1211.5063
-9. Blanchard, P., Higham, D. J., and Higham, N. J. "Accurately Computing the Log-Sum-Exp and Softmax Functions." *IMA Journal of Numerical Analysis*, 41(4), 2021. https://doi.org/10.1093/imanum/draa038
+6. Micikevicius, P., et al. "Mixed Precision Training." *International Conference on Learning Representations (ICLR)*, 2018. https://doi.org/10.48550/arXiv.1710.03740
+7. Kalamkar, D., et al. "A Study of BFLOAT16 for Deep Learning Training." arXiv preprint, 2019. https://doi.org/10.48550/arXiv.1905.12322
+8. Pascanu, R., Mikolov, T., and Bengio, Y. "On the Difficulty of Training Recurrent Neural Networks." *International Conference on Machine Learning (ICML)*, 28(3), 1310 to 1318, 2013. https://doi.org/10.48550/arXiv.1211.5063
+9. Blanchard, P., Higham, D. J., and Higham, N. J. "Accurately Computing the Log-Sum-Exp and Softmax Functions." *IMA Journal of Numerical Analysis*, 41(4), 2311 to 2330, 2021. https://doi.org/10.1093/imanum/draa038
+10. Kahan, W. "Pracniques: Further Remarks on Reducing Truncation Errors." *Communications of the ACM*, 8(1), 40, 1965. https://doi.org/10.1145/363707.363723
