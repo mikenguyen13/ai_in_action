@@ -62,6 +62,8 @@ $$
 
 Each component's mean is the weighted centroid of the data, its covariance is the weighted scatter, and its mixing weight is the fraction of total responsibility it captured. The expectation step recomputes the responsibilities from the current parameters, and the two steps alternate until convergence.
 
+The pseudocode below summarizes a single EM pass. The E-step recomputes responsibilities from the current parameters, and the M-step updates the parameters from those responsibilities, repeating until the log likelihood change falls below a tolerance.
+
 ```text
 EM for a GMM (one pass)
   E-step: for each n, k compute gamma(z_nk) from current params
@@ -70,6 +72,64 @@ EM for a GMM (one pass)
           Sig_k = (1/N_k) sum_n gamma(z_nk) (x_n - mu_k)(x_n - mu_k)^T
           pi_k  = N_k / N
   repeat until log-likelihood change < tol
+```
+
+The following cell fits a three component GMM with full covariances to synthetic data and draws each fitted component as one and two standard deviation ellipses, illustrating the elliptical, rotated shapes that full covariances capture. The fitted means, covariances, and mixing weights are exactly the responsibility weighted statistics from the M-step above.
+
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from sklearn.mixture import GaussianMixture
+
+rng = np.random.default_rng(0)
+means_true = [(-3, -3), (0, 4), (4, -1)]
+covs_true = [
+    [[1.2, 0.6], [0.6, 0.8]],
+    [[0.7, -0.5], [-0.5, 1.4]],
+    [[1.0, 0.0], [0.0, 0.3]],
+]
+X = np.vstack([
+    rng.multivariate_normal(m, c, size=n)
+    for m, c, n in zip(means_true, covs_true, [200, 200, 200])
+])
+
+gmm = GaussianMixture(n_components=3, covariance_type="full",
+                      n_init=5, random_state=0).fit(X)
+labels = gmm.predict(X)
+
+def draw_ellipse(mean, cov, ax, color):
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    for nsig in (1, 2):
+        w, h = 2 * nsig * np.sqrt(vals)
+        ax.add_patch(Ellipse(mean, w, h, angle=angle, fill=False,
+                             edgecolor=color, lw=1.5, alpha=0.7))
+
+fig, ax = plt.subplots(figsize=(6, 5))
+colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+for k in range(3):
+    ax.scatter(X[labels == k, 0], X[labels == k, 1], s=8,
+               color=colors[k], alpha=0.5)
+    draw_ellipse(gmm.means_[k], gmm.covariances_[k], ax, colors[k])
+ax.set_title("GMM fit: full covariance, 3 components")
+ax.set_xlabel("x1"); ax.set_ylabel("x2")
+plt.tight_layout()
+plt.show()
+
+print("converged:", gmm.converged_,
+      "log-likelihood:", round(gmm.score(X) * len(X), 1))
+```
+
+The responsibilities are the soft assignments derived above. Each row sums to one, distributing a single unit of membership across the components in proportion to how well each explains the point.
+
+```{python}
+resp = gmm.predict_proba(X)
+np.set_printoptions(precision=3, suppress=True)
+for i in [0, 250, 450]:
+    print(f"point {i}: responsibilities = {resp[i]}, sum = {resp[i].sum():.3f}")
 ```
 
 ## 4. The Likelihood
@@ -159,6 +219,34 @@ for cov_type in [spherical, diagonal, tied, full]:
         if best is None or bic < best.bic:
             best = (K, cov_type, bic)
 return best
+```
+
+The cell below runs the recipe over the number of components for the same synthetic data, which was generated from three Gaussians. BIC reaches its minimum at three components, recovering the true generating structure, while AIC's lighter penalty leaves it flatter on the high side. Lower is better, so the minimum of the BIC curve marks the selected model.
+
+```{python}
+import pandas as pd
+
+records = []
+for n in range(1, 9):
+    g = GaussianMixture(n_components=n, covariance_type="full",
+                        n_init=5, random_state=0).fit(X)
+    records.append({"n_components": n, "BIC": g.bic(X), "AIC": g.aic(X)})
+table = pd.DataFrame(records)
+best_n = int(table.loc[table["BIC"].idxmin(), "n_components"])
+print(table.to_string(index=False))
+print("BIC-selected number of components:", best_n)
+
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(table["n_components"], table["BIC"], "o-", label="BIC")
+ax.plot(table["n_components"], table["AIC"], "s--", label="AIC", alpha=0.6)
+ax.axvline(best_n, color="red", ls=":", alpha=0.6,
+           label=f"BIC min (n={best_n})")
+ax.set_xlabel("number of components")
+ax.set_ylabel("information criterion")
+ax.set_title("Model selection: BIC vs number of components")
+ax.legend()
+plt.tight_layout()
+plt.show()
 ```
 
 Two cautions temper the mechanical use of BIC. First, it answers a statistical question, not a substantive one. The BIC optimal number of components is the one that best explains the density of the data, which need not coincide with the number of semantically meaningful clusters a domain expert would name. A single skewed or heavy tailed group can demand two Gaussians to fit, inflating $K$ beyond the intuitive cluster count. Second, BIC's consistency guarantee assumes the data really were generated by a finite Gaussian mixture. Real data rarely are, so treat BIC as a well calibrated heuristic for comparing candidates rather than as ground truth. When the BIC curve is flat near its minimum, prefer the simpler model, and corroborate the choice with held out likelihood, stability across restarts, and visual inspection where dimensionality permits.
