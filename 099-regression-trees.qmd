@@ -1,0 +1,213 @@
+# Regression Trees
+
+Decision trees are among the most interpretable tools in supervised learning, and their adaptation to continuous targets, the regression tree, is a foundational building block for the ensemble methods that dominate tabular prediction today. This chapter develops regression trees from first principles. We define the model, derive the splitting criterion from variance and mean squared error, study the piecewise-constant predictor it produces, examine smoothing and regularization, and close with the structural limitations that motivate bagging, random forests, and gradient boosting.
+
+## 1. From Classification to Continuous Targets
+
+### 1.1 The supervised regression setup
+
+We observe training data $\{(x_i, y_i)\}_{i=1}^{n}$ where each $x_i \in \mathbb{R}^p$ is a feature vector and each $y_i \in \mathbb{R}$ is a continuous response. We seek a function $\hat{f}: \mathbb{R}^p \to \mathbb{R}$ that predicts $y$ from $x$ with low expected error. The standard loss is squared error, so we aim to minimize the risk
+
+$$
+R(f) = \mathbb{E}_{(X,Y)}\left[(Y - f(X))^2\right].
+$$
+
+The minimizer over all measurable functions is the conditional mean $f^{*}(x) = \mathbb{E}[Y \mid X = x]$, the regression function. Every estimator in this chapter can be understood as an attempt to approximate $f^{*}$ from finite data.
+
+### 1.2 What a tree represents
+
+A regression tree approximates $f^{*}$ by partitioning the feature space into $M$ disjoint axis-aligned regions $R_1, \dots, R_M$ and assigning a single constant prediction $c_m$ to each region. The model is
+
+$$
+\hat{f}(x) = \sum_{m=1}^{M} c_m \, \mathbb{1}\{x \in R_m\}.
+$$
+
+The partition is built by recursive binary splitting. Starting from the full space, the algorithm repeatedly chooses a feature $j$ and a threshold $s$ and divides a region into two children,
+
+$$
+R_{\text{left}}(j, s) = \{x : x_j \le s\}, \qquad R_{\text{right}}(j, s) = \{x : x_j > s\},
+$$
+
+producing the familiar binary tree whose leaves correspond to the regions $R_m$. Because each split conditions on a single feature, the resulting partition cells are axis-aligned hyperrectangles. This is the key structural assumption, and it drives both the strengths and the weaknesses we discuss later.
+
+## 2. The Splitting Criterion: Variance and MSE Reduction
+
+### 2.1 Optimal leaf values under squared error
+
+Suppose a region $R_m$ contains the index set $I_m = \{i : x_i \in R_m\}$ with $n_m = |I_m|$ points. For a fixed partition, the constant $c_m$ that minimizes the within-region squared error is found by setting the derivative of $\sum_{i \in I_m}(y_i - c_m)^2$ to zero, which yields the region mean
+
+$$
+\hat{c}_m = \bar{y}_{R_m} = \frac{1}{n_m} \sum_{i \in I_m} y_i .
+$$
+
+This is the regression analogue of the majority vote in classification. The minimized within-region cost is the residual sum of squares
+
+$$
+\mathrm{SSE}(R_m) = \sum_{i \in I_m} (y_i - \bar{y}_{R_m})^2 = n_m \cdot \widehat{\mathrm{Var}}(y \mid R_m),
+$$
+
+where $\widehat{\mathrm{Var}}$ is the (biased) sample variance of the responses in the region. The total training cost of a tree is the sum over leaves, $\sum_m \mathrm{SSE}(R_m)$.
+
+### 2.2 Choosing a split
+
+Because the responses are continuous, the impurity of a node is naturally measured by variance rather than by Gini index or entropy. Define the node impurity as the mean squared deviation from the node mean,
+
+$$
+Q(R_m) = \frac{1}{n_m} \sum_{i \in I_m} (y_i - \bar{y}_{R_m})^2 .
+$$
+
+When we split $R_m$ on $(j, s)$ into left and right children with $n_L$ and $n_R$ points, the splitting objective is the weighted child impurity
+
+$$
+\mathcal{L}(j, s) = \frac{n_L}{n_m} Q(R_L) + \frac{n_R}{n_m} Q(R_R) .
+$$
+
+The greedy algorithm selects the pair $(j, s)$ that minimizes $\mathcal{L}(j, s)$. Equivalently, because the parent impurity is fixed, it maximizes the impurity decrease, often called the variance reduction,
+
+$$
+\Delta(j, s) = Q(R_m) - \left[ \frac{n_L}{n_m} Q(R_L) + \frac{n_R}{n_m} Q(R_R) \right].
+$$
+
+### 2.3 Why variance reduction equals SSE reduction
+
+There is a clean identity connecting the two views. Writing everything in terms of sums of squared errors, the reduction in total SSE achieved by a split is
+
+$$
+\mathrm{SSE}(R_m) - \mathrm{SSE}(R_L) - \mathrm{SSE}(R_R) = n_m \, \Delta(j, s).
+$$
+
+So minimizing weighted child variance is identical to greedily minimizing the training mean squared error at each step. This is why regression trees are sometimes described as performing coordinate-wise, threshold-wise, greedy least squares fitting. It also exposes the parallel with the bias-variance decomposition: each split spends model complexity to remove a piece of explainable variance from the residuals.
+
+### 2.4 Efficient evaluation of candidate splits
+
+For a single feature, the candidate thresholds are the midpoints between consecutive sorted values, so there are at most $n_m - 1$ distinct splits to consider. Sorting the region once and sweeping left to right lets us update the child sums incrementally. Maintaining running counts and sums of $y$ and $y^2$ gives each child variance in constant time per candidate, because
+
+$$
+\sum_{i \in I}(y_i - \bar{y}_I)^2 = \sum_{i \in I} y_i^2 - \frac{1}{|I|}\left(\sum_{i \in I} y_i\right)^2 .
+$$
+
+The full sweep over one feature is therefore $O(n_m \log n_m)$ dominated by the sort, and $O(p \, n_m \log n_m)$ across all features at a node.
+
+```python
+# Greedy split search for one node (illustrative, not optimized)
+def best_split(X, y):
+    best = (None, None, float("inf"))   # (feature, threshold, weighted_var)
+    n = len(y)
+    for j in range(X.shape[1]):
+        order = X[:, j].argsort()
+        xs, ys = X[order, j], y[order]
+        s_left, s_left_sq, k = 0.0, 0.0, 0
+        s_tot, s_tot_sq = ys.sum(), (ys ** 2).sum()
+        for i in range(1, n):
+            k += 1
+            s_left += ys[i - 1]; s_left_sq += ys[i - 1] ** 2
+            if xs[i] == xs[i - 1]:
+                continue                # no split between equal values
+            nL, nR = k, n - k
+            varL = s_left_sq - s_left ** 2 / nL
+            varR = (s_tot_sq - s_left_sq) - (s_tot - s_left) ** 2 / nR
+            score = (varL + varR) / n   # total SSE / n
+            if score < best[2]:
+                best = (j, 0.5 * (xs[i] + xs[i - 1]), score)
+    return best
+```
+
+## 3. Piecewise-Constant Predictions
+
+### 3.1 The geometry of the predictor
+
+Because every leaf emits a single value, the fitted function $\hat{f}$ is constant on each hyperrectangle and jumps discontinuously across split boundaries. The prediction surface is a staircase: flat treads separated by sharp risers aligned to the coordinate axes. Three consequences follow directly.
+
+First, $\hat{f}$ is not smooth and not continuous, so it cannot represent a gentle linear trend without using many tiny steps. Second, $\hat{f}$ is invariant to any strictly monotone transformation of an individual feature, since only the ordering of $x_j$ values affects the chosen thresholds. This makes trees robust to feature scaling and to skewed inputs, and removes the need for normalization. Third, the predictor extrapolates as a flat plateau: outside the range of the training data in any direction, the prediction equals the value of the nearest boundary leaf and does not continue any trend.
+
+### 3.2 A worked one-dimensional example
+
+Consider a single feature and a target generated by $y = \sin(x) + \varepsilon$. A depth-two tree can make at most three splits and produce four leaves, so it approximates the sine curve by four horizontal segments. Each segment sits at the mean of the responses whose inputs fall in that interval. As we increase depth, the number of segments grows and the staircase tracks the curve more closely, but it never becomes smooth. The approximation error of a piecewise-constant fit on an interval of width $h$ scales like $O(h)$ for a Lipschitz target, which is why trees need increasingly fine partitions, and therefore increasingly many samples, to resolve smooth structure.
+
+### 3.3 Bias and variance of a leaf estimate
+
+Each leaf prediction is a sample mean, so its statistical behavior is transparent. If a leaf covers a region where the true regression function varies, the leaf incurs an approximation bias equal to the deviation of $f^{*}$ from its regional average. At the same time, the leaf mean has variance $\sigma^2 / n_m$ where $\sigma^2$ is the noise level. Deep trees produce small regions with few points, lowering bias but inflating variance, while shallow trees do the reverse. This explicit tension is the bias-variance trade-off in its most concrete form, and controlling it is the subject of the next section.
+
+## 4. Controlling Complexity and Smoothing
+
+### 4.1 Stopping rules and pre-pruning
+
+The most direct controls limit how the tree grows. Common hyperparameters include the maximum depth, the minimum number of samples required to attempt a split, the minimum number of samples allowed in a leaf, and a minimum impurity decrease below which a split is rejected. These pre-pruning rules are cheap but myopic, because a split that looks weak at one node may enable a strong split beneath it, an effect that depth-limited greedy search cannot foresee.
+
+### 4.2 Cost-complexity pruning
+
+A more principled approach grows a large tree $T_0$ and then prunes it back. Cost-complexity pruning, introduced with the CART method, penalizes the number of leaves $|T|$ and defines
+
+$$
+R_\alpha(T) = \sum_{m=1}^{|T|} \mathrm{SSE}(R_m) + \alpha \, |T| .
+$$
+
+For each value of the complexity parameter $\alpha \ge 0$ there is a unique smallest subtree that minimizes $R_\alpha(T)$, and as $\alpha$ increases the sequence of optimal subtrees is nested. One selects $\alpha$ by cross validation, choosing the value that minimizes held-out mean squared error. This separates fitting from model selection and tends to outperform pure pre-pruning.
+
+### 4.3 Smoothing the staircase
+
+The hard discontinuities of a single tree can be softened in several ways. One option fits a simple local model inside each leaf rather than a constant, for example a linear regression, giving a model tree whose pieces are sloped rather than flat and that can extrapolate locally. Another option replaces the indicator membership with soft, probabilistic routing, so each point contributes fractionally to multiple leaves and the prediction becomes a smooth weighted average, an idea used in soft and hierarchical mixture-of-experts trees. The most widely used remedy in practice, however, is averaging many trees, which we return to in Section 6. Averaging does not change any individual staircase, but the mean of many staircases with different break points is itself far smoother.
+
+### 4.4 Handling categorical features and missing data
+
+For an unordered categorical feature with $K$ levels, an exact split partitions the levels into two groups, and there are $2^{K-1} - 1$ nontrivial partitions. For regression under squared error there is a useful shortcut: sorting the categories by their mean response and treating the result as ordered yields the optimal binary partition, reducing the search to $K - 1$ candidates. Missing values are commonly handled by surrogate splits, which use a correlated backup feature to route observations whose primary split value is absent, or by sending missing inputs to whichever child reduces loss most, as several modern boosting libraries do by default.
+
+## 5. Properties That Make Trees Attractive
+
+### 5.1 Interpretability and feature relevance
+
+A regression tree is a flowchart of threshold tests, so any single prediction can be explained by reading the path from root to leaf. Aggregate feature importance is commonly estimated by summing the total variance reduction attributed to each feature across all splits, weighted by node sample counts,
+
+$$
+\mathrm{Imp}(j) = \sum_{\text{splits on } j} n_m \, \Delta(j, s).
+$$
+
+This impurity-based importance is convenient but biased toward high-cardinality and continuous features, since they offer more candidate thresholds and thus more chances to reduce variance by chance. Permutation importance, computed on held-out data, is a more reliable alternative.
+
+### 5.2 Mixed data, interactions, and robustness
+
+Trees handle numeric and categorical features together without preprocessing, capture nonlinearities, and model interactions automatically, because a split deep in the tree is conditional on the splits above it. They are insensitive to monotone feature transforms and reasonably robust to outliers in the feature space, since outliers tend to be isolated into their own small regions rather than tilting a global fit. These properties, combined with fast prediction, explain their enduring popularity on tabular data.
+
+## 6. Limitations That Motivate Ensembles
+
+### 6.1 High variance and instability
+
+The defining weakness of a single regression tree is high variance. Because splits are chosen greedily and hierarchically, a small change in the training data can alter the top split, which then changes every split below it. Two bootstrap samples from the same distribution can yield trees with very different structure and noticeably different predictions. This instability is precisely the condition under which averaging helps most.
+
+The variance reduction from averaging is easy to see. If we form $B$ trees whose predictions each have variance $\sigma^2$ and pairwise correlation $\rho$, the variance of their average is
+
+$$
+\rho \, \sigma^2 + \frac{1 - \rho}{B} \, \sigma^2 .
+$$
+
+Bagging, which fits trees on bootstrap resamples and averages them, drives the second term toward zero as $B$ grows. The residual $\rho \sigma^2$ is the obstacle, and reducing the correlation $\rho$ between trees is the central design goal. Random forests do exactly this by restricting each split to a random subset of features, decorrelating the trees so that averaging removes more variance. Crucially, bagging and random forests leave the bias of deep trees roughly unchanged while sharply cutting variance, which is why they pair well with fully grown, low-bias trees.
+
+### 6.2 Bias from axis-aligned staircases
+
+A single tree also has structural bias. Axis-aligned splits cannot represent a diagonal decision boundary or a smooth oblique trend without a deep cascade of steps, so functions that are smooth or rotated relative to the coordinate axes are awkward to fit. Likewise, an additive structure such as $f^{*}(x) = g_1(x_1) + g_2(x_2)$ forces a tree to replicate the effect of one variable inside every branch of the other, wasting capacity. Averaging identically distributed trees does not fix bias. The remedy is to attack the residual directly.
+
+### 6.3 The boosting alternative
+
+Gradient boosting builds trees sequentially, where each new shallow tree fits the negative gradient of the loss, which for squared error is simply the current residual $y_i - \hat{f}(x_i)$. The update
+
+$$
+\hat{f}_{t}(x) = \hat{f}_{t-1}(x) + \eta \, h_t(x)
+$$
+
+with a small learning rate $\eta$ adds many weak, low-variance learners to progressively reduce bias, the complement of bagging's variance reduction. Modern implementations such as XGBoost, LightGBM, and CatBoost build on exactly the regression-tree machinery developed here: variance or loss reduction splits, leaf-wise constant or regularized leaf values, and complexity penalties, augmented with second-order loss approximations, shrinkage, column and row subsampling, and efficient histogram-based split finding.
+
+### 6.4 Summary of the trade
+
+The single regression tree gives us interpretability, mixed-type handling, and invariance to monotone transforms at the cost of high variance, axis-aligned bias, and a discontinuous staircase fit. Ensembles trade away the easy interpretability of a single tree to recover accuracy: bagging and random forests reduce variance by averaging decorrelated trees, while boosting reduces bias by fitting residuals in sequence. Understanding the splitting criterion, the piecewise-constant predictor, and these two failure modes is what makes the leap to ensembles feel inevitable rather than mysterious.
+
+## References
+
+1. Breiman, L., Friedman, J., Olshen, R., and Stone, C. (1984). Classification and Regression Trees. Wadsworth. https://doi.org/10.1201/9781315139470
+2. Hastie, T., Tibshirani, R., and Friedman, J. (2009). The Elements of Statistical Learning, 2nd edition. Springer. https://hastie.su.domains/ElemStatLearn/
+3. Breiman, L. (1996). Bagging Predictors. Machine Learning, 24(2), 123 to 140. https://doi.org/10.1007/BF00058655
+4. Breiman, L. (2001). Random Forests. Machine Learning, 45(1), 5 to 32. https://doi.org/10.1023/A:1010933404324
+5. Friedman, J. (2001). Greedy Function Approximation: A Gradient Boosting Machine. Annals of Statistics, 29(5), 1189 to 1232. https://doi.org/10.1214/aos/1013203451
+6. Chen, T., and Guestrin, C. (2016). XGBoost: A Scalable Tree Boosting System. Proceedings of KDD 2016. https://doi.org/10.1145/2939672.2939785
+7. Ke, G., et al. (2017). LightGBM: A Highly Efficient Gradient Boosting Decision Tree. Advances in Neural Information Processing Systems 30. https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision-tree
+8. Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research, 12, 2825 to 2830. https://jmlr.org/papers/v12/pedregosa11a.html
+9. Loh, W.-Y. (2011). Classification and Regression Trees. WIREs Data Mining and Knowledge Discovery, 1(1), 14 to 23. https://doi.org/10.1002/widm.8

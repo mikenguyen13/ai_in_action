@@ -1,0 +1,205 @@
+# Data Quality Assessment
+
+Every machine learning system inherits the quality of the data it consumes. A model trained on flawed records does not signal its discontent; it silently encodes the flaws, propagates them through inference, and amplifies them at scale. The discipline of data quality assessment exists to make these flaws visible and measurable before they reach a model, a dashboard, or a decision. This chapter develops the conceptual vocabulary of data quality, formalizes the dimensions practitioners use to reason about it, and surveys the techniques (profiling, metric design, and early detection) that turn vague unease about a dataset into actionable, quantified findings.
+
+The central premise is that quality is not a property of data in the abstract but a relationship between data and an intended use. A timestamp precise to the second is excellent for transaction reconciliation and irrelevant for a yearly demographic summary. Assessment, therefore, always carries an implicit clause: fit for what purpose. We make that clause explicit throughout.
+
+## 1. Foundations and the Fitness for Use Principle
+
+### 1.1 Data Quality as a Relation, Not an Attribute
+
+The most durable definition in the literature frames data quality as fitness for use by data consumers [1]. This framing has two consequences. First, the same dataset can be high quality for one task and unacceptable for another, so an assessment without a stated use case is incomplete. Second, quality is multidimensional: a single scalar score conceals trade offs that matter operationally. A dataset can be perfectly accurate yet badly incomplete, or perfectly complete yet stale.
+
+Formally, let $D$ denote a dataset and $U$ a use case. We model quality as a vector valued function $Q(D, U) = (q_1, q_2, \dots, q_k)$ where each $q_i \in [0, 1]$ measures one dimension. Aggregation into a single index, when needed for reporting, uses an explicit weighting $w$ that encodes the priorities of $U$:
+
+$$
+Q_{\text{agg}}(D, U) = \sum_{i=1}^{k} w_i \, q_i, \qquad \sum_{i=1}^{k} w_i = 1 .
+$$
+
+The weights are part of the assessment design and should be documented, because they are where business judgment enters.
+
+### 1.2 The Cost Asymmetry of Late Detection
+
+A recurring empirical observation, often summarized as the "1 to 10 to 100 rule," holds that the cost of preventing a defect at the source is roughly an order of magnitude lower than correcting it downstream, and two orders of magnitude lower than the cost of failure once a bad record drives a decision [2]. While the exact multipliers vary by domain, the qualitative asymmetry is robust and motivates the emphasis on early detection in Section 5. Errors compound through pipelines: a malformed join key corrupts every aggregate built on top of it, and a model retrained on the corrupted aggregate inherits the bias.
+
+## 2. The Dimensions of Data Quality
+
+Practitioners decompose quality into named dimensions so that each can be measured and remediated independently. The six dimensions below are the most widely adopted [3], though no canonical list is universal. We give each an operational definition and a measurement template.
+
+### 2.1 Accuracy
+
+Accuracy is the degree to which a recorded value matches the true value of the entity it describes. Let $v_i$ be the stored value for record $i$ and $v_i^{\*}$ the ground truth. Accuracy is the fraction of records for which the two agree under a domain appropriate equivalence relation $\approx$:
+
+$$
+\text{Accuracy} = \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}[\, v_i \approx v_i^{\*} \,] .
+$$
+
+The practical difficulty is that $v_i^{\*}$ is rarely available. Accuracy is therefore estimated against a trusted reference (a system of record, an authoritative registry, or a manually audited sample). When no reference exists, accuracy can only be approximated through proxies such as plausibility checks, which properly belong to validity (Section 2.5).
+
+### 2.2 Completeness
+
+Completeness measures the presence of required values. It is evaluated at several granularities: at the cell level (is this attribute populated), at the record level (does this row have all mandatory fields), and at the population level (are all expected entities present). Cell level completeness for an attribute $a$ is
+
+$$
+\text{Completeness}(a) = 1 - \frac{|\{ i : v_{i,a} = \texttt{NULL} \}|}{N} .
+$$
+
+A subtle point is that "missing" is not always literally null. Sentinel values such as `0`, `-1`, `9999`, or the empty string frequently encode absence, and an assessment that counts only true nulls will overstate completeness. Population completeness is harder still: detecting that whole entities are absent requires an external expectation of cardinality, such as "we should have one record per active customer."
+
+### 2.3 Consistency
+
+Consistency is the absence of contradiction, both within a dataset and across datasets that describe the same entities. It is naturally expressed as a set of logical constraints that the data must satisfy. If $C = \{c_1, \dots, c_m\}$ is a set of constraints (functional dependencies, cross field rules, referential integrity), consistency is the fraction of records violating none:
+
+$$
+\text{Consistency} = \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}\!\left[\, \bigwedge_{j=1}^{m} c_j(\text{record}_i) \,\right] .
+$$
+
+Examples of constraints include a functional dependency such as `zip_code` determines `city`, a cross field rule such as `ship_date >= order_date`, and referential integrity such as every `customer_id` in orders existing in the customers table. Inconsistency often arises from independent updates to redundant copies of the same fact, which is one reason normalized schemas reduce consistency defects.
+
+### 2.4 Timeliness
+
+Timeliness captures whether data is sufficiently current for the use case. A common formalization combines currency (the age of the data) with volatility (how quickly the underlying fact changes). One widely cited model expresses timeliness as
+
+$$
+\text{Timeliness} = \left[ \max\!\left(0, \; 1 - \frac{\text{Currency}}{\text{Volatility}}\right) \right]^{s},
+$$
+
+where currency is the elapsed time since the value was last refreshed, volatility is the expected lifetime of the value before it changes, and $s \ge 0$ is a sensitivity exponent that tunes how sharply timeliness decays [4]. A stock price has volatility measured in seconds, so a five minute old quote scores poorly; a person's date of birth has effectively infinite volatility, so timeliness is rarely a concern for it.
+
+### 2.5 Validity
+
+Validity is conformance to syntactic and semantic rules: defined formats, types, ranges, and allowed value sets. A value can be valid yet inaccurate (a well formed but wrong email address) and accurate yet invalid (a correct date stored in a format the schema forbids). Validity is the cheapest dimension to check because it requires no external reference, only the schema and domain rules:
+
+$$
+\text{Validity}(a) = \frac{|\{ i : v_{i,a} \in \text{Domain}(a) \}|}{N},
+$$
+
+where $\text{Domain}(a)$ is the admissible set for attribute $a$, expressed as a regular expression, a numeric range, an enumeration, or a type constraint. Because validity rules are local and inexpensive, they form the first line of defense in most pipelines.
+
+### 2.6 Uniqueness
+
+Uniqueness is the absence of unwanted duplication: each real world entity should be represented exactly once. Duplicates inflate counts, bias aggregates, and double count revenue or risk. If $E$ is the number of distinct real world entities and $N$ the number of records, a simple measure is
+
+$$
+\text{Uniqueness} = \frac{E}{N} .
+$$
+
+The hard part is estimating $E$, because duplicates are frequently not exact copies. "Robert Smith, 12 Oak St" and "Bob Smith, 12 Oak Street" denote one person across two records. Detecting such cases is the province of entity resolution and record linkage, which compare records with similarity functions and cluster matches [5]. Blocking strategies reduce the quadratic comparison cost by only comparing records that share a coarse key.
+
+## 3. Data Profiling
+
+### 3.1 What Profiling Produces
+
+Data profiling is the systematic examination of data to collect statistics and metadata that describe its structure and content [6]. Where dimension scoring answers "how good is this data," profiling answers the prior question "what is in this data," and it is the empirical foundation on which meaningful quality rules are built. Profiling outputs fall into three broad classes.
+
+Single column profiling computes, for each attribute, its data type, cardinality (number of distinct values), null fraction, minimum and maximum, mean and quantiles for numeric fields, value length distributions, and the most frequent values. Multi column profiling discovers relationships: correlations, functional dependencies, and candidate keys. Dependency profiling extends across tables to find inclusion dependencies and foreign key relationships, which are the raw material for referential integrity checks.
+
+### 3.2 A Profiling Sketch
+
+A profile is typically generated once to understand a new source and then rerun periodically to detect drift. A minimal single column profile looks like the following.
+
+```text
+column: customer_age
+  type:            integer
+  count:           1,000,000
+  null_fraction:   0.031
+  distinct:        118
+  min / max:       -3 / 214
+  mean / median:   41.2 / 39
+  p01 / p99:       18 / 89
+  top values:      35 (2.1%), 42 (2.0%), -1 (1.4%)
+```
+
+This single profile already exposes several quality problems without any rule being written. The minimum of $-3$ and maximum of $214$ are impossible ages, signaling validity defects. The value $-1$ among the top values is a sentinel for missing data, meaning the true null fraction exceeds the reported $0.031$. The presence of $118$ distinct integer values in a plausible range confirms the field is genuinely numeric rather than categorical. Profiling thus converts inspection into evidence.
+
+### 3.3 From Profile to Expectations
+
+The strategic value of profiling is that it lets quality rules be inferred from observed data rather than guessed in advance. A field whose observed values are always nonnegative suggests a range constraint; a column whose values are always unique suggests a key constraint; a stable null fraction suggests a completeness threshold. These inferred rules become the executable expectations of Section 5. The discipline is to treat profile derived rules as hypotheses to confirm with a domain expert, not as ground truth, since a profile captures what the data has been, not what it ought to be.
+
+## 4. Designing Quality Metrics
+
+### 4.1 Properties of a Good Metric
+
+A quality metric should be objective (computable from the data without subjective judgment at runtime), reproducible (the same data yields the same score), interpretable (a stakeholder can act on it), and aligned with the use case (it penalizes the defects that actually matter). A metric that scores high while the data remains unfit is worse than no metric, because it manufactures false confidence.
+
+Most dimension metrics share the ratio form
+
+$$
+q = \frac{\text{number of records passing the check}}{\text{number of records assessed}},
+$$
+
+which is bounded in $[0,1]$ and trivially interpretable as a pass rate. Ratios are attractive but lossy: a $99\%$ completeness score is reassuring until one learns the missing $1\%$ is concentrated in the highest value customers. This motivates segmentation.
+
+### 4.2 Segmentation and Weighting
+
+Aggregate metrics hide localized failure. Computing a metric within meaningful segments (by region, by acquisition channel, by time window) exposes problems that the global average dilutes. Formally, for a partition of the data into segments $S_1, \dots, S_g$, the segment scores $q^{(1)}, \dots, q^{(g)}$ are reported alongside the global score, and the minimum across segments often matters more than the mean. Weighting by business impact further refines this: a defect in a field that drives pricing should count more than a defect in a cosmetic field, which is exactly what the weights $w_i$ in Section 1.1 encode.
+
+### 4.3 Thresholds and Service Level Objectives
+
+A metric becomes operational only when paired with a threshold that distinguishes acceptable from unacceptable. These thresholds are best expressed as data quality service level objectives, for example "completeness of `email` must exceed $0.98$, measured daily." Setting thresholds is a negotiation between the cost of remediation and the cost of defects, informed by the profiled baseline. A threshold far above the historical norm guarantees constant false alarms; one far below guarantees that real degradations pass unnoticed.
+
+## 5. Detecting Quality Problems Early
+
+### 5.1 Shifting Detection Left
+
+The cost asymmetry of Section 1.2 implies that detection should move as close to data creation as possible, a practice often called shifting left. Validation at ingestion, before data is persisted or joined, catches the cheapest to fix defects and prevents their propagation. The architectural pattern is to treat every dataset crossing a pipeline boundary as a contract with declared expectations, and to fail or quarantine data that violates the contract rather than letting it flow downstream [7].
+
+### 5.2 Declarative Expectations and Validation in the Pipeline
+
+Modern tooling expresses quality checks as declarative expectations attached to a dataset, evaluated automatically on every run [8]. The value of the declarative style is that expectations are versioned, reviewed, and testable like code, and they double as documentation of what the data is supposed to look like.
+
+```text
+expect column customer_age between 0 and 120
+expect column email matches regex ^[^@]+@[^@]+\.[^@]+$
+expect column customer_id to be unique
+expect column order_total not null
+expect table row_count between 950000 and 1050000
+```
+
+Each expectation maps to a dimension: the range check is validity, the regex is validity, uniqueness is uniqueness, the not null is completeness, and the row count bound is a population completeness and volume check. When an expectation fails, the pipeline can warn, block, or route the offending records to a quarantine area for inspection, depending on severity.
+
+### 5.3 Statistical Monitoring and Drift
+
+Static thresholds catch violations of known rules but miss gradual distributional change, where each value is individually valid yet the population has shifted. Monitoring distributions over time detects this. A standard tool is the Population Stability Index, which compares a current distribution to a reference baseline across bins:
+
+$$
+\text{PSI} = \sum_{b=1}^{B} \left( p_b - q_b \right) \ln \frac{p_b}{q_b},
+$$
+
+where $p_b$ and $q_b$ are the proportions of records in bin $b$ for the current and reference distributions respectively. A common rule of thumb treats $\text{PSI} < 0.1$ as stable, $0.1 \le \text{PSI} < 0.25$ as moderate shift warranting investigation, and $\text{PSI} \ge 0.25$ as significant shift [9]. Note that the PSI summand is the same per bin quantity that appears in the symmetrized Kullback Leibler divergence, which is why it behaves as a distance between distributions. Volume anomalies (a daily load arriving at half its usual row count) and schema changes (a column silently renamed upstream) are detected by analogous monitors on counts and metadata.
+
+### 5.4 Anomaly Detection for Unforeseen Problems
+
+Rules and drift monitors both require anticipating what to watch. For the residual class of problems nobody specified, unsupervised anomaly detection flags records or aggregates that deviate from learned normal behavior. Simple control charts on quality metrics, flagging any daily score beyond $\mu \pm 3\sigma$ of its trailing distribution, catch a surprising fraction of incidents with minimal machinery. The principle is layered defense: declarative rules for the known, drift monitors for the gradual, and anomaly detection for the unforeseen, with each layer catching what the previous one misses.
+
+## 6. Organizational Practice and Synthesis
+
+### 6.1 Observability and Ownership
+
+Tooling alone does not produce quality; ownership does. The emerging discipline of data observability treats data health like system health, with continuous monitoring across freshness, volume, schema, distribution, and lineage, and with clear ownership for responding to alerts [10]. Lineage is essential because it answers the question that follows every detected defect: what downstream tables, dashboards, and models are affected, and who must be notified. Without lineage, a detected problem is a fact in search of a remedy.
+
+### 6.2 Assessment as a Continuous Loop
+
+Data quality assessment is not a one time audit but a continuous loop: profile the data to understand it, derive metrics and thresholds aligned to use, validate continuously at pipeline boundaries, monitor distributions for drift, and feed every detected defect back into refined rules. The dimensions of Section 2 give the loop its vocabulary, profiling gives it evidence, metrics give it numbers, and early detection gives it leverage over the cost asymmetry that makes quality worth pursuing in the first place. A model is only ever as trustworthy as the data beneath it, and that trust is earned one measured dimension at a time.
+
+## References
+
+[1] R. Y. Wang and D. M. Strong, "Beyond Accuracy: What Data Quality Means to Data Consumers," Journal of Management Information Systems, vol. 12, no. 4, 1996. https://www.tandfonline.com/doi/abs/10.1080/07421222.1996.11518099
+
+[2] T. C. Redman, "Data's Credibility Problem," Harvard Business Review, December 2013. https://hbr.org/2013/12/datas-credibility-problem
+
+[3] DAMA International, "DAMA-DMBOK: Data Management Body of Knowledge," 2nd ed., Technics Publications, 2017. https://www.dama.org/cpages/body-of-knowledge
+
+[4] M. Bovee, R. P. Srivastava, and B. Mak, "A Conceptual Framework and Belief-function Approach to Assessing Overall Information Quality," International Journal of Intelligent Systems, vol. 18, no. 1, 2003. https://onlinelibrary.wiley.com/doi/10.1002/int.10074
+
+[5] P. Christen, "Data Matching: Concepts and Techniques for Record Linkage, Entity Resolution, and Duplicate Detection," Springer, 2012. https://link.springer.com/book/10.1007/978-3-642-31164-2
+
+[6] F. Naumann, "Data Profiling Revisited," ACM SIGMOD Record, vol. 42, no. 4, 2014. https://dl.acm.org/doi/10.1145/2590989.2590995
+
+[7] A. Lakshmanan, "Data Contracts and the Shift-Left Approach to Data Quality," 2023. https://www.montecarlodata.com/blog-data-contracts/
+
+[8] Great Expectations, "Great Expectations: Documentation and Core Concepts," 2024. https://docs.greatexpectations.io/docs/
+
+[9] B. Yurdakul, "Statistical Properties of Population Stability Index," PhD dissertation, Western Michigan University, 2018. https://scholarworks.wmich.edu/dissertations/3208/
+
+[10] B. Moses, L. Gavish, and M. Vorwerck, "Data Quality Fundamentals: A Practitioner's Guide to Building Trustworthy Data Pipelines," O'Reilly Media, 2022. https://www.oreilly.com/library/view/data-quality-fundamentals/9781098112035/

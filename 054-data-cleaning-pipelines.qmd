@@ -1,0 +1,225 @@
+# Data Cleaning Pipelines
+
+Most of the effort in any applied machine learning or analytics project is spent not on modeling but on preparing data. Raw data arrives messy. It carries duplicate records, inconsistent encodings, malformed dates, free text fields with a dozen spellings of the same category, and silent corruption introduced by upstream systems. A data cleaning pipeline is the disciplined machinery that turns this raw input into a trustworthy, analysis ready dataset. This chapter treats cleaning as software engineering rather than as a one off exploratory exercise. The goal is a pipeline that is reproducible, testable, idempotent, and free of subtle forms of leakage that would inflate model performance and mislead decision makers.
+
+## 1. Why Treat Cleaning as a Pipeline
+
+A common failure mode is to clean data interactively in a notebook, sprinkle in manual fixes, and then ship the resulting file downstream. The output looks fine, but nobody can reconstruct how it was produced. Six months later the upstream source changes, the numbers drift, and there is no way to tell whether the model degraded or the cleaning logic silently broke.
+
+### 1.1 The Properties We Want
+
+A production grade cleaning pipeline should satisfy a small set of properties. It should be reproducible, meaning that running it on the same input always yields the same output, with no dependence on hidden state, wall clock time, or random seeds that were never recorded. It should be testable, meaning that each transformation can be exercised in isolation against known inputs and expected outputs. It should be idempotent, meaning that cleaning already clean data is a safe no op rather than a source of new corruption. It should be observable, meaning that the pipeline records what it changed and why, so that anomalies can be traced. Finally it should be leakage safe, meaning that no information from the target variable or from the test set bleeds into the features that a model will train on.
+
+### 1.2 Declarative Stages Over Imperative Scripts
+
+The most maintainable pipelines express cleaning as a sequence of named, composable stages. Each stage takes a dataset and returns a dataset, plus a small report of what it did. Thinking of the pipeline as a list of functions has practical benefits. Stages can be reordered, skipped, or unit tested independently. The dependency between stages becomes explicit. And the whole pipeline can be serialized to a configuration file so that the same logic runs in development, in continuous integration, and in production.
+
+```python
+# A pipeline is just an ordered list of stages.
+# Each stage has a name, a transform, and a validation check.
+pipeline = [
+    Stage("dedup", deduplicate, check=no_exact_duplicates),
+    Stage("coerce_types", coerce_schema, check=types_match_schema),
+    Stage("standardize", standardize_categoricals, check=values_in_vocab),
+    Stage("resolve", resolve_inconsistencies, check=invariants_hold),
+]
+```
+
+## 2. Common Cleaning Operations
+
+Before discussing architecture in depth it helps to catalog the operations that recur across almost every project. These are the building blocks that the pipeline orchestrates.
+
+### 2.1 Deduplication
+
+Duplicates arrive in two flavors. Exact duplicates are byte identical rows, usually caused by a retried write or a double join. Fuzzy duplicates describe the same real world entity through slightly different records, such as two customer rows that differ only by a trailing space in the name or a reformatted phone number.
+
+Exact deduplication is straightforward and should be done early, since it reduces the volume that later stages must process. Fuzzy deduplication, often called entity resolution or record linkage, is harder. It requires a similarity function over records, a blocking strategy to avoid comparing every pair, and a threshold or learned classifier to decide which pairs are matches.
+
+A crucial design decision is which record survives a merge. Picking the first row encountered makes the result depend on input ordering, which silently violates reproducibility. A better rule is deterministic survivorship, where you sort by an explicit key, prefer the most complete record, or prefer the most recent verified timestamp.
+
+```python
+# Deterministic survivorship: sort, then keep the best per group.
+def deduplicate(df):
+    df = df.drop_duplicates()                  # exact
+    df = (df.sort_values(["entity_id", "updated_at", "completeness"],
+                         ascending=[True, False, False])
+            .groupby("entity_id", as_index=False)
+            .first())                          # deterministic survivor
+    return df
+```
+
+### 2.2 Type Coercion
+
+Raw data is frequently delivered as strings even when it represents numbers, dates, or booleans. Coercion converts each column to its intended type. The risk is silent failure. A naive numeric cast may turn the string "N/A" into a null without anyone noticing, or a date parser may interpret an ambiguous value under the wrong locale and shift every record by a month.
+
+The defensive pattern is to coerce with explicit handling of failures. Decide in advance whether a value that cannot be coerced should become null, should be quarantined into an error table, or should halt the pipeline. Whatever the policy, record how many values failed. A sudden spike in coercion failures is one of the earliest signals that an upstream schema changed.
+
+```python
+# Coerce, count failures, and route bad rows rather than swallowing them.
+def coerce_schema(df, schema):
+    errors = {}
+    for col, dtype in schema.items():
+        coerced = to_dtype(df[col], dtype)     # returns null on failure
+        failed = df[col].notna() & coerced.isna()
+        errors[col] = int(failed.sum())
+        df[col] = coerced
+    return df, errors
+```
+
+### 2.3 Standardization
+
+Standardization brings values that mean the same thing into a single canonical form. Categorical text is the usual culprit. A country field might contain "USA", "U.S.A.", "United States", and "us", all denoting one category. Standardization maps these variants to one agreed token.
+
+Standardization also covers numeric units and formats. Phone numbers, postal codes, currency amounts, and physical measurements all benefit from a canonical representation. The key practice is to maintain an explicit, version controlled vocabulary or mapping table rather than burying string replacements inside code. The mapping table becomes a reviewable artifact, and when a new variant appears it is added to the table rather than to a tangle of conditionals.
+
+Note that standardization of free text often relies on normalization steps such as trimming whitespace, lowercasing, removing diacritics, and collapsing internal spacing. These steps should be applied consistently and in a fixed order so that the result is stable.
+
+### 2.4 Handling Inconsistencies
+
+Inconsistencies are contradictions within or across records that violate the rules of the domain. A record may list a ship date earlier than its order date, a customer may appear in two mutually exclusive segments, or a sum of line items may not equal the stated total. Detecting these requires encoding domain invariants as explicit checks.
+
+Resolution is rarely automatic. Some inconsistencies can be fixed by a rule, such as swapping two transposed dates when one is clearly impossible. Others must be flagged for human review or routed to a quarantine table. The pipeline should never quietly overwrite a contradiction with a guess, because that destroys evidence and can mask a real upstream defect. The right default is to make the inconsistency visible.
+
+### 2.5 Missing Values
+
+Missing data deserves its own treatment because the choices made here interact strongly with leakage, a topic addressed later. At the cleaning stage the job is to detect missingness, distinguish its mechanisms where possible, and decide on a policy. Crucially, any imputation that learns from the data, such as filling with a column mean or a model prediction, is a modeling decision and should not be hard coded into the cleaning pipeline using statistics computed over the full dataset. Cleaning should standardize how missingness is represented, for example by converting sentinel values like 999 or empty strings into genuine nulls, and leave learned imputation to a later, leakage aware stage.
+
+## 3. Building Reproducible Pipelines
+
+Reproducibility means that anyone, anywhere, running the pipeline on the same input gets the same output. This is harder than it sounds because of the many sources of hidden nondeterminism.
+
+### 3.1 Eliminating Hidden State
+
+The chief enemies of reproducibility are implicit dependencies on the environment. A pipeline that parses dates using the host machine's locale will produce different results on different machines. One that depends on dictionary iteration order, on unsorted group by output, or on the current time will drift. The remedy is to make every such dependency explicit. Pin the locale and time zone. Sort before any operation whose output order matters. Pass any reference to "now" in as an explicit parameter rather than calling the system clock.
+
+### 3.2 Versioning Code, Data, and Configuration
+
+Reproducibility requires versioning three things together. The code that defines the transformations must live in version control. The configuration, including schemas, vocabularies, and thresholds, should be versioned alongside it rather than edited in place. And the data itself benefits from versioning or at least from content hashing, so that an output can be traced to the exact input that produced it.
+
+A useful discipline is to compute and log a hash of the input and the configuration at the start of every run. If two runs share the same input hash and configuration hash, they must produce the same output hash. When they do not, you have found a reproducibility bug.
+
+```python
+# Provenance: tie every output to the inputs that produced it.
+run_manifest = {
+    "input_hash": sha256_of(raw_data),
+    "config_hash": sha256_of(config),
+    "code_version": git_commit(),
+    "output_hash": sha256_of(clean_data),
+    "row_counts": {"in": len(raw_data), "out": len(clean_data)},
+}
+```
+
+### 3.3 Determinism in Randomized Steps
+
+Some cleaning steps involve randomness, such as sampling records for manual review or breaking ties during fuzzy matching. Randomness is acceptable only when the seed is fixed and recorded. An unrecorded seed makes a run impossible to reproduce, and a seed that changes between runs makes the output a moving target.
+
+## 4. Testing Cleaning Pipelines
+
+A cleaning pipeline is code, and like all code it should be tested. Testing transforms cleaning from a fragile manual process into a system you can change with confidence.
+
+### 4.1 Unit Tests for Stages
+
+Each stage is a pure function from data to data, which makes it ideal for unit testing. Construct small synthetic inputs that exercise the tricky cases, such as a duplicate that differs only by whitespace, a date in an ambiguous format, or a numeric field containing the string "N/A". Assert that the stage produces exactly the expected output. These tests double as executable documentation of what each stage is supposed to do.
+
+### 4.2 Property Based Tests
+
+Beyond specific examples, property based testing checks invariants that should hold for any input. After deduplication, the output should contain no exact duplicates. After type coercion, every column should match the declared schema. After standardization, every category should belong to the known vocabulary. A property based testing tool generates many random inputs and verifies that the property holds for all of them, often surfacing edge cases that hand written tests miss.
+
+```python
+# A property: dedup never increases row count and removes exact dupes.
+def test_dedup_properties(any_frame):
+    out = deduplicate(any_frame)
+    assert len(out) <= len(any_frame)
+    assert not out.duplicated().any()
+```
+
+### 4.3 Validation Gates and Contracts
+
+A data contract is a machine checkable specification of what valid data looks like, covering column names, types, allowed ranges, nullability, and uniqueness. Embedding the contract as a validation gate between stages or at the pipeline boundary turns silent corruption into a loud, early failure. When an upstream change violates the contract, the pipeline fails fast with a clear message rather than emitting subtly wrong data that pollutes every downstream consumer.
+
+It is worth distinguishing two failure policies. A hard gate halts the run when the contract is violated, appropriate when bad data must never reach production. A soft gate logs a warning and continues, appropriate during exploratory development. The policy should be a conscious, documented choice rather than an accident of how an exception was caught.
+
+## 5. Idempotency
+
+Idempotency is the property that applying an operation twice has the same effect as applying it once. For cleaning pipelines this is both a correctness guarantee and an operational convenience.
+
+### 5.1 Why Idempotency Matters
+
+Pipelines fail partway through and get retried. Backfills reprocess historical data that may already have been cleaned. Streaming systems deliver the same record more than once. If a cleaning step is not idempotent, these ordinary events corrupt the data. Consider a step that appends a country code prefix to phone numbers. Run once, a number becomes correctly prefixed. Run twice on already cleaned data, it gains a second prefix and is now wrong. The bug is invisible until someone tries to dial the number.
+
+### 5.2 Designing for Idempotency
+
+The design principle is that every transformation should reach a fixed point. Applying it to its own output should change nothing. Achieve this by checking whether work has already been done before doing it, by writing transformations as maps to a canonical form rather than as incremental edits, and by keying outputs deterministically so that reprocessing overwrites rather than appends.
+
+```python
+# Non-idempotent: appends every time it runs.
+df["phone"] = "+1" + df["phone"]
+
+# Idempotent: normalize to a canonical form regardless of input state.
+df["phone"] = df["phone"].map(to_e164)   # already-canonical stays the same
+```
+
+### 5.3 Testing for Idempotency
+
+Idempotency is easy to verify with a test. Run the full pipeline on an input, then run it again on its own output, and assert that the second result equals the first. This single test catches a whole class of subtle bugs and should be a standard fixture for any cleaning pipeline.
+
+```python
+def test_pipeline_idempotent(sample):
+    once = run_pipeline(sample)
+    twice = run_pipeline(once)
+    assert frames_equal(once, twice)
+```
+
+## 6. Avoiding Leakage During Cleaning
+
+Data leakage is the contamination of training data with information that would not be available at prediction time, or with information derived from the very examples a model is being evaluated on. Leakage produces models that look excellent in offline tests and then fail in production. Cleaning is a surprisingly common source of leakage because so many cleaning steps involve computing statistics over the data.
+
+### 6.1 Fit on Train, Apply to All
+
+The central rule is that any cleaning step that learns parameters from the data must learn them from the training portion only, then apply those frozen parameters to validation and test data. Imputing missing values with a column mean is the canonical example. If the mean is computed over the entire dataset, the test rows have influenced a value used to clean the training rows, and the train rows have influenced the test cleaning. The fix is to compute the mean on the training split and reuse it everywhere else.
+
+The same logic applies to scaling, to outlier clipping thresholds, to category vocabularies, to target encodings, and to any rare category grouping based on frequency counts. Each of these has a fit phase and a transform phase, and the fit phase must see only training data.
+
+```python
+# Leaky: statistic computed over all rows before the split.
+fill = df["income"].mean()
+df["income"] = df["income"].fillna(fill)
+
+# Safe: fit on train, transform everything with the frozen value.
+fill = train["income"].mean()
+train["income"] = train["income"].fillna(fill)
+test["income"]  = test["income"].fillna(fill)
+```
+
+### 6.2 Respecting Time
+
+When data has a temporal structure, leakage takes the form of using the future to predict the past. A cleaning step that fills a missing value by interpolating between neighboring rows, or that standardizes using a global statistic, can pull information backward in time. For time series and any prediction task with a temporal split, cleaning statistics must be computed using only data available up to the prediction point. Rolling and expanding windows that exclude the current and future observations are the safe constructions.
+
+### 6.3 Separating Cleaning from Learned Transformation
+
+The practical resolution of these hazards is architectural. Distinguish two categories of operation. Record level cleaning, such as trimming whitespace, parsing dates, deduplicating, and converting sentinel values to nulls, depends only on each record in isolation and is safe to apply to all data at once because it learns nothing from the distribution. Distribution dependent transformation, such as imputation with learned statistics, scaling, encoding, and frequency based grouping, must live inside the model training workflow where the train and test boundary is respected.
+
+Keeping these categories in separate stages, ideally in separate modules, prevents a well meaning engineer from accidentally fitting a global statistic during what was supposed to be innocuous cleaning. It also clarifies which artifacts must be saved and shipped with the model, since the frozen parameters of every learned transformation are part of the model and must be versioned with it.
+
+### 6.4 Leakage from Deduplication Across Splits
+
+A subtle leakage path runs through deduplication itself. If duplicate or near duplicate records are split across the training and test sets, the model can memorize an example in training and recognize its twin at test time, inflating the apparent score. The defense is to perform entity level deduplication and grouping before splitting, and to ensure that all records belonging to the same entity land in the same split. This is the data cleaning analogue of grouped cross validation.
+
+## 7. Putting It Together
+
+A mature cleaning pipeline reads as a short, declarative description. Record level cleaning runs first and applies uniformly. A data contract gates the boundary. Entity resolution and survivorship run before any split so that no entity straddles train and test. Learned transformations are deferred to a downstream, split aware stage that saves its fitted parameters as part of the model artifact. Every run records the hashes of its inputs, configuration, and outputs, along with counts of what changed, so that any anomaly can be traced to its cause. The whole thing is covered by unit tests, property tests, contract checks, and an idempotency test.
+
+None of these practices is exotic. Each is a modest discipline borrowed from ordinary software engineering and applied to the specific hazards of data. The payoff is large. A pipeline built this way produces data that downstream consumers can trust, that survives upstream change without silent corruption, and that does not flatter your models with leaked information. In applied work, where the majority of effort and the majority of catastrophic failures both live in data preparation, that reliability is worth far more than any individual modeling trick.
+
+## References
+
+1. Wickham, H. "Tidy Data." Journal of Statistical Software, 2014. https://www.jstatsoft.org/article/view/v059i10
+2. Kaufman, S., Rosset, S., Perlich, C. "Leakage in Data Mining: Formulation, Detection, and Avoidance." ACM TKDD, 2012. https://dl.acm.org/doi/10.1145/2382577.2382579
+3. Great Expectations. "Data Validation Documentation." https://docs.greatexpectations.io/
+4. pandera. "Statistical Data Testing for Pandas." https://pandera.readthedocs.io/
+5. Hypothesis. "Property Based Testing for Python." https://hypothesis.readthedocs.io/
+6. Christen, P. "Data Matching: Concepts and Techniques for Record Linkage." Springer, 2012. https://link.springer.com/book/10.1007/978-3-642-31164-2
+7. scikit-learn. "Common Pitfalls and Recommended Practices: Data Leakage." https://scikit-learn.org/stable/common_pitfalls.html
+8. Sculley, D. et al. "Hidden Technical Debt in Machine Learning Systems." NeurIPS, 2015. https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html
+9. Schelter, S. et al. "Automating Large Scale Data Quality Verification." VLDB, 2018. https://www.vldb.org/pvldb/vol11/p1781-schelter.pdf
+10. dbt Labs. "Tests and Data Contracts." https://docs.getdbt.com/docs/build/data-tests

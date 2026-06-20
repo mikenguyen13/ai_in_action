@@ -1,0 +1,161 @@
+# Classical Machine Learning Best Practices
+
+Classical machine learning still powers a large share of production systems. Fraud scoring, churn prediction, demand forecasting, credit risk, and ranking pipelines very often run on logistic regression, gradient boosted trees, or support vector machines rather than deep networks. These methods are fast to train, cheap to serve, easy to monitor, and frequently competitive with far more complex alternatives on tabular data. This chapter is a practical playbook. It walks through the modeling workflow as a disciplined process, explains how to build a baseline that you can trust, shows how leakage sneaks into projects and how to stop it, treats error analysis as a first class activity, gives concrete guidance on choosing among linear models, trees, and kernels, and closes with the reproducibility habits that separate a one off notebook from a durable system.
+
+## 1. Start With a Baseline You Can Defend
+
+### 1.1 Why the Baseline Comes First
+
+The single most common mistake in applied machine learning is to reach for a sophisticated model before establishing a reference point. Without a baseline you cannot answer the only question that matters: is this model good enough to be worth deploying, and is the added complexity buying real accuracy. A baseline turns a vague modeling effort into a measurable one. It also exposes data problems early, because a baseline that scores suspiciously high or suspiciously low is usually telling you something about the data rather than the algorithm.
+
+Build two kinds of baselines. The first is a trivial baseline that requires no learning at all. For classification, predict the majority class or the empirical class prior. For regression, predict the mean or median of the target. For a time series, predict the last observed value or a seasonal lag. These cost almost nothing and define the floor that any real model must clear.
+
+The second is a simple learned baseline. For tabular data this is usually a logistic or linear regression with light preprocessing, or a single gradient boosted tree model with default hyperparameters. The point is not to win, it is to set an honest reference and to verify that the full pipeline runs end to end.
+
+```python
+# Trivial baseline first, then a simple learned one
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+
+DummyClassifier(strategy="most_frequent")   # the floor
+LogisticRegression(max_iter=1000)           # the honest reference
+```
+
+### 1.2 Pick the Metric Before You Model
+
+Choose and write down your evaluation metric before training anything, because the metric defines what "better" means and quietly shapes every later decision. Match the metric to the decision the model supports. Accuracy is misleading under class imbalance, where a model that always predicts the majority class can look excellent while being useless. Prefer area under the precision recall curve when positives are rare, log loss or Brier score when you need calibrated probabilities, and a cost weighted metric when false positives and false negatives carry different business costs. For regression, decide deliberately between mean absolute error, which is robust to outliers, and root mean squared error, which punishes large misses. Define the metric once, and report it consistently from baseline through final model so that comparisons stay meaningful.
+
+## 2. The Modeling Workflow
+
+### 2.1 Frame the Problem and Split the Data
+
+Before any feature is engineered, state the prediction target precisely, the unit of prediction, and the moment in time at which a prediction must be made. This framing determines what information is legitimately available and therefore what counts as leakage later.
+
+Split the data immediately, and split it the way the model will actually be used. A random split is fine for independent and identically distributed rows, but most real problems are not that clean. If the data has a time dimension, split by time so that training precedes validation, which precedes the test period. If rows cluster by entity, such as multiple transactions per customer, split by group so that no customer appears in both training and test. Carve out a final test set that you touch exactly once, at the very end. Everything else, including cross validation, happens inside the remaining data.
+
+### 2.2 Build a Pipeline, Not a Pile of Steps
+
+Preprocessing must live inside a single object that is fit on training folds only and applied to validation and test data. This is the difference between a method that generalizes and one that quietly cheats. Encapsulating imputation, scaling, encoding, and the estimator in one pipeline guarantees that every transformation learns its parameters from training data alone, and it makes cross validation correct by construction.
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+pre = ColumnTransformer([
+    ("num", Pipeline([("imp", SimpleImputer()), ("sc", StandardScaler())]), num_cols),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+])
+model = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000))])
+```
+
+### 2.3 Validate Honestly, Then Tune
+
+Use cross validation to estimate performance and its variability, not just a single number. K fold cross validation with five or ten folds is the default for tabular data. Use stratified folds for classification to preserve class balance, grouped folds when rows cluster, and forward chaining splits for time series. Report the mean and the spread across folds, because a model with a high mean and a wide spread is fragile.
+
+Tune hyperparameters inside this validation loop, never against the final test set. When the tuning search is large, prefer nested cross validation or a clean separation of a tuning set, otherwise the validation score becomes optimistic. Random search and Bayesian optimization usually find good configurations faster than exhaustive grid search. Resist the urge to tune endlessly. The largest gains almost always come from better features and cleaner data, not from the third decimal place of a learning rate.
+
+### 2.4 Iterate in Tight Loops
+
+Treat modeling as a sequence of small, reversible experiments. Change one thing, measure against the same validation protocol, keep what helps, and discard what does not. Log every run. A modeling effort that drifts without a record of what was tried tends to rediscover its own dead ends.
+
+## 3. Avoiding Data Leakage
+
+### 3.1 What Leakage Is and Why It Is So Dangerous
+
+Leakage occurs when information that would not be available at prediction time, or information from the validation and test sets, influences training. Its signature is a model that performs beautifully in offline evaluation and then collapses in production. Leakage is dangerous precisely because it hides inside good looking numbers, so the team ships a model that was never as good as it appeared.
+
+### 3.2 The Common Leakage Patterns
+
+Several patterns recur often enough to memorize. Preprocessing on the full dataset is the classic case: fitting a scaler, an imputer, or a feature selector on all rows before splitting lets statistics from the test set bleed into training. Target leakage happens when a feature is a proxy for the label or is computed using the label, such as a "number of late payments" field that is only populated after default is known. Temporal leakage uses future information to predict the past, for example aggregating a customer's full year of activity to predict an event in the middle of that year. Group leakage places correlated rows from the same entity on both sides of the split. Duplicate rows that straddle the split inflate scores for the same reason.
+
+### 3.3 How to Stop It
+
+Fit every transformation inside the pipeline on training folds only, which the pipeline pattern in section 2.2 enforces automatically. Construct features using only data with a timestamp at or before the prediction moment, and prefer point in time joins for any aggregated feature. Split by group or by time whenever rows are not independent. Audit your top features after training: if one feature single handedly dominates and produces near perfect accuracy, treat it as a leakage suspect until proven innocent. A quick sanity check is to ask, for every feature, whether its value would truly be known at the instant the prediction is made.
+
+```python
+# Leaky: scaler sees the whole dataset before the split
+X_scaled = StandardScaler().fit_transform(X)   # do not do this
+
+# Correct: scaling lives in the pipeline, fit on train folds only
+cross_val_score(model, X_train, y_train, cv=5)
+```
+
+## 4. Error Analysis
+
+### 4.1 Look at the Mistakes, Not Just the Score
+
+A single aggregate metric compresses thousands of decisions into one number and hides where the model fails. Error analysis is the practice of reopening that number and studying the individual mistakes. It is the highest leverage activity in applied machine learning, because it tells you what to fix next, whether the answer is a new feature, more data of a particular kind, a different model, or a relabeling effort.
+
+Start by collecting the largest errors. For regression, sort by residual magnitude. For classification, sort by the confidence of wrong predictions, because a confident mistake is more informative than a borderline one. Read a few dozen of these cases by hand. Patterns emerge quickly: a particular category dominates the errors, a range of the target is systematically under predicted, or a cluster of inputs shares a missing field.
+
+### 4.2 Slice the Performance
+
+Aggregate metrics can hide serious failures in subpopulations. Compute your metric separately across meaningful slices: by region, by customer segment, by time period, by input source, by class. A model with strong overall accuracy may be failing badly on a slice that matters for fairness or for revenue. Slicing turns "the model is 92 percent accurate" into "the model is 96 percent accurate on returning customers and 71 percent on new ones," which is a finding you can act on.
+
+### 4.3 Diagnose Bias Versus Variance
+
+Use the gap between training and validation performance to decide your next move. When training and validation scores are both poor and close together, the model is underfitting, and the cure is a more expressive model, richer features, or less regularization. When training performance is high but validation lags well behind, the model is overfitting, and the cure is more data, stronger regularization, fewer features, or a simpler model. Learning curves, which plot performance against training set size, make this diagnosis visual: a wide persistent gap signals variance, while two low flat curves signal bias. This single distinction redirects more wasted effort than almost any other habit.
+
+## 5. Choosing the Model Family
+
+### 5.1 Linear Models
+
+Reach for linear and logistic regression when you want a strong, transparent, fast baseline, when the signal is roughly additive, and when interpretability or calibrated probabilities matter. Regularized variants are workhorses: ridge for correlated features, lasso when you want sparsity and implicit feature selection, and elastic net as a balance of the two. Linear models shine in high dimensional sparse settings such as text with bag of words features, where they are hard to beat for the compute. Their weaknesses are real: they assume a linear decision boundary in the feature space, they need careful encoding and scaling, and they require you to engineer interactions and nonlinearities by hand.
+
+### 5.2 Tree Ensembles
+
+Gradient boosted trees, as implemented in XGBoost, LightGBM, and CatBoost, are the default first choice for tabular data and win a large fraction of practical problems. They capture nonlinearities and feature interactions automatically, they are insensitive to monotonic feature scaling, they handle mixed numeric and categorical data gracefully, and they tolerate missing values. Random forests are a robust, lower maintenance alternative that is harder to overfit and needs less tuning, at some cost in peak accuracy. The trade offs to keep in mind are that boosted models need sensible tuning of tree depth, learning rate, and number of trees, that they can overfit if pushed too hard, and that they extrapolate poorly outside the range of the training data.
+
+### 5.3 Kernel Methods
+
+Support vector machines and kernel methods are most useful when you have a small to medium number of samples, a high or complex feature space, and a need for a flexible nonlinear boundary. A support vector machine with a radial basis function kernel can model intricate boundaries with strong margins and good generalization on clean data. The catch is cost: kernel methods scale poorly past roughly tens of thousands of rows because the kernel computation grows superlinearly, they demand careful scaling and tuning of the regularization and kernel parameters, and they do not produce calibrated probabilities without extra work. On large tabular datasets, tree ensembles usually dominate them.
+
+### 5.4 A Decision Heuristic
+
+For most tabular problems, the pragmatic order is simple. Start with a linear or logistic baseline to set the reference and check the pipeline. Move to gradient boosted trees as the likely production model. Consider kernel methods only when the dataset is modest in size and the boundary is genuinely nonlinear in a way trees handle awkwardly. Choose linear models when interpretability, latency, or calibrated probabilities are the binding constraint, even at a small accuracy cost. Always weigh accuracy against the operational cost of serving, monitoring, and explaining the model, because the most accurate model is not always the right one to deploy.
+
+```text
+small data, nonlinear boundary      -> SVM / kernel
+tabular, want best accuracy         -> gradient boosted trees
+need interpretability or calibration-> regularized linear
+high dimensional sparse text        -> linear (lasso / elastic net)
+```
+
+## 6. Reproducibility
+
+### 6.1 Pin Everything
+
+A result you cannot reproduce is a result you cannot trust or improve. Set and record random seeds for every source of randomness, including data splitting, model initialization, and any sampling. Pin library versions in a lockfile, because a silent upgrade of a numerical library can shift results. Capture the exact data snapshot used, ideally by versioning the dataset or recording a content hash, since data drifts even when code does not.
+
+### 6.2 Separate Configuration From Code
+
+Keep hyperparameters, file paths, feature lists, and split definitions in configuration files rather than scattered through the code. This makes an experiment a single artifact that can be rerun, compared, and shared. Configuration as data also makes it far easier to sweep settings and to diff two runs.
+
+### 6.3 Track Experiments
+
+Log each run with its configuration, its metrics across folds, the data version, and the resulting artifact. A lightweight experiment tracker, or even a disciplined append only log, prevents the common failure where the best model exists only as a forgotten notebook cell. The goal is that any past result can be located, explained, and regenerated.
+
+### 6.4 Make Training and Serving Match
+
+Leakage and silent failures often hide in the gap between how features are computed during training and how they are computed in production. Share the feature code between both paths, or use a feature store that guarantees identical logic. Validate at serving time that incoming data matches the schema and distribution the model was trained on, and monitor for drift after deployment so that a degrading model is caught before it does damage.
+
+## 7. Putting It Together
+
+The thread running through this chapter is discipline over cleverness. Establish a baseline so you know what better means. Wrap preprocessing and modeling in a pipeline so that validation is honest and leakage has nowhere to hide. Validate with a splitting scheme that mirrors how the model will be used. Spend real time reading the model's mistakes, because that is where the next improvement lives. Choose the model family to fit the data and the operational constraints rather than the hype, defaulting to linear baselines and tree ensembles for tabular work. Finally, make every result reproducible, because a model that cannot be regenerated cannot be maintained. None of these practices is glamorous, and together they are what reliably turns data into a system that works in production and keeps working.
+
+## References
+
+1. Pedregosa, F. et al. "Scikit learn: Machine Learning in Python." Journal of Machine Learning Research, 2011. https://jmlr.org/papers/v12/pedregosa11a.html
+2. Scikit learn developers. "Common pitfalls and recommended practices." https://scikit-learn.org/stable/common_pitfalls.html
+3. Scikit learn developers. "Cross validation: evaluating estimator performance." https://scikit-learn.org/stable/modules/cross_validation.html
+4. Kaufman, S., Rosset, S., Perlich, C. "Leakage in Data Mining: Formulation, Detection, and Avoidance." ACM Transactions on Knowledge Discovery from Data, 2012. https://dl.acm.org/doi/10.1145/2382577.2382579
+5. Chen, T., Guestrin, C. "XGBoost: A Scalable Tree Boosting System." KDD 2016. https://arxiv.org/abs/1603.02754
+6. Ke, G. et al. "LightGBM: A Highly Efficient Gradient Boosting Decision Tree." NeurIPS 2017. https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision-tree
+7. Prokhorenkova, L. et al. "CatBoost: unbiased boosting with categorical features." NeurIPS 2018. https://arxiv.org/abs/1706.09516
+8. Breiman, L. "Random Forests." Machine Learning, 2001. https://link.springer.com/article/10.1023/A:1010933404324
+9. Cortes, C., Vapnik, V. "Support Vector Networks." Machine Learning, 1995. https://link.springer.com/article/10.1007/BF00994018
+10. Ng, A. "Machine Learning Yearning." https://info.deeplearning.ai/machine-learning-yearning-book
+11. Grinsztajn, L., Oyallon, E., Varoquaux, G. "Why do tree based models still outperform deep learning on tabular data?" NeurIPS 2022. https://arxiv.org/abs/2207.08815
+12. Sculley, D. et al. "Hidden Technical Debt in Machine Learning Systems." NeurIPS 2015. https://papers.nips.cc/paper/5656-hidden-technical-debt-in-machine-learning-systems

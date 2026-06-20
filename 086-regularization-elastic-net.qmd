@@ -1,0 +1,224 @@
+# Elastic Net Regularization
+
+Elastic Net occupies a productive middle ground in penalized regression. It blends the sparsity of the Lasso with the stabilizing shrinkage of Ridge, and in doing so it repairs several failure modes that make pure $\ell_1$ penalization brittle in practice. This chapter develops the model from first principles, explains the grouping effect that distinguishes it from the Lasso, characterizes when Elastic Net outperforms either of its parents, and gives concrete guidance for tuning and deployment.
+
+## 1. From Ridge and Lasso to Elastic Net
+
+### 1.1 The penalized regression setup
+
+Consider the standard linear model with $n$ observations and $p$ predictors. Let $y \in \mathbb{R}^n$ be the response, $X \in \mathbb{R}^{n \times p}$ the design matrix, and $\beta \in \mathbb{R}^p$ the coefficient vector. We assume throughout that the columns of $X$ are standardized to zero mean and unit variance and that $y$ is centered, so the intercept can be handled separately and is left unpenalized.
+
+Ordinary least squares minimizes the residual sum of squares $\|y - X\beta\|_2^2$. When $p$ is large relative to $n$, or when predictors are collinear, the OLS solution has high variance and may not be unique. Regularization adds a penalty $P(\beta)$ that shrinks coefficients toward zero, trading a small increase in bias for a large reduction in variance.
+
+Ridge regression uses an $\ell_2$ penalty:
+
+$$
+\hat{\beta}^{\text{ridge}} = \arg\min_{\beta} \; \frac{1}{2n}\|y - X\beta\|_2^2 + \lambda \|\beta\|_2^2 .
+$$
+
+Ridge shrinks all coefficients smoothly but never sets any exactly to zero, so it does not perform variable selection. The Lasso uses an $\ell_1$ penalty:
+
+$$
+\hat{\beta}^{\text{lasso}} = \arg\min_{\beta} \; \frac{1}{2n}\|y - X\beta\|_2^2 + \lambda \|\beta\|_1 .
+$$
+
+The $\ell_1$ geometry produces sparse solutions: many coefficients are driven exactly to zero, yielding an interpretable subset of predictors.
+
+### 1.2 The Elastic Net penalty
+
+Elastic Net, introduced by Zou and Hastie in 2005, combines the two penalties:
+
+$$
+\hat{\beta}^{\text{en}} = \arg\min_{\beta} \; \frac{1}{2n}\|y - X\beta\|_2^2 + \lambda \left( \alpha \|\beta\|_1 + \frac{1-\alpha}{2}\|\beta\|_2^2 \right) .
+$$
+
+Here $\lambda \geq 0$ controls the overall penalty strength and $\alpha \in [0,1]$ is the mixing parameter that interpolates between the two penalty types. Setting $\alpha = 1$ recovers the Lasso, and $\alpha = 0$ recovers Ridge. Intermediate values blend selection and shrinkage.
+
+The penalty term $\alpha \|\beta\|_1 + \frac{1-\alpha}{2}\|\beta\|_2^2$ is strictly convex whenever $\alpha < 1$, because the $\ell_2$ component contributes positive curvature in every direction. Strict convexity guarantees a unique minimizer even when $X$ is rank deficient, which is the first concrete advantage over the Lasso.
+
+This is the parameterization used by `glmnet` and most modern libraries. An equivalent formulation writes the penalty as $\lambda_1 \|\beta\|_1 + \lambda_2 \|\beta\|_2^2$ with two separate strengths, related by $\lambda_1 = \lambda \alpha$ and $\lambda_2 = \lambda (1-\alpha)/2$. The single $\lambda$, single $\alpha$ form is more convenient for tuning because it separates the question of how much to penalize from the question of what kind of penalty to apply.
+
+## 2. The Grouping Effect
+
+### 2.1 Why the Lasso struggles with correlated predictors
+
+The Lasso has a well documented weakness. When a group of predictors is highly correlated, the Lasso tends to select one representative from the group somewhat arbitrarily and zero out the rest. Small perturbations in the data can flip which member is chosen, so the selected set is unstable. In genomics, where co-regulated genes form correlated clusters, or in any setting with redundant sensors or duplicated features, this behavior discards information and undermines interpretation.
+
+A second Lasso limitation is dimensional. In the $p > n$ regime, the Lasso can select at most $n$ variables before the optimization saturates. If the true model has more than $n$ relevant predictors, the Lasso cannot recover them all.
+
+### 2.2 How Elastic Net induces grouping
+
+Elastic Net solves both problems through the grouping effect. The $\ell_2$ component of the penalty encourages strongly correlated predictors to receive similar coefficients, so they enter or leave the model together as a group rather than competing for a single slot.
+
+Zou and Hastie made this precise. Suppose two predictors $x_i$ and $x_j$ have sample correlation $\rho = x_i^\top x_j$ (after standardization). For the Elastic Net solution with both coefficients of the same sign, the difference in their estimated coefficients is bounded:
+
+$$
+\frac{|\hat{\beta}_i - \hat{\beta}_j|}{\|y\|_1} \leq \frac{1}{\lambda(1-\alpha)} \sqrt{2(1-\rho)} .
+$$
+
+As $\rho \to 1$, the right side goes to zero, forcing $\hat{\beta}_i \approx \hat{\beta}_j$. The Ridge component is what supplies this guarantee. The pure Lasso, with $\alpha = 1$, has no such bound and is free to assign one predictor a large coefficient and its near-duplicate a coefficient of zero.
+
+The grouping effect also removes the saturation limit. Because the $\ell_2$ term keeps the objective strictly convex, Elastic Net can select more than $n$ variables in the $p > n$ setting, which is essential in high dimensional applications.
+
+### 2.3 A short illustration
+
+The intuition is easy to state in code, even without running it.
+
+```python
+import numpy as np
+from sklearn.linear_model import Lasso, ElasticNet
+
+# two nearly identical columns plus noise features
+rng = np.random.default_rng(0)
+z = rng.normal(size=(200, 1))
+x1 = z + 0.01 * rng.normal(size=(200, 1))
+x2 = z + 0.01 * rng.normal(size=(200, 1))
+X = np.hstack([x1, x2, rng.normal(size=(200, 8))])
+y = (3.0 * z + rng.normal(size=(200, 1)) * 0.5).ravel()
+
+lasso = Lasso(alpha=0.1).fit(X, y)
+enet = ElasticNet(alpha=0.1, l1_ratio=0.5).fit(X, y)
+
+# lasso typically loads one of the twins and zeros the other
+# elastic net splits the weight across both, reflecting the grouping effect
+print(lasso.coef_[:2], enet.coef_[:2])
+```
+
+The Lasso loads almost all of the shared signal onto one twin. Elastic Net distributes it across both, which is the more faithful description of a signal that genuinely lives in both columns.
+
+## 3. When Elastic Net Beats Lasso or Ridge
+
+### 3.1 The decision in terms of data structure
+
+No single penalty dominates. The right choice depends on the geometry of the problem.
+
+Ridge is preferable when essentially all predictors carry some signal and you want stable prediction without selection. It handles collinearity gracefully and minimizes variance, but it produces a dense model that is hard to interpret and does nothing to reduce the feature footprint at inference time.
+
+The Lasso is preferable when the truth is genuinely sparse, the relevant predictors are not strongly correlated with the irrelevant ones, and interpretability through a small selected set is the goal. Under such conditions the Lasso enjoys strong variable selection consistency.
+
+Elastic Net is preferable in the common middle case: the truth is sparse or approximately sparse, but the predictors come in correlated groups, and $p$ may exceed $n$. This describes a great deal of real data, including genomic, text, and many tabular industrial datasets. Elastic Net keeps the sparsity that makes models legible while borrowing the Ridge component's stability so that correlated features are handled as units rather than fought over.
+
+### 3.2 Failure modes Elastic Net repairs
+
+Three concrete Lasso pathologies motivate the switch.
+
+First, instability under resampling. If you bootstrap the data and refit, the Lasso's selected set can change substantially when correlated predictors are present. Elastic Net's selections are markedly more stable because the grouping effect ties correlated features together.
+
+Second, the $n$ variable ceiling. When $p > n$ and the support is larger than $n$, the Lasso cannot represent it. Elastic Net can.
+
+Third, over-aggressive selection in the presence of noise correlated with signal. The Ridge component damps the variance of individual estimates, which reduces the chance that a noise feature correlated with a true feature is selected in place of it.
+
+### 3.3 What Elastic Net does not fix
+
+Elastic Net is not a universal answer. It introduces a second hyperparameter, $\alpha$, that must be tuned, adding computational cost. When predictors are nearly orthogonal, the grouping effect has nothing to do and Elastic Net offers little over the Lasso. When the true model is dense, Ridge alone is usually as good and simpler. And the naive Elastic Net estimate suffers from double shrinkage, discussed next, which can degrade prediction if not corrected.
+
+## 4. Double Shrinkage and the Rescaled Estimator
+
+### 4.1 The double shrinkage problem
+
+Zou and Hastie observed that the direct minimizer above, which they call the naive Elastic Net, shrinks coefficients twice: once by the Lasso term and again by the Ridge term. The compounded shrinkage introduces extra bias that can hurt predictive accuracy, especially when $\alpha$ is small and the Ridge contribution is large.
+
+Their fix rescales the naive solution by a factor that undoes the redundant Ridge shrinkage:
+
+$$
+\hat{\beta}^{\text{en}} = (1 + \lambda_2)\,\hat{\beta}^{\text{naive}},
+$$
+
+where $\lambda_2$ is the effective Ridge strength. The rescaled estimator keeps the sparsity pattern and grouping behavior of the naive solution while restoring the magnitude of the surviving coefficients. Modern implementations such as `glmnet` use a coordinate descent scheme whose parameterization already incorporates this correction, so practitioners rarely apply it by hand, but understanding it explains why library defaults behave well.
+
+### 4.2 Connection to an augmented Lasso
+
+There is an elegant computational identity. The Elastic Net problem can be rewritten as a pure Lasso problem on an augmented dataset. Define
+
+$$
+X^* = \frac{1}{\sqrt{1+\lambda_2}}\begin{pmatrix} X \\ \sqrt{\lambda_2}\, I_p \end{pmatrix}, \qquad
+y^* = \begin{pmatrix} y \\ 0 \end{pmatrix} .
+$$
+
+Solving a Lasso on $(X^*, y^*)$ recovers the Elastic Net solution up to the rescaling factor. The augmented rows act as $p$ artificial observations that enforce the Ridge shrinkage. This identity guaranteed that any Lasso solver could be repurposed for Elastic Net, which accelerated its early adoption, and it also shows directly why the support can exceed $n$: the augmented design always has full column rank.
+
+## 5. The Regularization Path
+
+### 5.1 Coefficients as a function of lambda
+
+For fixed $\alpha$, the Elastic Net solution traces a path as $\lambda$ varies from large to small. At very large $\lambda$ all coefficients are zero. As $\lambda$ decreases, predictors enter the model one or in correlated groups, and coefficient magnitudes grow. At $\lambda = 0$ the solution approaches OLS (when $p < n$).
+
+Unlike the Lasso path, which is piecewise linear in $\lambda$, the Elastic Net path is piecewise smooth but not piecewise linear because of the quadratic penalty term. In practice the path is computed on a grid of $\lambda$ values, typically logarithmically spaced from a data-determined $\lambda_{\max}$ down to a small fraction of it.
+
+The largest useful $\lambda$ is the smallest value at which all coefficients are zero. For Elastic Net it depends on $\alpha$:
+
+$$
+\lambda_{\max} = \frac{1}{\alpha\, n} \max_j |x_j^\top y| .
+$$
+
+Below $\lambda_{\max}$ the first predictor enters. Computing the path from $\lambda_{\max}$ downward, using each solution to warm start the next, is the standard and highly efficient strategy that coordinate descent libraries employ.
+
+### 5.2 Warm starts and computational cost
+
+Coordinate descent cycles through coordinates, updating each $\beta_j$ by a soft thresholding operation that has a closed form. For the standardized Elastic Net the update is
+
+$$
+\hat{\beta}_j \leftarrow \frac{S\!\left(\frac{1}{n} x_j^\top r_j,\; \lambda \alpha\right)}{1 + \lambda(1-\alpha)},
+$$
+
+where $r_j$ is the partial residual excluding feature $j$ and $S(z, \gamma) = \operatorname{sign}(z)\,(|z| - \gamma)_+$ is the soft thresholding operator. The numerator's threshold produces sparsity; the denominator implements the Ridge shrinkage. Because consecutive points on the $\lambda$ grid have similar solutions, warm starting makes computing the full path only modestly more expensive than solving at a single $\lambda$.
+
+## 6. Hyperparameter Tuning
+
+### 6.1 Choosing lambda and alpha together
+
+Elastic Net has two hyperparameters. The standard approach is a two dimensional search: fix a small set of candidate $\alpha$ values, for each compute the full $\lambda$ path, and select the pair that minimizes cross validated error.
+
+A typical $\alpha$ grid might be $\{0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1\}$. Including values near 1 lets the search collapse toward the Lasso when that is best, while smaller values lean on the Ridge component. Because the $\lambda$ path is cheap to compute via warm starts, the dominant cost is the number of cross validation folds times the number of $\alpha$ values.
+
+```python
+from sklearn.linear_model import ElasticNetCV
+
+model = ElasticNetCV(
+    l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 1.0],
+    n_alphas=100,        # lambda grid per l1_ratio
+    cv=10,
+    random_state=0,
+).fit(X, y)
+
+# model.alpha_ is the chosen lambda; model.l1_ratio_ is the chosen alpha
+```
+
+In scikit-learn the naming is unfortunately inverted relative to the theory: `alpha` denotes the overall penalty strength $\lambda$, and `l1_ratio` denotes the mixing parameter $\alpha$. Keep this in mind when reading code against the equations above.
+
+### 6.2 Cross validation and the one standard error rule
+
+Selecting the $\lambda$ that minimizes cross validated error tends to choose a model slightly larger than necessary, because the CV curve is flat near its minimum and noise can favor a less regularized point. The one standard error rule offers a principled correction: among all $\lambda$ whose CV error is within one standard error of the minimum, choose the largest $\lambda$, that is, the most regularized and sparsest model that is statistically indistinguishable from the best. This yields simpler, more robust models and is the default recommendation in much of the penalized regression literature.
+
+### 6.3 Practical tuning guidance
+
+A few rules of thumb help. Use enough CV folds, typically five or ten, to get a stable error curve. Always standardize predictors before fitting, since the penalty is not scale invariant and unstandardized features receive arbitrarily unequal shrinkage; most libraries do this internally but verify the setting. Use the same folds across all $\alpha$ values so that comparisons are not confounded by fold-to-fold variation. If the chosen $\alpha$ lands at the boundary value 1, the data is telling you the Lasso suffices; if it lands near 0, consider whether plain Ridge is simpler and adequate.
+
+## 7. Practical Use and Extensions
+
+### 7.1 Beyond linear regression
+
+The Elastic Net penalty is not tied to squared error loss. It attaches to any generalized linear model by adding the same penalty term to the negative log likelihood. Logistic regression with an Elastic Net penalty is widely used for high dimensional classification, and Cox proportional hazards models with Elastic Net penalties are standard in survival analysis on genomic data. The coordinate descent machinery generalizes through iteratively reweighted least squares, so the same solvers apply.
+
+### 7.2 Workflow recommendations
+
+In applied work, a robust default workflow looks like this. Standardize features. Run `ElasticNetCV` or `glmnet` with a modest grid of $\alpha$ values and a logarithmic $\lambda$ path. Apply the one standard error rule to favor parsimony. Inspect the selected support and, critically, examine whether correlated features were retained together as the grouping effect intends. Refit the final model on the full training set at the chosen hyperparameters, and if predictive accuracy rather than the raw penalized estimates is paramount, consider a debiasing step that refits OLS on the selected support.
+
+### 7.3 Interpretation caveats
+
+Two cautions matter for graduate level practice. First, selected coefficients are biased toward zero by construction, so their magnitudes should not be read as unbiased effect sizes; for inference, use the selection only to define a model and refit, or use methods designed for valid post-selection inference. Second, the grouping effect means that membership in the selected set reflects correlation structure, not just marginal importance, so a retained feature may be standing in for a correlated cluster rather than being uniquely causal. Stability selection, which aggregates supports across many resamples, is a useful companion when the goal is reliable identification of relevant variables.
+
+### 7.4 Summary
+
+Elastic Net is the pragmatic default for penalized linear modeling when predictors are numerous and correlated. It retains the interpretable sparsity of the Lasso, inherits the stability and grouping behavior of Ridge, escapes the $n$ variable ceiling, and through the rescaling correction avoids the bias of double shrinkage. Its cost is a second hyperparameter, but efficient path algorithms and warm starts make joint tuning of $\lambda$ and $\alpha$ entirely practical. When the data is sparse and orthogonal, fall back to the Lasso; when it is dense, fall back to Ridge; in the broad and common middle, Elastic Net is the tool of choice.
+
+## References
+
+1. Zou, H. and Hastie, T. (2005). Regularization and variable selection via the elastic net. Journal of the Royal Statistical Society, Series B, 67(2), 301-320. https://doi.org/10.1111/j.1467-9868.2005.00503.x
+2. Friedman, J., Hastie, T. and Tibshirani, R. (2010). Regularization paths for generalized linear models via coordinate descent. Journal of Statistical Software, 33(1), 1-22. https://doi.org/10.18637/jss.v033.i01
+3. Hastie, T., Tibshirani, R. and Friedman, J. (2009). The Elements of Statistical Learning, 2nd edition. Springer. https://hastie.su.domains/ElemStatLearn/
+4. Tibshirani, R. (1996). Regression shrinkage and selection via the lasso. Journal of the Royal Statistical Society, Series B, 58(1), 267-288. https://doi.org/10.1111/j.2517-6161.1996.tb02080.x
+5. Hoerl, A. E. and Kennard, R. W. (1970). Ridge regression: biased estimation for nonorthogonal problems. Technometrics, 12(1), 55-67. https://doi.org/10.1080/00401706.1970.10488634
+6. Hastie, T., Tibshirani, R. and Wainwright, M. (2015). Statistical Learning with Sparsity: The Lasso and Generalizations. CRC Press. https://hastie.su.domains/StatLearnSparsity/
+7. scikit-learn developers. ElasticNet and ElasticNetCV documentation. https://scikit-learn.org/stable/modules/linear_model.html#elastic-net
+8. Meinshausen, N. and Buhlmann, P. (2010). Stability selection. Journal of the Royal Statistical Society, Series B, 72(4), 417-473. https://doi.org/10.1111/j.1467-9868.2010.00740.x

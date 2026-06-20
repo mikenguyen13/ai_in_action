@@ -1,0 +1,254 @@
+# Feature Engineering for Numerical Data
+
+Numerical features are the workhorses of applied machine learning. They appear as measurements, counts, monetary amounts, ratios, durations, and aggregates, and they arrive with distributions that rarely match the assumptions baked into our models. Feature engineering for numerical data is the disciplined practice of reshaping these raw quantities so that learning algorithms can extract signal efficiently, optimize stably, and generalize beyond the training sample. This chapter develops the core techniques: scaling and standardization, nonlinear transforms, binning, interactions and polynomial expansions, and the treatment of skew and outliers. Throughout, we emphasize both the mathematics that explains why a method works and the engineering discipline that keeps it from leaking information or silently degrading in production.
+
+## 1. Why Numerical Features Need Engineering
+
+### 1.1 Scale Sensitivity and the Geometry of Models
+
+Many algorithms operate on geometric notions of distance, magnitude, or curvature, and these notions are not invariant to the units in which features are recorded. Consider $k$ nearest neighbors with Euclidean distance. If one feature is income measured in dollars (values in the tens of thousands) and another is age measured in years (values in the tens), the squared distance
+
+$$
+d(\mathbf{x}, \mathbf{x}')^2 = \sum_{j=1}^{p} (x_j - x'_j)^2
+$$
+
+is dominated almost entirely by income. Age contributes nothing decision relevant even if it is the better predictor. The same pathology afflicts $k$ means clustering, support vector machines with radial basis kernels, and principal component analysis, where directions of maximal variance are an artifact of measurement units rather than of structure.
+
+Gradient based learners suffer a related problem. When features differ in scale, the loss surface becomes elongated and the condition number of the Hessian grows large. Gradient descent then zigzags across narrow valleys, forcing tiny learning rates and slow convergence. Standardizing features so that each contributes comparably to curvature improves conditioning and accelerates optimization. This is why neural network training, logistic regression with regularization, and any L1 or L2 penalized model expect inputs on comparable scales.
+
+### 1.2 Models That Do and Do Not Care
+
+Not every model is scale sensitive. Decision trees and their ensembles (random forests, gradient boosted trees) split on thresholds of individual features and are invariant to any monotone transformation of a single feature. Rescaling or applying a log to one input leaves the tree structure unchanged because the order of values is preserved. For these models, scaling is largely wasted effort, though monotone transforms can still matter when they change how a feature interacts with others through the partition geometry.
+
+The practical lesson is to match preprocessing to the inductive bias of the model. Distance based, kernel based, and gradient based linear or neural models benefit from scaling and from distributional transforms. Tree ensembles benefit instead from feature construction that exposes nonlinear relationships and interactions the splits would otherwise have to approximate piecewise.
+
+## 2. Scaling and Standardization
+
+### 2.1 Standardization (Z-score)
+
+Standardization centers a feature at zero mean and rescales it to unit variance:
+
+$$
+z = \frac{x - \mu}{\sigma},
+$$
+
+where $\mu$ and $\sigma$ are the mean and standard deviation estimated on the training set. The transformed feature has mean $0$ and variance $1$. Standardization is the default choice for regularized linear models and neural networks because it places all coefficients on a comparable footing, which makes a shared penalty strength meaningful, and because it improves the conditioning of the optimization. It does not bound the range of values and does not remove outliers, which remain present as large positive or negative $z$ scores.
+
+### 2.2 Min-Max and Range Scaling
+
+Min-max scaling maps a feature linearly onto a fixed interval, usually $[0, 1]$:
+
+$$
+x' = \frac{x - x_{\min}}{x_{\max} - x_{\min}}.
+$$
+
+This preserves the shape of the distribution while bounding the range, which is useful when an algorithm expects inputs in a specific interval or when you want to preserve zero entries in sparse data with the variant that divides by the maximum absolute value. The cost is extreme sensitivity to outliers: a single anomalous maximum compresses all other values into a tiny sub interval. Max-abs scaling, $x' = x / \max |x|$, is the sparsity preserving sibling that maps to $[-1, 1]$ without shifting the origin.
+
+### 2.3 Robust Scaling
+
+When outliers are present, robust scaling replaces the mean and standard deviation with order statistics that resist contamination:
+
+$$
+x' = \frac{x - \text{median}(x)}{\text{IQR}(x)},
+$$
+
+where $\text{IQR} = Q_3 - Q_1$ is the interquartile range. Because the median and quartiles are insensitive to a small fraction of extreme values, the bulk of the distribution is scaled sensibly even when heavy tails are present. Robust scaling is a strong default for messy real world numerical data.
+
+```python
+# Conceptual: choose a scaler by data characteristics
+# StandardScaler   -> roughly symmetric, light tails
+# RobustScaler     -> outliers present, heavy tails
+# MinMaxScaler     -> bounded range required, few outliers
+# MaxAbsScaler     -> sparse features, preserve zeros
+```
+
+### 2.4 Fit on Train, Transform Everywhere
+
+The single most important operational rule is that scaling parameters must be estimated only on training data and then applied unchanged to validation, test, and production inputs. Estimating $\mu$, $\sigma$, the median, or the min and max using the full dataset leaks information about the held out distribution into the model and inflates measured performance. The correct pattern is to fit the transformer within a pipeline and let cross validation refit it on each training fold.
+
+```python
+# Correct: parameters learned inside the resampling loop
+pipeline = make_pipeline(RobustScaler(), Ridge(alpha=1.0))
+scores = cross_val_score(pipeline, X, y, cv=5)
+```
+
+A subtle corollary concerns drift. Because the scaler freezes training statistics, a shift in the production distribution will push transformed values outside their training range. This is not a bug in the scaler; it is a signal worth monitoring, since it indicates the model is now extrapolating.
+
+## 3. Nonlinear Transforms
+
+Scaling is linear and cannot change the shape of a distribution. When a feature is strongly skewed or when its relationship with the target is multiplicative rather than additive, a nonlinear transform is the right tool.
+
+### 3.1 The Log Transform
+
+The logarithm compresses large values and expands small ones, which tames right skew and converts multiplicative structure into additive structure. If a target depends on a feature through a power law, $y \approx a x^b$, then $\log y \approx \log a + b \log x$ is linear and learnable by a linear model. Log transforms are natural for quantities that are inherently positive and span several orders of magnitude, such as income, prices, counts, populations, and durations.
+
+The bare logarithm is undefined at zero and negative values, so the common practice is the $\log 1p$ transform,
+
+$$
+x' = \log(1 + x),
+$$
+
+which is defined at $x = 0$ and behaves like $x$ near the origin. For data with a natural offset $c$, use $\log(x + c)$ with $c$ chosen to keep the argument positive. When a log transformed target is used for regression, remember that predicting the mean of $\log y$ and exponentiating gives the geometric mean of $y$, which is biased low for the arithmetic mean; a correction such as Duan's smearing estimator may be needed when the original scale matters.
+
+### 3.2 Box-Cox
+
+The Box-Cox family generalizes the log into a continuum of power transforms indexed by a parameter $\lambda$:
+
+$$
+x^{(\lambda)} =
+\begin{cases}
+\dfrac{x^{\lambda} - 1}{\lambda}, & \lambda \neq 0,\\[2mm]
+\log x, & \lambda = 0.
+\end{cases}
+$$
+
+The form is constructed so that the transform is continuous in $\lambda$ at zero, where it reduces smoothly to the log. The parameter is chosen by maximum likelihood to make the transformed feature as close to Gaussian as possible, which in practice means $\lambda$ is selected to maximize the profile log likelihood under a normality assumption. Box-Cox requires strictly positive inputs, so it cannot be applied directly to data containing zeros or negative values without an offset.
+
+### 3.3 Yeo-Johnson
+
+Yeo-Johnson extends the power transform to the whole real line, removing the positivity restriction:
+
+$$
+x^{(\lambda)} =
+\begin{cases}
+\dfrac{(x+1)^{\lambda} - 1}{\lambda}, & \lambda \neq 0,\ x \geq 0,\\[2mm]
+\log(x + 1), & \lambda = 0,\ x \geq 0,\\[2mm]
+\dfrac{-\left[(-x+1)^{2-\lambda} - 1\right]}{2 - \lambda}, & \lambda \neq 2,\ x < 0,\\[2mm]
+-\log(-x + 1), & \lambda = 2,\ x < 0.
+\end{cases}
+$$
+
+It handles zeros and negatives gracefully and reduces to a shifted log on the nonnegative side, which makes it the most general purpose of the parametric power transforms. As with Box-Cox, $\lambda$ is estimated by maximum likelihood under approximate normality. In modern pipelines, Yeo-Johnson applied as a power transformer is a reliable first attempt at symmetrizing arbitrary numerical features. As always, $\lambda$ is fit on training data only.
+
+### 3.4 Quantile and Rank Transforms
+
+A fully nonparametric alternative maps a feature through its empirical cumulative distribution function. The quantile transform sends each value to its rank percentile and then optionally pushes that uniform variable through the inverse normal CDF to produce a Gaussian output:
+
+$$
+x' = \Phi^{-1}\big(\hat{F}(x)\big).
+$$
+
+This forces any continuous distribution onto a target shape regardless of the original form, which makes it extremely robust to outliers since extreme values are mapped to extreme but finite quantiles. The cost is that it discards information about magnitude and the spacing between values, keeping only their order, and it can overfit the empirical CDF when the sample is small. Rank based transforms are valuable when the precise scale is meaningless but the ordering is informative.
+
+## 4. Binning and Discretization
+
+Binning replaces a continuous feature with a small set of intervals, converting a real value into an ordinal or categorical code. Discretization is a deliberate loss of resolution traded for robustness, nonlinearity, and interpretability.
+
+### 4.1 Equal-Width and Equal-Frequency Binning
+
+Equal-width binning partitions the observed range into $k$ intervals of identical width $(x_{\max} - x_{\min}) / k$. It is simple but allocates bins poorly when the distribution is skewed, leaving some bins nearly empty and others overcrowded. Equal-frequency (quantile) binning instead chooses cut points at sample quantiles so that each bin holds roughly the same number of observations. Quantile binning adapts to the distribution and is generally preferable for skewed data, though its boundaries are data dependent and must be frozen from the training set.
+
+### 4.2 Supervised and Model-Based Binning
+
+Unsupervised binning ignores the target. Supervised discretization chooses cut points to maximize a relationship with the outcome, for example by minimizing impurity the way a decision tree does when it selects a split. Tree based binning produces intervals that are predictive by construction and is essentially equivalent to fitting a shallow tree on a single feature. A related industrial technique is weight of evidence binning used in credit scoring, where each bin is encoded by
+
+$$
+\text{WoE} = \log\frac{P(x \in \text{bin} \mid y = 1)}{P(x \in \text{bin} \mid y = 0)},
+$$
+
+which linearizes the relationship between the feature and the log odds of the target and yields a monotone, interpretable encoding.
+
+### 4.3 When Binning Helps and When It Hurts
+
+Binning lets a linear model capture nonlinear and non monotone effects, since each bin can receive its own coefficient once expanded into indicator variables. It is robust to outliers because extreme values fall harmlessly into edge bins, and it can improve interpretability for stakeholders who reason in terms of ranges. The drawbacks are real: discretization discards within bin variation, introduces arbitrary boundary discontinuities where similar values land in different bins, and reduces statistical power if applied too aggressively. For tree ensembles, which already partition the space, manual binning is usually redundant. Reserve binning for linear and additive models where its expressive payoff is highest.
+
+## 5. Interactions and Polynomial Features
+
+### 5.1 Why Interactions Matter
+
+A linear model assumes the effect of each feature on the target is additive and independent of every other feature. Many real relationships violate this. The effect of a drug dose may depend on body weight; the value of a house feature may depend on neighborhood. An interaction term encodes such dependence as a product:
+
+$$
+\hat{y} = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \beta_{12} x_1 x_2.
+$$
+
+The coefficient $\beta_{12}$ measures how the slope on $x_1$ changes as $x_2$ varies. Without the product term, a linear model cannot represent this conditional structure at all. Constructing interaction features by hand, guided by domain knowledge, is often the highest leverage step in feature engineering for linear models.
+
+### 5.2 Polynomial Expansions
+
+Polynomial features generalize interactions to include powers of individual features. A degree two expansion of inputs $x_1, x_2$ produces
+
+$$
+\{1,\ x_1,\ x_2,\ x_1^2,\ x_1 x_2,\ x_2^2\}.
+$$
+
+This lets a linear model fit curved response surfaces while remaining linear in its parameters, so it is still solved by ordinary least squares or its regularized variants. The danger is combinatorial explosion: for $p$ inputs, a degree $d$ expansion generates on the order of $\binom{p + d}{d}$ terms, which grows rapidly and invites overfitting and multicollinearity. Polynomial features are best used at low degree, on a curated subset of inputs, and almost always paired with regularization to control the inflated parameter space.
+
+```python
+# Degree-2 interaction-only features keep the count manageable
+poly = PolynomialFeatures(degree=2, interaction_only=True,
+                          include_bias=False)
+X_inter = poly.fit_transform(X)
+```
+
+### 5.3 Practical Guidance
+
+Standardize before generating polynomial terms, because raising large valued features to powers produces enormous numbers that wreck conditioning. Prefer `interaction_only` expansions when you suspect cross effects but not curvature, since this avoids the squared terms and keeps the feature count lower. Let regularization, especially L1, prune the expanded set rather than trusting every generated term. Finally, recall that gradient boosted trees discover interactions automatically through sequential splits, so explicit polynomial construction yields the largest gains for linear and kernel free models.
+
+## 6. Handling Skew and Outliers
+
+### 6.1 Diagnosing Skew
+
+Skewness measures asymmetry of a distribution. The standardized third moment,
+
+$$
+\gamma_1 = \mathbb{E}\!\left[\left(\frac{x - \mu}{\sigma}\right)^3\right],
+$$
+
+is positive for a right tail and negative for a left tail. Heavy right skew is the most common pathology in business data, where counts and monetary amounts pile up near small values with a long tail of large ones. Skew degrades linear models because it makes residuals heteroscedastic and lets the tail dominate squared error loss. The log, Box-Cox, and Yeo-Johnson transforms of the previous sections are the primary remedies, chosen by inspecting the transformed skewness or by maximizing a normality criterion.
+
+### 6.2 Detecting Outliers
+
+An outlier is an observation far from the bulk of the data, and its influence depends entirely on the model. Two classical univariate rules are the $z$ score rule, which flags $|z| > 3$, and the more robust IQR rule, which flags points outside $[Q_1 - 1.5\,\text{IQR},\ Q_3 + 1.5\,\text{IQR}]$. The IQR rule is preferred because the $z$ score itself is computed from a mean and standard deviation that the outliers contaminate. Multivariate outliers, which look normal on every axis but anomalous jointly, require methods such as Mahalanobis distance,
+
+$$
+D_M(\mathbf{x}) = \sqrt{(\mathbf{x} - \boldsymbol{\mu})^{\top} \boldsymbol{\Sigma}^{-1} (\mathbf{x} - \boldsymbol{\mu})},
+$$
+
+or model based detectors like isolation forests and local outlier factor.
+
+### 6.3 Treating Outliers
+
+There is no universal correct treatment; the right action depends on whether the extreme value is an error or a genuine rare event. Common strategies include the following. Removal deletes the offending rows, appropriate only when you are confident they are measurement errors, because discarding genuine extremes biases the model. Winsorizing (clipping) caps values at chosen percentiles, for example the 1st and 99th, retaining the row while bounding its leverage. Transformation via the log or a power transform pulls in the tail so that extremes become unexceptional in the transformed space, often the most principled option. Robust modeling sidesteps the problem with loss functions such as the Huber loss that downweight large residuals rather than altering the data.
+
+$$
+L_\delta(r) =
+\begin{cases}
+\tfrac{1}{2} r^2, & |r| \leq \delta,\\[1mm]
+\delta\left(|r| - \tfrac{1}{2}\delta\right), & |r| > \delta.
+\end{cases}
+$$
+
+The Huber loss behaves quadratically for small residuals and linearly for large ones, which limits the influence any single outlier exerts on the fit.
+
+### 6.4 Documenting and Monitoring
+
+Whatever treatment you choose, record the thresholds and percentiles as part of the model artifact, derive them from training data only, and apply them unchanged at inference. Production monitoring should track the rate at which incoming values trigger clipping or fall outside training quantiles, because a rising rate is an early warning of distribution drift that may demand retraining.
+
+## 7. Putting It Together
+
+A coherent numerical feature pipeline composes these steps in a sensible order. Diagnose the distribution of each feature and the inductive bias of the chosen model. Apply a distributional transform such as Yeo-Johnson to symmetrize skewed inputs. Scale the result with a standard or robust scaler appropriate to the remaining tail behavior. Construct interactions and low degree polynomial terms where domain knowledge or diagnostics suggest conditional or curved effects. Bin selectively when a linear model must express non monotone structure. Treat outliers explicitly through clipping, transformation, or a robust loss. Critically, encapsulate every estimated parameter inside a pipeline so it is fit on training folds alone, preventing leakage and ensuring that cross validation reflects genuine generalization.
+
+```python
+pipe = make_pipeline(
+    PowerTransformer(method="yeo-johnson"),  # symmetrize, fit on train
+    RobustScaler(),                          # scale, resist residual tails
+    PolynomialFeatures(degree=2, interaction_only=True),
+    Ridge(alpha=1.0),                        # regularize the expansion
+)
+```
+
+Feature engineering for numerical data is not a mechanical preprocessing chore but a modeling decision in its own right. The transforms in this chapter encode hypotheses about the structure of the data: that effects are multiplicative, that tails are noise rather than signal, that two features interact. Chosen well and validated honestly, they often deliver larger gains than swapping one learning algorithm for another.
+
+## References
+
+1. Kuhn, M., and Johnson, K. *Feature Engineering and Selection: A Practical Approach for Predictive Models*. http://www.feat.engineering/
+2. Zheng, A., and Casari, A. *Feature Engineering for Machine Learning*. O'Reilly Media. https://www.oreilly.com/library/view/feature-engineering-for/9781491953235/
+3. Box, G. E. P., and Cox, D. R. "An Analysis of Transformations." *Journal of the Royal Statistical Society, Series B*, 1964. https://www.jstor.org/stable/2984418
+4. Yeo, I., and Johnson, R. A. "A New Family of Power Transformations to Improve Normality or Symmetry." *Biometrika*, 2000. https://doi.org/10.1093/biomet/87.4.954
+5. Scikit-learn Developers. "Preprocessing data." Scikit-learn User Guide. https://scikit-learn.org/stable/modules/preprocessing.html
+6. Scikit-learn Developers. "Compare the effect of different scalers on data with outliers." https://scikit-learn.org/stable/auto_examples/preprocessing/plot_all_scaling.html
+7. Huber, P. J. "Robust Estimation of a Location Parameter." *Annals of Mathematical Statistics*, 1964. https://doi.org/10.1214/aoms/1177703732
+8. Duan, N. "Smearing Estimate: A Nonparametric Retransformation Method." *Journal of the American Statistical Association*, 1983. https://doi.org/10.1080/01621459.1983.10478017
+9. Liu, F. T., Ting, K. M., and Zhou, Z. "Isolation Forest." *IEEE ICDM*, 2008. https://doi.org/10.1109/ICDM.2008.17
+10. Siddiqi, N. *Credit Risk Scorecards: Developing and Implementing Intelligent Credit Scoring*. Wiley. https://www.wiley.com/en-us/Credit+Risk+Scorecards-p-9780471754510

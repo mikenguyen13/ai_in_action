@@ -1,0 +1,229 @@
+# Web Scraping and Data Acquisition
+
+Most machine learning projects begin not with a model but with a question: where will the data come from? Curated benchmark datasets are convenient, but the interesting problems almost always require data that nobody has packaged for you. The web is the largest reservoir of such data, and web scraping is the practice of programmatically extracting structured information from it. This chapter develops the technical foundations of scraping alongside the legal, ethical, and operational discipline that separates a responsible data acquisition pipeline from a reckless one.
+
+## 1. The HTTP Foundation
+
+Every scraper, no matter how sophisticated, ultimately speaks HTTP. Understanding the protocol is the difference between writing code that works by accident and writing code you can reason about when it fails.
+
+### 1.1 The Request and Response Cycle
+
+HTTP is a stateless request and response protocol. A client sends a request to a server, the server returns a response, and the connection carries no memory of prior exchanges. A request consists of a method, a target URL, a set of headers, and an optional body. The most common methods for scraping are GET, which retrieves a resource, and POST, which submits data, typically used for search forms and login flows.
+
+```python
+import requests
+
+resp = requests.get(
+    "https://example.com/products",
+    params={"page": 2, "sort": "price"},
+    headers={"User-Agent": "ResearchBot/1.0 (contact@example.org)"},
+    timeout=10,
+)
+print(resp.status_code)   # 200
+print(resp.headers["Content-Type"])  # text/html; charset=utf-8
+```
+
+The response carries a status code, a set of headers, and a body. Status codes are grouped by their first digit: 2xx signals success, 3xx redirection, 4xx a client error such as 404 (not found) or 403 (forbidden), and 5xx a server error. A scraper that treats every non-200 response as a hard failure will be brittle, and one that ignores status codes entirely will silently parse error pages as if they were real content.
+
+### 1.2 Headers, Cookies, and Sessions
+
+Headers carry metadata that shapes how the server responds. The `User-Agent` header identifies the client; many servers vary their output or block requests based on it. The `Accept` family negotiates content type and language. The `Referer` header indicates the page that linked to the request, and some sites check it. Cookies, delivered through the `Set-Cookie` response header and returned in the `Cookie` request header, are how a stateless protocol simulates state across requests.
+
+For any scraper that touches more than a single page, use a session object rather than independent requests. A session pools the underlying TCP connection, reuses TLS handshakes, and persists cookies automatically.
+
+```python
+session = requests.Session()
+session.headers.update({"User-Agent": "ResearchBot/1.0 (contact@example.org)"})
+session.get("https://example.com/login")          # sets a session cookie
+session.post("https://example.com/login",         # cookie carried forward
+             data={"user": "alice", "token": "..."})
+```
+
+Connection reuse is not merely a performance optimization. Repeatedly opening fresh connections is one of the cheapest ways to look like an attacker and to exhaust a small server's resources.
+
+## 2. Parsing HTML
+
+Once you have a response body, you must turn a string of markup into structured fields. HTML on real websites is rarely clean, and the parser you choose has to tolerate broken nesting, unclosed tags, and inconsistent attributes.
+
+### 2.1 The Document Object Model
+
+A parser reads HTML into a tree, the Document Object Model, where each tag becomes a node with a tag name, attributes, text, and children. Extraction is then a matter of navigating that tree. The two dominant query languages are CSS selectors, familiar from styling, and XPath, a more expressive path language designed for XML. CSS selectors cover the large majority of practical cases and are easier to read.
+
+```python
+from bs4 import BeautifulSoup
+
+soup = BeautifulSoup(resp.text, "lxml")
+title = soup.select_one("h1.product-title").get_text(strip=True)
+price = soup.select_one("span.price").get_text(strip=True)
+links = [a["href"] for a in soup.select("a.related[href]")]
+```
+
+The `lxml` parser is fast and forgiving; Python's built in `html.parser` requires no dependencies but is slower. For very large documents or when you need full XPath support, parsing with `lxml` directly is worthwhile.
+
+### 2.2 Writing Selectors That Survive
+
+The single most common cause of scraper breakage is a fragile selector. Sites redesign frequently, and a selector that depends on deep structural position, such as `div > div > div:nth-child(3) > span`, will shatter at the first layout tweak. Prefer selectors anchored to semantic signals that designers are reluctant to change: stable identifiers, ARIA roles, `data-` attributes, and human readable class names tied to meaning rather than presentation. When a field carries a machine readable hint, such as an `itemprop` attribute from schema.org microdata, anchor to it.
+
+A second resilience technique is to extract from structured data that the page already exposes. Many sites embed JSON-LD in a `<script type="application/ld+json">` block for search engine optimization. Parsing that JSON is far more stable than scraping rendered text, because it is a contract the site maintains for crawlers.
+
+```python
+import json
+
+for tag in soup.select('script[type="application/ld+json"]'):
+    data = json.loads(tag.string)
+    if data.get("@type") == "Product":
+        price = data["offers"]["price"]
+```
+
+### 2.3 Separating Extraction From Logic
+
+A maintainable scraper isolates the selectors in one place, ideally a configuration or a small set of named functions, so that when a site changes you patch one location rather than hunting through business logic. Treat each extracted field as something that can be missing. A selector that returns `None` should produce a recorded gap, not an unhandled exception that aborts a batch of ten thousand pages.
+
+## 3. robots.txt, Legal, and Ethical Considerations
+
+Scraping sits at the intersection of technology, law, and ethics, and competent practitioners take all three seriously. The technical ability to fetch a page does not by itself grant the right to do so at scale or to reuse what you find.
+
+### 3.1 The Robots Exclusion Protocol
+
+`robots.txt` is a file at the root of a domain that declares which paths automated agents may and may not access. It is an advisory standard, formalized as RFC 9309 in 2022, not an enforcement mechanism. Honoring it is nevertheless a baseline expectation of good citizenship and, increasingly, a factor courts weigh when assessing whether access was authorized.
+
+```
+User-agent: *
+Disallow: /private/
+Crawl-delay: 5
+
+User-agent: ResearchBot
+Allow: /
+```
+
+The directives are grouped by `User-agent`. `Disallow` lists forbidden path prefixes, `Allow` carves out exceptions, and the nonstandard but widely respected `Crawl-delay` requests a minimum gap between requests. Python's standard library can parse and apply these rules.
+
+```python
+import urllib.robotparser as rp
+
+parser = rp.RobotFileParser()
+parser.set_url("https://example.com/robots.txt")
+parser.read()
+allowed = parser.can_fetch("ResearchBot/1.0", "https://example.com/products")
+```
+
+A scraper should fetch and cache `robots.txt` once per domain at the start of a run and consult it before every request. Note that `robots.txt` governs access, not reuse; even fully permitted content may be subject to copyright and licensing constraints.
+
+### 3.2 The Legal Landscape
+
+There is no single law of web scraping, and the rules vary by jurisdiction, but several themes recur. In the United States, the Computer Fraud and Abuse Act has historically been invoked against scrapers, though the 2019 and 2022 rulings in *hiQ Labs v. LinkedIn* indicated that scraping publicly available data is unlikely to constitute unauthorized access under the statute. The story is more complicated once a login or a paywall is involved, because bypassing an access control changes the analysis substantially.
+
+Copyright is a separate and independent concern. Facts are not copyrightable, but the creative expression that surrounds them often is, and wholesale reproduction of articles, photographs, or databases can infringe. The fair use doctrine, and its analogues abroad, offers a defense in some research and transformative contexts, but it is a defense argued case by case, not a blanket permission. Terms of service add a contractual layer: clicking through or even browsing a site may bind you to terms that prohibit automated access, and breach of contract claims can succeed where statutory claims fail.
+
+Data protection regimes impose further duties. The European Union's General Data Protection Regulation treats names, identifiers, and other personal data as regulated regardless of whether they are publicly posted, and scraping such data requires a lawful basis and triggers obligations around purpose, retention, and the rights of the individuals concerned. The California Consumer Privacy Act creates parallel duties in its jurisdiction. The safe posture is to assume that personal data carries legal weight wherever you collect it.
+
+### 3.3 An Ethical Checklist
+
+Beyond what the law compels, responsible scraping follows a few principles. Prefer an official API when one exists, because it represents the site's own sanctioned access path and usually comes with stable schemas and clear terms. Identify yourself honestly in the `User-Agent` string, including a contact address, so that an administrator who notices your traffic can reach you rather than simply blocking a range. Collect only the data you actually need, and minimize the personal data within it. Cache aggressively so that you never request the same resource twice. Above all, weigh the burden you impose on the operator against the value of what you are collecting.
+
+## 4. Rate Limiting and Politeness
+
+A scraper that hammers a server is both unethical and self defeating, since the fastest route to an IP ban is to behave like a denial of service attack. Politeness is the engineering discipline of extracting data without degrading the service for anyone else.
+
+### 4.1 Pacing Requests
+
+The simplest control is a delay between requests. A fixed delay is easy but predictable and slightly unnatural; adding jitter, a small random component, both spreads load and avoids the metronome signature that triggers bot detection. Respect any `Crawl-delay` the site declares, and when none is given, a conservative default of one to a few seconds per request is a reasonable starting point for a single client.
+
+```python
+import time, random
+
+def polite_get(session, url, base_delay=1.0):
+    time.sleep(base_delay + random.uniform(0, 0.5))
+    return session.get(url, timeout=10)
+```
+
+For higher throughput, a token bucket limiter caps the average rate while permitting short bursts, which is gentler than a rigid per request sleep and easier to tune to a target requests per second.
+
+### 4.2 Concurrency With Restraint
+
+Concurrency multiplies throughput but also multiplies the load you place on a server. The key constraint is per host concurrency: even with a large worker pool, limit the number of simultaneous connections to any single domain to a small number, often just one or two, while allowing many hosts to be crawled in parallel. Asynchronous frameworks such as `asyncio` with `aiohttp` make this pattern efficient, but the politeness logic, not the raw capability, should govern how hard you push.
+
+### 4.3 Backoff and Server Signals
+
+Servers tell you when you are going too fast, and a polite scraper listens. A 429 (too many requests) or 503 (service unavailable) response is an explicit request to slow down, and many include a `Retry-After` header naming the number of seconds to wait. On such responses, and on transient network errors, apply exponential backoff: wait one second, then two, then four, with jitter, up to a ceiling, before giving up. Retrying immediately at full speed after a rejection is the behavior of a hostile client.
+
+```python
+def fetch_with_backoff(session, url, max_retries=5):
+    delay = 1.0
+    for attempt in range(max_retries):
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", delay))
+            time.sleep(wait + random.uniform(0, 1))
+            delay *= 2
+            continue
+        return resp
+    raise RuntimeError(f"giving up on {url}")
+```
+
+## 5. Handling Dynamic Pages
+
+A growing share of the web renders its content in the browser using JavaScript, so the HTML returned by a plain HTTP request may be an empty shell. Recognizing and handling this case is essential to modern scraping.
+
+### 5.1 Diagnosing Client Side Rendering
+
+The diagnostic is straightforward: fetch the page with `requests` and search the raw response for the data you expect to see. If the values are present, the page is server rendered and a simple HTTP plus parse pipeline suffices. If the response contains only a skeleton, a root `<div>`, and bundled scripts, the content is assembled in the browser after the initial load, and you must either drive a browser or find the data source the browser itself uses.
+
+### 5.2 Finding the Underlying API
+
+Before reaching for a heavyweight browser, inspect the network traffic in your browser's developer tools. Client side applications fetch their data from backend endpoints, typically returning JSON, and calling those endpoints directly is dramatically faster and more stable than rendering a full page. The JSON is structured, versioned, and free of presentation noise. Replicating the request often requires copying a few headers and an authentication token, but the payoff in speed and robustness is large. This should be your first move whenever a page is dynamic.
+
+### 5.3 Browser Automation as a Last Resort
+
+When the data is genuinely available only after JavaScript executes, drive a real browser with a tool such as Playwright or Selenium. These libraries launch a headless browser, load the page, wait for the relevant elements to appear, and expose the fully rendered DOM to your selectors.
+
+```python
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto("https://example.com/app", wait_until="networkidle")
+    page.wait_for_selector("div.results")
+    html = page.content()
+    browser.close()
+```
+
+Browser automation is powerful but expensive: it consumes far more memory and time per page, it is harder to scale, and it is more fragile. The cardinal mistake is to wait a fixed number of seconds for content to load; instead, wait on an explicit condition, such as the appearance of a specific selector or a network idle state, so the scraper adapts to varying load times.
+
+## 6. Building Robust Scrapers
+
+A one off script that extracts a page is a toy. A scraper that runs for hours across thousands of pages, survives network failures, and produces clean data is an engineering artifact, and the gap between the two is robustness.
+
+### 6.1 Failure Is the Normal Case
+
+At scale, failure is not an exception but a steady background rate. Connections time out, servers return 500 errors, pages change layout, and selectors return nothing. A robust scraper treats each of these as expected and handles them explicitly. Wrap every network call in retry logic with backoff, set timeouts on every request so a single hung connection cannot stall the pipeline, and validate every extracted record before accepting it. When a page cannot be parsed, log the URL and the raw response so you can diagnose it later rather than losing it.
+
+### 6.2 Idempotency and Checkpointing
+
+A long running job will be interrupted, whether by a crash, a deployment, or a manual stop. Design so that restarting resumes rather than starting over. Persist the frontier of URLs still to visit and the set already completed, so a restart skips finished work. Make writes idempotent by keying records on a stable identifier, typically the canonical URL, so that reprocessing a page updates rather than duplicates its record. Checkpointing turns a fragile multi hour run into a process you can stop and resume at will.
+
+### 6.3 Storage and Data Quality
+
+Decide early how raw and parsed data will be stored. A durable pattern is to save the raw response body before parsing, so that when you discover a parser bug you can reprocess the archived HTML without re fetching and re burdening the source. Validate parsed records against a schema that encodes types, required fields, and plausible ranges, and route records that fail validation to a quarantine for inspection rather than into your clean dataset. Track the provenance of every record, the source URL, the fetch timestamp, and the parser version, because data without provenance is difficult to trust or to correct.
+
+### 6.4 Monitoring and Adaptation
+
+Sites change without warning, and a scraper that ran perfectly yesterday can silently return empty fields today. Instrument the pipeline so that a sudden drop in the fill rate of a field, a spike in 403 responses, or a surge in validation failures raises an alert. These signals usually mean the site was redesigned or has begun blocking you, and catching them early is the difference between losing an hour of data and losing a month. Treat a scraper as a living system that requires maintenance, not a script you write once and forget.
+
+## 7. Conclusion
+
+Web scraping is deceptively simple to begin and genuinely difficult to do well. The technical core, issuing HTTP requests and parsing HTML, can be learned in an afternoon, but the surrounding discipline takes longer to internalize: choosing resilient selectors, honoring `robots.txt`, navigating an uncertain legal landscape, pacing requests with restraint, handling dynamic pages efficiently, and engineering for the failures that scale guarantees. The practitioners who acquire data successfully over the long term are not those who scrape the fastest but those who scrape the most carefully, treating the sites they depend on as resources to be preserved rather than exploited. For the machine learning engineer, that care is what turns the chaotic, sprawling web into a dependable source of training data.
+
+## References
+
+1. Fielding, R., et al. "HTTP Semantics." RFC 9110, IETF, 2022. https://www.rfc-editor.org/rfc/rfc9110
+2. Koster, M., et al. "Robots Exclusion Protocol." RFC 9309, IETF, 2022. https://www.rfc-editor.org/rfc/rfc9309
+3. Richardson, L. "Beautiful Soup Documentation." https://www.crummy.com/software/BeautifulSoup/bs4/doc/
+4. Reitz, K. "Requests: HTTP for Humans." https://requests.readthedocs.io/
+5. "Playwright for Python Documentation." Microsoft. https://playwright.dev/python/
+6. United States Court of Appeals for the Ninth Circuit. "hiQ Labs, Inc. v. LinkedIn Corp." 2022. https://cdn.ca9.uscourts.gov/datastore/opinions/2022/04/18/17-16783.pdf
+7. European Parliament and Council. "General Data Protection Regulation (GDPR), Regulation (EU) 2016/679." https://eur-lex.europa.eu/eli/reg/2016/679/oj
+8. "Scrapy: An Open Source Web Crawling Framework." https://docs.scrapy.org/
+9. Mozilla. "HTTP Headers." MDN Web Docs. https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers
+10. "Schema.org Structured Data Vocabulary." https://schema.org/

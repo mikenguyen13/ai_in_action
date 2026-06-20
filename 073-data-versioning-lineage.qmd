@@ -1,0 +1,196 @@
+# Data Versioning and Lineage
+
+Machine learning systems are defined as much by their data as by their code. A model is a function of the dataset it was trained on, the hyperparameters chosen, and the code that wires everything together. Software engineers have spent decades building disciplined practices around versioning code, yet the data that flows through machine learning pipelines is frequently treated as a mutable, unversioned blob sitting in a bucket somewhere. This asymmetry is the source of a large fraction of the reproducibility crises that plague production machine learning. This chapter examines why data versioning matters, how content addressing and hashing provide the technical foundation for reliable versioning, which tools implement these ideas at scale, how lineage tracking connects datasets to the artifacts derived from them, and how teams assemble all of this into reproducible datasets for machine learning.
+
+## 1. Why Data Versioning Matters for Reproducibility
+
+### 1.1 The Reproducibility Problem
+
+Reproducibility means that given the same inputs, a process yields the same outputs. For a machine learning experiment, the inputs include the training data, the validation and test splits, the preprocessing logic, the model architecture, the random seeds, and the software environment. If any of these drift without being recorded, the experiment cannot be reconstructed. Code versioning with Git addresses the architecture and the preprocessing logic, and environment tools address the software stack, but the data is often left out.
+
+Consider a common failure mode. A data scientist trains a model on a CSV exported from a warehouse on a Tuesday. The model performs well, so it is promoted to production. Three weeks later a colleague tries to reproduce the result and re-exports the same query, but rows have been added, a few records have been corrected by an upstream team, and one column has been renamed. The new training run produces a different model with different behavior. Nobody changed the code, yet the result changed. Without a version identifier pinned to the exact bytes used in the original run, the discrepancy is nearly impossible to diagnose.
+
+### 1.2 Data Is Not Code, and That Matters
+
+Data versioning is harder than code versioning for several reasons. Datasets are large, often gigabytes or terabytes, so storing a full copy per version is wasteful. Datasets are frequently binary or columnar, so line based diffing is meaningless. Datasets often live in object stores, databases, or data lakes rather than in a developer's working tree. And datasets change through ingestion pipelines that run continuously, not through discrete human commits.
+
+These differences mean we cannot simply commit a 500 GB Parquet file to Git. Git stores full copies of changed files and was designed for text. Putting large binary data directly into Git bloats the repository and makes clones unbearably slow. The solution that the ecosystem converged on is to separate the metadata, which is small and lives in Git, from the data payload, which is large and lives in scalable storage. The link between the two is a content hash.
+
+### 1.3 What Reproducibility Buys You
+
+Beyond debugging, rigorous data versioning supports several concrete capabilities. Auditability lets you answer the question of exactly which records a regulated model was trained on, which matters for compliance regimes such as the EU AI Act. Rollback lets you revert a dataset to a known good state when a bad batch of ingestion corrupts a feature table. Collaboration lets multiple team members reference the same immutable dataset version by a short identifier rather than by passing files around. And time travel lets you reconstruct the state of the world as your pipeline saw it at any past moment, which is essential for fair model comparison across experiments.
+
+## 2. Content Addressing and Hashing
+
+### 2.1 The Core Idea
+
+Content addressing means that an object is identified by a cryptographic hash of its contents rather than by a location or a human assigned name. If you compute the SHA-256 digest of a file, you get a 256 bit value that is, for all practical purposes, unique to those exact bytes. Change a single bit and the hash changes completely. This property is what makes content addressing useful: the identifier is the fingerprint of the data itself.
+
+```text
+content = bytes of the file
+address = SHA256(content)  ->  e3b0c44298fc1c149afbf4c8996fb924...
+```
+
+This is the same idea that underlies Git, which addresses every blob, tree, and commit by its SHA-1 (now migrating to SHA-256) hash. It is the same idea behind the InterPlanetary File System and behind every modern data versioning tool. Once you accept content addressing, several useful properties follow almost for free.
+
+### 2.2 Deduplication and Integrity
+
+Because the address is derived from the content, two identical files produce the same address and need to be stored only once. A dataset that is copied across ten experiment branches consumes storage for one physical copy. When you chunk large files and hash each chunk, you get deduplication at the sub file level, so a new version that appends rows to a billion row table only stores the new chunks.
+
+Content addressing also gives you integrity verification for free. When you read an object back, you recompute its hash and compare it to the address you requested. If they match, the bytes are intact. If they do not, the data is corrupt or has been tampered with. This is why content addressed stores are sometimes called verifiable.
+
+### 2.3 Immutability and the Merkle Structure
+
+Content addressed objects are immutable by construction. You cannot change the contents without changing the address, so any reference to a specific hash always points to the same bytes forever. Mutable concepts such as branches and tags are layered on top as pointers that can be moved to reference different immutable objects over time.
+
+When you address a collection of objects, you build a Merkle tree or Merkle directed acyclic graph. A directory is represented as a list of names paired with the hashes of their contents, and that list is itself hashed. The result is that a single root hash captures the entire state of a possibly enormous dataset. Comparing two dataset versions reduces to comparing root hashes, and finding what changed reduces to walking down the tree until the hashes diverge. This is precisely how Git computes diffs efficiently and how data versioning tools detect changes across massive trees without scanning every byte.
+
+```text
+root_hash
+ |- features/   -> hash_A
+ |- labels/     -> hash_B
+ |- splits/     -> hash_C   (only this changed in v2)
+```
+
+## 3. Tools for Data Versioning
+
+The ecosystem offers several tools, each making different trade-offs about where the data lives, how much it resembles Git, and how tightly it couples to the storage and query layers. Three representative tools are DVC, lakeFS, and Delta Lake.
+
+### 3.1 DVC
+
+Data Version Control, or DVC, is the tool that most directly extends the Git mental model to data. It sits alongside Git in the same repository. When you track a file or directory with DVC, it computes a hash of the content, moves the actual bytes into a content addressed cache, and writes a small pointer file with a `.dvc` extension that contains the hash and metadata. That tiny pointer file is committed to Git, while the large data is pushed to a remote such as S3, Google Cloud Storage, Azure Blob, or an SSH server.
+
+```text
+# track a dataset directory
+dvc add data/raw
+
+# the pointer file data/raw.dvc now contains:
+#   outs:
+#     - md5: a1b2c3d4...
+#       path: raw
+
+git add data/raw.dvc .gitignore
+git commit -m "Add raw dataset v1"
+dvc push   # uploads bytes to the configured remote
+```
+
+Because the hash lives in Git, checking out an old commit and running `dvc checkout` restores the exact data that matched that commit. DVC also models pipelines as stages with declared dependencies and outputs in a `dvc.yaml` file, so it can rebuild only the stages whose inputs changed. This makes DVC a natural fit for individual researchers and small teams who already think in terms of Git branches and want data and pipeline reproducibility without adopting heavy infrastructure.
+
+### 3.2 lakeFS
+
+lakeFS brings Git like semantics to an entire object store. Rather than pointer files in a repository, lakeFS sits as a layer in front of S3 compatible storage and exposes branches, commits, and merges over the objects living there. You can create a branch of a multi terabyte data lake instantly, because branching is a metadata operation that copies no data. You then write to the branch in isolation, run jobs against it, and either merge the result back into the main branch atomically or discard it.
+
+```text
+lakectl branch create lakefs://repo/experiment --source lakefs://repo/main
+# run ingestion or transformation writing to the experiment branch
+lakectl commit lakefs://repo/experiment -m "Reprocessed feature table"
+lakectl merge lakefs://repo/experiment lakefs://repo/main
+```
+
+The advantage of lakeFS is that it operates at the scale of a data lake and integrates with engines such as Spark, Presto, and Trino that read directly from object storage. It gives data engineers atomic, all or nothing commits across many files, the ability to validate a branch before merging it into production, and instant rollback by pointing the main branch back to an earlier commit. It is well suited to organizations whose data already lives in S3 and who want repository style governance over it.
+
+### 3.3 Delta Lake
+
+Delta Lake takes a different angle. It is a storage format, originally from Databricks and now an open standard, that adds a transaction log on top of Parquet files in object storage. Every change to a Delta table appends an entry to an ordered transaction log in a `_delta_log` directory. Each log entry records which Parquet files were added and which were removed, giving the table ACID transactions, schema enforcement, and the ability to query any historical version.
+
+```text
+-- read the current table
+SELECT * FROM events;
+
+-- time travel to an earlier version
+SELECT * FROM events VERSION AS OF 42;
+SELECT * FROM events TIMESTAMP AS OF '2026-05-01';
+```
+
+Time travel is the feature most relevant to versioning. Because the log records every version, you can query the table as it existed at version 42 or as of a specific timestamp, which lets you pin training data to an exact snapshot. Delta Lake also supports concurrent writers safely, compacts small files, and integrates tightly with Spark and a growing set of query engines. Comparable open table formats, notably Apache Iceberg and Apache Hudi, provide similar snapshot isolation and time travel and are worth evaluating alongside Delta when choosing a lakehouse foundation.
+
+### 3.4 Choosing Among Them
+
+These tools are not strictly competitors, since they target different layers. DVC versions files and pipelines in a Git centric workflow and shines for experiment reproducibility. lakeFS versions an entire object store with branch and merge semantics and shines for data engineering governance. Delta Lake and its peers version tabular data with transactional guarantees and shine for the analytics and feature engineering layer. Many production stacks use more than one, for example Delta tables for the warehouse and DVC to pin the specific extract that fed a training run.
+
+## 4. Lineage Tracking
+
+### 4.1 What Lineage Is
+
+Lineage is the record of how a data artifact came to be. It answers questions of provenance: which upstream sources fed this table, which transformation produced this feature, which dataset version trained this model, and which model version generated this prediction. Where versioning gives you the ability to name and retrieve a specific state, lineage gives you the graph that connects those states across the pipeline.
+
+A lineage graph is a directed acyclic graph whose nodes are datasets, transformations, models, and runs, and whose edges express the consumed by and produced by relationships. Tracing forward from a node tells you the downstream impact of a change, which is essential for impact analysis when a source is found to be faulty. Tracing backward from a model or a prediction tells you exactly what produced it, which is essential for debugging and for audit.
+
+### 4.2 Coarse Grained and Fine Grained Lineage
+
+Lineage operates at different granularities. Coarse grained lineage tracks relationships at the level of whole datasets and jobs: this Spark job read tables A and B and wrote table C. This is cheap to capture and sufficient for most reproducibility and governance needs. Fine grained lineage tracks relationships at the level of individual columns or even rows: column C.revenue is computed from A.price and A.quantity. Column level lineage is more expensive to compute, often requiring parsing of SQL or dataflow, but it is invaluable for understanding the blast radius of a schema change and for compliance tasks such as tracking where a particular personal data field propagates.
+
+### 4.3 How Lineage Is Captured
+
+There are two broad strategies. Observational lineage is inferred by watching the system, for example by parsing query logs or SQL to deduce which tables a job touched. It requires little change to existing pipelines but can miss logic that happens outside the observed surface. Declarative lineage is emitted by the pipeline itself, where each job reports its inputs and outputs as it runs. It is more accurate and complete but requires instrumentation.
+
+OpenLineage has emerged as an open standard for emitting lineage events in a vendor neutral format, with integrations for orchestrators such as Airflow, dbt, and Spark. A run event carries the job identity, the input datasets with their versions, and the output datasets with their versions and schema. Collectors such as Marquez ingest these events and assemble the lineage graph. The MLflow tracking layer plays an analogous role on the experiment side, recording for each run the parameters, the metrics, the code version, and references to the data versions consumed, so that a model registered in MLflow can be traced back to its inputs.
+
+```text
+# pseudo lineage event emitted by a job run
+{
+  "run": "train_churn_2026_06_19",
+  "inputs":  [{"dataset": "features.churn", "version": "delta:v42"}],
+  "outputs": [{"model": "churn_clf", "version": "3", "hash": "9f8e..."}]
+}
+```
+
+### 4.4 Why Lineage Completes the Picture
+
+Versioning without lineage gives you immutable snapshots that you cannot easily connect. You might know that dataset version `a1b2c3` exists, but not that it was derived from raw export `d4e5f6` by a cleaning job, nor that model version 3 was trained on it. Lineage stitches the versioned artifacts into a coherent history. Together, versioning and lineage let you start from a production prediction that looks wrong and walk backward through the model, the training dataset, the feature pipeline, and the raw source, reproducing each step exactly because each artifact is pinned to an immutable version.
+
+## 5. Reproducible Datasets for Machine Learning
+
+### 5.1 Pinning Every Input
+
+A reproducible training run pins every input to an immutable identifier. The code is pinned by a Git commit hash. The environment is pinned by a lockfile or a container image digest. And the data is pinned by a content hash or a snapshot version. The training script should record all three in its run metadata so that the run can be reconstructed from the record alone.
+
+```text
+run_manifest:
+  code_commit:   git:7f3a9c1
+  environment:   docker@sha256:5d41402a...
+  train_data:    delta://features.churn@v42
+  val_data:      dvc://splits/val@md5:a1b2c3
+  seed:          1337
+```
+
+The seed matters as much as the data. Many preprocessing and training steps are stochastic, including shuffling, augmentation, dropout, and weight initialization. Pinning the random seed and using deterministic operations where the framework allows turns an otherwise irreproducible run into a deterministic one. Be aware that some accelerated operations on GPUs are nondeterministic by default and must be explicitly configured for full determinism, sometimes at a performance cost.
+
+### 5.2 Immutable Splits and Leakage
+
+Train, validation, and test splits must themselves be versioned and immutable. A frequent and subtle bug is to regenerate splits with a random shuffle on each run, which means a record that was in the test set yesterday may be in the training set today. This makes metrics incomparable across experiments and can leak test information into training over time as you tune against a moving target. The discipline is to compute splits once, version them as first class artifacts, and reference them by version in every experiment. Deterministic, hash based assignment of records to splits is a robust technique: assign a record to a split based on a hash of its stable identifier, so the same record always lands in the same split even as the dataset grows.
+
+### 5.3 Snapshots Versus Live Queries
+
+Training directly against a live table or a live SQL query is a reproducibility trap, because the query result changes as the underlying data changes. The reproducible pattern is to materialize a snapshot. With Delta Lake or a similar table format you pin to a version or timestamp. With DVC you add and commit the extract. With lakeFS you commit a branch and reference the commit. In every case the training job reads from an immutable reference rather than from a moving target. A useful rule is that no training run should ever read from an unpinned source.
+
+### 5.4 Feature Stores and Point in Time Correctness
+
+Feature stores add a temporal dimension to reproducibility. When you assemble a training set, each feature value must reflect what was known at the time of the label, not what is known now. Joining current feature values onto historical labels leaks future information and inflates offline metrics, a failure that collapses in production. Point in time correct joins, supported by feature store frameworks such as Feast and by the time travel capability of table formats, ensure that each training row sees only the feature values that were valid as of its event timestamp. Versioning the feature definitions alongside the feature values completes the picture, so that the logic that computed a feature is reproducible together with the data.
+
+### 5.5 Putting It Together
+
+A mature reproducible dataset workflow combines these practices. Raw data lands in a versioned store. Transformation pipelines run as declared stages that emit lineage and write versioned outputs. Splits are computed deterministically and versioned. Each training run materializes immutable snapshots, pins code, environment, data, and seed in a run manifest, and registers the resulting model with references back to its inputs. The result is a system where any model in production can be traced to its exact training data, that data can be retrieved bit for bit, and the entire run can be reproduced months later. This is the difference between machine learning as a craft of one off experiments and machine learning as a reliable engineering discipline.
+
+### 5.6 Common Pitfalls
+
+A few recurring mistakes undermine even well intentioned efforts. Storing large data directly in Git defeats the purpose and should be replaced with pointer based or lakehouse approaches. Mutating data in place rather than appending new versions destroys history. Forgetting to version the splits silently breaks comparability. Capturing lineage for some pipelines but not others leaves blind spots exactly where incidents tend to occur. And treating reproducibility as a one time setup rather than an enforced invariant lets the system decay, since a single unpinned source anywhere in the chain breaks the guarantee for everything downstream. The remedy is to make pinning and lineage emission automatic and to fail loudly when an input cannot be pinned.
+
+## 6. Summary
+
+Data versioning brings to data the discipline that source control brought to code. Content addressing and hashing provide the foundation, giving immutable, deduplicated, verifiable artifacts identified by the fingerprint of their contents and organized into Merkle structures that make change detection efficient. Tools such as DVC, lakeFS, and Delta Lake implement these ideas at different layers, from Git centric file versioning to object store branching to transactional table formats with time travel. Lineage tracking connects the versioned artifacts into a graph of provenance, answering how each dataset, model, and prediction came to be. Reproducible datasets for machine learning emerge when every input is pinned, splits are immutable, snapshots replace live queries, point in time correctness is enforced, and lineage is captured automatically. Together these practices convert machine learning from an irreproducible craft into a dependable engineering discipline.
+
+## References
+
+1. DVC: Open source Version Control system for Machine Learning Projects. https://dvc.org/
+2. lakeFS: Data Version Control for Object Storage. https://docs.lakefs.io/
+3. Delta Lake Documentation. https://docs.delta.io/latest/index.html
+4. Apache Iceberg: Open Table Format. https://iceberg.apache.org/
+5. Apache Hudi: Transactions and Upserts on Data Lakes. https://hudi.apache.org/
+6. OpenLineage: An Open Standard for Data Lineage Collection. https://openlineage.io/
+7. Marquez: Collect, aggregate, and visualize metadata about data ecosystems. https://marquezproject.ai/
+8. MLflow: An Open Source Platform for the Machine Learning Lifecycle. https://mlflow.org/
+9. Feast: The Open Source Feature Store for Machine Learning. https://docs.feast.dev/
+10. Git Internals on Git Objects and Content Addressing. https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+11. InterPlanetary File System (IPFS) Documentation on Content Addressing. https://docs.ipfs.tech/concepts/content-addressing/
+12. Sculley, D. et al. Hidden Technical Debt in Machine Learning Systems. NeurIPS 2015. https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html

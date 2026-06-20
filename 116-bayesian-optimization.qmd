@@ -1,0 +1,174 @@
+# Bayesian Optimization
+
+## 1. Motivation: Optimizing Expensive Black-Box Functions
+
+Many of the most consequential optimization problems in machine learning and engineering share an awkward structure. We want to minimize (or maximize) a function $f(\mathbf{x})$ over a domain $\mathcal{X} \subseteq \mathbb{R}^d$, but $f$ has properties that defeat the standard toolkit of gradient descent and convex optimization.
+
+First, $f$ is a black box. We can query it at a point $\mathbf{x}$ and observe a value, but we have no analytic form, no gradient, and often no guarantee of convexity or even continuity in a useful sense. Second, $f$ is expensive. Each evaluation might cost hours of GPU time, a wet-lab experiment, or a costly physical simulation. Third, observations may be noisy, returning $y = f(\mathbf{x}) + \varepsilon$ rather than $f(\mathbf{x})$ itself.
+
+The canonical example is hyperparameter tuning. Training a deep network with a given learning rate, weight decay, and architecture width yields a validation loss, but a single evaluation can take many hours, and the loss surface over hyperparameters is non-convex and noisy. Grid search wastes evaluations on uninformative regions, and random search, while a respectable baseline, ignores everything learned from past queries.
+
+Bayesian optimization (BO) addresses exactly this regime. The central idea is to spend computation on reasoning rather than on raw evaluations. We build a probabilistic surrogate model of $f$ from the data observed so far, then use that model to decide where to query next. Because the surrogate is cheap to evaluate, we can afford to optimize an auxiliary criterion, the acquisition function, that balances exploration of uncertain regions against exploitation of promising ones. The result is a sample-efficient procedure that typically finds strong solutions in tens or hundreds of evaluations, where brute force methods would need orders of magnitude more.
+
+### 1.1 The Sequential Decision Loop
+
+The BO loop is conceptually simple. Given a dataset $\mathcal{D}_n = \{(\mathbf{x}_i, y_i)\}_{i=1}^{n}$, we repeat:
+
+1. Fit a surrogate model to $\mathcal{D}_n$, producing a posterior over $f$.
+2. Optimize an acquisition function $\alpha(\mathbf{x} \mid \mathcal{D}_n)$ to choose the next point $\mathbf{x}_{n+1}$.
+3. Evaluate $y_{n+1} = f(\mathbf{x}_{n+1}) + \varepsilon$ and append it to the dataset.
+
+```text
+initialize D with a few quasi-random points
+for t in 1..budget:
+    posterior = fit_surrogate(D)
+    x_next    = argmax_x acquisition(x, posterior)
+    y_next    = evaluate_expensive_function(x_next)
+    D         = D union {(x_next, y_next)}
+return best observed (x, y) in D
+```
+
+The two design choices that define a BO method are the surrogate model and the acquisition function. The remainder of this chapter develops each in turn.
+
+## 2. Surrogate Models: Gaussian Processes
+
+A surrogate model must do more than interpolate observed points. It must quantify uncertainty, because the acquisition function needs to know not just the predicted value at an untried $\mathbf{x}$ but how confident that prediction is. The Gaussian process (GP) is the default surrogate precisely because it delivers a full predictive distribution in closed form.
+
+### 2.1 Gaussian Process Priors
+
+A Gaussian process is a distribution over functions such that any finite collection of function values is jointly Gaussian. It is specified by a mean function $m(\mathbf{x})$, commonly taken to be zero after centering, and a covariance or kernel function $k(\mathbf{x}, \mathbf{x}')$:
+
+$$
+f(\mathbf{x}) \sim \mathcal{GP}\bigl(m(\mathbf{x}),\, k(\mathbf{x}, \mathbf{x}')\bigr).
+$$
+
+The kernel encodes our prior beliefs about smoothness and length scales. A widely used choice is the Matern 5/2 kernel,
+
+$$
+k_{5/2}(\mathbf{x}, \mathbf{x}') = \sigma_f^2 \left(1 + \sqrt{5}\,r + \tfrac{5}{3} r^2\right) \exp\!\left(-\sqrt{5}\,r\right), \quad r = \frac{\lVert \mathbf{x} - \mathbf{x}' \rVert}{\ell},
+$$
+
+where $\ell$ is a length scale and $\sigma_f^2$ a signal variance. The Matern 5/2 kernel is often preferred over the smoother squared-exponential (RBF) kernel for optimization because it assumes the objective is twice differentiable rather than infinitely smooth, which better matches realistic loss surfaces. In practice each input dimension receives its own length scale $\ell_j$, a setup called automatic relevance determination that lets the model downweight irrelevant inputs.
+
+### 2.2 Posterior Inference
+
+Suppose we have observations $\mathbf{y} = (y_1, \ldots, y_n)^\top$ at inputs $X = (\mathbf{x}_1, \ldots, \mathbf{x}_n)$ with independent Gaussian noise of variance $\sigma_n^2$. Let $K$ be the $n \times n$ matrix with entries $K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$, and let $\mathbf{k}_*(\mathbf{x}) = (k(\mathbf{x}, \mathbf{x}_1), \ldots, k(\mathbf{x}, \mathbf{x}_n))^\top$. The posterior at a test point $\mathbf{x}$ is Gaussian with mean and variance
+
+$$
+\mu_n(\mathbf{x}) = \mathbf{k}_*(\mathbf{x})^\top \left(K + \sigma_n^2 I\right)^{-1} \mathbf{y},
+$$
+
+$$
+\sigma_n^2(\mathbf{x}) = k(\mathbf{x}, \mathbf{x}) - \mathbf{k}_*(\mathbf{x})^\top \left(K + \sigma_n^2 I\right)^{-1} \mathbf{k}_*(\mathbf{x}).
+$$
+
+These two quantities, the predicted value $\mu_n(\mathbf{x})$ and the predictive standard deviation $\sigma_n(\mathbf{x})$, are the raw material for every acquisition function. The variance shrinks near observed points and grows in unexplored regions, which is exactly the signal that drives exploration.
+
+### 2.3 Hyperparameters and Model Fitting
+
+The kernel hyperparameters $\boldsymbol{\theta} = (\sigma_f^2, \ell_1, \ldots, \ell_d, \sigma_n^2)$ are themselves learned, typically by maximizing the log marginal likelihood
+
+$$
+\log p(\mathbf{y} \mid X, \boldsymbol{\theta}) = -\tfrac{1}{2} \mathbf{y}^\top \left(K_{\boldsymbol{\theta}} + \sigma_n^2 I\right)^{-1} \mathbf{y} - \tfrac{1}{2} \log \det\!\left(K_{\boldsymbol{\theta}} + \sigma_n^2 I\right) - \tfrac{n}{2} \log 2\pi.
+$$
+
+This objective automatically balances data fit against model complexity through the log-determinant term, an instance of Occam's razor emerging from the marginal likelihood. A fully Bayesian treatment instead marginalizes over $\boldsymbol{\theta}$ with a prior, often via slice sampling or Hamiltonian Monte Carlo, which improves robustness early in the search when data is scarce and point estimates of $\boldsymbol{\theta}$ are unreliable.
+
+### 2.4 Cost and Alternatives
+
+The matrix inversion in the posterior costs $O(n^3)$, which is harmless for the small budgets typical of BO but becomes a bottleneck past a few thousand points. When evaluations are cheaper or higher dimensional, practitioners turn to alternative surrogates. Random forests, used in the SMAC system, handle categorical and conditional parameters gracefully. The Tree-structured Parzen Estimator (TPE), used in Hyperopt and Optuna, models $p(\mathbf{x} \mid y)$ rather than $p(y \mid \mathbf{x})$ and scales well to high-dimensional and conditional search spaces. Bayesian neural networks and deep kernel learning offer further scalability at the cost of more delicate tuning.
+
+## 3. Acquisition Functions
+
+The acquisition function turns the surrogate's posterior into a concrete decision about where to sample. Every useful acquisition function trades off exploitation, querying where $\mu_n(\mathbf{x})$ predicts good values, against exploration, querying where $\sigma_n(\mathbf{x})$ is large. We adopt the convention of maximizing $f$, and write $f^+ = \max_i y_i$ for the best value observed so far.
+
+### 3.1 Probability of Improvement
+
+The earliest acquisition function, probability of improvement (PI), asks how likely a point is to beat the incumbent by at least a margin $\xi \ge 0$:
+
+$$
+\alpha_{\text{PI}}(\mathbf{x}) = \Phi\!\left(\frac{\mu_n(\mathbf{x}) - f^+ - \xi}{\sigma_n(\mathbf{x})}\right),
+$$
+
+where $\Phi$ is the standard normal cumulative distribution function. PI is intuitive but tends to be overly greedy when $\xi$ is small, because a point with a tiny but near-certain improvement scores higher than a point with a large but uncertain one. The margin $\xi$ must be tuned to inject exploration, which is a practical nuisance.
+
+### 3.2 Expected Improvement
+
+Expected improvement (EI) repairs the greediness of PI by accounting for the magnitude of improvement, not just its probability. Define the improvement at $\mathbf{x}$ as $I(\mathbf{x}) = \max\bigl(f(\mathbf{x}) - f^+, 0\bigr)$. Taking the expectation under the GP posterior yields a closed form. Writing $z = \frac{\mu_n(\mathbf{x}) - f^+ - \xi}{\sigma_n(\mathbf{x})}$,
+
+$$
+\alpha_{\text{EI}}(\mathbf{x}) = \bigl(\mu_n(\mathbf{x}) - f^+ - \xi\bigr)\,\Phi(z) + \sigma_n(\mathbf{x})\,\phi(z),
+$$
+
+for $\sigma_n(\mathbf{x}) > 0$, and $\alpha_{\text{EI}}(\mathbf{x}) = 0$ otherwise, where $\phi$ is the standard normal density. The two terms have a clean reading. The first rewards a high posterior mean (exploitation), and the second rewards high posterior uncertainty (exploration). EI requires no tuning to behave reasonably, with $\xi = 0$ a common default, which is a large part of why it remains the workhorse acquisition function.
+
+### 3.3 Upper Confidence Bound
+
+The GP upper confidence bound (UCB) takes an optimistic view, scoring each point by an upper quantile of its posterior:
+
+$$
+\alpha_{\text{UCB}}(\mathbf{x}) = \mu_n(\mathbf{x}) + \beta_t^{1/2}\,\sigma_n(\mathbf{x}).
+$$
+
+The parameter $\beta_t$ controls the exploration weight directly and transparently. Its great virtue is theoretical: Srinivas and colleagues showed that with a suitable schedule for $\beta_t$, growing logarithmically in the iteration count, GP-UCB achieves sublinear cumulative regret, meaning the average gap to the optimum vanishes as the budget grows. This gives UCB a firmer regret-bound footing than EI, though in practice the prescribed $\beta_t$ is often conservative and tuned down.
+
+### 3.4 Thompson Sampling
+
+Thompson sampling takes a sampling-based rather than a deterministic view. At each step we draw a single function $\tilde{f}$ from the GP posterior and then select the point that maximizes that sampled function:
+
+$$
+\mathbf{x}_{n+1} = \arg\max_{\mathbf{x} \in \mathcal{X}} \tilde{f}(\mathbf{x}), \qquad \tilde{f} \sim p(f \mid \mathcal{D}_n).
+$$
+
+Because the draw reflects the full posterior, regions of high uncertainty are explored automatically in proportion to the probability that they contain the optimum, with no explicit exploration parameter. Exact posterior samples over a continuum are intractable, so implementations use approximations such as random Fourier features, which represent the sampled function as a finite weighted sum of random basis functions. Thompson sampling is especially attractive for parallel and batch settings, where drawing several independent posterior samples yields a diverse batch of query points almost for free.
+
+### 3.5 Information-Theoretic and Knowledge-Gradient Criteria
+
+A more recent family targets information directly. Entropy search and predictive entropy search choose the point that most reduces the entropy of the posterior over the location of the optimum $\mathbf{x}^\star$, and max-value entropy search does the same for the optimal value $f(\mathbf{x}^\star)$. The knowledge gradient measures the expected increase in the best posterior mean after a query, making it well suited to noisy and decoupled settings. These criteria often outperform EI on hard problems but cost considerably more to compute, since each requires nested expectations or sampling over the optimum.
+
+### 3.6 Optimizing the Acquisition Function
+
+A subtlety that newcomers underestimate: the acquisition function is itself a function over $\mathcal{X}$ that must be maximized at every iteration. It is cheap to evaluate but usually multimodal and non-convex. Standard practice combines a coarse search, evaluating the acquisition on many quasi-random points, with local refinement by a gradient-based optimizer such as L-BFGS started from the best candidates, repeated from several restarts. Getting this inner optimization right matters, because a poorly maximized acquisition function silently degrades the whole procedure.
+
+## 4. Hyperparameter Tuning Applications
+
+Hyperparameter optimization is the application that brought BO into the machine learning mainstream, following the demonstration by Snoek and colleagues that BO could tune deep networks more effectively than human experts.
+
+### 4.1 Framing the Search Space
+
+The objective is the validation performance of a model as a function of its hyperparameters, $f(\mathbf{x}) = \text{ValPerf}(\text{train}(\mathbf{x}))$. The search space mixes types. Learning rate and weight decay are continuous and best searched on a logarithmic scale, since they range over several orders of magnitude. Layer counts and batch sizes are integers. Choices like the optimizer or activation function are categorical, and some parameters are conditional, relevant only when another takes a particular value, such as momentum existing only for SGD. GPs handle continuous and log-scaled parameters naturally; integer and categorical parameters require rounding, specialized kernels, or one-hot encodings, and conditional structure is where tree-based surrogates like TPE and SMAC have an edge.
+
+### 4.2 Multi-Fidelity Methods
+
+The defining cost in hyperparameter tuning is that each evaluation trains a model. Multi-fidelity BO exploits cheap approximations of the true objective, such as training for fewer epochs, on a subset of data, or at lower resolution. Hyperband allocates budget through successive halving, aggressively stopping unpromising configurations early. BOHB combines Hyperband's bandit-style budget allocation with a TPE model that decides which configurations to try, capturing both the efficiency of early stopping and the sample efficiency of a model-based search. The Freeze-Thaw approach models entire learning curves, pausing and resuming runs based on extrapolated performance.
+
+### 4.3 Batch, Parallel, and Constrained Settings
+
+Real tuning happens on clusters, so we want to evaluate several configurations at once. Naive parallelism would query the same acquisition optimum repeatedly, so batch methods enforce diversity, for example through the local penalization of EI around pending points, or simply by drawing multiple Thompson samples. When evaluations are still running, the fantasizing technique imputes plausible outcomes from the posterior so the acquisition function accounts for in-flight queries. Many problems also carry constraints, such as a latency or memory ceiling, which are handled by constrained EI, multiplying EI by the posterior probability that the constraints are satisfied.
+
+### 4.4 Practical Guidance
+
+Several rules of thumb improve results in practice. Initialize with a space-filling design such as a Sobol or Latin hypercube sequence rather than purely random points, so the initial GP fit covers the domain. Transform the objective if it is skewed, for instance optimizing log loss, and standardize the outputs before fitting the GP. Always log-transform parameters that span orders of magnitude. Keep dimensionality modest: vanilla BO struggles past roughly twenty dimensions, where methods exploiting low-dimensional structure such as random embeddings (REMBO) or additive kernels become necessary, and the trust-region approach TuRBO restores strong performance in higher dimensions by maintaining local GP models. Finally, remember that BO is sequential and its overhead per step grows with $n$; if evaluations are cheap, random or grid search may be simpler and competitive.
+
+### 4.5 Tooling
+
+Mature open-source libraries lower the barrier to adoption considerably. BoTorch, built on PyTorch and GPyTorch, provides differentiable Monte Carlo acquisition functions and is the modern foundation for research. Ax wraps BoTorch in a higher-level experimentation interface. Optuna and Hyperopt center on the TPE algorithm and integrate cleanly with common training frameworks, while Scikit-Optimize offers a lightweight GP-based interface. For large-scale distributed tuning, Ray Tune integrates many of these search algorithms with cluster scheduling and early stopping.
+
+## 5. Summary
+
+Bayesian optimization is the method of choice when evaluations are expensive, gradients are unavailable, and sample efficiency is paramount. Its two pillars are a probabilistic surrogate, usually a Gaussian process that supplies a posterior mean and variance in closed form, and an acquisition function that converts that posterior into a query decision by balancing exploitation against exploration. Expected improvement remains a robust default, UCB offers transparent control and regret guarantees, and Thompson sampling shines in parallel settings, while information-theoretic criteria push performance further at higher computational cost. In hyperparameter tuning, the flagship application, multi-fidelity and batch extensions such as Hyperband, BOHB, and TuRBO have made BO a practical default for squeezing the most out of a constrained training budget.
+
+## References
+
+1. Brochu, E., Cora, V. M., and de Freitas, N. (2010). A Tutorial on Bayesian Optimization of Expensive Cost Functions. https://arxiv.org/abs/1012.2599
+2. Shahriari, B., Swersky, K., Wang, Z., Adams, R. P., and de Freitas, N. (2016). Taking the Human Out of the Loop: A Review of Bayesian Optimization. https://ieeexplore.ieee.org/document/7352306
+3. Rasmussen, C. E., and Williams, C. K. I. (2006). Gaussian Processes for Machine Learning. https://gaussianprocess.org/gpml/
+4. Snoek, J., Larochelle, H., and Adams, R. P. (2012). Practical Bayesian Optimization of Machine Learning Algorithms. https://arxiv.org/abs/1206.2944
+5. Srinivas, N., Krause, A., Kakade, S., and Seeger, M. (2010). Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design. https://arxiv.org/abs/0912.3995
+6. Bergstra, J., Bardenet, R., Bengio, Y., and Kegl, B. (2011). Algorithms for Hyper-Parameter Optimization (TPE). https://papers.nips.cc/paper/2011/hash/86e8f7ab32cfd12577bc2619bc635690-Abstract.html
+7. Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., and Talwalkar, A. (2017). Hyperband: A Novel Bandit-Based Approach to Hyperparameter Optimization. https://arxiv.org/abs/1603.06560
+8. Falkner, S., Klein, A., and Hutter, F. (2018). BOHB: Robust and Efficient Hyperparameter Optimization at Scale. https://arxiv.org/abs/1807.01774
+9. Wang, Z., and Jegelka, S. (2017). Max-value Entropy Search for Efficient Bayesian Optimization. https://arxiv.org/abs/1703.01968
+10. Eriksson, D., Pearce, M., Gardner, J., Turner, R., and Poloczek, M. (2019). Scalable Global Optimization via Local Bayesian Optimization (TuRBO). https://arxiv.org/abs/1910.01739
+11. Balandat, M., et al. (2020). BoTorch: A Framework for Efficient Monte-Carlo Bayesian Optimization. https://arxiv.org/abs/1910.06403
+12. Frazier, P. I. (2018). A Tutorial on Bayesian Optimization. https://arxiv.org/abs/1807.02811

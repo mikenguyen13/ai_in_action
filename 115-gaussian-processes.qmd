@@ -1,0 +1,203 @@
+# Gaussian Processes
+
+Gaussian processes (GPs) provide a principled, fully probabilistic framework for learning unknown functions from data. Where a parametric model commits to a fixed functional form and learns a finite set of weights, a Gaussian process places a probability distribution directly over functions and lets the data sculpt that distribution. The result is a nonparametric regression method that returns not only point predictions but calibrated uncertainty, with the entire pipeline reducing to operations on Gaussian distributions. This chapter develops GPs from the ground up: the prior over functions, the covariance kernel that encodes our assumptions, the closed form posterior for regression, the learning of hyperparameters through the marginal likelihood, and the computational strategies that make GPs usable at scale.
+
+## 1. From Weights to Functions
+
+### 1.1 The Bayesian linear model as a warm up
+
+Consider Bayesian linear regression with feature map $\phi(\mathbf{x}) \in \mathbb{R}^M$ and weights $\mathbf{w}$. The model is $f(\mathbf{x}) = \phi(\mathbf{x})^\top \mathbf{w}$, with a Gaussian prior $\mathbf{w} \sim \mathcal{N}(\mathbf{0}, \Sigma_p)$. Because $f$ is a linear function of the Gaussian vector $\mathbf{w}$, any finite collection of function values $f(\mathbf{x}_1), \dots, f(\mathbf{x}_n)$ is jointly Gaussian. Its mean is zero and its covariance is
+
+$$
+\operatorname{Cov}\!\big(f(\mathbf{x}), f(\mathbf{x}')\big) = \phi(\mathbf{x})^\top \Sigma_p\, \phi(\mathbf{x}').
+$$
+
+This is the key observation. We never needed the weights explicitly. The distribution over functions is fully characterized by a mean function and a covariance function. If we define $k(\mathbf{x}, \mathbf{x}') = \phi(\mathbf{x})^\top \Sigma_p\, \phi(\mathbf{x}')$ then the inner product can be replaced by any positive definite kernel, including kernels corresponding to infinite dimensional feature maps. That generalization is exactly the Gaussian process.
+
+### 1.2 Definition
+
+A Gaussian process is a collection of random variables, any finite number of which have a joint Gaussian distribution. It is completely specified by a mean function $m(\mathbf{x})$ and a covariance function $k(\mathbf{x}, \mathbf{x}')$:
+
+$$
+m(\mathbf{x}) = \mathbb{E}[f(\mathbf{x})], \qquad
+k(\mathbf{x}, \mathbf{x}') = \mathbb{E}\big[(f(\mathbf{x}) - m(\mathbf{x}))(f(\mathbf{x}') - m(\mathbf{x}'))\big],
+$$
+
+and we write $f \sim \mathcal{GP}(m, k)$. The defining consistency property is that for any finite set of inputs $X = \{\mathbf{x}_1, \dots, \mathbf{x}_n\}$, the vector $\mathbf{f} = (f(\mathbf{x}_1), \dots, f(\mathbf{x}_n))^\top$ is distributed as $\mathcal{N}(\mathbf{m}_X, K_{XX})$, where $(\mathbf{m}_X)_i = m(\mathbf{x}_i)$ and $(K_{XX})_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$. A common and harmless convention is to set $m(\mathbf{x}) = 0$ after centering the data, so that all structure lives in the kernel.
+
+## 2. The GP Prior
+
+### 2.1 Sampling functions
+
+Before seeing any data, a GP is a prior belief about which functions are plausible. To visualize this we choose a grid of test inputs $X_\ast$, form the prior covariance matrix $K_{\ast\ast}$, and draw samples from $\mathcal{N}(\mathbf{0}, K_{\ast\ast})$.
+
+```python
+# Pseudocode: draw sample functions from a GP prior
+K = kernel(X_star, X_star)          # n_star x n_star covariance
+L = cholesky(K + 1e-9 * I)          # jitter for numerical stability
+for s in range(num_samples):
+    u = normal(size=n_star)         # standard normal vector
+    f_sample = L @ u                # a sample function on the grid
+```
+
+Each draw is a vector of correlated function values. The kernel controls how strongly nearby inputs are correlated, and therefore how smooth and how wiggly the sampled functions look. The prior does not pick out a single function. It assigns probability mass across a whole space of functions, and that mass is what gets reshaped by observations.
+
+### 2.2 Kernels encode assumptions
+
+The covariance function is where modeling happens. It must be symmetric and positive semidefinite, meaning $K_{XX}$ is a valid covariance matrix for every finite $X$. The most widely used kernel is the squared exponential, also called the radial basis function or RBF kernel:
+
+$$
+k_{\mathrm{SE}}(\mathbf{x}, \mathbf{x}') = \sigma_f^2 \exp\!\left(-\frac{\lVert \mathbf{x} - \mathbf{x}' \rVert^2}{2\ell^2}\right).
+$$
+
+Here $\sigma_f^2$ is the signal variance, controlling the vertical scale of functions, and $\ell$ is the length scale, controlling how rapidly the function can vary. A short length scale yields wiggly functions, a long one yields nearly flat functions. The squared exponential produces infinitely differentiable sample paths, which is sometimes too smooth for real phenomena.
+
+The Matern family relaxes that assumption with a smoothness parameter $\nu$. For $\nu = 3/2$,
+
+$$
+k_{3/2}(r) = \sigma_f^2\left(1 + \frac{\sqrt{3}\,r}{\ell}\right)\exp\!\left(-\frac{\sqrt{3}\,r}{\ell}\right), \qquad r = \lVert \mathbf{x} - \mathbf{x}' \rVert,
+$$
+
+which gives once differentiable paths that are often more realistic. Other building blocks include the periodic kernel for repeating structure, the linear kernel for trends, and the rational quadratic kernel for a mixture of length scales. Kernels are closed under addition and multiplication, so complex structure can be composed. A sum models additive components, such as a slow trend plus a seasonal pattern, while a product couples them, such as a periodic pattern whose amplitude decays.
+
+### 2.3 Automatic relevance determination
+
+For multivariate inputs, assigning a separate length scale to each dimension yields
+
+$$
+k(\mathbf{x}, \mathbf{x}') = \sigma_f^2 \exp\!\left(-\frac{1}{2}\sum_{d=1}^{D} \frac{(x_d - x_d')^2}{\ell_d^2}\right).
+$$
+
+When a learned length scale $\ell_d$ becomes very large, the kernel becomes nearly constant along dimension $d$, effectively switching that feature off. This is automatic relevance determination, and it lets the marginal likelihood perform soft feature selection during hyperparameter learning.
+
+## 3. GP Regression: The Posterior
+
+### 3.1 The observation model
+
+Assume we observe targets corrupted by independent Gaussian noise:
+
+$$
+y_i = f(\mathbf{x}_i) + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0, \sigma_n^2).
+$$
+
+Stacking observations, $\mathbf{y} = \mathbf{f} + \boldsymbol{\varepsilon}$ with $\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \sigma_n^2 I)$. The prior on training latent values is $\mathbf{f} \sim \mathcal{N}(\mathbf{0}, K_{XX})$, so the marginal distribution of the observed targets is $\mathbf{y} \sim \mathcal{N}(\mathbf{0}, K_{XX} + \sigma_n^2 I)$.
+
+### 3.2 The joint and the conditional
+
+Let $X_\ast$ denote test inputs and $\mathbf{f}_\ast = f(X_\ast)$ the latent test values. By the GP definition, the training targets and test latents are jointly Gaussian:
+
+$$
+\begin{bmatrix} \mathbf{y} \\ \mathbf{f}_\ast \end{bmatrix}
+\sim \mathcal{N}\!\left(
+\mathbf{0},
+\begin{bmatrix}
+K_{XX} + \sigma_n^2 I & K_{X\ast} \\
+K_{\ast X} & K_{\ast\ast}
+\end{bmatrix}
+\right).
+$$
+
+The standard formula for conditioning a joint Gaussian gives the posterior predictive distribution $\mathbf{f}_\ast \mid X, \mathbf{y}, X_\ast \sim \mathcal{N}(\bar{\mathbf{f}}_\ast, \operatorname{cov}(\mathbf{f}_\ast))$ with
+
+$$
+\bar{\mathbf{f}}_\ast = K_{\ast X}\,(K_{XX} + \sigma_n^2 I)^{-1}\,\mathbf{y},
+$$
+
+$$
+\operatorname{cov}(\mathbf{f}_\ast) = K_{\ast\ast} - K_{\ast X}\,(K_{XX} + \sigma_n^2 I)^{-1}\,K_{X\ast}.
+$$
+
+These two equations are the heart of GP regression. The predictive mean is a linear combination of the observed targets, weighted by how the test points correlate with the training points. The predictive covariance starts from the prior covariance $K_{\ast\ast}$ and subtracts the information contributed by the data. Notice that the variance reduction term does not depend on the observed $\mathbf{y}$ at all, only on where we observed. Uncertainty shrinks near data and grows back toward the prior far from data, which is exactly the behavior we want from a calibrated model.
+
+### 3.3 The weight space view of the mean
+
+Writing $\boldsymbol{\alpha} = (K_{XX} + \sigma_n^2 I)^{-1}\mathbf{y}$, the predictive mean becomes
+
+$$
+\bar{f}(\mathbf{x}_\ast) = \sum_{i=1}^{n} \alpha_i\, k(\mathbf{x}_\ast, \mathbf{x}_i).
+$$
+
+The prediction is a weighted sum of kernel functions centered at the training points. This is the representer theorem in action and connects GP regression to kernel ridge regression, whose solution coincides exactly with the GP posterior mean. The probabilistic framing adds the variance, which kernel ridge regression lacks.
+
+### 3.4 A practical recipe
+
+Direct inversion is numerically fragile. The stable implementation uses the Cholesky factorization of the symmetric positive definite matrix $K_{XX} + \sigma_n^2 I = LL^\top$.
+
+```python
+# Pseudocode: stable GP regression (Rasmussen and Williams, Algorithm 2.1)
+L = cholesky(K + sigma_n2 * I)         # lower triangular factor
+alpha = solve_triangular(L.T, solve_triangular(L, y))
+f_mean = K_star_X @ alpha              # predictive mean
+v = solve_triangular(L, K_X_star)      # for the variance
+f_var = K_star_star - v.T @ v          # predictive covariance
+log_ml = -0.5 * y @ alpha - sum(log(diag(L))) - 0.5 * n * log(2 * pi)
+```
+
+Solving two triangular systems is far cheaper and more stable than forming an explicit inverse, and the same factor $L$ yields the marginal likelihood used for learning.
+
+## 4. Hyperparameter Learning via Marginal Likelihood
+
+### 4.1 The marginal likelihood objective
+
+The kernel carries hyperparameters $\boldsymbol{\theta}$, such as $\ell$, $\sigma_f^2$, and the noise variance $\sigma_n^2$. Rather than cross validating over a grid, GPs learn these by maximizing the log marginal likelihood, obtained by integrating out the latent function:
+
+$$
+\log p(\mathbf{y} \mid X, \boldsymbol{\theta}) = -\frac{1}{2}\mathbf{y}^\top K_y^{-1}\mathbf{y} - \frac{1}{2}\log\lvert K_y \rvert - \frac{n}{2}\log 2\pi,
+$$
+
+where $K_y = K_{XX} + \sigma_n^2 I$. This quantity is also called the evidence. It is the probability of the observed data under the model with the latent function marginalized away, which is precisely what a Bayesian model selection criterion should be.
+
+### 4.2 The automatic Occam balance
+
+The three terms have clean interpretations. The data fit term $-\tfrac{1}{2}\mathbf{y}^\top K_y^{-1}\mathbf{y}$ rewards kernels that explain the targets well, which pushes toward flexible models with short length scales. The complexity penalty $-\tfrac{1}{2}\log\lvert K_y \rvert$ punishes models that can fit too many possible datasets, which pushes toward smoother, simpler models. The final term is a normalizing constant. Maximizing their sum trades fit against complexity automatically, embodying Occam's razor without any held out validation set. This is one of the most attractive properties of the GP framework.
+
+### 4.3 Gradients and optimization
+
+The objective is differentiable in $\boldsymbol{\theta}$. Using $K_y^{-1}$ and $\boldsymbol{\alpha} = K_y^{-1}\mathbf{y}$, the gradient with respect to a hyperparameter $\theta_j$ is
+
+$$
+\frac{\partial}{\partial \theta_j}\log p(\mathbf{y}\mid X, \boldsymbol{\theta}) = \frac{1}{2}\operatorname{tr}\!\left((\boldsymbol{\alpha}\boldsymbol{\alpha}^\top - K_y^{-1})\frac{\partial K_y}{\partial \theta_j}\right).
+$$
+
+These gradients feed a gradient based optimizer such as L-BFGS. The marginal likelihood is generally nonconvex, so multiple restarts from different initial length scales are advisable to avoid poor local optima. Positivity constraints on $\ell$, $\sigma_f^2$, and $\sigma_n^2$ are usually enforced by optimizing in the log domain.
+
+### 4.4 Beyond point estimates
+
+Maximizing the marginal likelihood gives a point estimate of $\boldsymbol{\theta}$, which can overfit when data are scarce. A fully Bayesian treatment places a prior on $\boldsymbol{\theta}$ and integrates over it, typically with Markov chain Monte Carlo such as Hamiltonian Monte Carlo or the No-U-Turn sampler. This propagates hyperparameter uncertainty into the predictions at the cost of much heavier computation. In practice marginal likelihood maximization is the default, with sampling reserved for small data settings where calibration matters most.
+
+## 5. Scalability
+
+### 5.1 The cubic bottleneck
+
+The Cholesky factorization of an $n \times n$ matrix costs $O(n^3)$ time and the matrix itself costs $O(n^2)$ memory. For a few thousand points this is fine on a laptop. Beyond roughly $10^4$ points the exact GP becomes impractical, and this scaling is the central obstacle to applying GPs to modern datasets. The whole field of scalable GPs exists to break this barrier.
+
+### 5.2 Sparse and inducing point methods
+
+The dominant family of approximations summarizes the dataset with a small set of $m \ll n$ inducing points $Z$. The latent function at the inducing locations, $\mathbf{u} = f(Z)$, acts as a sufficient statistic that the rest of the function depends on. Methods such as the fully independent training conditional and the variational free energy approach of Titsias reduce the cost to $O(nm^2)$ time and $O(nm)$ memory. The variational formulation is especially clean: it minimizes a Kullback-Leibler divergence to the exact posterior and jointly optimizes the inducing locations and the kernel hyperparameters through a single lower bound on the marginal likelihood.
+
+### 5.3 Stochastic variational and deep approaches
+
+Hensman and colleagues reformulated the variational bound so that it decomposes as a sum over data points. This allows minibatch training with stochastic gradient descent, pushing GPs to millions of observations and enabling non Gaussian likelihoods for classification and count data. Stacking GP layers gives deep Gaussian processes, which model functions whose smoothness varies across the input space, at the cost of approximate inference within and across layers.
+
+### 5.4 Structure exploiting and iterative methods
+
+A complementary route avoids approximation and instead exploits structure. When inputs lie on a grid with a separable kernel, $K_{XX}$ has Kronecker or Toeplitz structure that enables fast exact solves. Structured kernel interpolation extends this idea to off grid data by interpolating onto a latent grid. More generally, iterative solvers based on conjugate gradients reduce GP inference to repeated matrix vector products with $K_{XX}$. Combined with GPU acceleration and preconditioning, as in the GPyTorch library, this scales exact GPs to tens of thousands of points and integrates naturally with automatic differentiation for the marginal likelihood gradients.
+
+### 5.5 Choosing an approach
+
+The right tool depends on the regime. For up to a few thousand points, exact GP regression with Cholesky is simplest and best calibrated. For tens of thousands, iterative conjugate gradient methods on a GPU keep inference exact. For hundreds of thousands or more, or for non Gaussian likelihoods, stochastic variational inducing point methods are the standard choice. Gridded or spatial data should exploit Kronecker or interpolation structure. In every case the modeling decisions, especially the kernel, matter more than the inference engine, since a misspecified kernel will produce confident and wrong predictions no matter how exactly the posterior is computed.
+
+## 6. Why Gaussian Processes Matter
+
+Gaussian processes occupy a distinctive place in machine learning. They are nonparametric, so model capacity grows gracefully with data. They are probabilistic, so every prediction comes with calibrated uncertainty that downstream decisions can use. They are interpretable, since the kernel exposes our smoothness, periodicity, and relevance assumptions explicitly. And they support principled model selection through the marginal likelihood, with no validation set required. These properties make GPs the workhorse of Bayesian optimization, where the uncertainty drives where to sample next, and of spatial statistics, active learning, and surrogate modeling for expensive simulations. The cost is computational, but the toolkit of sparse, variational, and iterative methods has steadily widened the range of problems where GPs are not only elegant but practical.
+
+## References
+
+1. Rasmussen, C. E., and Williams, C. K. I. Gaussian Processes for Machine Learning. MIT Press, 2006. https://gaussianprocess.org/gpml/
+2. Titsias, M. K. Variational Learning of Inducing Variables in Sparse Gaussian Processes. AISTATS, 2009. https://proceedings.mlr.press/v5/titsias09a.html
+3. Hensman, J., Fusi, N., and Lawrence, N. D. Gaussian Processes for Big Data. UAI, 2013. https://arxiv.org/abs/1309.6835
+4. Quinonero-Candela, J., and Rasmussen, C. E. A Unifying View of Sparse Approximate Gaussian Process Regression. JMLR, 2005. https://www.jmlr.org/papers/v6/quinonero-candela05a.html
+5. Wilson, A. G., and Nickisch, H. Kernel Interpolation for Scalable Structured Gaussian Processes (KISS-GP). ICML, 2015. https://arxiv.org/abs/1503.01057
+6. Gardner, J., Pleiss, G., Weinberger, K. Q., Bindel, D., and Wilson, A. G. GPyTorch: Blackbox Matrix-Matrix Gaussian Process Inference with GPU Acceleration. NeurIPS, 2018. https://arxiv.org/abs/1809.11165
+7. Damianou, A., and Lawrence, N. D. Deep Gaussian Processes. AISTATS, 2013. https://proceedings.mlr.press/v31/damianou13a.html
+8. Duvenaud, D. Automatic Model Construction with Gaussian Processes. PhD thesis, University of Cambridge, 2014. https://www.cs.toronto.edu/~duvenaud/thesis.pdf

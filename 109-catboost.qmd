@@ -1,0 +1,199 @@
+# CatBoost: Ordered Boosting and Categorical Features Done Right
+
+CatBoost is a gradient boosting library developed at Yandex that addresses two problems most gradient boosting toolkits handle poorly: the statistical leakage introduced when categorical features are encoded with target information, and a subtler prediction shift that affects gradient boosted models in general. Its two signature ideas, ordered target statistics and ordered boosting, both rest on the same principle of using only the past to estimate the present. Combined with a fast oblivious tree learner and strong default hyperparameters, CatBoost is often the strongest out of the box choice on tabular data with high cardinality categorical columns.
+
+This chapter develops the theory behind these mechanisms, explains why the obvious alternatives leak information, and gives practical guidance for using the library effectively.
+
+## 1. Why Categorical Features Are Hard
+
+### 1.1 The encoding problem
+
+Tree based learners split on numeric thresholds. A categorical feature such as `user_id`, `merchant`, or `city` has no natural ordering, so it must be turned into numbers before a tree can use it. The classical options each have a failure mode.
+
+One hot encoding creates one binary column per category. For a feature with thousands of levels this explodes the feature space, dilutes the signal across many sparse columns, and makes splits shallow and weak. Label encoding assigns an arbitrary integer to each category, which imposes a meaningless ordering that the tree will happily exploit in misleading ways.
+
+A far more powerful approach is target encoding, also called target statistics. Replace each category with a statistic of the target computed over the rows that share that category. For a binary classification target $y \in \{0,1\}$ and a categorical value $x^i_k$ for feature $i$ in row $k$, the natural estimate is the category mean
+
+$$
+\hat{x}^i_k = \frac{\sum_{j : x^i_j = x^i_k} y_j}{\sum_{j : x^i_j = x^i_k} 1}.
+$$
+
+This is compact, scales to arbitrary cardinality, and captures exactly the predictive relationship we care about. It is also dangerously leaky.
+
+### 1.2 Target leakage and the smoothing band aid
+
+The estimate above uses $y_k$, the label of the very row we are encoding, inside the numerator. A category that appears only once will be encoded with its own target value, so the feature becomes a perfect copy of the label on the training set and carries no information at test time. Even for categories that appear a handful of times, the encoded value is contaminated by the current row, producing an optimistic training signal that does not generalize. This is target leakage, and it is the central pathology CatBoost is built to remove.
+
+The standard mitigation is additive smoothing toward a prior $p$ with weight $a$:
+
+$$
+\hat{x}^i_k = \frac{\sum_{j} \mathbb{1}[x^i_j = x^i_k]\, y_j + a\,p}{\sum_{j} \mathbb{1}[x^i_j = x^i_k] + a}.
+$$
+
+Smoothing reduces variance for rare categories but does not eliminate leakage, because $y_k$ still sits in the sum. Holdout encoding, where the statistic is computed on a separate fold, removes leakage but throws away data and increases variance. CatBoost wants the leakage gone without sacrificing the training rows, and this is what ordered target statistics achieve.
+
+## 2. Ordered Target Statistics
+
+### 2.1 The ordering principle
+
+CatBoost borrows the idea behind online learning. Imagine the training examples arrive in a sequence. When we encode row $k$, we are only allowed to use the labels of rows that arrived earlier. By construction $y_k$ can never appear in its own encoding, so leakage is impossible.
+
+Concretely, CatBoost samples a random permutation $\sigma$ of the training set. Let $\mathcal{D}_k = \{ j : \sigma(j) < \sigma(k) \}$ be the set of rows preceding $k$ in that permutation. The ordered target statistic for a category is
+
+$$
+\hat{x}^i_k = \frac{\sum_{j \in \mathcal{D}_k} \mathbb{1}[x^i_j = x^i_k]\, y_j + a\, p}{\sum_{j \in \mathcal{D}_k} \mathbb{1}[x^i_j = x^i_k] + a}.
+$$
+
+The prior $p$ and weight $a$ still provide smoothing, which matters a great deal for the earliest rows in the permutation, where $\mathcal{D}_k$ is small or empty. For regression, $p$ is typically the global target mean; for classification, the prior is a tunable constant.
+
+### 2.2 Why this is unbiased in expectation
+
+The property that makes ordered statistics sound is that, for any fixed row, the expectation of its encoded value over random permutations matches the true category mean it is trying to estimate, while never including the row's own label. Each row sees a different prefix of history, so no single row's encoding is systematically inflated by its own target. The encoding behaves like a value computed on held out data, yet every training row still contributes to the encodings of rows that follow it. We get the leakage safety of holdout encoding and the data efficiency of full target encoding at the same time.
+
+### 2.3 Multiple permutations
+
+A single permutation has a drawback: rows near the front of the order have tiny histories and therefore high variance encodings, while rows near the back are stable. To keep this variance from biasing the model in a fixed direction, CatBoost samples several independent permutations and rotates among them across boosting iterations. Early rows in one permutation are late rows in another, so the noise averages out over the course of training. By default the library maintains a handful of permutations for this purpose.
+
+### 2.4 Feature combinations
+
+A major source of predictive power in tabular data is the interaction between categorical features, for example the pair (`country`, `device_type`). CatBoost constructs such combinations greedily during tree growth. At the root, no combinations exist. When a categorical feature is used at a split, the library considers combining the categoricals already on the current path with all remaining categoricals, encoding each resulting combination with the same ordered target statistic machinery. This lets the model discover high order interactions without the analyst enumerating them, and the ordered encoding keeps these combinations leakage free as well.
+
+## 3. Prediction Shift and Ordered Boosting
+
+### 3.1 A leak hiding inside gradient boosting
+
+Ordered statistics fix leakage in feature encoding. CatBoost's authors identified a second, more subtle leak that affects gradient boosting itself, independent of categorical features. They call the resulting bias prediction shift.
+
+Recall the gradient boosting loop. At iteration $t$ we hold a model $F^{t-1}$. We compute the negative gradient of the loss at each training point,
+
+$$
+g_k = -\left.\frac{\partial L(y_k, s)}{\partial s}\right|_{s = F^{t-1}(x_k)},
+$$
+
+fit a new tree $h^t$ to approximate these gradients, and update $F^t = F^{t-1} + \eta\, h^t$. The problem is that $g_k$ is computed using $F^{t-1}(x_k)$, and $F^{t-1}$ was itself trained on a dataset that included row $k$. The model has already seen $y_k$ indirectly, so the gradient at $x_k$ is not representative of the gradient the model would produce on an unseen point with the same features. The distribution of $g_k \mid x_k$ on the training set differs from the distribution on test data. Trees fit to these shifted gradients inherit the bias, and the effect compounds across iterations. This is exactly the same leakage pattern as target encoding, now hiding one level deeper.
+
+### 3.2 The ordered boosting algorithm
+
+The fix mirrors ordered statistics. Fix a permutation $\sigma$. To compute the gradient for row $k$, use a model that was trained only on the rows preceding $k$ in $\sigma$. Then $F^{t-1}$ as applied to $x_k$ has never been exposed to $y_k$, and the gradient is unbiased.
+
+Maintained literally, this requires a separate model $M_j$ for every prefix length, which is quadratic in cost. The conceptual algorithm is:
+
+```text
+sample permutation sigma over n training rows
+initialize models M_1 ... M_n to zero
+for t in 1 .. number_of_trees:
+    for each row k:
+        # gradient uses only rows before k in sigma
+        g_k = gradient(y_k, M_{sigma(k)-1}(x_k))
+    fit tree h_t to the residuals g
+    for each row k:
+        M_{sigma(k)}(x_k) += learning_rate * h_t(x_k)
+```
+
+The key line is that the gradient for row $k$ is read from the model $M_{\sigma(k)-1}$, which was updated only by rows earlier in the permutation. No row contributes to its own gradient estimate.
+
+### 3.3 Making it practical
+
+The naive version keeps $n$ supporting models, which is infeasible. CatBoost approximates it by maintaining models for a geometric sequence of prefix lengths, roughly $\log n$ of them, so a row of rank $r$ reads its gradient from the supporting model whose prefix is the largest power of two not exceeding $r$. This brings the overhead down to a constant factor while preserving the no self leakage property closely enough to remove most of the prediction shift. The same permutations used for ordered statistics are reused for ordered boosting, which keeps bookkeeping coherent.
+
+### 3.4 Ordered versus plain mode
+
+CatBoost exposes this choice through the `boosting_type` parameter. The value `Ordered` runs the algorithm above and gives the strongest defense against prediction shift; it is most valuable on small datasets, where overfitting from the leak is severe. The value `Plain` uses the classical gradient boosting update and is faster and lighter on memory; CatBoost selects it automatically for large datasets, where the shift is negligible because each model is trained on enough data that the contribution of any single row is vanishing.
+
+## 4. Symmetric (Oblivious) Trees
+
+### 4.1 Structure
+
+Most boosting libraries grow asymmetric trees: each internal node chooses its own splitting feature and threshold. CatBoost instead grows oblivious trees, also called symmetric trees. In an oblivious tree, every node at the same depth uses the same split condition. A tree of depth $d$ is therefore defined by an ordered list of $d$ split conditions, and all $2^d$ leaves are reached by evaluating those same $d$ tests in order.
+
+A depth 3 oblivious tree might be:
+
+```text
+level 0: age > 30 ?
+level 1: country in {US, CA} ?   (same test for both children)
+level 2: purchases > 5 ?         (same test for all four nodes)
+```
+
+Each example produces a 3 bit index from the three test outcomes, and that index selects one of 8 leaves directly.
+
+### 4.2 Why obliviousness helps
+
+This structure is more constrained than a general tree, and the constraint acts as a regularizer. An oblivious tree cannot overfit a narrow region of feature space by growing a deep idiosyncratic branch there, which reduces variance and improves robustness, a good match for the small to medium tabular datasets where CatBoost shines.
+
+The structure is also extremely fast to evaluate. Because the same $d$ comparisons apply to every example, scoring reduces to computing a $d$ bit index and a single lookup into a leaf array of length $2^d$. This is branch free and cache friendly. The leaf index can be assembled as
+
+$$
+\text{index} = \sum_{l=0}^{d-1} 2^{l}\, b_l, \qquad b_l = \mathbb{1}[\text{condition } l \text{ is true}],
+$$
+
+which vectorizes cleanly across a batch of examples. The result is prediction latency low enough for demanding serving environments, one reason CatBoost is popular in production ranking and recommendation systems.
+
+### 4.3 The cost
+
+Forcing one split per level is a real restriction. If the ideal model needs different features in different regions, an oblivious tree must spend extra depth or extra trees to express what an asymmetric tree captures in one branch. CatBoost compensates with the ensemble: many shallow symmetric trees, typically depth 6, combine to represent complex functions, and the per tree regularization tends to win on the dataset sizes CatBoost targets. The tradeoff is favorable often enough that the symmetric tree is the default, though it is not universally optimal.
+
+## 5. Practical Use
+
+### 5.1 Installation and the three interfaces
+
+CatBoost ships as a Python package, `pip install catboost`, with three primary estimators: `CatBoostClassifier`, `CatBoostRegressor`, and the ranking oriented `CatBoost`. The scikit-learn compatible API means `fit`, `predict`, and `predict_proba` behave as expected and the models drop into pipelines and cross validation utilities.
+
+The most important practical point is how you declare categorical features. You pass column indices or names through `cat_features` and leave the raw string values in place. Do not pre encode them; CatBoost's whole advantage is that it applies ordered target statistics internally.
+
+```python
+from catboost import CatBoostClassifier, Pool
+
+cat_cols = ["country", "device_type", "merchant"]
+
+train_pool = Pool(X_train, y_train, cat_features=cat_cols)
+valid_pool = Pool(X_valid, y_valid, cat_features=cat_cols)
+
+model = CatBoostClassifier(
+    iterations=2000,
+    learning_rate=0.03,
+    depth=6,
+    loss_function="Logloss",
+    eval_metric="AUC",
+    random_seed=42,
+)
+
+model.fit(train_pool, eval_set=valid_pool, use_best_model=True, verbose=200)
+```
+
+The `Pool` object bundles features, labels, and the categorical declaration. It is the efficient container CatBoost prefers and is required for some advanced features such as text features and custom feature weights.
+
+### 5.2 Key hyperparameters
+
+CatBoost is known for sane defaults, but a few parameters reward attention.
+
+`iterations` and `learning_rate` trade off in the usual way. A lower learning rate with more iterations and early stopping usually generalizes better. Set `iterations` generously and rely on `od_type="Iter"` with `od_wait` to stop when the validation metric stalls.
+
+`depth` controls tree complexity. Because trees are oblivious, depth has an outsized effect; the default of 6 is a strong baseline and values above 10 are rarely needed and risk a $2^{10}$ leaf blowup.
+
+`l2_leaf_reg` is the L2 penalty on leaf values and is the main explicit regularizer. Increase it when the validation gap is wide.
+
+`boosting_type` chooses `Ordered` or `Plain` as discussed; let CatBoost default it unless you have a small dataset and want to force `Ordered`.
+
+For high cardinality features, `one_hot_max_size` sets the threshold below which a categorical is one hot encoded rather than target encoded. Raising it applies one hot to slightly larger features, which can help when those features are not strongly predictive on their own.
+
+### 5.3 GPU training and large data
+
+CatBoost has a mature GPU implementation enabled with `task_type="GPU"`. The oblivious tree structure is particularly well suited to GPUs because the uniform per level split lets the histogram computation be laid out as dense regular work. On large datasets the speedup over CPU is substantial, and because plain boosting is selected automatically at scale the GPU path carries little statistical penalty.
+
+### 5.4 Interpretation
+
+CatBoost provides feature importances through `model.get_feature_importance`, including the standard prediction values change importance and the more rigorous `LossFunctionChange` importance, which measures the loss degradation when a feature is removed. For local explanations it supports SHAP values via `type="ShapValues"`, giving per prediction attributions consistent with the SHAP framework. These tools matter because target encoded categoricals can otherwise be opaque.
+
+### 5.5 When to reach for CatBoost
+
+CatBoost is the strongest default when your data has many categorical columns, especially high cardinality ones such as user or item identifiers, and when the dataset is small enough that prediction shift and encoding leakage would otherwise hurt. It frequently wins with little tuning, which makes it an excellent baseline even when you intend to try LightGBM or XGBoost afterward. On purely numeric data with very large row counts, the gap narrows and the choice among the three libraries comes down to speed and tuning effort rather than the encoding machinery that distinguishes CatBoost. In every case, the discipline that makes the library work, using only the past to estimate the present, is the idea worth carrying to any modeling problem where leakage threatens.
+
+## References
+
+1. Prokhorenkova, L., Gusev, G., Vorobev, A., Dorogush, A. V., and Gulin, A. CatBoost: unbiased boosting with categorical features. NeurIPS 2018. https://arxiv.org/abs/1706.09516
+2. Dorogush, A. V., Ershov, V., and Gulin, A. CatBoost: gradient boosting with categorical features support. 2018. https://arxiv.org/abs/1810.11363
+3. CatBoost official documentation. https://catboost.ai/docs/
+4. Micci-Barreca, D. A preprocessing scheme for high cardinality categorical attributes in classification and prediction problems. ACM SIGKDD Explorations, 2001. https://dl.acm.org/doi/10.1145/507533.507538
+5. Friedman, J. H. Greedy function approximation: a gradient boosting machine. Annals of Statistics, 2001. https://projecteuclid.org/journals/annals-of-statistics/volume-29/issue-5/Greedy-function-approximation-A-gradient-boosting-machine/10.1214/aos/1013203451.full
+6. Lundberg, S. M. and Lee, S. A unified approach to interpreting model predictions. NeurIPS 2017. https://arxiv.org/abs/1705.07874
+7. CatBoost GitHub repository. https://github.com/catboost/catboost

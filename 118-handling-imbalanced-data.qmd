@@ -1,0 +1,208 @@
+# Handling Imbalanced Data
+
+Many of the most valuable prediction problems are also the most lopsided. Fraud, disease, equipment failure, churn, and ad clicks all share a structural feature: the event of interest is rare. A dataset in which one class accounts for ninety nine percent of the examples will tempt any learning algorithm into a degenerate solution, namely predicting the majority class every time. That classifier achieves ninety nine percent accuracy and zero practical value. This chapter develops the why and the how of learning under class imbalance, covering the reasons imbalance is genuinely hard, the family of resampling methods, cost sensitive learning through class weights, decision threshold adjustment, and the evaluation metrics that survive contact with skewed label distributions.
+
+## 1. Why Imbalance Is Hard
+
+### 1.1 The problem is rarely the ratio alone
+
+A common misconception is that class imbalance is intrinsically harmful. It is not. If two classes are perfectly separable, a learner will find the boundary regardless of whether the split is fifty fifty or one in ten thousand. The difficulty arises when imbalance compounds with other pathologies: class overlap, small absolute counts of the minority class, and within class structure such as rare subconcepts. The minority class in a fraud problem may itself contain several distinct fraud patterns, each represented by only a handful of examples. These small disjuncts are where most errors concentrate.
+
+The practical consequence is that the relevant quantity is often not the ratio but the absolute number of minority examples and how cleanly they separate. A million to one ratio with fifty thousand positives is far more tractable than a ten to one ratio with twelve positives.
+
+### 1.2 What standard training optimizes
+
+Most classifiers minimize an empirical risk that weights every example equally. For a model $f$ with parameters $\theta$ and per example loss $\ell$,
+
+$$
+\hat{\theta} = \arg\min_{\theta} \frac{1}{N} \sum_{i=1}^{N} \ell\big(y_i, f(x_i; \theta)\big).
+$$
+
+When $N_{-} \gg N_{+}$, the majority class dominates the sum. The gradient that drives optimization is essentially the gradient of the majority loss, so the model invests its capacity in fitting the common class and treats the rare class as noise it can afford to misclassify. Accuracy, the implicit objective behind the standard zero one loss, is maximized by ignoring the minority when its prior is small enough.
+
+### 1.3 Imbalance distorts probability estimates
+
+Even a well calibrated learner trained on a resampled set will produce scores that no longer match the deployment population. If the training prior of the positive class is $\pi_{\text{train}}$ but the true prior is $\pi_{\text{test}}$, posterior probabilities must be corrected. Under the assumption that only the class priors shift and the class conditional densities are unchanged, Bayes rule gives the adjustment
+
+$$
+p_{\text{test}}(y=1 \mid x) = \frac{\frac{\pi_{\text{test}}}{\pi_{\text{train}}}\, p_{\text{train}}(y=1 \mid x)}{\frac{\pi_{\text{test}}}{\pi_{\text{train}}}\, p_{\text{train}}(y=1\mid x) + \frac{1-\pi_{\text{test}}}{1-\pi_{\text{train}}}\,\big(1 - p_{\text{train}}(y=1\mid x)\big)}.
+$$
+
+Forgetting this recalibration step is one of the most frequent and silent mistakes in imbalanced learning. Any resampling that changes the class prior changes the meaning of the model output scores.
+
+## 2. Resampling Methods
+
+Resampling rebalances the training distribution before or during learning. It treats imbalance as a data problem rather than an algorithm problem, which makes it model agnostic and easy to reason about.
+
+### 2.1 Random oversampling and undersampling
+
+Random oversampling duplicates minority examples until the desired ratio is reached. It throws away no information, but exact duplication encourages overfitting, since the model can memorize the repeated points and inflate their apparent density. Random undersampling discards majority examples. It is cheap and often surprisingly effective, but it can throw away informative majority points near the decision boundary and increases variance because the trained model depends on which examples survived the sampling.
+
+A useful mental model: oversampling reduces bias toward the majority at the cost of overfitting risk, while undersampling reduces majority bias at the cost of discarding data. The two can be combined.
+
+### 2.2 SMOTE
+
+The Synthetic Minority Oversampling Technique synthesizes new minority examples rather than copying existing ones. For a minority point $x_i$, SMOTE selects one of its $k$ nearest minority neighbors $x_{nn}$ and creates a synthetic point along the segment between them:
+
+$$
+x_{\text{new}} = x_i + \lambda \,(x_{nn} - x_i), \qquad \lambda \sim \mathrm{Uniform}(0,1).
+$$
+
+By interpolating, SMOTE expands the minority region into a smoother manifold instead of a set of spikes, which reduces the overfitting seen with naive duplication.
+
+```python
+# Conceptual SMOTE, not production code
+for x_i in minority:
+    neighbors = k_nearest(x_i, minority, k)
+    x_nn = random_choice(neighbors)
+    lam = uniform(0, 1)
+    synthetic.append(x_i + lam * (x_nn - x_i))
+```
+
+SMOTE has well known limitations. It interpolates in feature space, so it assumes the space between two minority points is itself minority, which fails when classes overlap and produces synthetic points inside majority territory. It treats all minority points alike, including noisy outliers. It also struggles with high dimensional data and with categorical features, since linear interpolation is meaningless for unordered categories.
+
+### 2.3 SMOTE variants
+
+A family of refinements targets these weaknesses by being selective about where synthesis happens.
+
+Borderline SMOTE synthesizes only from minority points whose neighborhoods are dominated by the majority class, concentrating new examples near the decision boundary where they matter most. ADASYN, adaptive synthetic sampling, generates more synthetic examples for minority points that are harder to learn, measured by the fraction of majority neighbors, shifting the learned boundary toward difficult regions.
+
+SMOTENC handles mixed numeric and categorical features by interpolating numeric attributes and assigning the most frequent category among neighbors for categorical attributes. Combination methods pair SMOTE with a cleaning step: SMOTE followed by Tomek links removes pairs of opposite class nearest neighbors to sharpen boundaries, and SMOTE with Edited Nearest Neighbors removes synthetic or original points misclassified by their neighbors, reducing overlap introduced by interpolation.
+
+### 2.4 A critical methodological rule
+
+Resampling must occur inside the cross validation loop, applied only to the training fold. If you oversample first and then split, synthetic points derived from a record can leak into the validation fold while their parent sits in training, producing optimistic and meaningless scores. The correct pipeline fits the resampler on the training fold and leaves validation and test data untouched at their natural prior.
+
+```python
+# Correct ordering inside each CV fold
+pipeline = make_pipeline(SMOTE(), classifier)
+score = cross_val_score(pipeline, X, y, scoring="average_precision")
+```
+
+## 3. Class Weighting and Cost Sensitive Learning
+
+### 3.1 Reweighting the loss
+
+Instead of changing the data, cost sensitive learning changes the objective so that errors on the rare class carry more weight. The weighted empirical risk is
+
+$$
+\hat{\theta} = \arg\min_{\theta} \frac{1}{N} \sum_{i=1}^{N} w_{y_i}\, \ell\big(y_i, f(x_i; \theta)\big),
+$$
+
+where $w_{y}$ assigns a larger penalty to the minority class. A widely used heuristic, the inverse frequency weighting popularized by scikit learn, sets
+
+$$
+w_{c} = \frac{N}{K \, N_{c}},
+$$
+
+for $K$ classes, so each class contributes equally to the total loss regardless of its count. Class weighting is mathematically related to oversampling: duplicating a minority example $w$ times has the same effect on the expected gradient as scaling its loss by $w$. The weighting form is usually preferable because it does not enlarge the dataset and integrates cleanly with stochastic gradient training.
+
+### 3.2 Where weighting fits in the cost framework
+
+The principled version of weighting comes from a cost matrix. Let $C(\hat{y}, y)$ be the cost of predicting $\hat{y}$ when the truth is $y$. The Bayes optimal decision minimizes expected cost,
+
+$$
+\hat{y}(x) = \arg\min_{a} \sum_{y} C(a, y)\, p(y \mid x).
+$$
+
+For binary classification with cost $C_{\text{FN}}$ for a missed positive and $C_{\text{FP}}$ for a false alarm, this reduces to a threshold rule, which connects directly to the next section. The advantage of stating costs explicitly is that they often come from the business: a missed fraud case may cost the average transaction value, while a false alarm costs a few minutes of analyst review. When real costs are known, use them rather than the symmetric inverse frequency default.
+
+### 3.3 Focal loss
+
+Deep learning practitioners frequently replace static class weights with focal loss, which down weights examples the model already classifies confidently and focuses gradient on hard examples. For a predicted probability $p_t$ of the true class,
+
+$$
+\mathcal{L}_{\text{focal}} = -\alpha_t \,(1 - p_t)^{\gamma} \log(p_t).
+$$
+
+The modulating factor $(1 - p_t)^{\gamma}$ shrinks toward zero as $p_t$ approaches one, so easy majority examples contribute little once they are learned. The tunable focusing parameter $\gamma$ controls the strength of this effect, and $\alpha_t$ optionally adds class balancing. Focal loss was introduced for dense object detection, where the background to object ratio is extreme, and it transfers well to other heavily imbalanced settings.
+
+## 4. Threshold Moving
+
+### 4.1 Decoupling scoring from deciding
+
+A probabilistic classifier outputs a score, and a separate decision rule turns that score into a label by comparing it to a threshold $\tau$. The conventional choice $\tau = 0.5$ is optimal only when classes are balanced and misclassification costs are equal, neither of which holds under imbalance. Threshold moving keeps the trained model fixed and tunes $\tau$ to the operating goal. This is often the single most effective intervention, since it is free, leaves the model untouched, and directly targets the decision that matters.
+
+From the cost analysis above, the optimal threshold satisfies
+
+$$
+\tau^{*} = \frac{C_{\text{FP}}}{C_{\text{FP}} + C_{\text{FN}}},
+$$
+
+assuming well calibrated probabilities. If a false negative is nine times as costly as a false positive, the optimal threshold drops to $0.1$, making the model far more willing to flag the rare class.
+
+### 4.2 Choosing the threshold empirically
+
+When costs are not precisely known, the threshold is selected on validation data to optimize a chosen metric. Common targets are the threshold that maximizes the F1 score, the one that fixes precision at a contractual minimum and maximizes recall, or the one corresponding to a fixed alert budget. The crucial discipline is to select $\tau$ on a held out split, never on the test set, otherwise the reported metric is optimistically biased.
+
+```python
+# Pick threshold maximizing F1 on validation scores
+prec, rec, thr = precision_recall_curve(y_val, scores_val)
+f1 = 2 * prec * rec / (prec + rec + 1e-12)
+tau = thr[f1[:-1].argmax()]
+```
+
+## 5. Metrics for Imbalanced Problems
+
+### 5.1 Why accuracy fails
+
+Accuracy is a weighted average of per class recall with weights equal to class priors. Under heavy imbalance the majority prior dominates, so accuracy reflects almost entirely the majority recall and is nearly blind to the minority class. The all majority classifier already exposes this: high accuracy, useless behavior. Imbalanced evaluation therefore reports metrics that treat the classes more symmetrically or that focus on the positive class directly.
+
+### 5.2 The confusion matrix vocabulary
+
+All scalar metrics derive from four counts: true positives, false positives, true negatives, and false negatives. The two metrics most relevant to a rare positive class are
+
+$$
+\text{Precision} = \frac{TP}{TP + FP}, \qquad \text{Recall} = \frac{TP}{TP + FN}.
+$$
+
+Precision answers how trustworthy a positive prediction is, while recall answers how much of the positive class is captured. The F1 score is their harmonic mean, $F_1 = 2 \cdot \text{Precision} \cdot \text{Recall} / (\text{Precision} + \text{Recall})$, and the more general $F_\beta$ weights recall $\beta^2$ times as much as precision, letting you encode that misses hurt more than false alarms.
+
+Balanced accuracy averages the recall of each class,
+
+$$
+\text{Balanced Accuracy} = \frac{1}{2}\left(\frac{TP}{TP + FN} + \frac{TN}{TN + FP}\right),
+$$
+
+so a degenerate majority classifier scores $0.5$ rather than near one. It is a sensible default scalar when both classes deserve attention.
+
+### 5.3 ROC versus precision recall curves
+
+The receiver operating characteristic curve plots true positive rate against false positive rate as the threshold sweeps. Its area, the ROC AUC, equals the probability that a random positive outranks a random negative. ROC has an important blind spot under heavy imbalance: the false positive rate has the large true negative count in its denominator, so a flood of false positives barely moves the curve. A model can look excellent by ROC AUC while delivering terrible precision.
+
+The precision recall curve plots precision against recall and is far more informative when positives are rare, because both axes ignore true negatives and focus entirely on the positive class. The summary statistic, average precision, approximates the area under this curve,
+
+$$
+\text{AP} = \sum_{n} (R_n - R_{n-1})\, P_n,
+$$
+
+where $P_n$ and $R_n$ are precision and recall at the $n$th threshold. A key reference point is the baseline: a random classifier achieves a precision recall curve at the constant height equal to the positive prior $\pi$, so on a one percent positive problem an average precision of $0.30$ represents a thirty fold lift over chance even though it sounds low in absolute terms. Always report the prior alongside average precision so readers can judge the lift.
+
+### 5.4 Calibration and the Matthews correlation coefficient
+
+Two further tools round out a rigorous evaluation. Calibration assessment, via reliability diagrams or the expected calibration error, checks whether predicted probabilities match observed frequencies, which matters whenever the scores feed a downstream cost based decision. The Matthews correlation coefficient,
+
+$$
+\text{MCC} = \frac{TP \cdot TN - FP \cdot FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}},
+$$
+
+is a single balanced summary that ranges from minus one to one and only scores high when the model does well on both classes, making it a robust headline metric for imbalanced binary tasks.
+
+## 6. Putting It Together
+
+A disciplined workflow for an imbalanced problem proceeds in a fixed order. First, fix evaluation before touching the model: choose average precision, balanced accuracy, or a cost weighted metric, and split data so the test fold keeps the natural prior. Second, establish a baseline with class weights, since reweighting is cheap and often closes most of the gap. Third, if the minority class is small and the feature space is well behaved, add resampling such as SMOTE or a SMOTE plus cleaning combination, always inside the cross validation loop. Fourth, tune the decision threshold on validation data against the operating objective rather than accepting $0.5$. Fifth, recalibrate probabilities if any resampling altered the training prior, and verify calibration before trusting score based decisions.
+
+The recurring theme is that imbalance is a problem of objectives and decisions, not only of data. The label distribution shapes what the loss rewards, what the threshold should be, and which metric tells the truth. Address all three and the rarity of the positive class becomes a property to exploit rather than an obstacle that quietly defeats an otherwise competent model.
+
+## References
+
+1. He, H. and Garcia, E. A. Learning from Imbalanced Data. IEEE Transactions on Knowledge and Data Engineering, 2009. https://ieeexplore.ieee.org/document/5128907
+2. Chawla, N. V., Bowyer, K. W., Hall, L. O., and Kegelmeyer, W. P. SMOTE: Synthetic Minority Over-sampling Technique. Journal of Artificial Intelligence Research, 2002. https://www.jair.org/index.php/jair/article/view/10302
+3. Han, H., Wang, W., and Mao, B. Borderline-SMOTE: A New Over-Sampling Method in Imbalanced Data Sets Learning. ICIC, 2005. https://link.springer.com/chapter/10.1007/11538059_91
+4. He, H., Bai, Y., Garcia, E. A., and Li, S. ADASYN: Adaptive Synthetic Sampling Approach for Imbalanced Learning. IJCNN, 2008. https://ieeexplore.ieee.org/document/4633969
+5. Lin, T. Y., Goyal, P., Girshick, R., He, K., and Dollar, P. Focal Loss for Dense Object Detection. ICCV, 2017. https://arxiv.org/abs/1708.02002
+6. Saito, T. and Rehmsmeier, M. The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets. PLOS ONE, 2015. https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0118432
+7. Elkan, C. The Foundations of Cost-Sensitive Learning. IJCAI, 2001. https://cseweb.ucsd.edu/~elkan/rescale.pdf
+8. Chicco, D. and Jurman, G. The Advantages of the Matthews Correlation Coefficient (MCC) over F1 Score and Accuracy. BMC Genomics, 2020. https://bmcgenomics.biomedcentral.com/articles/10.1186/s12864-019-6413-7
+9. Lemaitre, G., Nogueira, F., and Aridas, C. K. Imbalanced-learn: A Python Toolbox to Tackle the Curse of Imbalanced Datasets. Journal of Machine Learning Research, 2017. https://jmlr.org/papers/v18/16-365.html
+10. Branco, P., Torgo, L., and Ribeiro, R. P. A Survey of Predictive Modeling on Imbalanced Domains. ACM Computing Surveys, 2016. https://dl.acm.org/doi/10.1145/2907070

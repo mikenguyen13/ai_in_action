@@ -1,0 +1,135 @@
+# Stacking and Blending
+
+Ensemble methods combine the predictions of several models in the hope that the combination is more accurate than any single member. Bagging reduces variance by averaging over bootstrap replicates, and boosting reduces bias by fitting models sequentially to residual errors. Stacking and blending take a different route. Rather than averaging predictions with fixed or hand-tuned weights, they treat the predictions of a collection of base models as a new feature representation and train a second model to learn how to combine them. This second model is called the meta-learner, or the combiner, and the procedure is sometimes called stacked generalization. This chapter develops the theory and practice of stacking, explains why out-of-fold predictions are essential to avoid leakage, contrasts blending with stacking, and shows how multi-level stacks are constructed and when they are worth the cost.
+
+## 1. From Averaging to Learned Combination
+
+### 1.1 The limitation of fixed weights
+
+Suppose we have $M$ base models $f_1, \dots, f_M$, each producing a prediction $f_m(x)$ for an input $x$. A simple ensemble forms the average $\frac{1}{M} \sum_{m=1}^{M} f_m(x)$, or a weighted average $\sum_{m=1}^{M} w_m f_m(x)$ with non-negative weights summing to one. The weights might be tuned by grid search on a validation set, or set proportional to each model's validation accuracy.
+
+Fixed weighting is simple and surprisingly hard to beat, but it leaves value on the table. It assumes that a model's optimal contribution is constant across the input space. In reality a gradient boosted tree might dominate on tabular regions with sharp interactions while a linear model is more reliable in sparse regions, and a nearest neighbor model might shine only near dense clusters. A learned combiner can in principle discover these region-dependent weightings, and it can also discover that two models are nearly redundant and should not both receive full weight.
+
+### 1.2 Stacked generalization
+
+Stacking, introduced by Wolpert in 1992, replaces the fixed weighting rule with a trained model. The key idea is to construct a new dataset in which each original training example is represented by the vector of base-model predictions for that example, and the original label is retained as the target. Formally, define the meta-feature vector
+
+$$
+z_i = \big(f_1(x_i),\, f_2(x_i),\, \dots,\, f_M(x_i)\big),
+$$
+
+and train a meta-learner $g$ to predict $y_i$ from $z_i$. At inference time, an unseen example $x$ is passed through every base model to form $z = (f_1(x), \dots, f_M(x))$, and the final prediction is $g(z)$.
+
+The meta-learner can be anything: linear or logistic regression, a regularized generalized linear model, a small gradient boosted ensemble, or even another neural network. The choice matters, and section 5 returns to it. The deeper subtlety, and the most common source of error in practice, is how the meta-features $z_i$ are generated for the training examples. Generating them naively destroys the entire method.
+
+## 2. The Leakage Problem and Out-of-Fold Predictions
+
+### 2.1 Why in-sample predictions leak
+
+The naive approach is to train each base model on the full training set, then ask each base model to predict the same training examples it just learned from. These in-sample predictions become the meta-features, and the meta-learner is trained on them.
+
+This is wrong because the predictions are optimistically biased. A flexible base model such as a deep tree or a high-capacity neural network can nearly memorize its training set, so $f_m(x_i)$ for a training example $x_i$ is far more accurate than $f_m(x)$ would be for a genuinely unseen $x$. The meta-learner sees suspiciously good base predictions and learns to trust whichever base model overfits the most, because that model looks most accurate on the meta-training data. At deployment those base predictions revert to their true, weaker quality, and the meta-learner's trust is misplaced. The result is an ensemble that validates beautifully and generalizes poorly. This is a textbook case of information leakage: the target influences the meta-features through the base model's memorization.
+
+### 2.2 Out-of-fold construction
+
+The remedy is to ensure that every meta-feature is produced by a base model that did not see the corresponding example during training. Out-of-fold prediction, also called cross-validated prediction, achieves exactly this. The construction mirrors $k$-fold cross-validation.
+
+Partition the training set into $k$ disjoint folds $D_1, \dots, D_k$. For each base model $m$ and each fold $j$:
+
+1. Train a copy of model $m$ on all folds except $D_j$, that is on $D \setminus D_j$.
+2. Use that copy to predict the held-out fold $D_j$.
+
+Because every example lands in exactly one held-out fold, every example receives a prediction from a model that never trained on it. Stacking these held-out predictions back together gives a complete column of out-of-fold predictions for model $m$ over the entire training set, with no leakage. Repeating across all $M$ models fills the meta-feature matrix $Z \in \mathbb{R}^{n \times M}$, where $n$ is the number of training examples.
+
+```text
+for each base model m:
+    for each fold j in 1..k:
+        fit model m on D \ D_j
+        predict D_j        -> store as oof[D_j, m]
+# oof is now an n x M leakage-free meta-feature matrix
+train meta-learner g on (oof, y)
+```
+
+### 2.3 Refitting base models for inference
+
+The out-of-fold matrix solves training, but at inference time we need a single base model per algorithm, not $k$ fold-specific copies. Two conventions are common.
+
+The first refits each base model on the entire training set after the out-of-fold matrix has been built, and uses these full-data models to generate meta-features for new data. This is the standard choice. The full-data model is trained on more data than any fold model, so its predictions are usually a little stronger, and crucially the meta-learner was trained on out-of-fold predictions whose accuracy is a conservative estimate of the full-data model's accuracy. A mild distribution shift exists between the slightly noisier out-of-fold training features and the slightly cleaner full-data inference features, but it errs on the safe side.
+
+The second convention keeps all $k$ fold models and averages their predictions for each new example. This avoids the refit and produces inference-time features whose statistics more closely match the out-of-fold training features, at the cost of storing and evaluating $k$ times as many models. In large competitions this is sometimes preferred for its fidelity; in production the single refit model is usually chosen for simplicity.
+
+### 2.4 Practical cautions
+
+Several details determine whether the construction is truly leakage-free. The folds must respect the structure of the problem. For grouped data, where multiple rows share an entity such as a patient or a user, grouped folds must keep all rows of an entity together, or the base model will have seen a near-duplicate of the held-out example. For time series, the folds must be ordered so that training data precedes the held-out block, since a model that trains on the future to predict the past leaks information that will never exist at deployment. Any preprocessing fitted on data, such as target encoding of categorical variables, imputation statistics, or feature scaling, must be fitted inside each fold's training partition and applied to the held-out fold, never fitted on the full set before splitting. The entire stacking pipeline, base models and preprocessing together, must be cross-validated as a unit.
+
+## 3. Blending versus Stacking
+
+### 3.1 What blending is
+
+Blending is a simpler cousin of stacking that replaces the cross-validation scheme with a single holdout split. The training data is divided once into a base-training portion and a smaller blending holdout, often around eighty and twenty percent. Every base model is trained on the base-training portion. The base models then predict the blending holdout, and these predictions, paired with the holdout labels, form the meta-training set for the combiner. The base models are usually also refit on all data, or kept as is, for inference.
+
+```text
+split train into train_base (80%) and holdout (20%)
+fit base models on train_base
+predict holdout            -> meta-features for the combiner
+fit meta-learner on (holdout predictions, holdout labels)
+```
+
+### 3.2 Trade-offs
+
+The contrast is essentially the bias-variance and complexity trade-off familiar from any holdout-versus-cross-validation comparison.
+
+Blending is simpler to implement and reason about, has no risk of subtle fold leakage across the cross-validation boundary, and is faster because each base model is trained once rather than $k$ times. Its weaknesses are statistical. The meta-learner is trained on only the holdout fraction of the data, so when the holdout is small the meta-training set is small and the combiner is fitted on a noisy, possibly unrepresentative sample. The base models are also trained on less data than they would be under stacking, since a fixed slice is permanently reserved for blending.
+
+Stacking uses out-of-fold predictions over the entire training set, so the meta-learner sees $n$ meta-examples rather than a fraction of them, and the base models that produce the out-of-fold features are each trained on a $(k-1)/k$ majority of the data. This generally yields a stronger, lower-variance combiner. The price is computational: $k$ times the base-model training cost, plus the engineering care needed to keep the folds honest.
+
+A reasonable rule of thumb is to prefer stacking when data is limited or model training is cheap, and to consider blending when training is expensive, when the dataset is large enough that a holdout still contains many thousands of examples, or when a quick, low-risk ensemble is wanted. Blending also remains popular when team members independently produce out-of-sample predictions on a shared holdout, since it requires no coordination of fold assignments.
+
+## 4. Multi-Level Stacks
+
+### 4.1 Stacking as a layered architecture
+
+Nothing restricts the meta-learner to a single layer. A multi-level or multi-layer stack treats the out-of-fold predictions of one layer as the input features to the next, which is itself trained and validated by out-of-fold prediction, and so on. Level 0 is the set of base models operating on the original features. Level 1 takes the level-0 out-of-fold predictions as input and produces its own out-of-fold predictions. Level 2 takes those, and a final small model or a simple average sits on top.
+
+The appeal is hierarchical combination. Level 1 models can be diverse combiners, a linear stack, a tree-based stack, a nearest neighbor stack, each blending the base predictions differently, and level 2 then reconciles those combiners. In practice the largest published gains from multi-level stacks have come from machine learning competitions with very large datasets, where the marginal accuracy from a third decimal place justified enormous ensembles.
+
+### 4.2 Diminishing returns and overfitting
+
+Each added level multiplies training cost and adds parameters that can overfit the meta-validation signal. The accuracy gains shrink quickly: the jump from a single model to a stacked level 1 is usually the largest, the jump from level 1 to level 2 is smaller, and beyond two levels the improvement is rarely worth the complexity and the maintenance burden. Every level also compounds the risk of leakage, because the out-of-fold discipline must be maintained perfectly at each stage; a single fold assignment reused across levels can quietly reintroduce the optimism that stacking was designed to remove.
+
+For these reasons, most production systems stop at a single stacking layer with a deliberately simple meta-learner, reserving multi-level stacks for settings where a small accuracy gain has outsized value and engineering resources are abundant.
+
+### 4.3 Augmenting meta-features
+
+A refinement that often helps more than adding a level is to concatenate a few of the original input features, or engineered summaries of them, alongside the base-model predictions in the meta-feature vector. This lets the meta-learner condition its combination on context, for example trusting one base model more for high-cardinality categorical inputs and another for dense numeric ones. Feature-weighted linear stacking formalizes this by allowing the combination weight on each base model to be a linear function of selected meta-features. The cost is a higher-dimensional meta-problem and a renewed risk of overfitting, so the augmenting features should be few and chosen with care.
+
+## 5. Choosing the Meta-Learner and Practical Guidance
+
+### 5.1 Why simple combiners win
+
+The meta-learner operates on a low-dimensional, highly informative input: $M$ predictions that are each already a strong estimate of the target. The signal-to-noise ratio is high and the meta-features are often strongly correlated with one another, since good base models tend to agree. In this regime a high-capacity meta-learner has little new structure to discover and ample opportunity to overfit. Empirically, regularized linear models are the most reliable combiners. For regression a non-negative least squares or ridge regression works well, and for classification a logistic regression on the predicted class probabilities is a standard and robust default.
+
+Non-negativity and a sum-to-one constraint on the meta-weights are worth considering, because they keep the combination interpretable as a weighted vote and prevent the combiner from assigning large compensating positive and negative weights to correlated base models, a pattern that fits noise. When a more expressive combiner is genuinely needed, a shallow gradient boosted model with strong regularization is the usual next step, but it should be adopted only if it beats the linear combiner under honest nested validation.
+
+### 5.2 Diversity of base models
+
+Stacking rewards base models that make different errors. If every base model is a slightly retuned gradient boosted tree, their predictions are highly correlated and the meta-learner can do little more than average them. Diversity comes from different model families, such as linear models, tree ensembles, nearest neighbors, and neural networks, from different feature representations, and from different preprocessing. The combiner extracts value precisely from the disagreements, so engineering effort spent on a varied, decorrelated base set typically pays off more than effort spent on an elaborate meta-learner.
+
+### 5.3 Honest evaluation
+
+Because stacking introduces a second fitting stage, its performance must be estimated with nested cross-validation or a completely untouched final test set. The out-of-fold predictions used to train the meta-learner are an internal device and do not by themselves give an unbiased estimate of ensemble performance, since the meta-learner was fitted on them. An outer loop that holds out data unseen by both base models and meta-learner is the only trustworthy measure. Skipping this step is the second most common stacking error after fold leakage, and it produces the same illusion of accuracy.
+
+### 5.4 When stacking is not worth it
+
+Stacking is not free. It multiplies training and inference cost, complicates deployment because the full pipeline of base models plus combiner must be versioned and served together, and adds failure modes through its fold discipline. For many problems a well-tuned single gradient boosted model, or a plain average of a few diverse models, captures most of the available accuracy at a fraction of the operational cost. Stacking earns its place when the base models are genuinely diverse, when a small accuracy improvement carries real value, and when the team can sustain the validation rigor the method demands. Used with that discipline it remains one of the most effective ways to squeeze the last increment of performance out of a model portfolio.
+
+## References
+
+1. Wolpert, D. H. (1992). Stacked Generalization. Neural Networks, 5(2), 241-259. https://doi.org/10.1016/S0893-6080(05)80023-1
+2. Breiman, L. (1996). Stacked Regressions. Machine Learning, 24(1), 49-64. https://doi.org/10.1007/BF00117832
+3. Ting, K. M., and Witten, I. H. (1999). Issues in Stacked Generalization. Journal of Artificial Intelligence Research, 10, 271-289. https://doi.org/10.1613/jair.594
+4. Sill, J., Takacs, G., Mackey, L., and Lin, D. (2009). Feature-Weighted Linear Stacking. arXiv preprint. https://arxiv.org/abs/0911.0460
+5. Van der Laan, M. J., Polley, E. C., and Hubbard, A. E. (2007). Super Learner. Statistical Applications in Genetics and Molecular Biology, 6(1). https://doi.org/10.2202/1544-6115.1309
+6. Toscher, A., Jahrer, M., and Bell, R. M. (2009). The BigChaos Solution to the Netflix Grand Prize. https://www.netflixprize.com/assets/GrandPrize2009_BPC_BigChaos.pdf
+7. scikit-learn developers. Stacking and Voting Ensembles. https://scikit-learn.org/stable/modules/ensemble.html#stacked-generalization
+8. Gorman, B. (2016). A Kaggler's Guide to Model Stacking in Practice. https://datasciblog.github.io/2016/12/27/a-kagglers-guide-to-model-stacking-in-practice/

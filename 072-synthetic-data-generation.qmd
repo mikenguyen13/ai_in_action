@@ -1,0 +1,170 @@
+# Synthetic Data Generation
+
+Synthetic data is information that is produced by an algorithm rather than collected from a real observation, yet is intended to carry the statistical signal of the real thing. The motivation is practical. Real data is expensive to label, encumbered by privacy law, imbalanced across the classes we care about, and frequently unavailable for the rare events that matter most. Synthetic data promises an escape from these constraints, and over the past decade it has moved from a niche augmentation trick to a central pillar of how modern systems are trained, evaluated, and stress tested. This chapter develops the subject rigorously and practically. It covers simulation, the major generative model families, the rise of large language models as data engines, privacy-preserving synthesis, and the failure mode that haunts the whole enterprise, model collapse.
+
+## 1. Why Synthesize Data
+
+### 1.1 The Demand Curve for Data
+
+The scaling behavior of deep learning ties model quality to dataset size. Empirically, test loss for a model with $N$ parameters trained on $D$ tokens follows an approximate power law, $L(N, D) \approx L_\infty + a N^{-\alpha} + b D^{-\beta}$, so reductions in loss demand large multiplicative increases in $D$. Human generated data is finite. High quality text on the public web is a bounded resource, and credible projections suggest the stock of useful tokens will be largely exhausted within a few years of continued scaling. Synthetic data is one of the few levers that can extend the curve.
+
+### 1.2 Beyond Volume
+
+Volume is not the only reason to synthesize. Four others recur in practice.
+
+1. Privacy. Health records, financial transactions, and location traces cannot be shared freely. A synthetic surrogate that preserves utility while breaking the link to real individuals lets teams collaborate and publish.
+2. Class imbalance and rare events. Fraud, equipment failure, and adverse drug reactions are scarce by definition. Generating plausible minority examples can rebalance a training set.
+3. Coverage and edge cases. Autonomous systems must handle situations that are dangerous or unethical to collect in the wild, such as a child running into a road.
+4. Controllability. Synthetic pipelines expose knobs. We can dial the lighting, the dialect, the failure rate, or the label distribution, which makes systematic evaluation possible.
+
+## 2. Simulation Based Generation
+
+### 2.1 Mechanistic and Physics Based Simulators
+
+The oldest form of synthetic data comes from simulators that encode domain knowledge directly. Game engines and ray tracers render labeled images for perception. Physics solvers produce sensor readings for robotics. Agent based models generate population level behavior in epidemiology and economics. The defining feature is that labels are free. Because the simulator knows the ground truth pose, depth, or segmentation mask, annotation cost collapses to zero.
+
+The defining problem is the reality gap, the distribution shift between simulated and real observations. A model trained only on synthetic renders often fails on real photographs because textures, noise, and lighting differ in ways the simulator did not capture.
+
+### 2.2 Domain Randomization
+
+Domain randomization closes the gap by making the simulator deliberately diverse. Rather than trying to render one photorealistic world, we randomize textures, colors, camera positions, and lighting across a wide range. The intuition is that if the real world looks like just one more random variation, a model trained across the randomized ensemble will treat reality as in distribution. Formally, if $p_{\text{sim}}(\theta)$ is a distribution over simulator parameters $\theta$, we train on $\mathbb{E}_{\theta \sim p_{\text{sim}}}[\,\mathcal{L}(f, \mathcal{D}_\theta)\,]$ and hope the support is broad enough to contain the real distribution. This technique underpinned early sim to real transfer for robotic manipulation and remains a strong baseline.
+
+## 3. Generative Models for Data
+
+When no mechanistic simulator exists, we learn the data distribution from samples. The goal of a generative model is to approximate an unknown density $p_{\text{data}}(x)$ with a model $p_\theta(x)$ that we can sample from. Three families dominate.
+
+### 3.1 Variational Autoencoders
+
+A variational autoencoder (VAE) couples an encoder $q_\phi(z \mid x)$ that maps data to a latent code with a decoder $p_\theta(x \mid z)$ that reconstructs it. Training maximizes the evidence lower bound,
+
+$$\mathcal{L}_{\text{ELBO}} = \mathbb{E}_{q_\phi(z \mid x)}[\log p_\theta(x \mid z)] - D_{\mathrm{KL}}\!\left(q_\phi(z \mid x)\,\|\,p(z)\right),$$
+
+which trades reconstruction fidelity against keeping the posterior close to a simple prior $p(z)$, usually a standard normal. To generate, we sample $z \sim p(z)$ and decode. VAEs are stable to train and give a smooth, interpretable latent space, but the Gaussian assumptions and the averaging behavior of the reconstruction term tend to produce blurry samples. They remain valuable for tabular data, anomaly detection, and as components inside larger systems.
+
+### 3.2 Generative Adversarial Networks
+
+A generative adversarial network (GAN) pits a generator $G$ against a discriminator $D$ in a minimax game,
+
+$$\min_G \max_D \; \mathbb{E}_{x \sim p_{\text{data}}}[\log D(x)] + \mathbb{E}_{z \sim p(z)}[\log(1 - D(G(z)))].$$
+
+The discriminator learns to separate real from fake, and the generator learns to fool it. At the theoretical optimum the generator distribution matches the data distribution and the discriminator is maximally confused. GANs produce sharp, high fidelity samples and dominated image synthesis for years. They are also notoriously hard to train. The two failure modes to know are non convergence, where the adversarial dynamics oscillate rather than settle, and mode collapse, where the generator maps many inputs to a few outputs and ignores large regions of the data distribution. Wasserstein losses, gradient penalties, and spectral normalization were developed to stabilize training. For tabular synthesis, conditional variants such as CTGAN handle mixed discrete and continuous columns and skewed marginals.
+
+### 3.3 Diffusion Models
+
+Diffusion models have become the state of the art for high fidelity generation. The idea is to define a forward process that gradually corrupts data with Gaussian noise across $T$ steps,
+
+$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(x_t; \sqrt{1 - \beta_t}\, x_{t-1}, \beta_t \mathbf{I}\right),$$
+
+until the signal is pure noise, and then to learn the reverse process that denoises step by step. A neural network $\epsilon_\theta(x_t, t)$ is trained to predict the noise added at each step, minimizing a simple regression objective,
+
+$$\mathcal{L} = \mathbb{E}_{x_0, \epsilon, t}\left[\,\|\epsilon - \epsilon_\theta(x_t, t)\|^2\,\right].$$
+
+Sampling starts from noise and iterates the learned reverse steps. Diffusion models avoid the adversarial instability of GANs and cover modes far better, at the cost of slow, multi step sampling. They power most current text to image systems and have extended to audio, video, molecules, and tabular data. The following sketch shows the training loop at a high level.
+
+```python
+# Diffusion training step (schematic, not runnable as-is)
+x0 = sample_batch(data)
+t  = randint(1, T)                      # random diffusion step
+noise = randn_like(x0)
+xt = sqrt(alpha_bar[t]) * x0 + sqrt(1 - alpha_bar[t]) * noise
+loss = mse(model(xt, t), noise)         # predict the injected noise
+loss.backward()
+```
+
+### 3.4 Choosing a Family
+
+There is no universally best model. VAEs are a sensible default for tabular and low dimensional data where stability and a structured latent space matter. GANs still compete when sample sharpness is paramount and training budget is limited. Diffusion models are the choice when fidelity and mode coverage justify heavier compute. For text and code, the autoregressive transformer, discussed next, dominates outright.
+
+## 4. LLM Generated Data
+
+### 4.1 The Shift to Language Models as Data Engines
+
+Large language models changed synthetic data from a research curiosity into a production workflow. A capable model can be prompted to produce instruction and response pairs, question and answer sets, classification examples with rationales, and entire dialogues. The output is fluent, controllable through natural language instructions, and cheap relative to human annotation. Several influential instruction tuned models were trained largely on data generated by a stronger model, and the practice of distilling a teacher model into a smaller student through generated data is now routine.
+
+### 4.2 Common Patterns
+
+Three patterns appear repeatedly.
+
+1. Self instruct. A model bootstraps a diverse instruction set from a small seed pool by generating new tasks, filtering for quality, and using the result to fine tune itself or a smaller model.
+2. Distillation. A strong teacher generates inputs and high quality outputs, and a cheaper student is trained to imitate them. This compresses capability into a deployable size.
+3. Augmentation and rephrasing. Existing examples are paraphrased, translated, or perturbed to expand coverage without changing the underlying labels.
+
+### 4.3 Quality Control and Verification
+
+The central risk of LLM generated data is that fluent text is not necessarily correct text. Hallucinated facts, subtle reasoning errors, and homogeneous phrasing degrade the resulting model. Effective pipelines therefore treat generation as the first stage of a filter. Verification strategies include execution feedback, where generated code or math is checked by running it or a verifier; model based judging, where a separate model scores candidates against a rubric; consistency filtering, where only answers a model reaches by multiple independent paths are retained; and deduplication to limit repetition. The reliable signal comes from grounding generation in a checkable oracle. Synthetic data for code and mathematics has advanced faster than for open ended text precisely because correctness is verifiable there.
+
+```text
+generate -> filter for correctness -> deduplicate -> balance -> train
+            (execution, judge, consistency, schema checks)
+```
+
+## 5. Privacy Preserving Synthesis
+
+### 5.1 The Goal and Its Subtlety
+
+A common claim is that synthetic data is automatically private because no row corresponds to a real person. This is false. A model trained on sensitive data can memorize and regurgitate individual records, and membership inference attacks can determine whether a specific person was in the training set by probing the model or its outputs. Privacy must be engineered, not assumed.
+
+### 5.2 Differential Privacy
+
+The rigorous standard is differential privacy (DP). A randomized mechanism $\mathcal{M}$ is $(\varepsilon, \delta)$ differentially private if for all datasets $D$ and $D'$ differing in one record and all output sets $S$,
+
+$$\Pr[\mathcal{M}(D) \in S] \le e^{\varepsilon}\, \Pr[\mathcal{M}(D') \in S] + \delta.$$
+
+The parameter $\varepsilon$ bounds how much any single individual can influence the output. Smaller $\varepsilon$ means stronger privacy. The dominant training technique is DP-SGD, which clips per example gradients to a fixed norm and adds calibrated Gaussian noise before each update. A generative model trained under DP-SGD inherits the guarantee, so its synthetic samples carry the same protection by the post processing property of differential privacy. The cost is a privacy utility tradeoff. Tighter privacy injects more noise and lowers fidelity, and that tension is fundamental rather than a temporary engineering gap.
+
+### 5.3 Measuring Privacy and Utility
+
+Synthetic data should be evaluated on both axes. Utility is measured by fidelity, how well marginal and joint distributions match the real data, and by downstream task performance, often using the train on synthetic, test on real protocol. Privacy is measured by resistance to membership inference and by distance to nearest real records, since a synthetic point that is nearly identical to a training row is a leak regardless of any aggregate metric. A responsible release reports a privacy budget and an attack based audit, not just a fidelity score.
+
+## 6. Evaluation
+
+### 6.1 Fidelity, Diversity, and Utility
+
+Three properties define good synthetic data. Fidelity asks whether samples are individually realistic. Diversity asks whether the samples cover the full range of the real distribution rather than a few modes. Utility asks whether a model trained on the synthetic data performs well on real data. These can conflict. A generator that copies a handful of real examples scores high on fidelity but fails diversity and offers little utility. For images, metrics such as Frechet Inception Distance compare feature statistics, while precision and recall style metrics disentangle fidelity from coverage. The most decisive test remains train on synthetic, test on real, because it measures the only thing that ultimately matters.
+
+### 6.2 The Train on Synthetic, Test on Real Protocol
+
+The protocol is simple. Train a downstream model entirely on synthetic data, then evaluate it on a held out set of real data. The gap to a model trained on real data quantifies how much signal the synthetic pipeline preserved. Crucially, the test set must be real and untouched by the generator, otherwise the evaluation inherits the generator's blind spots.
+
+## 7. Model Collapse and the Pitfalls
+
+### 7.1 What Model Collapse Is
+
+Model collapse is the degenerative process that occurs when generative models are trained on data produced by earlier generative models, recursively, over generations. Each generation samples from an imperfect approximation of the previous distribution. Errors compound. Tails of the distribution, the rare events and minority modes, are sampled less and less until they vanish, and the model's outputs drift toward a narrow, over smoothed average. Late stage collapse can converge to near constant output that bears little resemblance to the original data.
+
+### 7.2 Why It Happens
+
+Three error sources drive collapse. Statistical error arises because we train on finite samples, so rare events are sometimes simply absent. Functional expressivity error arises because models cannot perfectly represent the true distribution. Functional approximation error arises from imperfect optimization and biased estimators. Each generation, sampling from the model rather than reality, re injects and amplifies these errors. The mathematical signature is a steady contraction of variance. Even in the idealized case of fitting a Gaussian to its own samples each generation, the estimated variance shrinks toward zero over time, a clean illustration of how tails disappear under recursion.
+
+### 7.3 Mitigations
+
+Collapse is not inevitable. The decisive mitigation is to retain real data. If each generation continues to train on the original real corpus alongside synthetic data, rather than replacing it, the degeneration is largely arrested. Accumulating data, where synthetic outputs are added to rather than substituted for the real anchor, avoids the worst outcomes in both theory and experiment. Other defenses include provenance tracking to distinguish human from machine generated content, strong verification filters that discard low quality synthetic samples before they enter the training pool, and mixing ratios that cap the synthetic fraction. The practical guidance is direct. Never let a model's own outputs silently become its entire diet.
+
+### 7.4 The Broader Risk
+
+Model collapse is not only a per project concern. As machine generated text and images fill the public web, future models scraped from that web will increasingly train on their predecessors' output without anyone intending it. This raises the value of data with verified human provenance and of curated, attested corpora collected before the saturation point. The commons that made large models possible is itself at risk of contamination, which is one reason data provenance has become a first class engineering concern.
+
+## 8. Practical Guidance
+
+A workable synthetic data program follows a few principles. Start from the cheapest source that meets the need, which is often a simulator or simple augmentation before any learned generator. Anchor everything in real data, both as a training ingredient and as the evaluation set that the generator never sees. Verify aggressively, preferring oracles that can check correctness over judgments of plausibility. Measure privacy and utility as separate axes and report a budget, not a vibe. Cap the synthetic fraction and track provenance so that collapse cannot creep in unnoticed. Treat synthetic data as a powerful supplement to reality, never a wholesale replacement for it.
+
+## 9. Summary
+
+Synthetic data has become indispensable because real data is finite, costly, imbalanced, and constrained by privacy. Simulation offers free labels at the price of a reality gap that domain randomization helps close. Learned generative models, the VAE, the GAN, and the diffusion model, approximate data distributions with different tradeoffs among stability, fidelity, and coverage, while transformers dominate synthetic text and code. Large language models have made generation cheap and controllable, shifting the bottleneck from production to verification. Differential privacy gives synthesis a rigorous privacy guarantee at a measurable utility cost. The overriding pitfall is model collapse, the recursive degeneration that strips away the tails of a distribution when models feed on their own output, and its remedy is to keep real data in the loop. Used with discipline, synthetic data extends the reach of machine learning. Used carelessly, it quietly hollows it out.
+
+## References
+
+1. Kaplan, J. et al. Scaling Laws for Neural Language Models. 2020. https://arxiv.org/abs/2001.08361
+2. Villalobos, P. et al. Will We Run Out of Data? Limits of LLM Scaling Based on Human Generated Data. 2022. https://arxiv.org/abs/2211.04325
+3. Tobin, J. et al. Domain Randomization for Transferring Deep Neural Networks from Simulation to the Real World. 2017. https://arxiv.org/abs/1703.06907
+4. Kingma, D. P. and Welling, M. Auto-Encoding Variational Bayes. 2013. https://arxiv.org/abs/1312.6114
+5. Goodfellow, I. et al. Generative Adversarial Networks. 2014. https://arxiv.org/abs/1406.2661
+6. Xu, L. et al. Modeling Tabular Data using Conditional GAN (CTGAN). 2019. https://arxiv.org/abs/1907.00503
+7. Ho, J., Jain, A., and Abbeel, P. Denoising Diffusion Probabilistic Models. 2020. https://arxiv.org/abs/2006.11239
+8. Wang, Y. et al. Self-Instruct: Aligning Language Models with Self-Generated Instructions. 2022. https://arxiv.org/abs/2212.10560
+9. Abadi, M. et al. Deep Learning with Differential Privacy (DP-SGD). 2016. https://arxiv.org/abs/1607.00133
+10. Dwork, C. and Roth, A. The Algorithmic Foundations of Differential Privacy. 2014. https://www.cis.upenn.edu/~aaroth/Papers/privacybook.pdf
+11. Shumailov, I. et al. The Curse of Recursion: Training on Generated Data Makes Models Forget. 2023. https://arxiv.org/abs/2305.17493
+12. Gerstgrasser, M. et al. Is Model Collapse Inevitable? Breaking the Curse of Recursion by Accumulating Real and Synthetic Data. 2024. https://arxiv.org/abs/2404.01413
+13. Heusel, M. et al. GANs Trained by a Two Time-Scale Update Rule Converge to a Local Nash Equilibrium (FID). 2017. https://arxiv.org/abs/1706.08500
+14. Shokri, R. et al. Membership Inference Attacks Against Machine Learning Models. 2017. https://arxiv.org/abs/1610.05820

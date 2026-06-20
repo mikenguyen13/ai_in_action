@@ -1,0 +1,184 @@
+# Model Calibration
+
+A classifier that outputs probabilities makes two distinct claims. The first is a ranking claim: instances it scores higher are more likely to be positive than instances it scores lower. The second is a probabilistic claim: when the model says 0.8, the event really happens about 80 percent of the time. Accuracy, AUC, and most ranking metrics measure only the first claim. Calibration measures the second. A model can rank perfectly and still be badly miscalibrated, and a model can be well calibrated while ranking poorly. Because real decisions almost always combine model scores with costs, thresholds, and downstream actions, the probabilistic claim is often the one that matters most. This chapter develops what calibration means formally, how to measure it with reliability diagrams and the expected calibration error, how to fix it with Platt scaling, isotonic regression, and temperature scaling, and why all of this changes the quality of decisions.
+
+## 1. What Calibrated Probabilities Mean
+
+### 1.1 The formal definition
+
+Let $X$ be an input, $Y \in \{0, 1\}$ the label, and $f(X) \in [0, 1]$ the score a model assigns to the positive class. The model is perfectly calibrated if
+
+$$
+\Pr\big(Y = 1 \mid f(X) = p\big) = p \quad \text{for all } p \in [0, 1].
+$$
+
+In words, among all instances that receive score $p$, exactly a fraction $p$ are positive. This is a strong condition. It is conditional on the score value, not merely correct on average. A spam filter that flags 100 emails with confidence 0.9 should be wrong on about 10 of them. If it is wrong on 40, the 0.9 is a lie even if the filter has excellent accuracy.
+
+For multiclass problems with classes $1, \ldots, K$, the analogous notion is that the predicted probability vector matches the conditional class distribution. A weaker and more commonly measured version is confidence calibration, which looks only at the top predicted class:
+
+$$
+\Pr\big(Y = \hat{Y} \mid \hat{p} = p\big) = p,
+$$
+
+where $\hat{Y}$ is the predicted class and $\hat{p}$ its probability. This is what most deep learning calibration work targets, because the maximum softmax probability is the quantity that drives accept or abstain decisions.
+
+### 1.2 Calibration is not accuracy and not sharpness
+
+Two models can both be perfectly calibrated yet differ enormously in usefulness. Consider a binary problem where the base rate of positives is 0.3. A constant predictor that outputs 0.3 for every input is perfectly calibrated: among all instances it scores 0.3, exactly 30 percent are positive. But it is useless because it never separates anything. What it lacks is sharpness, the tendency to issue confident predictions near 0 and 1.
+
+The decomposition that makes this precise is due to the proper scoring rule literature. The Brier score, defined for binary labels as
+
+$$
+\text{BS} = \frac{1}{n} \sum_{i=1}^{n} \big(f(x_i) - y_i\big)^2,
+$$
+
+decomposes into reliability, resolution, and an irreducible uncertainty term. Reliability is a calibration penalty, resolution rewards sharpness, and uncertainty depends only on the base rate. A good probabilistic forecaster minimizes the Brier score by being both calibrated and sharp. Calibration alone is necessary but not sufficient. The practical message is that you should never improve calibration at the cost of destroying sharpness, and the methods below are designed to preserve ranking while fixing probabilities.
+
+### 1.3 Why models are miscalibrated
+
+Classical logistic regression trained by maximum likelihood on the same distribution it is evaluated on tends to be reasonably calibrated, because the cross entropy objective is a proper scoring rule that is minimized at the true conditional probability. Trouble arises elsewhere. Margin maximizing methods such as support vector machines and boosted trees push scores toward the extremes and are systematically overconfident or underconfident. Naive Bayes is miscalibrated because its independence assumption produces scores too close to 0 and 1. Modern neural networks are the most studied case: as shown by Guo and colleagues in 2017, large networks trained with high capacity, batch normalization, and weight decay achieve high accuracy but become severely overconfident, with maximum softmax probabilities far exceeding empirical accuracy. Distribution shift between training and deployment makes all of this worse.
+
+## 2. Reliability Diagrams
+
+### 2.1 Construction
+
+A reliability diagram is the standard visual diagnostic for calibration. Sort predictions into $M$ bins by their score, usually $M = 10$ or $M = 15$ equal width bins covering $[0, 1]$. For each bin $B_m$ compute the average predicted score and the empirical fraction of positives:
+
+$$
+\text{conf}(B_m) = \frac{1}{|B_m|} \sum_{i \in B_m} f(x_i), \qquad
+\text{acc}(B_m) = \frac{1}{|B_m|} \sum_{i \in B_m} \mathbf{1}[y_i = 1].
+$$
+
+Plot $\text{acc}(B_m)$ against $\text{conf}(B_m)$. Perfect calibration lies on the diagonal $y = x$. Bars below the diagonal indicate overconfidence, where the model claims more certainty than reality supports. Bars above the diagonal indicate underconfidence.
+
+```text
+acc
+1.0 |                          /
+    |                      /  #
+    |                  /   #
+    |              /   #          # = model
+0.5 |          /  #               / = perfect
+    |      /  #
+    |  /  #
+0.0 +---------------------------- conf
+    0.0          0.5         1.0
+```
+
+### 2.2 Reading and pitfalls
+
+The diagram above shows bars consistently under the diagonal, the signature of an overconfident network. The gap between each bar and the diagonal is the local calibration error, and the methods in Section 4 are essentially ways to bend the score axis so the bars land on the line.
+
+Reliability diagrams have two well known pitfalls. First, they hide bin counts. A bin with three points and a bin with thirty thousand points look identical, so always annotate bins with their population or overlay a histogram of scores. Second, equal width binning leaves high score bins nearly empty for sharp models, where most mass sits near the extremes. Equal mass binning, which places an equal number of points in each bin, gives more stable estimates but variable bin widths. Neither choice is canonical, which is one reason the scalar summary below should be read alongside, not instead of, the picture.
+
+## 3. The Expected Calibration Error
+
+### 3.1 Definition
+
+To compress a reliability diagram into one number, the expected calibration error takes a weighted average of the absolute gaps between accuracy and confidence across bins:
+
+$$
+\text{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{n} \,\big|\, \text{acc}(B_m) - \text{conf}(B_m) \,\big|.
+$$
+
+Each bin contributes in proportion to how many points it holds, so empty bins do not distort the score. ECE lies in $[0, 1]$, and lower is better. A related summary, the maximum calibration error, replaces the weighted sum with a maximum over bins and is appropriate when worst case reliability matters, as in safety critical settings.
+
+```text
+ECE = sum over bins of (bin_weight * |acc - conf|)
+bin_weight = points_in_bin / total_points
+```
+
+### 3.2 Limitations to respect
+
+ECE is convenient but flawed, and a graduate reader should know why. It is biased and depends on the number of bins: too few bins hide error by averaging overconfident and underconfident regions against each other, while too many bins inflate variance. It is not a proper scoring rule, so optimizing it directly can be gamed and can reward a model that is uninformative. It also measures only confidence calibration in the multiclass case, ignoring the probabilities assigned to non predicted classes. Recent work proposes alternatives such as adaptive binning, kernel density estimators of calibration error, the kolmogorov smirnov calibration error, and debiased estimators. The pragmatic stance is to report ECE for comparability with the literature, report a proper score such as Brier or negative log likelihood for soundness, and always show the reliability diagram so that a single misleading scalar cannot stand alone.
+
+## 4. Recalibration Methods
+
+Recalibration learns a mapping from raw scores to calibrated probabilities using a held out calibration set that is disjoint from both training and test data. Reusing training data here leaks information and produces optimistic, useless calibration. The methods differ in the functional form of the mapping and in how many parameters they fit.
+
+### 4.1 Platt scaling
+
+Platt scaling fits a one dimensional logistic regression on top of the model scores. Given a raw score $s$, often a logit or an SVM margin, it outputs
+
+$$
+\hat{p} = \sigma(a s + b) = \frac{1}{1 + \exp(-(a s + b))},
+$$
+
+and fits the two parameters $a$ and $b$ by minimizing cross entropy on the calibration set. Because it has only two parameters, Platt scaling is data efficient and robust to small calibration sets, and it cannot overfit a reliability curve. Its limitation is rigidity: it assumes the miscalibration has a sigmoidal shape, which fits the symmetric distortion of SVM margins well but cannot correct non monotone or irregular miscalibration. A standard refinement uses target smoothing, replacing the hard labels 0 and 1 with $\frac{N_-+1}{N_-+2}$ and $\frac{1}{N_++2}$ to avoid overfitting at the extremes.
+
+```python
+# scores: raw model outputs on the calibration set
+# labels: 0/1 calibration targets
+clf = LogisticRegression()
+clf.fit(scores.reshape(-1, 1), labels)
+p_calibrated = clf.predict_proba(test_scores.reshape(-1, 1))[:, 1]
+```
+
+### 4.2 Isotonic regression
+
+Isotonic regression is nonparametric. It fits the best monotone nondecreasing function $g$ that maps scores to probabilities by minimizing squared error subject to a monotonicity constraint:
+
+$$
+\min_{g \text{ monotone}} \sum_{i=1}^{n} \big(g(s_i) - y_i\big)^2.
+$$
+
+The solution is a step function computed efficiently by the pool adjacent violators algorithm, which repeatedly averages adjacent groups that violate monotonicity until the sequence is sorted. Because it makes no shape assumption beyond monotonicity, isotonic regression can correct arbitrary distortions and usually outperforms Platt scaling when the calibration set is large. Its weaknesses are a hunger for data and a tendency to overfit small sets, producing wide flat regions and sharp jumps. It also extrapolates poorly outside the range of calibration scores. Preserving monotonicity is important because it keeps the model ranking and therefore the AUC intact while only re mapping probabilities.
+
+```python
+iso = IsotonicRegression(out_of_bounds="clip")
+iso.fit(scores, labels)
+p_calibrated = iso.predict(test_scores)
+```
+
+### 4.3 Temperature scaling
+
+Temperature scaling is the method of choice for deep neural networks. It divides the logit vector $z$ by a single scalar temperature $T > 0$ before the softmax:
+
+$$
+\hat{p}_k = \frac{\exp(z_k / T)}{\sum_{j=1}^{K} \exp(z_j / T)}.
+$$
+
+The temperature $T$ is fit by minimizing negative log likelihood on the calibration set, holding all network weights fixed. When $T = 1$ nothing changes. When $T > 1$ the distribution is softened and confidence drops, which is the usual correction for overconfident networks. When $T < 1$ the distribution sharpens. The decisive property is that dividing every logit by the same constant does not change which logit is largest, so the predicted class and the entire accuracy of the model are untouched. Temperature scaling only rescales confidence. With a single parameter it is the simplest possible fix, it cannot overfit, and Guo and colleagues showed it is surprisingly hard to beat for modern networks, often reducing ECE by an order of magnitude.
+
+```python
+# z: logits on the calibration set, y: integer labels
+# optimize a single scalar T by minimizing NLL
+T = fit_temperature(z, y)          # 1-D optimization, e.g. LBFGS
+p_calibrated = softmax(test_logits / T)
+```
+
+### 4.4 Choosing among them
+
+The choice follows the data budget and the model family. Use temperature scaling for neural networks, especially when you must not disturb accuracy and have only a modest calibration set. Use Platt scaling for SVMs and other margin methods, or whenever the calibration set is small and a smooth sigmoidal correction is plausible. Use isotonic regression when the calibration set is large, the miscalibration is irregular, and you can afford the variance. For tree ensembles and boosting, isotonic regression is the common default when data permits, with Platt scaling as the small data fallback. All three are post hoc and cheap, and all three should be evaluated by recomputing the reliability diagram, ECE, and a proper score on a separate test set. Methods that touch training directly, such as label smoothing, focal loss, mixup, and deep ensembles, also improve calibration and are complementary to post hoc scaling.
+
+## 5. Why Calibration Matters for Decisions
+
+### 5.1 Thresholds and expected cost
+
+The reason to care about calibration is that probabilities feed decisions. Bayes optimal decision theory says that to minimize expected cost you should act when the expected benefit of acting exceeds the expected cost. For a binary action with cost $c_{\text{fp}}$ for a false positive and $c_{\text{fn}}$ for a false negative, the optimal decision threshold on the true probability is
+
+$$
+\tau^{\star} = \frac{c_{\text{fp}}}{c_{\text{fp}} + c_{\text{fn}}}.
+$$
+
+This formula is only valid when $f(X)$ is a calibrated estimate of $\Pr(Y = 1 \mid X)$. If the model is overconfident, a threshold of $\tau^{\star}$ on the raw score corresponds to a different and wrong threshold on the true probability, so you act too often or too rarely and pay unnecessary cost. A ranking metric like AUC cannot tell you where to put this threshold, because AUC is invariant to any monotone transformation of the scores. Calibration is precisely the missing information that turns a ranking into a decision.
+
+### 5.2 Where the stakes are highest
+
+Several settings make miscalibration expensive. In medical diagnosis a model that reports 0.95 risk when the true risk is 0.6 leads to over treatment, and the reverse leads to missed disease. In autonomous systems and selective prediction, a model abstains and defers to a human when its confidence falls below a threshold, so an overconfident model never abstains when it should. In risk and fraud scoring, expected loss is computed by multiplying a predicted probability by a monetary amount, and a probability that is off by a factor of two doubles the error in every downstream financial calculation. When the outputs of several models are combined, for example in an ensemble or a cascade, only calibrated components can be averaged or multiplied coherently. Large language models add a fresh instance of the same problem: their verbalized and token level confidences are often poorly calibrated, and the same diagnostics and temperature based corrections apply.
+
+### 5.3 A practical workflow
+
+A disciplined calibration workflow has five steps. Hold out a dedicated calibration split that is disjoint from training and test. Plot the reliability diagram on raw scores and annotate bin counts to see the shape and severity of miscalibration. Compute ECE alongside a proper score such as Brier or negative log likelihood so you have both a comparable scalar and a sound one. Fit the recalibration method matched to your model family and data budget, choosing temperature scaling for networks, Platt scaling for small data or margin models, and isotonic regression for large data. Finally, re evaluate all metrics on the held out test set, confirm that ranking metrics such as AUC are unchanged, and set decision thresholds using the calibrated probabilities and the actual costs. Done this way, calibration is a low cost, high leverage step that converts a good ranker into a trustworthy probabilistic decision maker.
+
+## References
+
+1. Guo, C., Pleiss, G., Sun, Y., and Weinberger, K. Q. On Calibration of Modern Neural Networks. ICML 2017. https://arxiv.org/abs/1706.04599
+2. Niculescu-Mizil, A. and Caruana, R. Predicting Good Probabilities with Supervised Learning. ICML 2005. https://www.cs.cornell.edu/~alexn/papers/calibration.icml05.crc.rev3.pdf
+3. Platt, J. Probabilistic Outputs for Support Vector Machines and Comparisons to Regularized Likelihood Methods. Advances in Large Margin Classifiers, 1999. https://www.researchgate.net/publication/2594015
+4. Zadrozny, B. and Elkan, C. Transforming Classifier Scores into Accurate Multiclass Probability Estimates. KDD 2002. https://dl.acm.org/doi/10.1145/775047.775151
+5. Naeini, M. P., Cooper, G., and Hauskrecht, M. Obtaining Well Calibrated Probabilities Using Bayesian Binning. AAAI 2015. https://ojs.aaai.org/index.php/AAAI/article/view/9602
+6. Brier, G. W. Verification of Forecasts Expressed in Terms of Probability. Monthly Weather Review, 1950. https://journals.ametsoc.org/view/journals/mwre/78/1/1520-0493_1950_078_0001_vofeit_2_0_co_2.xml
+7. Kull, M., Silva Filho, T., and Flach, P. Beta Calibration. AISTATS 2017. https://proceedings.mlr.press/v54/kull17a.html
+8. Nixon, J., Dusenberry, M., Zhang, L., Jerfel, G., and Tran, D. Measuring Calibration in Deep Learning. CVPR Workshops 2019. https://arxiv.org/abs/1904.01685
+9. Gupta, C. and Ramdas, A. Top-label Calibration and Multiclass-to-binary Reductions. ICLR 2022. https://arxiv.org/abs/2107.08353
+10. scikit-learn. Probability Calibration. https://scikit-learn.org/stable/modules/calibration.html

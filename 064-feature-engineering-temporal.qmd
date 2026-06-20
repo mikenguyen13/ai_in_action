@@ -1,0 +1,218 @@
+# Feature Engineering for Temporal Data
+
+Temporal data carries information that ordinary tabular data does not. The order of observations matters, the spacing between them matters, and the relationship between a value and its own past matters. A model that ignores these properties throws away much of the signal that makes forecasting and time aware classification work. This chapter develops the core vocabulary of temporal feature engineering: lag features, rolling and expanding windows, calendar and seasonality encodings, and time since event features. It closes with the single most consequential issue in the entire discipline, lookahead leakage, and the validation discipline that prevents it.
+
+Throughout, we assume a data set indexed by time $t$, with a target $y_t$ and possibly a panel of entities such as users, stores, or sensors. The recurring question is simple to state and easy to get wrong: at the moment a prediction must be made, which information is genuinely available, and which would only be known later.
+
+## 1. Why Temporal Features Are Different
+
+### 1.1 The independence assumption fails
+
+Most supervised learning rests on the assumption that examples are independent and identically distributed. Time series violate both halves of this. Observations are autocorrelated, meaning $y_t$ is correlated with $y_{t-1}$, $y_{t-2}$, and so on. The distribution also drifts: the mean, variance, and seasonal structure of a series in January can differ from the same series in July, and the structure this year can differ from last year. Feature engineering for temporal data is largely the craft of turning this dependence into explicit, model readable columns, so that an otherwise time blind learner such as gradient boosted trees can exploit it.
+
+### 1.2 Information availability defines correctness
+
+The defining constraint is causality of information. A feature computed for the row at time $t$ may only use data observed at or before $t$. If a feature secretly incorporates $y_{t+1}$ or any quantity derived from the future, the model will appear to perform brilliantly in offline evaluation and then collapse in production. This is not a tuning problem, it is a correctness problem, and it is the reason the final section of this chapter is the longest. Every transformation below is presented with its availability boundary made explicit.
+
+## 2. Lag Features
+
+### 2.1 Definition and intuition
+
+A lag feature is simply a past value of a series, shifted forward so it lines up with the current row. The lag $k$ feature is
+
+$$
+x^{(k)}_t = y_{t-k}.
+$$
+
+Because $y_{t-k}$ was observed $k$ steps before $t$, any lag with $k \geq 1$ is safe with respect to the present, provided $y_{t-k}$ was actually known by time $t$. Lags convert autocorrelation into columns. If demand today is strongly correlated with demand yesterday and demand seven days ago, then lags of 1 and 7 give a tree based model direct access to that relationship.
+
+```python
+# pandas-style pseudocode, not executed
+df["lag_1"]  = df["y"].shift(1)
+df["lag_7"]  = df["y"].shift(7)
+df["lag_28"] = df["y"].shift(28)
+```
+
+### 2.2 Choosing which lags to include
+
+Three sources guide lag selection. First, domain knowledge: daily retail data warrants lags at 1, 7, and 28 to capture day over day, weekly, and roughly monthly structure. Second, the autocorrelation function (ACF) and partial autocorrelation function (PACF), which quantify the linear correlation between $y_t$ and $y_{t-k}$. The PACF isolates the direct contribution of lag $k$ after removing the influence of shorter lags, and a sharp cutoff in the PACF at lag $p$ suggests an autoregressive structure of order $p$. Third, the forecast horizon. If you must predict $h$ steps ahead and only data up to time $t$ is available, then the smallest usable lag relative to the target $y_{t+h}$ is $h$ itself. Lags shorter than the horizon are not available at prediction time and must be excluded, a point we return to in Section 6.
+
+### 2.3 Lags in panel data
+
+With multiple entities, lags must be computed within each entity, never across the boundary between them. Grouping is mandatory.
+
+```python
+df["lag_1"] = df.groupby("store_id")["y"].shift(1)
+```
+
+Without the group by, the first row of one store would borrow the last value of the previous store, fabricating a relationship that does not exist. This silent cross contamination is among the most common temporal feature bugs.
+
+## 3. Rolling and Expanding Windows
+
+### 3.1 Rolling windows
+
+A rolling, or moving, window aggregates the most recent $w$ observations into a summary statistic. The rolling mean over window $w$ is
+
+$$
+\bar{x}_{t,w} = \frac{1}{w} \sum_{i=1}^{w} y_{t-i}.
+$$
+
+Note the index runs from $t-1$ back to $t-w$, deliberately excluding $y_t$. Including the current value would leak the target into its own feature. In practice this is enforced by shifting before rolling, or by using a closed interval that excludes the right endpoint.
+
+```python
+# shift first, then roll: the window ends at t-1
+roll = df["y"].shift(1).rolling(window=7)
+df["roll_mean_7"] = roll.mean()
+df["roll_std_7"]  = roll.std()
+df["roll_max_7"]  = roll.max()
+df["roll_min_7"]  = roll.min()
+```
+
+Common rolling statistics include the mean (local level), the standard deviation (local volatility), the minimum and maximum (recent extremes), the median (robust level), and quantiles. Rolling counts of events, such as the number of purchases in the trailing 30 days, are equally useful for behavioral data.
+
+### 3.2 Window size and the bias variance tradeoff
+
+The window length $w$ controls a smoothing tradeoff. Short windows react quickly to change but are noisy. Long windows are stable but lag behind genuine shifts in the series. Rather than choosing a single $w$, it is common to compute the same statistic over several windows, for example 7, 14, 30, and 90 days, and let the model decide which resolution matters. Each additional window is another column, so be mindful of dimensionality and correlation among the resulting features.
+
+### 3.3 Weighted and exponential windows
+
+A flat rolling mean weights every observation in the window equally, which is rarely ideal because recent observations usually carry more information. The exponentially weighted moving average (EWMA) addresses this by decaying older observations geometrically:
+
+$$
+s_t = \alpha\, y_{t-1} + (1 - \alpha)\, s_{t-1}, \qquad 0 < \alpha \leq 1.
+$$
+
+A larger $\alpha$ means faster adaptation and shorter effective memory. The EWMA has the practical advantage of an unbounded but decaying memory, summarizing all past data in a single recursively updated value, and it again excludes $y_t$ when defined with $y_{t-1}$ as the most recent input.
+
+### 3.4 Expanding windows
+
+An expanding window grows to include all history up to the current point rather than a fixed span:
+
+$$
+\bar{x}^{\text{exp}}_t = \frac{1}{t-1} \sum_{i=1}^{t-1} y_{t-i}.
+$$
+
+Expanding aggregates capture long run level, cumulative counts, and running records such as the historical maximum to date. They are appropriate when the early history remains relevant indefinitely, for instance a customer's lifetime average order value. As with rolling windows, the summation must stop at $t-1$.
+
+```python
+exp = df["y"].shift(1).expanding(min_periods=1)
+df["cum_mean"] = exp.mean()
+df["cum_max"]  = exp.max()
+```
+
+### 3.5 Target encoding over time
+
+A subtle and powerful case is encoding a categorical variable by the historical mean of the target within each category, computed only from past rows. This is an expanding group statistic and is highly prone to leakage if computed naively over the whole data set. The safe construction computes, for each row, the mean of the target over earlier rows sharing the same category, optionally smoothed toward the global mean to stabilize categories with little history.
+
+## 4. Calendar and Seasonality Features
+
+### 4.1 Decomposing the timestamp
+
+A raw timestamp is nearly useless to a model, but the calendar fields extracted from it are rich. Standard extractions include the hour of day, day of week, day of month, week of year, month, quarter, and year. Boolean flags for weekend, month start, month end, quarter end, and holiday capture structural breaks in human activity. These features let a model learn, for example, that traffic peaks on weekday mornings or that sales spike at month end.
+
+```python
+ts = df["timestamp"]
+df["hour"]       = ts.dt.hour
+df["dayofweek"]  = ts.dt.dayofweek
+df["month"]      = ts.dt.month
+df["is_weekend"] = ts.dt.dayofweek >= 5
+```
+
+Calendar features are computed entirely from the timestamp of the row being predicted, so they are always available at prediction time and never leak. The future calendar is known in advance, which is precisely why these features are so valuable for forecasting.
+
+### 4.2 Cyclical encoding
+
+Calendar fields are cyclical: hour 23 is adjacent to hour 0, and December is adjacent to January, yet a naive integer encoding places them maximally far apart. The standard remedy is to map a cyclical variable with period $P$ onto a circle using sine and cosine:
+
+$$
+x_{\sin} = \sin\!\left(\frac{2\pi\, c}{P}\right), \qquad x_{\cos} = \cos\!\left(\frac{2\pi\, c}{P}\right),
+$$
+
+where $c$ is the raw cyclical value, such as the hour, and $P$ is its period, such as 24. The pair $(x_{\sin}, x_{\cos})$ encodes proximity correctly, so that 23:00 and 00:00 sit close together. This encoding mainly benefits models that rely on smooth distance in feature space, such as linear models and neural networks. Tree based models, which split on thresholds, often handle raw integer calendar fields adequately, though cyclical features can still help.
+
+### 4.3 Fourier terms for seasonality
+
+When seasonality is strong or multi period, a richer representation uses several Fourier harmonics of the seasonal cycle:
+
+$$
+\sum_{k=1}^{K} \left[ a_k \sin\!\left(\frac{2\pi k t}{P}\right) + b_k \cos\!\left(\frac{2\pi k t}{P}\right) \right].
+$$
+
+Increasing the number of harmonics $K$ lets the model represent more complex, non sinusoidal seasonal shapes. Fourier features are central to additive forecasting models such as Prophet and are a compact way to inject yearly seasonality, with $P = 365.25$, into a model that operates at daily resolution.
+
+### 4.4 Holidays and events
+
+Holidays, promotions, sporting finals, and product launches create deviations that pure calendar arithmetic cannot capture. These are typically supplied through an external calendar and encoded as binary indicators, often with leading and trailing windows to model anticipation and aftermath, for example a flag for the three days before a major holiday. Because such events are usually scheduled in advance, they remain available at prediction time. Events that are not known in advance must be treated with care, since using them would constitute leakage.
+
+## 5. Time Since Event Features
+
+### 5.1 Elapsed time and recency
+
+Many problems hinge not on calendar position but on elapsed time since something happened. The time since last event feature measures, at each row, how long it has been since the most recent occurrence of an event of interest:
+
+$$
+\Delta_t = t - t_{\text{last event} \leq t}.
+$$
+
+Examples include days since a customer's last purchase, hours since the last login, time since the last fault on a machine, and tenure since account creation. These features encode recency and are often among the strongest predictors in churn, conversion, and survival style problems. Because the construction looks only at the most recent past event, it respects the availability boundary by definition.
+
+### 5.2 Time until a known future event
+
+When an event is scheduled and therefore known ahead of time, a symmetric time until next event feature is legitimate. Days until the next public holiday or until a contract renewal are known at prediction time and carry strong signal. The crucial distinction is knowability. Time until the next purchase is not known in advance and would leak the future, whereas time until the next scheduled holiday is fixed on the calendar and is safe.
+
+### 5.3 Counts and decay since events
+
+Recency can be combined with frequency. Useful constructions include the count of events in a trailing window, the cumulative count of events to date, and a decayed event intensity that weights recent events more heavily. A common decay form is $\exp(-\lambda \Delta_t)$, which assigns high weight to events that occurred recently and negligible weight to those in the distant past. The decay rate $\lambda$ becomes a tunable hyperparameter governing how quickly the influence of an event fades.
+
+## 6. Avoiding Lookahead Leakage
+
+### 6.1 What leakage is
+
+Lookahead leakage, also called temporal leakage or data leakage from the future, occurs when a feature for the row at time $t$ depends on information that would not have been available until after $t$. The model learns from this illicit information during training, reports excellent metrics during offline evaluation, and then degrades sharply in production because the future information is genuinely absent when predictions are made in real time. Leakage is insidious because it inflates exactly the metrics practitioners trust, so it is rarely caught by looking at validation scores alone.
+
+### 6.2 Common sources of leakage
+
+A handful of patterns account for most temporal leakage in practice.
+
+The first is fitting preprocessing on the full data set. Computing a scaler's mean and variance, a target encoding, or an imputation value over all rows, including future ones, lets statistics from the future contaminate the past. Every such transform must be fit on training data only and then applied to later data.
+
+The second is centered or symmetric windows. A rolling statistic that is centered on $t$ uses observations from both sides, meaning it reads from the future. Temporal features must use trailing windows that end at or before $t$, never centered ones.
+
+The third is forgetting to exclude the current value. A rolling mean that includes $y_t$ leaks the target into its own feature. Shift before aggregating, as shown earlier.
+
+The fourth is ignoring the forecast horizon. If predictions for $y_{t+h}$ are made using only data up to $t$, then any feature requiring data between $t+1$ and $t+h$ is unavailable. The minimum usable lag is $h$, and rolling windows must be offset by the horizon accordingly.
+
+The fifth is publication and ingestion delay. Even past data may not have been recorded yet at prediction time. A daily sales figure may only be finalized two days later, so a feature must respect the latency with which each input actually arrives, not merely its nominal timestamp. Modeling this with an explicit availability timestamp per field is the rigorous solution.
+
+### 6.3 Validation that respects time
+
+Standard $k$ fold cross validation shuffles rows and trains on data that is, in time, both before and after the validation rows. For temporal data this is invalid because it trains on the future to predict the past. The correct approach uses time ordered splits.
+
+In forward chaining, also called rolling origin evaluation, the data is split at successive time points. The model trains on everything up to a cutoff and is evaluated on the following block, then the cutoff advances and the process repeats. Two common variants exist. An expanding window keeps all history in each training fold, while a sliding window uses a fixed length training period that moves forward, which is preferable when the relationship between features and target drifts over time.
+
+```text
+Fold 1: train [..t1]              test (t1..t2]
+Fold 2: train [..t2]              test (t2..t3]
+Fold 3: train [..t3]              test (t3..t4]
+```
+
+A further refinement inserts a gap, sometimes called an embargo, between the end of training and the start of testing. The gap equals the forecast horizon plus any window over which feature and label construction could otherwise overlap, and it prevents information from bleeding across the boundary through overlapping windows. This embargo discipline is standard in domains such as quantitative finance where overlapping labels are common.
+
+### 6.4 A practical leakage checklist
+
+Before trusting any temporal model, audit each feature against the following questions. Does the feature use only data observed at or before the prediction time, accounting for ingestion delay. Were all preprocessing statistics fit on training data alone. Are all windows trailing rather than centered, and do they exclude the current target. Is the smallest lag at least as large as the forecast horizon. Does the validation scheme preserve time order with an appropriate gap. A feature that fails any of these is a leakage candidate and must be corrected before the model is considered valid. A useful sanity check is that suspiciously high offline accuracy, far above what the problem plausibly allows, is more often a symptom of leakage than of a breakthrough.
+
+## 7. Summary
+
+Temporal feature engineering is the practice of making the structure of time explicit so that general purpose learners can use it. Lag features expose autocorrelation, rolling and expanding windows summarize recent and full history, calendar and Fourier features encode known periodicity, and time since event features capture recency and decay. Each of these is only as good as its respect for the availability boundary. The discipline that ties everything together is the relentless question of what is known when a prediction is made, enforced through trailing windows, horizon aware lags, train only preprocessing, and time ordered validation with an embargo. Master that question, and the rest of temporal feature engineering follows naturally.
+
+## References
+
+1. Hyndman, R. J., and Athanasopoulos, G. Forecasting: Principles and Practice (3rd ed.). OTexts. https://otexts.com/fpp3/
+2. Kuhn, M., and Johnson, K. Feature Engineering and Selection: A Practical Approach for Predictive Models. https://bookdown.org/max/FES/
+3. scikit-learn Developers. TimeSeriesSplit and time series cross validation. https://scikit-learn.org/stable/modules/cross_validation.html#time-series-split
+4. pandas Developers. Window operations: rolling, expanding, and exponentially weighted. https://pandas.pydata.org/docs/user_guide/window.html
+5. Taylor, S. J., and Letham, B. Forecasting at Scale (Prophet). https://peerj.com/preprints/3190/
+6. Lopez de Prado, M. Advances in Financial Machine Learning (purged cross validation and embargo). https://www.wiley.com/en-us/Advances+in+Financial+Machine+Learning-p-9781119482086
+7. Kaufman, S., Rosset, S., and Perlich, C. Leakage in Data Mining: Formulation, Detection, and Avoidance. https://dl.acm.org/doi/10.1145/2020408.2020496
+8. Bergmeir, C., and Benitez, J. M. On the use of cross validation for time series predictor evaluation. https://doi.org/10.1016/j.ins.2011.12.028

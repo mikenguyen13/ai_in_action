@@ -1,0 +1,175 @@
+# Image Data Augmentation
+
+Image data augmentation is the practice of synthesizing additional training examples by applying label preserving (or label aware) transformations to existing images. It is one of the most reliable regularizers in modern computer vision, often contributing several points of top-1 accuracy at essentially zero data collection cost. This chapter develops the theory and practice of augmentation, moving from classical geometric and photometric transforms through the regularizing family of Cutout, Mixup, and CutMix, into learned policies such as AutoAugment and RandAugment, and finally to test time augmentation. The emphasis is on what each method assumes about the data, how it interacts with the loss, and how to deploy it without surprises.
+
+## 1. Why Augmentation Works
+
+### 1.1 The invariance and regularization view
+
+A classifier $f_\theta$ should respect the symmetries of the visual world. A cat photographed slightly to the left, dimmed by one stop, or mirrored horizontally is still a cat. Formally, if $T$ is a transformation drawn from a distribution $\mathcal{T}$ that preserves the label $y$ of an image $x$, then we want $f_\theta(T(x)) \approx f_\theta(x)$. Augmentation injects this prior by replacing the empirical risk with an expectation over transformations:
+
+$$
+\mathcal{L}_{\text{aug}}(\theta) = \frac{1}{N}\sum_{i=1}^{N} \mathbb{E}_{T \sim \mathcal{T}}\big[\ell\big(f_\theta(T(x_i)), y_i\big)\big].
+$$
+
+Because $T$ is sampled fresh on every access, the network effectively sees an infinite, smoothly varying dataset. This expands the support of the input distribution, flattens sharp minima, and discourages the model from memorizing pixel level idiosyncrasies. Augmentation can also be read as a form of vicinal risk minimization, in which each training point is replaced by a neighborhood (a vicinity) of plausible variants rather than a single delta function.
+
+### 1.2 The label preservation constraint
+
+The central design rule is that $\mathcal{T}$ must respect the task semantics. Horizontal flips are safe for natural object recognition but destroy information in text recognition and in any task with chirality, such as distinguishing the digit reflections or reading road signs. Heavy color shifts can erase the signal in a task where color is the label, for example classifying ripe versus unripe fruit. Rotations beyond a small range are appropriate for satellite or microscopy imagery, which has no canonical up direction, but harmful for street scenes. The practitioner's first job is to enumerate the invariances the task actually has, then choose transforms that match.
+
+## 2. Geometric Transforms
+
+Geometric transforms alter the spatial arrangement of pixels while leaving intensities untouched. They model changes in viewpoint, pose, and framing.
+
+### 2.1 Affine and projective families
+
+An affine transform maps a pixel coordinate $\mathbf{p} = (x, y)$ to
+
+$$
+\mathbf{p}' = A\mathbf{p} + \mathbf{t}, \qquad A = \begin{bmatrix} a & b \\ c & d \end{bmatrix},
+$$
+
+which composes translation, rotation, scaling, and shear. Rotation by angle $\phi$ uses $A = \begin{bmatrix}\cos\phi & -\sin\phi \\ \sin\phi & \cos\phi\end{bmatrix}$; isotropic scaling uses $A = sI$; shear along $x$ uses $A = \begin{bmatrix}1 & \lambda \\ 0 & 1\end{bmatrix}$. Projective (homography) transforms add a perspective component and are useful when simulating camera tilt. Two implementation details matter. First, interpolation: backward mapping with bilinear sampling avoids holes, and the choice between bilinear, bicubic, and nearest neighbor trades smoothness against edge fidelity. Second, boundary handling: rotated or scaled images leave undefined regions that are filled by zero padding, reflection, or edge replication, and the chosen fill should not introduce artifacts that the network can exploit as a shortcut.
+
+### 2.2 Elastic and nonrigid deformations
+
+Elastic distortion perturbs each pixel by a smooth random displacement field, typically a Gaussian blurred field of random vectors scaled by a magnitude $\alpha$. It was decisive for handwritten digit recognition because it mimics the natural variability of strokes. In medical and microscopy imaging, elastic and grid based warps capture tissue deformation that affine transforms cannot. The cost is that aggressive warping can break fine structure, so the smoothing kernel and magnitude must be tuned conservatively.
+
+## 3. Photometric Transforms
+
+Photometric transforms modify pixel intensities and color while preserving geometry. They model changes in lighting, sensor response, and color balance.
+
+### 3.1 Brightness, contrast, saturation, and hue
+
+Brightness scales intensities, contrast rescales them around a midpoint, saturation interpolates between the image and its grayscale version, and hue rotates colors in a cylindrical color space such as HSV. A common bundle is the color jitter operator, which samples each factor independently within a configured range. Care is needed at the extremes: collapsing saturation to zero turns the task into grayscale recognition, which may or may not be desirable. Color jitter is one of the workhorses of self supervised pretraining, where strong color and grayscale augmentation prevents the network from solving the pretext task through trivial color cues.
+
+### 3.2 Noise, blur, and channel operations
+
+Gaussian noise, Gaussian blur, and JPEG compression artifacts simulate sensor and pipeline degradations and improve robustness to corrupted inputs. Posterization, solarization, equalization, and histogram based operations alter the intensity mapping in nonlinear ways and feature prominently in the learned policies discussed later. Grayscale conversion, applied stochastically, forces reliance on shape and texture rather than color. As with geometric transforms, the guiding question is whether the corruption plausibly appears at test time or in deployment.
+
+## 4. Cropping and Flipping
+
+### 4.1 Random resized crop
+
+The single most important augmentation for large scale image classification is random resized cropping. A patch is sampled with a random area fraction (commonly $8\%$ to $100\%$ of the image) and a random aspect ratio (commonly $3/4$ to $4/3$), then resized to the network's input resolution. This simultaneously provides scale invariance, translation invariance, and a mild form of occlusion, since only part of the object may survive the crop. It is aggressive enough that on its own it accounts for much of the gain in standard ImageNet pipelines.
+
+```text
+# Standard training crop policy (pseudocode)
+patch = sample_crop(image,
+                    area_fraction in [0.08, 1.0],
+                    aspect_ratio in [3/4, 4/3])
+image = resize(patch, target_size)
+```
+
+### 4.2 Flips and the train test gap
+
+Horizontal flipping doubles the effective dataset for symmetric tasks at negligible cost and is a default in most pipelines. Vertical flips suit overhead imagery but rarely natural photos. A subtle point is the mismatch between training and evaluation crops. Training uses random resized crops, while evaluation typically uses a deterministic resize followed by a center crop, often at a slightly larger resolution. This train test resolution discrepancy can cost accuracy, and a short fine tuning step at test resolution, or matching the crop statistics, recovers it.
+
+## 5. Information Deletion: Cutout and Random Erasing
+
+### 5.1 Cutout
+
+Cutout masks a single square region of the input by setting it to a constant (often zero or the dataset mean). Let $M \in \{0,1\}^{H\times W}$ be a mask that is zero inside a randomly placed square of side $s$ and one elsewhere; the augmented image is $\tilde{x} = M \odot x$, broadcast over channels. By removing a contiguous block, Cutout forces the network to distribute its evidence across the whole object rather than fixating on the single most discriminative part. It improves robustness to occlusion and acts as a strong regularizer on small datasets such as CIFAR.
+
+### 5.2 Random erasing
+
+Random erasing generalizes Cutout by randomizing the erased region's area and aspect ratio and by filling it with random values rather than a constant. The two are close cousins; the practical guidance is to keep the erased fraction moderate so that the label is preserved, and to disable region deletion when the object of interest is small relative to the image, where a careless mask can remove the entire signal.
+
+## 6. Label Mixing: Mixup and CutMix
+
+The methods above keep one image per training sample. The mixing family combines two images and their labels, which regularizes the decision boundary and improves calibration.
+
+### 6.1 Mixup
+
+Mixup forms convex combinations of pairs. Given two examples $(x_i, y_i)$ and $(x_j, y_j)$ with one hot labels, sample $\lambda \sim \text{Beta}(\alpha, \alpha)$ and construct
+
+$$
+\tilde{x} = \lambda x_i + (1-\lambda) x_j, \qquad \tilde{y} = \lambda y_i + (1-\lambda) y_j.
+$$
+
+Training on these blends encourages the model to behave linearly between examples, which empirically reduces overconfidence, improves calibration, and increases robustness to label noise and adversarial perturbation. The hyperparameter $\alpha$ controls the strength: small $\alpha$ keeps $\lambda$ near zero or one (weak mixing), while $\alpha \approx 0.2$ to $0.4$ is typical for ImageNet and larger values suit smaller datasets. Because the loss is linear in the one hot target, the implementation is simply a $\lambda$ weighted sum of two cross entropy terms.
+
+### 6.2 CutMix
+
+CutMix replaces a rectangular region of one image with a patch from another, and sets the mixing weight to the area fraction. With a binary mask $M$ that is one inside the pasted rectangle,
+
+$$
+\tilde{x} = M \odot x_j + (1 - M) \odot x_i, \qquad \tilde{y} = \lambda y_i + (1-\lambda) y_j,
+$$
+
+where $\lambda = 1 - \tfrac{\text{area}(M)}{HW}$ matches the label proportions to the visible pixel proportions. CutMix combines the localization benefit of Cutout (a region is removed) with the efficiency of Mixup (no pixels are wasted on a gray patch). It tends to produce strong localization, since the network must recognize objects from partial views, and it is a standard ingredient in high accuracy ImageNet recipes.
+
+### 6.3 Choosing and combining mixers
+
+```text
+if rand() < p_mix:
+    if rand() < 0.5:
+        batch = mixup(batch,  alpha=0.2)
+    else:
+        batch = cutmix(batch, alpha=1.0)
+```
+
+In practice Mixup and CutMix are often applied stochastically within the same training run, switching between them per batch. They interact with label smoothing (both soften targets, so stacking them aggressively can underfit) and with long schedules (mixing benefits from many epochs because each blended image is harder to fit). For tasks with dense outputs such as detection and segmentation, naive pixel mixing breaks the geometric label correspondence, so mosaic style spatial composition is usually preferred over intensity blending.
+
+## 7. Learned Augmentation Policies
+
+Hand tuning the magnitude and probability of a dozen transforms is tedious and dataset specific. Two influential lines of work automate it.
+
+### 7.1 AutoAugment
+
+AutoAugment frames augmentation design as a search problem. A policy is a set of subpolicies, each a sequence of operations with an associated probability and discrete magnitude. A controller, originally a recurrent network trained with reinforcement learning, proposes policies; each is evaluated by training a child model and reading off validation accuracy, which serves as the reward. The result is a strong, transferable policy, but the search is extraordinarily expensive, requiring thousands of child model trainings. The discovered policies (for example the published ImageNet, CIFAR, and SVHN policies) are frequently reused directly, which sidesteps the search cost but inherits whatever dataset assumptions the search encoded.
+
+### 7.2 RandAugment
+
+RandAugment removes the search almost entirely. It observes that a large learned policy can be approximated by a uniform random choice over a fixed set of $K$ operations, controlled by just two integers: $N$, the number of operations applied in sequence per image, and $M$, a single global magnitude shared by all operations. The augmentation space collapses from billions of policies to a $14 \times 30$ grid (operations by magnitude levels), which is small enough to tune with ordinary grid search on the target dataset and model.
+
+```text
+def rand_augment(image, N, M):
+    ops = sample(OPERATIONS, k=N)   # uniform, with replacement
+    for op in ops:
+        image = op(image, magnitude=M)
+    return image
+```
+
+The appeal is twofold. First, $N$ and $M$ are interpretable and can be tuned jointly with model size and training length, which matters because the optimal magnitude grows with model capacity and dataset size. Second, it avoids the proxy task pitfall of search methods, where a policy tuned on a small child model is suboptimal for the final large model. RandAugment matches or exceeds AutoAugment on standard benchmarks at a tiny fraction of the cost and is the de facto default in many modern recipes. Related variants such as TrivialAugment go further, removing $N$ and sampling a single operation with a random magnitude, and remain competitive, which suggests that much of the benefit comes from diversity rather than from a precisely optimized schedule.
+
+### 7.3 Practical guidance on policy strength
+
+The dominant failure mode is augmentation that is too strong for the regime. Strong policies (large $M$, Mixup, CutMix, RandAugment together) shine when the model is large and the schedule is long, because the network has the capacity and the epochs to fit harder examples. The same policy applied to a small model on a short schedule underfits and loses accuracy. A reasonable workflow is to start from a published recipe for a comparable model and dataset, then sweep magnitude on a small grid, watching the gap between training and validation loss. If training loss never approaches validation loss, the augmentation is too aggressive for the budget.
+
+## 8. Test Time Augmentation
+
+### 8.1 Mechanism
+
+Test time augmentation (TTA) applies augmentation at inference and averages the predictions. Given transforms $T_1, \dots, T_K$ drawn from a label preserving family, the prediction is
+
+$$
+\hat{p}(x) = \frac{1}{K}\sum_{k=1}^{K} f_\theta\big(T_k(x)\big),
+$$
+
+usually averaged over softmax probabilities rather than logits. Classic choices are horizontal flip (a cheap doubling), multi crop (corners plus center, optionally at several scales), and multi scale evaluation. TTA reduces variance by marginalizing over nuisance transformations and typically yields a small but consistent accuracy gain, often a few tenths to a point on ImageNet.
+
+### 8.2 Costs, calibration, and when to use it
+
+The obvious cost is that inference becomes $K$ times more expensive, which is unattractive for latency sensitive or high throughput deployments. The transforms used at test time should be a subset of those the model saw during training; applying a transform the model never learned to be invariant to can hurt. TTA also tends to improve calibration because averaging smooths overconfident predictions, which is valuable when probabilities feed downstream decisions. It is most justified in offline settings, in competition or benchmark contexts where the last fraction of a point matters, and in ensembling pipelines where it composes naturally with model averaging. For real time systems, the better investment is usually stronger training time augmentation, which moves the cost to training and keeps inference cheap.
+
+## 9. Putting It Together
+
+A robust default for modern image classification combines four ingredients. Random resized crop and horizontal flip provide the geometric backbone. RandAugment supplies diverse photometric and geometric perturbation with two tunable knobs. Mixup and CutMix, applied stochastically per batch, regularize the decision boundary and improve calibration. Random erasing adds occlusion robustness. Magnitudes are scaled to the model size and schedule length, validated by watching the train and validation loss gap. TTA is reserved for offline evaluation where its inference cost is acceptable.
+
+The unifying principle is that augmentation encodes a prior about which input variations should not change the output, or in the mixing case, how the output should vary smoothly between inputs. The art is matching that prior to the genuine invariances of the task, neither weaker (leaving generalization on the table) nor stronger (corrupting the label and starving the model of signal). Used with that discipline, augmentation remains among the highest leverage tools in the practitioner's kit.
+
+## References
+
+1. DeVries, T. and Taylor, G. W. Improved Regularization of Convolutional Neural Networks with Cutout. arXiv, 2017. https://arxiv.org/abs/1708.04552
+2. Zhong, Z., Zheng, L., Kang, G., Li, S., and Yang, Y. Random Erasing Data Augmentation. arXiv, 2017. https://arxiv.org/abs/1708.04896
+3. Zhang, H., Cisse, M., Dauphin, Y. N., and Lopez-Paz, D. mixup: Beyond Empirical Risk Minimization. ICLR, 2018. https://arxiv.org/abs/1710.09412
+4. Yun, S., Han, D., Oh, S. J., Chun, S., Choe, J., and Yoo, Y. CutMix: Regularization Strategy to Train Strong Classifiers with Localizable Features. ICCV, 2019. https://arxiv.org/abs/1905.04899
+5. Cubuk, E. D., Zoph, B., Mane, D., Vasudevan, V., and Le, Q. V. AutoAugment: Learning Augmentation Strategies from Data. CVPR, 2019. https://arxiv.org/abs/1805.09501
+6. Cubuk, E. D., Zoph, B., Shlens, J., and Le, Q. V. RandAugment: Practical Automated Data Augmentation with a Reduced Search Space. NeurIPS, 2020. https://arxiv.org/abs/1909.13719
+7. Muller, S. G. and Hutter, F. TrivialAugment: Tuning-free Yet State-of-the-Art Data Augmentation. ICCV, 2021. https://arxiv.org/abs/2103.10158
+8. Simonyan, K. and Zisserman, A. Very Deep Convolutional Networks for Large-Scale Image Recognition. ICLR, 2015. https://arxiv.org/abs/1409.1556
+9. Touvron, H., Vedaldi, A., Douze, M., and Jegou, H. Fixing the train-test resolution discrepancy. NeurIPS, 2019. https://arxiv.org/abs/1906.06423
+10. Chen, T., Kornblith, S., Norouzi, M., and Hinton, G. A Simple Framework for Contrastive Learning of Visual Representations (SimCLR). ICML, 2020. https://arxiv.org/abs/2002.05709
+11. Shorten, C. and Khoshgoftaar, T. M. A survey on Image Data Augmentation for Deep Learning. Journal of Big Data, 2019. https://journalofbigdata.springeropen.com/articles/10.1186/s40537-019-0197-0

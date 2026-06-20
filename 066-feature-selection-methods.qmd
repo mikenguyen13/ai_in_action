@@ -1,0 +1,214 @@
+# Feature Selection Methods
+
+Feature selection is the process of choosing a subset of the available input variables to use in a predictive model. In an era of high dimensional data, where the number of candidate features $p$ can rival or exceed the number of observations $n$, selecting the right features is often as consequential as choosing the model itself. A well selected feature set reduces variance, lowers computational cost, improves interpretability, and can mitigate the curse of dimensionality. A poorly chosen one discards signal, encodes leakage, or bakes in biases that surface only in production. This chapter develops the three classical families of feature selection methods, filter, wrapper, and embedded, and then treats permutation importance as a model agnostic tool that cuts across all of them.
+
+## 1. Why Feature Selection Matters
+
+### 1.1 The statistical case
+
+Consider a linear model $y = X\beta + \varepsilon$ with $X \in \mathbb{R}^{n \times p}$. The variance of the ordinary least squares estimator scales with the number of parameters, and when irrelevant features are included the estimator pays a variance penalty without any reduction in bias. The expected prediction error decomposes as
+
+$$
+\mathbb{E}\big[(y - \hat{f}(x))^2\big] = \underbrace{\sigma^2}_{\text{irreducible}} + \underbrace{\text{Bias}^2(\hat{f}(x))}_{} + \underbrace{\text{Var}(\hat{f}(x))}_{}.
+$$
+
+Adding noise features inflates the variance term. Removing them, when they carry no signal, strictly improves expected error. This is the core justification for feature selection beyond mere convenience.
+
+### 1.2 Selection versus extraction
+
+Feature selection keeps a subset of the original variables intact, which preserves their meaning. This differs from feature extraction methods such as principal component analysis, which build new variables as combinations of the originals. Selection is preferable when interpretability, measurement cost, or regulatory transparency matter, because a retained feature still corresponds to a quantity a domain expert can name. Extraction can be more powerful when the predictive structure lives in linear combinations rather than individual columns.
+
+### 1.3 A taxonomy
+
+The literature organizes methods by how tightly they couple to the downstream model. Filter methods rank features using statistics computed from the data alone, independent of any learner. Wrapper methods treat a specific model as a black box and search over feature subsets by repeated training and evaluation. Embedded methods perform selection as a side effect of model fitting, folding it into the optimization. Permutation importance, discussed last, is a post hoc model agnostic technique that estimates how much each feature contributes to a trained model's accuracy.
+
+## 2. Filter Methods
+
+Filter methods score each feature, or each feature relative to the target, using a fast statistical criterion and then keep the top ranked features. They are cheap, scale to very wide data, and act as a sensible preprocessing step even when a more expensive method follows.
+
+### 2.1 Correlation based filtering
+
+The Pearson correlation coefficient measures the strength of a linear relationship between a feature $x_j$ and a continuous target $y$:
+
+$$
+r_{j} = \frac{\sum_{i=1}^{n} (x_{ij} - \bar{x}_j)(y_i - \bar{y})}{\sqrt{\sum_{i=1}^{n} (x_{ij} - \bar{x}_j)^2}\sqrt{\sum_{i=1}^{n} (y_i - \bar{y})^2}}.
+$$
+
+Features with $|r_j|$ near zero are candidates for removal. Correlation filtering also addresses redundancy: if two features are highly correlated with each other, one of them carries little additional information. A common heuristic computes the feature to feature correlation matrix and drops one member of any pair whose absolute correlation exceeds a threshold such as $0.9$.
+
+The central weakness is that Pearson correlation captures only monotonic linear association. A feature with a strong quadratic or interaction relationship to the target can have $r_j \approx 0$ and be discarded wrongly. Spearman rank correlation relaxes the linearity assumption to monotonicity, but neither handles arbitrary nonlinear dependence.
+
+```text
+for each feature j:
+    score[j] = abs(pearson(x_j, y))
+keep features where score[j] >= threshold
+```
+
+### 2.2 Mutual information
+
+Mutual information measures the general dependence between two random variables, capturing nonlinear relationships that correlation misses. For a feature $X_j$ and target $Y$ it is defined as
+
+$$
+I(X_j; Y) = \sum_{x}\sum_{y} p(x, y) \log \frac{p(x, y)}{p(x)\,p(y)} = H(Y) - H(Y \mid X_j),
+$$
+
+where $H$ denotes Shannon entropy. Mutual information is zero if and only if $X_j$ and $Y$ are statistically independent, and it grows as knowing $X_j$ reduces uncertainty about $Y$. For continuous variables the sums become integrals, and practical estimators rely on $k$ nearest neighbor distances, as in the Kozachenko Leonenko and Kraskov estimators, to avoid binning artifacts.
+
+Mutual information is attractive because it is model free and detects any kind of dependence. Its drawbacks are that estimation in continuous high dimensional spaces is noisy, and that the univariate form $I(X_j; Y)$ ignores feature interactions. A feature useless on its own but informative in combination with another, the canonical XOR pattern, scores zero under univariate mutual information.
+
+### 2.3 The chi-squared test
+
+For categorical features and a categorical target, the chi-squared statistic tests whether feature and target are independent. Given a contingency table with observed counts $O_{kl}$ and expected counts $E_{kl} = \frac{(\text{row}_k)(\text{col}_l)}{n}$ under independence,
+
+$$
+\chi^2 = \sum_{k}\sum_{l} \frac{(O_{kl} - E_{kl})^2}{E_{kl}}.
+$$
+
+A large statistic indicates dependence and hence a potentially useful feature. The test assumes non negative feature values, which is why it is typically applied to counts, term frequencies, or one hot encoded indicators. It requires adequate expected cell counts, often stated as $E_{kl} \geq 5$, or the chi-squared approximation degrades. As with the other filters, the chi-squared score is univariate and does not account for joint behavior across features.
+
+### 2.4 Strengths and limits of filters
+
+Filters share a common profile. They are computationally light, robust to overfitting because they never look at a model, and easy to parallelize across thousands of features. Their shared blind spot is that they evaluate features in isolation against the target, ignoring both feature interactions and the inductive bias of the model that will ultimately be trained. They are best used as a first pass to prune obviously irrelevant variables before a more discriminating method runs.
+
+## 3. Wrapper Methods
+
+Wrapper methods choose features by directly optimizing the performance of a particular model. They wrap the learner inside a search over subsets, scoring each candidate subset by cross validated predictive accuracy. Because they account for the model and for feature interactions, they often find better subsets than filters, at substantially higher computational cost.
+
+### 3.1 The search problem
+
+With $p$ features there are $2^p$ possible subsets, so exhaustive search is infeasible beyond roughly twenty features. Wrapper methods therefore use greedy heuristics that explore a tractable path through subset space.
+
+### 3.2 Forward selection
+
+Forward selection begins with the empty set and adds features one at a time. At each step it tentatively adds each feature not yet selected, evaluates the resulting model by cross validation, and permanently adds the single feature that yields the largest improvement. It stops when no addition improves the validation score by more than a tolerance, or when a target subset size is reached.
+
+```text
+selected = {}
+repeat:
+    best = argmax over j not in selected of CV_score(selected + {j})
+    if score improves: selected = selected + {best}
+    else: stop
+```
+
+Forward selection is efficient when the final subset is small, since it never trains on large subsets. Its weakness is that it cannot reconsider: a feature that looks weak alone but strong in combination with a later addition may never be selected, because its value only appears once its partner is present.
+
+### 3.3 Backward elimination
+
+Backward elimination runs in the opposite direction. It starts with all features and removes them one at a time, at each step deleting the feature whose removal hurts performance least. It continues until any further removal would degrade the score beyond tolerance. Backward elimination can capture interactions better than forward selection because all features are present early, so a feature is evaluated in the context of its potential partners. The tradeoff is cost: the early iterations train models on the full, wide feature set, which is expensive when $p$ is large, and it is infeasible when $p > n$ for models that require it.
+
+### 3.4 Recursive feature elimination
+
+Recursive feature elimination, or RFE, is a refined backward strategy that uses the model's own importance estimates to decide what to drop, rather than retraining once per candidate removal. It trains the model on the current feature set, ranks features by an internal importance measure such as linear coefficient magnitude or tree based importance, removes the least important feature or a fixed fraction, and repeats on the reduced set.
+
+```text
+features = all
+while len(features) > target:
+    fit model on features
+    rank features by model importance
+    drop the lowest ranked fraction
+    features = remaining
+```
+
+RFE is far cheaper than naive backward elimination because each iteration trains a single model rather than one per candidate. Pairing RFE with cross validation, often called RFECV, lets the procedure choose the optimal number of features automatically by tracking validation accuracy as features are pruned. RFE remains model dependent, so the importance measure it relies on must be meaningful for the chosen learner.
+
+### 3.5 The cost of wrapping
+
+Wrapper methods are prone to overfitting the validation set when the search space is large, because evaluating many subsets is itself a form of multiple comparisons. Nesting the feature search inside an outer cross validation loop, so that selection is repeated independently on each outer fold, is essential for an honest estimate of generalization. Skipping this nesting is one of the most common sources of optimistic bias in applied machine learning.
+
+## 4. Embedded Methods
+
+Embedded methods perform selection during model training. The selection criterion is the model's own objective function, so there is no separate search and no separate scoring statistic. This makes embedded methods a middle ground: more model aware than filters, far cheaper than wrappers.
+
+### 4.1 L1 regularization and the lasso
+
+The lasso adds an $\ell_1$ penalty to the regression objective:
+
+$$
+\hat{\beta} = \arg\min_{\beta} \; \frac{1}{2n}\sum_{i=1}^{n}\big(y_i - x_i^\top \beta\big)^2 + \lambda \sum_{j=1}^{p} |\beta_j|.
+$$
+
+The geometry of the $\ell_1$ ball, with its corners on the coordinate axes, drives many coefficients to be exactly zero at the optimum. Features with zero coefficients are effectively deselected, so the lasso performs continuous feature selection through a single convex optimization. The penalty strength $\lambda$ controls sparsity: larger values zero out more coefficients. Contrast this with the $\ell_2$ penalty of ridge regression, $\lambda \sum_j \beta_j^2$, which shrinks coefficients toward zero but never sets them exactly to zero and therefore selects nothing.
+
+The lasso has known limitations. Among a group of highly correlated features it tends to pick one arbitrarily and zero the rest, which can be unstable. When $p > n$ it selects at most $n$ features. The elastic net addresses both issues by combining $\ell_1$ and $\ell_2$ penalties,
+
+$$
+\lambda \Big( \alpha \sum_j |\beta_j| + (1 - \alpha)\sum_j \beta_j^2 \Big),
+$$
+
+retaining sparsity while encouraging correlated features to enter or leave together.
+
+### 4.2 Tree based importance
+
+Decision tree ensembles such as random forests and gradient boosted trees produce feature importances as a byproduct of training. The classical measure is mean decrease in impurity (MDI), which sums the reduction in node impurity, Gini index or entropy for classification and variance for regression, attributable to each feature across all splits in all trees, weighted by the proportion of samples reaching each node:
+
+$$
+\text{Imp}(j) = \frac{1}{T}\sum_{t=1}^{T} \sum_{\text{nodes } s \in t \,:\, \text{split on } j} \frac{n_s}{n}\,\Delta i(s),
+$$
+
+where $\Delta i(s)$ is the impurity decrease at node $s$ and $n_s$ the number of samples reaching it. Features that produce large, frequent impurity reductions rank highly.
+
+MDI is computed for free during training and gives an immediate ranking usable for selection or for driving RFE. It carries a well documented bias: it inflates the importance of high cardinality features and continuous variables, because such features offer more candidate split points and can reduce impurity on the training data by chance. It is also computed on the training set, so it can reward overfitting. These biases motivate the model agnostic alternative of the next section.
+
+### 4.3 The embedded tradeoff
+
+Embedded methods give selection essentially for free as part of fitting, and the selected subset is by construction tuned to the model. The cost is that the selection is tied to one model family and to one set of hyperparameters. An $\ell_1$ selection reflects a linear view of the world; a tree importance reflects a partition based view. Neither transfers automatically to a different learner.
+
+## 5. Permutation Importance
+
+Permutation importance is a model agnostic, post hoc method that measures how much a trained model relies on each feature by observing how much its performance degrades when that feature's values are randomly shuffled.
+
+### 5.1 Definition
+
+Let $s$ be a baseline performance score of a fitted model $\hat{f}$ on a held out set, for example accuracy or $R^2$. For feature $j$, randomly permute the values of column $j$ across the rows, breaking its association with the target while preserving its marginal distribution, then recompute the score $s_{k,j}$ on this corrupted data. Repeating $K$ times, the permutation importance is the mean drop in performance:
+
+$$
+\text{PI}(j) = s - \frac{1}{K}\sum_{k=1}^{K} s_{k,j}.
+$$
+
+A large positive value means the model depended heavily on feature $j$, because destroying it hurt performance. A value near zero means the feature was unused or redundant.
+
+```text
+baseline = score(model, X_val, y_val)
+for each feature j:
+    drops = []
+    repeat K times:
+        X_perm = X_val with column j shuffled
+        drops.append(baseline - score(model, X_perm, y_val))
+    importance[j] = mean(drops)
+```
+
+### 5.2 Advantages
+
+Permutation importance applies to any fitted model, from linear regression to deep networks, because it treats the model as a black box and only needs its predict function. Computed on held out data it reflects generalization rather than training fit, which avoids the overfitting bias of MDI. It also does not inherit the cardinality bias of impurity based importance, since it never looks at split structure.
+
+### 5.3 Pitfalls and correlated features
+
+The chief weakness appears with correlated features. If two features are strongly correlated, permuting one leaves the model able to recover the lost information from its partner, so both can appear unimportant even though the underlying signal is essential. The importances then understate the true relevance of the correlated group. Permutation can also evaluate the model on unrealistic, out of distribution inputs, because shuffling breaks the joint structure of the data and may create feature combinations that never occur naturally. Conditional permutation schemes and grouped permutation of correlated clusters mitigate these effects. Finally, the procedure is stochastic, so reporting the variability of $\text{PI}(j)$ across the $K$ repetitions is important before declaring a feature unimportant.
+
+## 6. Practical Guidance
+
+### 6.1 Choosing a method
+
+Method choice follows from dimensionality, compute budget, and the importance of interpretability. For very wide data, begin with a filter to remove clearly irrelevant features cheaply. When a specific model is fixed and compute allows, a wrapper such as RFECV often yields the strongest subset. When the model is itself a lasso or a tree ensemble, embedded selection comes for free and should be the default. Permutation importance is the right tool for auditing and explaining an already trained model, and for comparing feature relevance across model families on equal footing.
+
+### 6.2 Avoiding leakage and bias
+
+The single most important discipline is to perform feature selection inside the cross validation loop, never on the full dataset before splitting. Selecting features using the entire dataset, including the eventual test rows, leaks target information and produces optimistic, irreproducible results. All of the methods here must see only training data within each fold. Standardization, encoding, and selection should be fitted on training folds and applied to validation folds, ideally inside a single pipeline object so the dependency is explicit and impossible to bypass.
+
+### 6.3 Stability
+
+A robust feature set should be stable under resampling. Running the selection procedure on multiple bootstrap samples and retaining features chosen frequently, an approach known as stability selection, guards against the instability that lasso and greedy wrappers exhibit on correlated data. Reporting selection frequency alongside the chosen subset gives a far more honest picture than a single run.
+
+## References
+
+1. Guyon, I. and Elisseeff, A. (2003). An Introduction to Variable and Feature Selection. Journal of Machine Learning Research. https://www.jmlr.org/papers/v3/guyon03a.html
+2. Tibshirani, R. (1996). Regression Shrinkage and Selection via the Lasso. Journal of the Royal Statistical Society, Series B. https://www.jstor.org/stable/2346178
+3. Zou, H. and Hastie, T. (2005). Regularization and Variable Selection via the Elastic Net. Journal of the Royal Statistical Society, Series B. https://doi.org/10.1111/j.1467-9868.2005.00503.x
+4. Breiman, L. (2001). Random Forests. Machine Learning. https://doi.org/10.1023/A:1010933404324
+5. Guyon, I., Weston, J., Barnhill, S. and Vapnik, V. (2002). Gene Selection for Cancer Classification using Support Vector Machines. Machine Learning. https://doi.org/10.1023/A:1012487302797
+6. Kraskov, A., Stoegbauer, H. and Grassberger, P. (2004). Estimating Mutual Information. Physical Review E. https://doi.org/10.1103/PhysRevE.69.066138
+7. Strobl, C., Boulesteix, A., Zeileis, A. and Hothorn, T. (2007). Bias in Random Forest Variable Importance Measures. BMC Bioinformatics. https://doi.org/10.1186/1471-2105-8-25
+8. Meinshausen, N. and Buehlmann, P. (2010). Stability Selection. Journal of the Royal Statistical Society, Series B. https://doi.org/10.1111/j.1467-9868.2010.00740.x
+9. Hastie, T., Tibshirani, R. and Friedman, J. (2009). The Elements of Statistical Learning, 2nd edition. Springer. https://hastie.su.domains/ElemStatLearn/
+10. Pedregosa, F. et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research. https://www.jmlr.org/papers/v12/pedregosa11a.html
+11. Molnar, C. (2022). Interpretable Machine Learning, 2nd edition. https://christophm.github.io/interpretable-ml-book/

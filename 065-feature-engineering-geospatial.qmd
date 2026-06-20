@@ -1,0 +1,230 @@
+# Feature Engineering for Geospatial Data
+
+Geospatial data carries information that few other modalities possess: every observation is anchored to a location on the surface of the Earth, and that location relates to every other location through distance, adjacency, and containment. A machine learning model that treats latitude and longitude as two ordinary numeric columns discards almost all of this structure. The art of geospatial feature engineering is to surface the relationships that location implies, encode them as model ready features, and do so without violating the geometry of a curved planet. This chapter develops the foundations and the practical tooling for that task, moving from coordinate systems through distance metrics, spatial joins, geohashing, proximity and density features, and finally the diagnostics of spatial autocorrelation.
+
+## 1. Coordinate Systems and Projections
+
+### 1.1 Geographic Coordinates and the Geodetic Datum
+
+A geographic coordinate system describes position on an ellipsoidal model of the Earth using latitude $\phi$ and longitude $\lambda$, both measured in degrees. The most widely used reference frame is the World Geodetic System 1984 (WGS84), identified by the code EPSG:4326, which underlies the Global Positioning System and the bulk of consumer location data. Latitude ranges over $[-90^\circ, 90^\circ]$ and longitude over $[-180^\circ, 180^\circ]$.
+
+The critical property to internalize is that geographic coordinates are angular, not linear. One degree of latitude corresponds to roughly 111 kilometers everywhere, but one degree of longitude shrinks toward the poles according to
+
+$$
+\Delta x \approx 111.32 \cos(\phi) \;\text{km per degree of longitude}.
+$$
+
+At the equator a degree of longitude is about 111 km; at $60^\circ$ latitude it is about 55 km. Treating raw longitude differences as if they were comparable to latitude differences therefore distorts any model that depends on distance. This single fact motivates much of what follows.
+
+### 1.2 Projected Coordinate Systems
+
+A projected coordinate system maps the curved surface onto a plane so that Euclidean geometry becomes locally valid and coordinates are expressed in meters. No projection preserves area, shape, distance, and direction simultaneously; each trades one property for another. For feature engineering the most useful family is the Universal Transverse Mercator (UTM) system, which divides the globe into 60 zones each six degrees of longitude wide. Within a zone, planar distance computed with the ordinary formula is accurate to a fraction of a percent, which is sufficient for most modeling.
+
+A common and disciplined workflow is to store data in EPSG:4326 for interoperability, then reproject to an appropriate local projection (a UTM zone, a national grid, or a web friendly system such as EPSG:3857) before computing any planar distance or area feature.
+
+```python
+import geopandas as gpd
+gdf = gpd.read_file("points.geojson")      # EPSG:4326
+gdf_m = gdf.to_crs(epsg=32633)             # UTM zone 33N, meters
+gdf_m["area_m2"] = gdf_m.geometry.area     # now meaningful
+```
+
+A frequent and costly mistake is computing `.area` or `.length` on unprojected geometry. The result is expressed in square degrees, a quantity with no consistent physical meaning, and it will silently poison downstream features.
+
+## 2. Distance Metrics on the Sphere
+
+### 2.1 The Haversine Formula
+
+When data spans more than a single projection zone, or when reprojection is impractical, distances must be computed directly on the sphere. The great circle distance is the shortest path along the surface between two points. Given points $1$ and $2$ with latitudes $\phi_1, \phi_2$ and longitudes $\lambda_1, \lambda_2$ in radians, the haversine formula is
+
+$$
+a = \sin^2\!\left(\frac{\Delta\phi}{2}\right) + \cos\phi_1 \cos\phi_2 \sin^2\!\left(\frac{\Delta\lambda}{2}\right),
+$$
+
+$$
+d = 2 R \, \operatorname{arcsin}\!\left(\sqrt{a}\right),
+$$
+
+where $\Delta\phi = \phi_2 - \phi_1$, $\Delta\lambda = \lambda_2 - \lambda_1$, and $R \approx 6371$ km is the mean Earth radius. The haversine form is numerically preferred over the equivalent spherical law of cosines because it remains stable for small distances, where the law of cosines loses precision through catastrophic cancellation.
+
+```python
+import numpy as np
+
+def haversine(lat1, lon1, lat2, lon2, R=6371.0):
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlmb = np.radians(lon2 - lon1)
+    a = np.sin(dphi/2)**2 + np.cos(p1)*np.cos(p2)*np.sin(dlmb/2)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
+```
+
+The function is fully vectorized, so distances from one query point to a million candidates cost a single array expression.
+
+### 2.2 Choosing Among Distance Definitions
+
+Several distance notions coexist, and the correct choice depends on the application.
+
+The Euclidean distance on projected coordinates, $\sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$, is fast and exact within a projection zone, making it the default for local analysis.
+
+The haversine or great circle distance is appropriate for global or continental scale data where any single projection would introduce unacceptable error.
+
+The Vincenty and Karney geodesic distances account for the Earth's flattening on the WGS84 ellipsoid and reach millimeter accuracy. They cost more per evaluation and matter when surveying grade precision is required.
+
+For routing and accessibility problems, none of these straight line measures is the right feature. The relevant quantity is network distance or travel time along a road or transit graph, which can differ from straight line distance by a factor of two or more in dense urban environments. When the downstream task concerns human movement, a network distance feature derived from a routing engine usually dominates any geometric distance.
+
+### 2.3 Encoding Coordinates for Models
+
+Raw latitude and longitude are poor model inputs because they are cyclic at the date line and because their linear relationship to outcomes is rarely linear in coordinate space. Two encodings help. First, transform to a local planar frame so that the features carry metric meaning. Second, when global coverage forces the use of angular coordinates, project them onto a sphere in three dimensions,
+
+$$
+x = \cos\phi \cos\lambda, \quad y = \cos\phi \sin\lambda, \quad z = \sin\phi,
+$$
+
+which removes the date line discontinuity and gives tree based and distance based models a smooth, wraparound representation.
+
+## 3. Spatial Joins
+
+### 3.1 Predicates and Semantics
+
+A spatial join associates records from two layers based on a geometric relationship rather than a shared key. The relationship is expressed through a topological predicate. The most common predicates are `intersects`, `contains`, `within`, `touches`, and `crosses`, formalized by the Dimensionally Extended nine Intersection Model (DE-9IM). The canonical feature engineering use is point in polygon assignment: given a set of GPS pings and a set of administrative polygons, attach to each ping the neighborhood, census tract, or sales territory that contains it.
+
+```python
+joined = gpd.sjoin(points, polygons, predicate="within", how="left")
+```
+
+After this join each point inherits the attributes of its enclosing polygon, which become categorical or aggregate features such as district median income or zoning class.
+
+### 3.2 Spatial Indexing and Performance
+
+A naive spatial join compares every geometry in one layer against every geometry in the other, an $O(nm)$ operation that is infeasible at scale. Production systems avoid this with a spatial index, most often an R-tree, which organizes geometries by their bounding boxes into a balanced hierarchy. A query first retrieves candidate geometries whose bounding boxes overlap the query region, typically a small set, and only then performs the exact and expensive geometric test. This two phase filter and refine strategy reduces the effective cost to roughly $O((n+m)\log n)$ and is built into modern libraries automatically.
+
+### 3.3 Nearest Neighbor Joins
+
+When no containment relationship exists, the relevant join attaches to each record its nearest feature of another type, for example the closest hospital to each residence. A nearest neighbor join is supported directly by spatially indexed structures and yields both the matched attribute and the distance to it, the latter being a valuable feature in its own right.
+
+```python
+nearest = gpd.sjoin_nearest(homes, hospitals,
+                            how="left", distance_col="dist_to_hospital")
+```
+
+The returned distance column is often more predictive than the matched identity, because proximity to critical infrastructure frequently drives the outcome of interest.
+
+## 4. Geohashing and Spatial Discretization
+
+### 4.1 The Geohash Encoding
+
+A geohash encodes a latitude longitude pair as a short alphanumeric string by recursively bisecting the longitude and latitude ranges and interleaving the resulting bits, then base32 encoding them. Each added character refines the cell, so the string length controls precision. A one character geohash covers roughly $5000 \times 5000$ km, a five character geohash about $5 \times 5$ km, and an eight character geohash about $40 \times 20$ meters.
+
+| Precision (chars) | Approx. cell width | Approx. cell height |
+|-------------------|--------------------|---------------------|
+| 4                 | 39 km              | 20 km               |
+| 5                 | 5 km               | 5 km                |
+| 6                 | 1.2 km             | 0.6 km              |
+| 7                 | 153 m              | 153 m               |
+| 8                 | 38 m               | 19 m                |
+
+The key property is the prefix relationship: two locations that share a geohash prefix are spatially close, because a common prefix means they fall in the same coarse cell. This turns spatial proximity into string prefix matching, which databases and hash tables handle efficiently. Geohashes therefore serve as a lightweight categorical feature, a key for bucketing and aggregation, and a coarse spatial join surrogate.
+
+### 4.2 Limitations and Hierarchical Alternatives
+
+Geohashing has two well known weaknesses. First, because it is built on a rectangular subdivision of an angular coordinate space, cell dimensions vary with latitude and cells are not equal area. Second, the prefix property is asymmetric with respect to the edge problem: two points can be only meters apart yet straddle a cell boundary and share no prefix at all. Aggregating features by geohash cell can thus create artificial discontinuities exactly at boundaries.
+
+Modern systems often prefer hierarchical grids that mitigate these issues. Uber's H3 partitions the sphere into hexagons, which have uniform adjacency (every cell has six neighbors, avoiding the corner ambiguity of squares) and more consistent area. Google's S2 maps the sphere onto the six faces of a cube and uses a space filling Hilbert curve to preserve locality. Both expose multiple resolutions and integer cell identifiers, and both are now common substrates for proximity features.
+
+```python
+import h3
+cell = h3.latlng_to_cell(40.7128, -74.0060, res=9)   # ~170 m hexagon
+ring = h3.grid_disk(cell, k=1)                        # cell plus 6 neighbors
+```
+
+The neighbor ring is the natural building block for smoothing a feature over local space, which leads directly to density and proximity features.
+
+## 5. Proximity and Density Features
+
+### 5.1 Distance Based Features
+
+The simplest and frequently strongest geospatial features measure distance from each observation to one or more reference layers. Typical examples include distance to the nearest transit station, distance to the central business district, distance to the coast, and distance to the nearest competitor location. Because the effect of distance on most outcomes is nonlinear and saturating, a raw distance is often improved by a transform such as $\log(1 + d)$ or an exponential decay $e^{-d/\tau}$, where the length scale $\tau$ encodes how quickly influence falls off.
+
+### 5.2 Count and Density Within a Radius
+
+Beyond the single nearest feature, the local quantity of features carries signal. Define for each point $i$ the count of reference points within radius $r$,
+
+$$
+n_i(r) = \big|\{\, j : d(i, j) \le r \,\}\big|,
+$$
+
+which measures local intensity, for example the number of restaurants within 500 meters of a property. A distance weighted variant softens the hard cutoff,
+
+$$
+s_i = \sum_{j} w(d_{ij}), \qquad w(d) = e^{-d^2 / 2h^2},
+$$
+
+a Gaussian kernel with bandwidth $h$. This is kernel density estimation evaluated at the observation location, and it produces a smooth surface of local density that avoids the boundary artifacts of hard radius counts. Computing these features efficiently again relies on a spatial index or grid: a ball tree or KD-tree answers radius queries in logarithmic time per point rather than scanning all candidates.
+
+### 5.3 Aggregation Over Areal Units
+
+When reference data is naturally areal rather than point based, features are built by aggregating within a containing or neighboring region. After a point in polygon join, one can attach polygon level statistics such as population density, mean income, or land use mix. With hierarchical grids these aggregates extend gracefully to neighbor rings, so a feature might be the mean of some quantity over an H3 cell and its first ring, smoothing noise while preserving locality. The choice of aggregation scale is a modeling decision: too fine and the features are noisy and sparse, too coarse and they wash out genuine local variation. This sensitivity to the unit of aggregation is the modifiable areal unit problem, and it should be acknowledged whenever areal features drive a model.
+
+## 6. Spatial Autocorrelation
+
+### 6.1 Tobler's Law and Why It Matters
+
+The first law of geography, attributed to Waldo Tobler, states that everything is related to everything else, but near things are more related than distant things. Quantitatively, this is spatial autocorrelation: the tendency of values at nearby locations to be similar. House prices, disease rates, and pollution levels all exhibit it strongly. Spatial autocorrelation has two consequences for modeling. It is an opportunity, because a neighbor's value is a powerful predictor, and it is a hazard, because it violates the independence assumption behind most statistical learning and behind naive cross validation.
+
+### 6.2 Measuring Global Autocorrelation: Moran's I
+
+To measure autocorrelation we first encode neighborhood structure in a spatial weights matrix $W$ with entries $w_{ij}$ that are positive when locations $i$ and $j$ are neighbors and zero otherwise. Neighbors can be defined by contiguity (sharing a boundary), by a distance threshold, or by $k$ nearest neighbors. Given a variable $x$ with mean $\bar{x}$ over $n$ locations, the global Moran's I statistic is
+
+$$
+I = \frac{n}{\sum_{i}\sum_{j} w_{ij}} \cdot \frac{\sum_{i}\sum_{j} w_{ij}\,(x_i - \bar{x})(x_j - \bar{x})}{\sum_{i}(x_i - \bar{x})^2}.
+$$
+
+Its value lies near $1$ for strong positive autocorrelation (clustering of similar values), near $-1$ for negative autocorrelation (a checkerboard of dissimilar neighbors), and near the expected value $-1/(n-1)$, approximately zero, under spatial randomness. Significance is assessed by permutation: the observed $I$ is compared against a null distribution generated by randomly reshuffling values across locations.
+
+### 6.3 Local Indicators and Engineered Features
+
+Global Moran's I gives one number for an entire region, but autocorrelation often varies across space. Local Indicators of Spatial Association (LISA), such as local Moran's I, decompose the global statistic into a per location contribution, identifying hot spots (high values surrounded by high values), cold spots, and spatial outliers (a high value amid low neighbors). These local statistics are themselves excellent features, flagging each observation's relationship to its surroundings.
+
+The most direct way to exploit autocorrelation in a feature pipeline is the spatially lagged variable. For each location $i$, the spatial lag of $x$ is the weighted average of its neighbors,
+
+$$
+(Wx)_i = \sum_{j} w_{ij}\, x_j,
+$$
+
+using a row standardized weights matrix so that the lag is a proper average. Adding the spatial lag of the target or of a covariate as a feature injects neighborhood context that point level attributes cannot supply, and it is often among the most predictive features in spatial models.
+
+```python
+from libpysal.weights import KNN
+from esda.moran import Moran
+
+w = KNN.from_dataframe(gdf, k=8)
+w.transform = "r"                 # row standardize
+gdf["price_lag"] = w.sparse @ gdf["price"].values
+moran = Moran(gdf["price"].values, w)
+print(moran.I, moran.p_sim)
+```
+
+### 6.4 Autocorrelation and Honest Validation
+
+The same dependence that makes spatial lags predictive also breaks standard model evaluation. Random train test splits place neighboring, and therefore correlated, observations on both sides of the split, allowing the model to memorize local conditions and inflating reported accuracy. The remedy is spatial cross validation, in which folds are defined by spatial blocks or clusters so that the validation set is geographically separated from the training set. Reported performance under spatial blocking is a far more honest estimate of how the model will behave at genuinely new locations, and any geospatial feature engineering effort should pair its features with a spatially aware validation scheme.
+
+## 7. Practical Summary
+
+Effective geospatial feature engineering follows a consistent discipline. Store coordinates in a known datum and reproject to a local metric system before computing any planar distance or area. Use the haversine or geodesic distance when data crosses projection zones, and prefer network distance when the task concerns human movement. Encode location for models through metric or spherical transforms rather than raw degrees. Exploit spatial joins, accelerated by R-tree indexing, to attach contextual attributes, and use nearest neighbor joins to manufacture distance features. Discretize with geohash, H3, or S2 to enable bucketing and neighbor aggregation. Build proximity, count, and kernel density features at deliberately chosen scales, mindful of the modifiable areal unit problem. Finally, measure spatial autocorrelation with Moran's I and its local variants, harvest spatial lags as features, and validate with spatial blocking so that the model's reported skill reflects its true generalization across space.
+
+## References
+
+1. Snyder, J. P. "Map Projections: A Working Manual." U.S. Geological Survey Professional Paper 1395, 1987. https://pubs.usgs.gov/pp/1395/report.pdf
+2. EPSG Geodetic Parameter Dataset. https://epsg.org/
+3. Veness, C. "Calculate distance, bearing and more between Latitude/Longitude points." Movable Type Scripts. https://www.movable-type.co.uk/scripts/latlong.html
+4. Karney, C. F. F. "Algorithms for geodesics." Journal of Geodesy, 2013. https://doi.org/10.1007/s00190-012-0578-z
+5. GeoPandas Documentation: Spatial Joins. https://geopandas.org/en/stable/docs/user_guide/mergingdata.html
+6. Guttman, A. "R-trees: A Dynamic Index Structure for Spatial Searching." ACM SIGMOD, 1984. https://doi.org/10.1145/602259.602266
+7. Niemeyer, G. "Geohash." https://en.wikipedia.org/wiki/Geohash
+8. Uber Engineering. "H3: A Hexagonal Hierarchical Geospatial Indexing System." https://h3geo.org/
+9. Google S2 Geometry Library. https://s2geometry.io/
+10. Tobler, W. R. "A Computer Movie Simulating Urban Growth in the Detroit Region." Economic Geography, 1970. https://doi.org/10.2307/143141
+11. Moran, P. A. P. "Notes on Continuous Stochastic Phenomena." Biometrika, 1950. https://doi.org/10.2307/2332142
+12. Anselin, L. "Local Indicators of Spatial Association: LISA." Geographical Analysis, 1995. https://doi.org/10.1111/j.1538-4632.1995.tb00338.x
+13. Rey, S. J., and Anselin, L. "PySAL: A Python Library of Spatial Analytical Methods." https://pysal.org/
+14. Roberts, D. R., et al. "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure." Ecography, 2017. https://doi.org/10.1111/ecog.02881

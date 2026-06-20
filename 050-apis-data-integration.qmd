@@ -1,0 +1,213 @@
+# APIs and Data Integration
+
+Modern AI systems rarely live on a single tidy spreadsheet. The data that fuels a model arrives from a payments processor, a CRM, a clickstream service, a weather feed, and an internal database, each speaking its own dialect and enforcing its own rules. The discipline of pulling those sources together into one clean, trustworthy dataset is data integration, and the primary tool for the job is the Application Programming Interface, or API. This chapter treats APIs as a practical engineering concern. We cover the two dominant query styles, REST and GraphQL, then the cross cutting concerns that determine whether your pipeline survives contact with production: authentication, pagination, rate limits, retries, webhooks, and streaming. We close by assembling several sources into a single coherent table.
+
+## 1. Why APIs Matter for Data Work
+
+### 1.1 The integration problem
+
+A practitioner who wants to train a churn model needs subscription history, support tickets, product usage, and billing events. Each of these lives behind a different system owned by a different team or vendor. An API is a contract that lets one program request data or actions from another without knowing the internals. The contract specifies endpoints, accepted inputs, output shapes, and error conventions. When you respect the contract you get predictable data; when you ignore it you get silent corruption that surfaces three weeks later as a mysteriously skewed feature.
+
+### 1.2 The shape of an HTTP API
+
+Most data APIs you will meet ride on HTTP. A request carries a method (GET to read, POST to create, PUT or PATCH to update, DELETE to remove), a URL, headers, and an optional body. The response carries a status code, headers, and a body, usually JSON. The status code is the first thing you should inspect in code. Codes in the 200 range mean success, 400 range mean you made a mistake, and 500 range mean the server failed. Treating all non success responses identically is the most common beginner error and the source of the most painful data bugs.
+
+```
+GET /v2/customers?status=active HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <token>
+Accept: application/json
+```
+
+## 2. REST APIs
+
+### 2.1 Resources and conventions
+
+REST, short for Representational State Transfer, organizes an API around resources addressed by URL. A collection lives at `/customers` and a single item at `/customers/4821`. Sub resources nest: `/customers/4821/invoices` lists invoices for that customer. The HTTP method expresses intent, so the same URL behaves differently under GET versus DELETE. This convention is a convention, not a guarantee, and real world APIs deviate constantly, so always read the documentation rather than assuming.
+
+### 2.2 Working with a REST endpoint
+
+A typical read in Python uses the `requests` library. Note that the example checks the status before trusting the body, which you should treat as mandatory.
+
+```python
+resp = requests.get(
+    "https://api.example.com/v2/customers",
+    params={"status": "active", "limit": 100},
+    headers={"Authorization": f"Bearer {token}"},
+    timeout=30,
+)
+resp.raise_for_status()   # turn 4xx and 5xx into exceptions
+batch = resp.json()["data"]
+```
+
+Always set a timeout. A request without one can hang forever when a server stalls, freezing an entire pipeline behind a single dead connection.
+
+### 2.3 Strengths and weaknesses
+
+REST is simple, cacheable, and universally understood. Its weakness is shape mismatch. To assemble a customer view you may call `/customers/4821`, then `/customers/4821/invoices`, then `/customers/4821/tickets`, three round trips for one logical record. This is the N plus one problem, and it grows expensive across thousands of records. The opposite failure also appears: an endpoint returns fifty fields when you need three, wasting bandwidth and parsing time. These two frictions, under fetching and over fetching, are exactly what the next style was designed to solve.
+
+## 3. GraphQL APIs
+
+### 3.1 One endpoint, declared queries
+
+GraphQL exposes a single endpoint, usually `/graphql`, and lets the client declare the exact shape it wants. You send a query describing fields, and the server returns precisely those fields, nested as requested. The earlier three call customer view collapses into one request.
+
+```graphql
+query {
+  customer(id: "4821") {
+    name
+    invoices(last: 5) { amount status }
+    tickets(open: true) { subject createdAt }
+  }
+}
+```
+
+The response mirrors the query structure, so a deeply nested object arrives in a single round trip. This solves both under fetching and over fetching at once, which is why data heavy front ends and aggregation layers favor it.
+
+### 3.2 Costs and cautions
+
+The flexibility has a price. Caching is harder because every query can differ, so the simple URL based caching that REST enjoys does not apply. A careless client can also request an enormous nested structure that forces the server to do heavy work, so mature GraphQL servers impose query depth limits and cost analysis. From the data engineer's side, error handling is subtler: GraphQL often returns HTTP 200 even when part of the query failed, placing the failure inside an `errors` array in the body. You must inspect that array rather than trusting the status code alone.
+
+### 3.3 Choosing between REST and GraphQL
+
+There is no universal winner. Choose REST when the API is simple, caching matters, or the provider only offers REST. Choose GraphQL when you assemble complex nested records, when network round trips are costly, or when different consumers need different field subsets from the same graph. In practice you will consume both within a single project, so fluency in each is the realistic goal.
+
+## 4. Authentication
+
+### 4.1 API keys
+
+The simplest scheme is a static API key, a long secret string passed in a header. It identifies the caller but offers no fine grained scope and no expiry unless rotated manually. Keys are acceptable for server to server jobs where you control both ends, but they must never appear in client side code or version control. Store them in environment variables or a secrets manager and load them at runtime.
+
+```python
+api_key = os.environ["EXAMPLE_API_KEY"]   # never hard code this
+```
+
+### 4.2 OAuth 2.0 and bearer tokens
+
+For access to user owned data, OAuth 2.0 is the standard. The flow exchanges credentials for a short lived access token, which you then send as a bearer token in the `Authorization` header. Because access tokens expire, the server also issues a refresh token that buys a new access token without re prompting the user. A robust client detects a 401 Unauthorized response, refreshes the token, and retries the original request once. The client credentials grant is the variant you want for machine to machine pipelines with no human in the loop.
+
+### 4.3 Signed requests and good hygiene
+
+Some providers, notably cloud platforms, require each request to be cryptographically signed using a secret, so the secret itself never travels over the wire. Regardless of scheme, three rules hold everywhere. Keep secrets out of code and logs. Grant each credential the narrowest scope that works. Rotate credentials on a schedule and immediately after any suspected leak. A logged bearer token in a debugging dump is a breach waiting to be discovered.
+
+## 5. Pagination
+
+### 5.1 Why pagination exists
+
+No API returns a million rows in one response, so large collections are split into pages. Your code must loop until it has collected every page, and getting this loop wrong is a frequent cause of silently incomplete datasets. There are two dominant styles, and they fail in different ways.
+
+### 5.2 Offset pagination
+
+Offset pagination uses `?limit=100&offset=300` to request rows 301 through 400. It is easy to reason about and supports jumping to an arbitrary page. Its flaw is instability: if rows are inserted or deleted while you page, the window shifts and you can skip or duplicate records. It also degrades on large offsets because the database must count past every skipped row.
+
+### 5.3 Cursor pagination
+
+Cursor pagination returns an opaque token pointing at the last item seen, and you pass it back to fetch the next page. It is stable under concurrent writes and performant at any depth, which is why most modern APIs prefer it. The loop terminates when the response stops returning a next cursor.
+
+```python
+cursor, rows = None, []
+while True:
+    page = get_page(cursor=cursor)        # one HTTP call
+    rows.extend(page["data"])
+    cursor = page.get("next_cursor")
+    if not cursor:
+        break
+```
+
+Whichever style you use, set a sane page size, handle the empty final page, and never assume the first page is the whole dataset.
+
+## 6. Rate Limits and Retries
+
+### 6.1 Understanding rate limits
+
+Providers cap how many requests you may send per unit of time to protect their infrastructure and to enforce fairness across customers. Exceed the cap and you receive HTTP 429 Too Many Requests. Well behaved APIs publish your remaining budget in response headers such as `X-RateLimit-Remaining` and tell you when the window resets. They frequently include a `Retry-After` header naming the seconds to wait. Reading these headers proactively lets you slow down before you are blocked rather than after.
+
+### 6.2 Retrying transient failures
+
+Not every failure is permanent. A 429, a 503 Service Unavailable, or a dropped connection is transient and worth retrying. A 400 Bad Request or a 404 Not Found is permanent and retrying it only wastes effort. Your retry logic must distinguish the two and retry only the transient class.
+
+### 6.3 Exponential backoff with jitter
+
+Retrying immediately and in lockstep makes congestion worse, because every client retries at the same instant and creates a thundering herd. The remedy is exponential backoff: wait one second, then two, then four, doubling each time up to a ceiling. Add random jitter so that many clients do not synchronize. Always honor an explicit `Retry-After` header over your own computed delay.
+
+```python
+for attempt in range(6):
+    resp = call_api()
+    if resp.status_code not in (429, 500, 502, 503):
+        break
+    wait = min(2 ** attempt, 60) + random.uniform(0, 1)
+    time.sleep(wait)   # back off, then retry
+```
+
+Cap the number of attempts so a genuinely broken endpoint fails fast instead of looping forever, and surface the final failure loudly so it is not mistaken for an empty result.
+
+## 7. Webhooks
+
+### 7.1 Push instead of pull
+
+Everything so far has been pull based: you ask, the server answers. Webhooks invert this. Instead of polling an API every minute to ask whether anything changed, you register a URL and the provider sends an HTTP POST to that URL the moment an event occurs, such as a payment settling or an order shipping. This eliminates wasteful polling and delivers data with near real time freshness.
+
+### 7.2 Receiving webhooks safely
+
+A webhook endpoint is a public URL on the open internet, so you must verify that an incoming request genuinely came from the expected provider. Providers sign each payload with a shared secret, placing a signature in a header. Your handler recomputes the signature over the raw body and rejects the request if it does not match. Skipping this check lets anyone forge events into your pipeline.
+
+Two more rules keep webhook handling reliable. Respond quickly, ideally under a few seconds, by acknowledging receipt and processing the payload asynchronously on a queue, because slow handlers cause the provider to time out and retry. Design for idempotency, because providers deliver at least once and will occasionally send the same event twice. Deduplicate on the event identifier so a repeated delivery does not double count a transaction.
+
+### 7.3 Webhooks and polling together
+
+Webhooks can be missed during an outage on your side, so they are best paired with a periodic reconciliation pull that backfills anything dropped. The webhook gives you speed; the scheduled pull gives you completeness. Relying on either alone leaves a gap.
+
+## 8. Streaming Data
+
+### 8.1 When batch is not enough
+
+Some sources never stop producing: market ticks, sensor readings, log lines, social feeds. Fetching these in discrete pages is awkward, so streaming protocols keep a connection open and deliver records as they arrive. The two lightweight HTTP options are Server Sent Events, a one way text stream from server to client, and long lived chunked responses. For higher volume and bidirectional needs, teams reach for WebSockets or a dedicated log broker such as Apache Kafka.
+
+### 8.2 Consuming a stream
+
+A streaming consumer reads records in a loop that may run for hours or days, so resilience matters more than in a batch job. The connection will drop; your code must reconnect and resume, ideally from the last acknowledged position so no records are lost or replayed. Server Sent Events support this directly through a last event identifier that the client sends on reconnect.
+
+```python
+with requests.get(url, stream=True, timeout=None) as r:
+    for line in r.iter_lines():
+        if line:
+            event = json.loads(line)
+            process(event)   # handle one record at a time
+```
+
+### 8.3 Backpressure and buffering
+
+A fast producer can overwhelm a slow consumer. If you read events faster than you can process them, an unbounded in memory buffer will exhaust your memory and crash the process. The solution is backpressure: bound the buffer, and either slow consumption or spill to a durable queue when it fills. Treating a stream as if it were an infinitely patient list is a reliable way to take down a service.
+
+## 9. Integrating Multiple Sources into a Clean Dataset
+
+### 9.1 Extract, then normalize
+
+With the mechanics in hand, the goal is one analysis ready table built from many feeds. The pattern is extract, transform, load. First extract each source into raw form and persist it unchanged, so you can replay transformations without re hitting the API. Then normalize: convert every timestamp to UTC, standardize currencies, unify enumerations so that `active`, `ACTIVE`, and `1` become one value, and flatten nested JSON into columns. Schema drift, where a provider quietly renames or removes a field, is a constant threat, so validate the incoming schema and fail loudly when it changes.
+
+### 9.2 Joining on stable keys
+
+Sources rarely share a clean key. The CRM identifies a customer by email, billing by an internal numeric identifier, and the product database by a UUID. Integration requires a mapping that resolves these to one canonical entity. Where no shared key exists you fall back to entity resolution, matching on combinations of fields such as normalized email plus name. Decide explicitly how to handle records that match in one source but are absent in another, because an inner join silently drops them while an outer join preserves them with nulls. That choice changes your dataset and must be deliberate.
+
+### 9.3 Quality, lineage, and reproducibility
+
+A clean dataset is not merely joined; it is trustworthy. Run validation checks for uniqueness of keys, acceptable value ranges, and non null required fields, and quarantine rows that fail rather than letting them poison downstream features. Record lineage so every column traces back to its source, fetch time, and transformation, which is indispensable when a number looks wrong. Make the pipeline reproducible by versioning both the code and the extracted raw snapshots, so a result from last month can be regenerated exactly. Idempotent loads, where rerunning the pipeline produces the same table rather than duplicating rows, round out a pipeline you can trust and operate without fear.
+
+### 9.4 A reference pipeline
+
+Putting the pieces together, a dependable integration job authenticates with scoped short lived credentials, paginates each REST or GraphQL source with cursors, retries transient failures with jittered backoff while honoring rate limit headers, receives webhooks for low latency events and reconciles them against a scheduled pull, ingests any true streams with bounded buffers, and finally normalizes, joins, validates, and loads the result idempotently with full lineage. None of these steps is exotic on its own. Reliability comes from applying all of them consistently, because the weakest link, a missing timeout or an unverified webhook, is where real pipelines break.
+
+## References
+
+1. MDN Web Docs, "HTTP request methods." https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods
+2. MDN Web Docs, "HTTP response status codes." https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
+3. Fielding, R. T., "Architectural Styles and the Design of Network based Software Architectures" (REST dissertation). https://www.ics.uci.edu/~fielding/pubs/dissertation/top.htm
+4. GraphQL Foundation, "Introduction to GraphQL." https://graphql.org/learn/
+5. IETF, "The OAuth 2.0 Authorization Framework" (RFC 6749). https://datatracker.ietf.org/doc/html/rfc6749
+6. IETF, "Additional HTTP Status Codes" (RFC 6585, defines 429). https://datatracker.ietf.org/doc/html/rfc6585
+7. Google Cloud, "Implementing exponential backoff." https://cloud.google.com/storage/docs/retry-strategy
+8. Stripe, "Webhooks documentation." https://docs.stripe.com/webhooks
+9. MDN Web Docs, "Using server sent events." https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+10. Apache Kafka, "Introduction." https://kafka.apache.org/intro
+11. Python Software Foundation and Requests project, "Requests: HTTP for Humans." https://requests.readthedocs.io/
+12. Kleppmann, M., "Designing Data Intensive Applications." https://dataintensive.net/

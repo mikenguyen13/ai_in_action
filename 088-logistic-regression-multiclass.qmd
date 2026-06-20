@@ -1,0 +1,191 @@
+# Multiclass Logistic Regression
+
+Binary logistic regression is one of the workhorses of applied statistics and machine learning, but most real classification problems involve more than two outcomes. A document belongs to one of dozens of topics, an image depicts one of a thousand object categories, a patient is assigned one of several diagnostic codes. This chapter develops the theory and practice of extending logistic regression to the multiclass setting. We treat the two dominant reduction strategies, one-vs-rest and one-vs-one, then build the native multinomial model through the softmax link, and finally confront the question that practitioners too often ignore: whether the probabilities a multiclass model emits can be trusted as probabilities at all.
+
+## 1. From Binary to Multiclass
+
+### 1.1 The Problem Setup
+
+Let the response variable $Y$ take values in a finite label set $\{1, 2, \ldots, K\}$ with $K \geq 3$. Given a feature vector $x \in \mathbb{R}^d$, our goal is to estimate the conditional class probabilities $p_k(x) = \Pr(Y = k \mid X = x)$ for each $k$, subject to the simplex constraints $p_k(x) \geq 0$ and $\sum_{k=1}^{K} p_k(x) = 1$. A classifier then typically predicts $\hat{y}(x) = \arg\max_k p_k(x)$, though the full probability vector is far more useful than the single label, as we will see when we discuss calibration.
+
+Binary logistic regression models the log odds of the positive class as a linear function of the features:
+
+$$
+\log \frac{\Pr(Y = 1 \mid x)}{\Pr(Y = 0 \mid x)} = \beta_0 + \beta^\top x.
+$$
+
+The challenge is that "odds" is inherently a two-outcome notion. With $K$ classes there are many possible odds to model, and the central design decision in multiclass logistic regression is which ratios to parameterize and how to keep the resulting probabilities coherent.
+
+### 1.2 Two Philosophies
+
+Two broad approaches exist. The first keeps the binary machinery intact and decomposes the multiclass problem into a collection of binary problems, combining their outputs afterward. One-vs-rest and one-vs-one belong to this family. The second approach generalizes the probabilistic model itself, fitting a single objective that jointly respects the simplex constraint. This is multinomial logistic regression, also called softmax regression. The reduction approaches are simple, modular, and work with any binary learner. The native approach is statistically cleaner and produces coherent probabilities by construction, at the cost of a coupled optimization. We treat each in turn.
+
+## 2. One-vs-Rest
+
+### 2.1 Construction
+
+One-vs-rest, also known as one-vs-all, trains $K$ independent binary classifiers. The $k$-th classifier $f_k$ learns to separate class $k$ (treated as the positive class) from the union of all other classes (treated as negative). Each classifier is an ordinary binary logistic regression:
+
+$$
+\sigma_k(x) = \frac{1}{1 + \exp\big(-(\beta_{0k} + \beta_k^\top x)\big)},
+$$
+
+where $\sigma_k(x)$ estimates $\Pr(Y = k \mid Y \in \{k, \text{not } k\})$. At prediction time we evaluate all $K$ scores and select the class whose classifier is most confident:
+
+$$
+\hat{y}(x) = \arg\max_{k} \, \sigma_k(x).
+$$
+
+```python
+# conceptual one-vs-rest
+for k in range(K):
+    y_k = (y == k).astype(int)      # relabel: class k vs all others
+    models[k] = fit_binary_logit(X, y_k)
+
+scores = [models[k].predict_proba(x) for k in range(K)]
+yhat = argmax(scores)
+```
+
+### 2.2 Strengths and Failure Modes
+
+One-vs-rest is attractive because it requires only $K$ fits, scales linearly in the number of classes, and reuses any well-tuned binary pipeline. It is the historical default in many libraries.
+
+Its weaknesses are instructive. First, the $K$ classifiers are trained on different relabelings and optimized independently, so their output scores are not on a common scale. The raw sigmoids $\sigma_k$ do not sum to one, and the comparison $\arg\max_k \sigma_k$ implicitly assumes calibration across classifiers that nothing in the training enforces. A common remedy is to normalize, $p_k = \sigma_k / \sum_j \sigma_j$, but this is a heuristic with no probabilistic justification. Second, each binary problem is class imbalanced: with $K$ balanced classes, the positive class in each subproblem holds only a fraction $1/K$ of the data, which worsens as $K$ grows. Third, regions of feature space can fall into ambiguous territory where multiple classifiers claim the point or none does, leaving the $\arg\max$ to break ties on poorly calibrated margins.
+
+## 3. One-vs-One
+
+### 3.1 Construction
+
+One-vs-one trains a separate binary classifier for every unordered pair of classes, giving $\binom{K}{2} = K(K-1)/2$ models. The classifier $f_{ij}$ is trained using only the examples whose true label is $i$ or $j$, learning to distinguish those two classes and ignoring all others. Prediction proceeds by voting: each pairwise classifier casts a vote for one of its two classes, and the class with the most votes wins.
+
+$$
+\hat{y}(x) = \arg\max_{k} \sum_{j \neq k} \mathbb{1}\big[f_{kj}(x) \text{ votes for } k\big].
+$$
+
+### 3.2 Trade-offs and Probability Coupling
+
+The number of classifiers grows quadratically in $K$, which sounds worse than one-vs-rest, but each model trains on a much smaller slice of data containing only two classes, so per-model training is fast and, crucially, free of the severe imbalance that plagues one-vs-rest. For learners whose training cost is superlinear in the sample size, the total work of one-vs-one can actually be lower than one-vs-rest despite the larger model count. One-vs-one is the default strategy for support vector machines for exactly this reason.
+
+The main drawbacks are the quadratic memory footprint at large $K$ and the crudeness of plain voting, which discards the confidence of each pairwise decision and can produce ties. To recover full probability estimates from pairwise outputs, the Wu, Lin, and Weng coupling method solves a small optimization that finds class probabilities $p_k$ best consistent with the pairwise estimates $r_{ij} \approx p_i / (p_i + p_j)$. This is the technique used internally by libraries such as scikit-learn when probability outputs are requested from a one-vs-one model.
+
+## 4. Multinomial Logistic Regression
+
+### 4.1 The Softmax Link
+
+Rather than reducing to binary problems, multinomial logistic regression directly models the full conditional distribution over classes. Each class $k$ receives its own weight vector $\beta_k \in \mathbb{R}^d$ and intercept $\beta_{0k}$, producing a linear score (a logit) $z_k = \beta_{0k} + \beta_k^\top x$. These scores are mapped to a probability distribution by the softmax function:
+
+$$
+p_k(x) = \frac{\exp(z_k)}{\sum_{j=1}^{K} \exp(z_j)} = \frac{\exp(\beta_{0k} + \beta_k^\top x)}{\sum_{j=1}^{K} \exp(\beta_{0j} + \beta_j^\top x)}.
+$$
+
+By construction the outputs are nonnegative and sum to one, so they live on the probability simplex without any post hoc normalization. The softmax is the natural multiclass generalization of the sigmoid: when $K = 2$, the softmax reduces algebraically to the binary logistic model.
+
+### 4.2 Identifiability and the Reference Category
+
+The softmax parameterization is overcomplete. Adding any constant vector $c$ to every $z_k$ leaves the probabilities unchanged, because the shift cancels between numerator and denominator. This means the parameters are identified only up to a common offset per example. Two standard fixes exist. The classical statistics convention pins one class as a reference, say class $K$, by setting $\beta_K = 0$ and $\beta_{0K} = 0$, so the remaining coefficients describe log odds relative to that baseline:
+
+$$
+\log \frac{p_k(x)}{p_K(x)} = \beta_{0k} + \beta_k^\top x.
+$$
+
+This is the form reported by statistical software and is the cleanest for interpretation: each coefficient is a log odds ratio against the reference category. The machine learning convention keeps all $K$ weight vectors but adds $L_2$ regularization, which breaks the symmetry by selecting the minimum norm solution and is numerically convenient. Both describe the same model.
+
+### 4.3 Maximum Likelihood and the Cross-Entropy Loss
+
+Given training data $\{(x_i, y_i)\}_{i=1}^n$, we encode each label as a one-hot vector $y_i \in \{0,1\}^K$ with $y_{ik} = 1$ if example $i$ belongs to class $k$. The conditional log likelihood is
+
+$$
+\ell(\beta) = \sum_{i=1}^{n} \sum_{k=1}^{K} y_{ik} \log p_k(x_i).
+$$
+
+Maximizing this is equivalent to minimizing the average cross-entropy (also called the multiclass log loss), the standard training objective for softmax classifiers including the final layer of neural networks. The negative log likelihood is convex in $\beta$, so there are no spurious local minima and any gradient based optimizer converges to the global solution.
+
+The gradient has a famously clean form. For class $k$,
+
+$$
+\frac{\partial \ell}{\partial \beta_k} = \sum_{i=1}^{n} \big(y_{ik} - p_k(x_i)\big)\, x_i.
+$$
+
+The update is driven by the residual between the observed one-hot label and the predicted probability, exactly mirroring the binary case. This residual structure is why softmax regression trains so robustly: at the optimum the predicted class proportions match the empirical proportions along every feature direction.
+
+```python
+# conceptual softmax regression objective
+Z = X @ W + b                 # (n, K) logits
+P = softmax(Z, axis=1)        # row-wise softmax
+loss = -mean(sum(Y_onehot * log(P), axis=1))   # cross-entropy
+grad_W = X.T @ (P - Y_onehot) / n              # clean residual gradient
+```
+
+In practice the logits are shifted by subtracting their per-row maximum before exponentiating, a numerically stable softmax that prevents overflow without changing the result, exploiting precisely the shift invariance noted in Section 4.2.
+
+### 4.4 Regularization
+
+As in the binary case, an unregularized fit can diverge when classes are linearly separable, because pushing a coefficient to infinity drives the loss arbitrarily low. A penalty restores finite, well behaved estimates. The regularized objective adds a norm term:
+
+$$
+\min_{\beta} \; -\ell(\beta) + \lambda \sum_{k=1}^{K} \lVert \beta_k \rVert_2^2 .
+$$
+
+The $L_2$ penalty shrinks coefficients toward zero and resolves both the separability and identifiability issues at once. An $L_1$ penalty instead induces sparsity, useful when only a few features are expected to matter per class. The strength $\lambda$ is chosen by cross-validation on a held-out criterion such as log loss rather than accuracy, since calibration depends on it.
+
+### 4.5 When to Prefer the Native Model
+
+Multinomial logistic regression is generally the better default when probability estimates matter, because it produces coherent, mutually exclusive probabilities from a single convex objective and yields directly interpretable log odds ratios. The reduction methods retain an edge when the base learner is not naturally multiclass, when classes can be added incrementally without refitting everything, or when the per-problem modularity simplifies engineering. For ordinary logistic regression there is rarely a reason to prefer one-vs-rest over the native multinomial fit on statistical grounds.
+
+## 5. Calibration of Multiclass Probabilities
+
+### 5.1 What Calibration Means
+
+A classifier is calibrated if its stated probabilities match observed frequencies. If we collect all predictions where the model assigns probability $0.8$ to the predicted class, roughly $80\%$ of those predictions should be correct. Formally, for a calibrated model, $\Pr\big(Y = k \mid p_k(X) = q\big) = q$ for all $k$ and $q$. Accuracy and calibration are distinct: a model can be accurate yet badly miscalibrated, systematically overconfident or underconfident, which corrupts any downstream decision that weighs probabilities against costs.
+
+Maximum likelihood multinomial regression tends to be reasonably calibrated in-sample because the cross-entropy objective is a proper scoring rule, meaning it is minimized exactly when the predicted distribution equals the true conditional distribution. Heavy regularization, model misspecification, class imbalance, or distribution shift can still break this, and one-vs-rest with naive normalization is calibrated essentially by accident.
+
+### 5.2 Measuring Multiclass Calibration
+
+The most common diagnostic is the reliability diagram together with the Expected Calibration Error (ECE). Predictions are sorted by their confidence (the probability of the predicted class) and grouped into $M$ bins. Within each bin we compare the average confidence to the empirical accuracy. The ECE is the weighted average gap:
+
+$$
+\text{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{n} \,\big| \operatorname{acc}(B_m) - \operatorname{conf}(B_m) \big|,
+$$
+
+where $B_m$ is the set of examples in bin $m$, $\operatorname{acc}(B_m)$ is the fraction correct, and $\operatorname{conf}(B_m)$ is the mean predicted confidence. The multiclass log loss and the Brier score, $\frac{1}{n}\sum_i \lVert p(x_i) - y_i \rVert_2^2$, are proper scores that capture calibration and sharpness jointly and are preferable for model selection because, unlike ECE, they cannot be gamed by trivial predictors.
+
+### 5.3 Post Hoc Recalibration
+
+When a fitted model is miscalibrated, the standard remedy is to learn a calibration map on a held-out set, leaving the original model untouched. The dominant method for softmax models is temperature scaling: divide all logits by a single scalar $T > 0$ before the softmax,
+
+$$
+p_k(x) = \frac{\exp(z_k / T)}{\sum_{j} \exp(z_j / T)},
+$$
+
+and fit $T$ by minimizing the log loss on validation data. A temperature $T > 1$ softens overconfident distributions toward the uniform, while $T < 1$ sharpens them. Because $T$ is a single parameter and the transformation is monotone in each logit, temperature scaling does not change the predicted class or the accuracy; it only rescales confidence. This single-parameter simplicity makes it the default for calibrating deep networks, which are notoriously overconfident.
+
+More flexible alternatives exist. Vector and matrix scaling generalize temperature scaling with per-class parameters or a full linear map on the logits, trading parsimony for expressiveness and risking overfitting on small calibration sets. Dirichlet calibration fits a distribution over the simplex. For reduction methods, one calibrates each binary classifier first, for example with Platt scaling or isotonic regression, and then couples the results. Across methods the discipline is the same: tune the calibrator on data disjoint from both training and final evaluation, and report a proper score before and after.
+
+```python
+# conceptual temperature scaling on a validation split
+def nll(T):
+    return cross_entropy(softmax(val_logits / T), val_labels)
+
+T_star = minimize(nll, init=1.0, bounds=(0.05, 20.0))   # one scalar
+calibrated = softmax(test_logits / T_star)               # class unchanged
+```
+
+### 5.4 Practical Guidance
+
+Three habits separate trustworthy multiclass probabilities from dangerous ones. First, hold out a dedicated calibration split distinct from the test set, because measuring and fixing calibration on the same data you report on is circular. Second, select models and regularization strengths on a proper score such as log loss rather than on accuracy alone, since accuracy is blind to overconfidence. Third, inspect reliability diagrams per class and not just in aggregate, because a model can be well calibrated on average while being wildly off on a rare but important class. When decisions depend on the magnitude of a probability and not merely the top label, recalibration is not optional polish but a required step.
+
+## 6. Summary
+
+We began with the difficulty that the binary odds notion does not generalize uniquely to many classes, and we examined three resolutions. One-vs-rest and one-vs-one reduce the problem to binary subproblems, offering modularity and compatibility with any binary learner at the cost of incoherent or vote-based outputs that require coupling to become true probabilities. Multinomial logistic regression generalizes the model itself through the softmax link, optimizing a single convex cross-entropy objective whose gradient is the familiar label minus prediction residual, and producing coherent simplex probabilities with interpretable log odds against a reference category. Finally we stressed that probabilities are only as useful as they are calibrated, introduced the reliability diagram and Expected Calibration Error as diagnostics, proper scores for selection, and temperature scaling as the workhorse recalibration tool. The throughline is that a multiclass classifier should be judged not only by whether it picks the right label but by whether the numbers it attaches to that choice can be believed.
+
+## References
+
+1. Bishop, C. M. (2006). *Pattern Recognition and Machine Learning*. Springer. https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+2. Hastie, T., Tibshirani, R., and Friedman, J. (2009). *The Elements of Statistical Learning*, 2nd ed. Springer. https://hastie.su.domains/ElemStatLearn/
+3. Wu, T. F., Lin, C. J., and Weng, R. C. (2004). Probability Estimates for Multi-class Classification by Pairwise Coupling. *Journal of Machine Learning Research*, 5, 975-1005. https://www.jmlr.org/papers/v5/wu04a.html
+4. Guo, C., Pleiss, G., Sun, Y., and Weinberger, K. Q. (2017). On Calibration of Modern Neural Networks. *Proceedings of the 34th International Conference on Machine Learning (ICML)*. https://arxiv.org/abs/1706.04599
+5. Niculescu-Mizil, A., and Caruana, R. (2005). Predicting Good Probabilities with Supervised Learning. *Proceedings of the 22nd International Conference on Machine Learning (ICML)*. https://www.cs.cornell.edu/~alexn/papers/calibration.icml05.crc.rev3.pdf
+6. Kull, M., Perello-Nieto, M., Kangsepp, M., Silva Filho, T., Song, H., and Flach, P. (2019). Beyond Temperature Scaling: Obtaining Well-calibrated Multi-class Probabilities with Dirichlet Calibration. *Advances in Neural Information Processing Systems (NeurIPS)*. https://arxiv.org/abs/1910.12656
+7. Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. *Journal of Machine Learning Research*, 12, 2825-2830. https://scikit-learn.org/stable/modules/multiclass.html
+8. Murphy, K. P. (2022). *Probabilistic Machine Learning: An Introduction*. MIT Press. https://probml.github.io/pml-book/book1.html

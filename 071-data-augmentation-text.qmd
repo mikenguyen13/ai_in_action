@@ -1,0 +1,151 @@
+# Text Data Augmentation
+
+Text data augmentation is the practice of synthetically expanding a labeled corpus by generating new training examples from existing ones. Unlike image augmentation, where a rotation or a brightness shift leaves the label untouched, language is discrete, compositional, and meaning-bearing at the token level. Swapping a single word can invert a sentiment label, negate a factual claim, or render a sentence ungrammatical. This tension between generating useful variety and preserving the original label runs through every technique in this chapter. We survey the major families of methods, from cheap surface edits to language-model-driven rewrites, and treat the risk of meaning drift as a first-class engineering concern rather than an afterthought.
+
+## 1. Why Augment Text?
+
+### 1.1 The data scarcity problem
+
+Supervised learning in natural language processing is bottlenecked by labeled data. Annotation is expensive, slow, and often requires domain experts for tasks such as clinical note classification or legal document tagging. When a practitioner has only a few hundred labeled examples per class, a high-capacity model will memorize the training set and generalize poorly. Augmentation offers a way to inject additional variation without paying for new annotations, effectively trading compute and engineering effort for label cost.
+
+The benefit is largest in the low-resource regime. Empirically, augmentation methods that add a clear gain when training on 500 examples frequently add little or nothing once the labeled set reaches tens of thousands of examples, because a large corpus already covers the lexical and syntactic variation that augmentation tries to manufacture. A useful mental model is that augmentation is a prior. It encodes the assumption that certain transformations should not change the label, and priors matter most when data is thin.
+
+### 1.2 Augmentation as a regularizer
+
+Beyond raw volume, augmentation acts as a regularizer that smooths the model's decision boundary. By exposing the model to many surface forms that map to the same label, we discourage it from latching onto spurious lexical cues. If every positive movie review in the training set happens to contain the word "brilliant," a model may treat that token as a shortcut. Replacing it with "superb," "excellent," or "remarkable" across augmented copies forces the model to rely on broader evidence. This is closely related to consistency training, where the model is penalized for producing different predictions on an example and its augmented variant.
+
+### 1.3 The invariance assumption
+
+Every augmentation technique implicitly asserts an invariance: the claim that a transformation preserves the property the model is meant to predict. For topic classification, swapping two adjacent words rarely changes the topic, so the invariance holds. For sentiment analysis, deleting the word "not" destroys it. For natural language inference, almost any lexical change can flip the entailment relationship. The practitioner's central job is to match the strength of a transformation to the sensitivity of the task. The rest of this chapter can be read as a catalogue of transformations ordered by how aggressively they intervene, paired with guidance on when each invariance is safe to assume.
+
+## 2. Synonym Replacement
+
+### 2.1 The basic recipe
+
+Synonym replacement substitutes words in a sentence with words of similar meaning. The classic implementation draws synonyms from a lexical database such as WordNet, which groups words into synsets, or sets of cognitive synonyms. The procedure selects a small number of eligible words, usually excluding stop words, looks up candidate synonyms, and replaces each chosen word with a randomly selected member of its synset.
+
+```text
+Original:  The film was absolutely fantastic and moving.
+Augmented: The film was absolutely marvelous and poignant.
+```
+
+### 2.2 Why synonyms are not really synonyms
+
+The word "synonym" hides a great deal of complexity. WordNet synsets are sense-specific, but a raw lookup ignores word sense disambiguation. The word "bank" belongs to synsets for both a financial institution and a river edge, and a naive replacement can swap "river bank" for "river trust company." Polysemy is the single largest source of nonsense in lexical augmentation. Even within the correct sense, synonyms differ in register, connotation, and collocational fit. "Slim" and "skinny" share a denotation but carry different sentiment, which matters precisely for sentiment tasks.
+
+### 2.3 Embedding-based replacement
+
+A more flexible alternative replaces a word with one of its nearest neighbors in a pretrained embedding space such as word2vec, GloVe, or fastText. This captures distributional similarity and can surface domain-specific substitutions that WordNet lacks. The danger is that embedding neighbors include antonyms and topically related but non-substitutable words. In many embedding spaces "good" and "bad" sit close together because they appear in similar contexts, which makes naive nearest-neighbor replacement actively harmful for sentiment classification. Filtering candidates by part-of-speech agreement and by a similarity threshold reduces but does not eliminate the problem.
+
+## 3. Easy Data Augmentation (EDA)
+
+### 3.1 The four operations
+
+Easy Data Augmentation, introduced by Wei and Zou in 2019, bundles four cheap operations into a single recipe that requires no external model. For each sentence the method applies some mixture of the following.
+
+1. Synonym Replacement (SR): randomly choose n non-stop words and replace each with a WordNet synonym.
+2. Random Insertion (RI): find a synonym of a random word and insert it at a random position; repeat n times.
+3. Random Swap (RS): pick two words at random and swap their positions; repeat n times.
+4. Random Deletion (RD): remove each word independently with probability p.
+
+```text
+Original: a sleek and surprisingly fast electric car
+SR:       a sleek and surprisingly quick electric car
+RI:       a sleek rapid and surprisingly fast electric car
+RS:       a sleek and electric fast surprisingly car
+RD:       a sleek and fast car
+```
+
+### 3.2 What each operation assumes
+
+The four operations span a range of invariance assumptions. Random swap and random deletion produce locally ungrammatical text, which is tolerable for bag-of-words and convolutional models that are somewhat order-insensitive, but more damaging for models that depend on syntax. Random deletion is the riskiest of the four for meaning preservation, because deleting a negation, a quantifier, or the head noun can change the label outright. Random insertion tends to be the safest, since it adds a topically related word without removing information, though it can dilute a short sentence.
+
+### 3.3 Hyperparameters and dosage
+
+EDA exposes two main knobs: alpha, which controls the fraction of words changed per sentence, and n_aug, the number of augmented sentences generated per original. The original study found that a small alpha around 0.05 to 0.1 works well, and that gains saturate quickly as n_aug grows, with four augmentations per sentence being a reasonable default for small datasets. Critically, the paper reported that benefits concentrate on small training sets and largely vanish when the full dataset is used. The lesson generalizes beyond EDA: augmentation dosage should scale inversely with how much real data you already have.
+
+### 3.4 When EDA helps and when it hurts
+
+EDA is attractive because it is fast, dependency-light, and model-agnostic. It is most appropriate for topic and intent classification on short texts where word order and fine lexical choice carry little of the signal. It is a poor fit for tasks where syntax or precise wording is the signal, including natural language inference, question answering, sequence labeling such as named entity recognition, and any task with span-level labels, because shuffling and deleting tokens corrupt the alignment between tokens and labels.
+
+## 4. Back-Translation
+
+### 4.1 The core idea
+
+Back-translation generates a paraphrase by translating a sentence into a pivot language and then translating it back to the source language. The round trip through a different linguistic system tends to preserve meaning while changing surface form, producing fluent and grammatical variants that surface edits cannot match.
+
+```text
+English:  The customer was extremely satisfied with the prompt service.
+French:   Le client etait extremement satisfait du service rapide.
+Back:     The client was extremely satisfied with the fast service.
+```
+
+### 4.2 Why it produces good paraphrases
+
+Back-translation works because translation is a meaning-preserving map by design, and modern neural machine translation systems are fluent enough that the output reads naturally. The transformation operates at the sentence level rather than the word level, so it can restructure clauses, change voice, and substitute idiomatic phrasings in ways that respect grammar. This makes back-translation one of the few augmentation methods appropriate for tasks that require well-formed input, and it was a key ingredient in the Unsupervised Data Augmentation (UDA) framework, which used it to drive consistency training on unlabeled data.
+
+### 4.3 Controlling diversity
+
+The diversity of back-translated output can be tuned. Decoding with greedy or beam search yields conservative, near-deterministic paraphrases, while sampling with a temperature or restricting to top-k or nucleus sampling produces more varied output at the cost of higher noise. The choice of pivot language also matters. A linguistically distant pivot, or a chain through several pivots, increases divergence from the original but raises the risk of meaning drift and translation artifacts. Practitioners often hold out semantic similarity as a filter, discarding back-translations whose embedding similarity to the source falls below a threshold.
+
+### 4.4 Costs and failure modes
+
+Back-translation is computationally heavier than EDA because it requires two passes through translation models. Its failure modes are subtler than those of surface edits. Named entities, numbers, and units can be mistranslated or dropped, which is dangerous for information extraction. Negation and quantifier scope can shift across the round trip. Low-resource source or pivot languages produce lower-quality translations and more artifacts. As with synonym methods, the safest deployments pair generation with an automated meaning-preservation check.
+
+## 5. Contextual Augmentation with Language Models
+
+### 5.1 Masked language model substitution
+
+Contextual augmentation replaces words using a language model that conditions on the surrounding sentence, rather than a context-free lexical resource. The canonical approach masks selected tokens and asks a masked language model such as BERT to predict replacements. Because the model sees the full context, its candidates fit grammatically and respect local semantics far better than WordNet or static embeddings.
+
+```text
+Original: The lecture was [MASK] and hard to follow.
+BERT top candidates: long, dense, confusing, technical, dull
+```
+
+### 5.2 The label-conditioning problem
+
+Plain masked-model substitution has a well-known flaw for classification: the language model has no knowledge of the label, so it may propose a fluent replacement that flips the class. Masking "boring" in a negative review and letting BERT fill the blank can produce "fascinating," yielding a positive sentence still tagged negative. Kobayashi addressed this in 2018 with label-conditional augmentation, fine-tuning the language model to condition on the class label so that its substitutions stay consistent with the intended label. CBERT extended the idea by feeding the label into BERT's segment embeddings. The general principle is that any generative augmenter for a supervised task should be made label-aware, either by conditioning or by post-hoc filtering.
+
+### 5.3 Generative and instruction-tuned models
+
+Large autoregressive and instruction-tuned models extend contextual augmentation from word substitution to full-sentence generation. LAMBADA, for example, fine-tunes a generative model on the labeled data and then samples new class-conditioned examples, filtering them with a classifier trained on the original data. With current instruction-following models the same effect is achievable through prompting: ask the model to rephrase an example while preserving its meaning and label, or to generate fresh examples for a given class and style. This is powerful for very small datasets but introduces new risks. The generator can hallucinate facts, drift toward its own stylistic priors, leak the distribution of its pretraining data, and produce examples that are too easy because they echo patterns the downstream model would learn anyway.
+
+### 5.4 Filtering generated data
+
+Because generative augmentation can produce off-label or low-quality text, a filtering stage is essential. A common pattern trains a classifier on the original labeled data and keeps only generated examples that the classifier scores confidently and consistently with their intended label. Round-trip consistency, semantic-similarity thresholds against a source example, and simple deduplication against the training set all help. The combination of a strong generator and an aggressive filter typically outperforms either an unfiltered generator or a weak one, because filtering converts the generator's recall into the pipeline's precision.
+
+## 6. The Risk of Changing Meaning
+
+### 6.1 Label-preserving versus label-altering transformations
+
+The unifying risk across every method in this chapter is that an augmentation intended to preserve the label silently alters it, injecting label noise. A transformation is only valid to the extent that the invariance it assumes actually holds for the task. The danger ranks roughly by how much semantic content a transformation can touch. Random deletion and antonym-prone embedding replacement are the most dangerous, generative free-form generation is dangerous without filtering, back-translation is moderately safe, and conservative label-conditioned substitution is the safest. No method is universally safe, because safety is a property of the task, not the technique.
+
+### 6.2 Tasks especially sensitive to meaning drift
+
+Some tasks tolerate almost no perturbation. Negation detection and sentiment analysis hinge on individual function words. Natural language inference depends on the precise logical relationship between premise and hypothesis, which nearly any lexical edit can disturb. Sequence labeling tasks such as named entity recognition and part-of-speech tagging carry labels on individual tokens, so insertion, deletion, and swapping break the token-to-label alignment unless the labels are transformed in lockstep. For these tasks, aggressive augmentation can degrade performance below the no-augmentation baseline, and conservative or task-specific methods are mandatory.
+
+### 6.3 Guardrails and validation
+
+Several guardrails reduce meaning drift in practice. First, constrain the transformation: protect negations, numbers, named entities, and other high-salience tokens from deletion and replacement. Second, filter after generation using a semantic-similarity check, a label-consistency classifier, or round-trip agreement, discarding examples that fail. Third, treat augmentation strength as a hyperparameter and tune it on a clean validation set rather than assuming more augmentation is better. Fourth, never augment the validation or test sets, since doing so corrupts your estimate of real-world performance.
+
+### 6.4 A decision framework
+
+A workable selection heuristic follows from the sensitivity of the task and the amount of available data. For order-insensitive topic or intent classification with little data, EDA offers the best effort-to-reward ratio. For tasks needing grammatical, meaning-preserving variety, back-translation is the strong default. For very small datasets where maximal diversity is worth the engineering cost, label-conditioned contextual augmentation or filtered generative augmentation is appropriate. For meaning-sensitive tasks such as natural language inference or sequence labeling, prefer conservative, label-aware methods and validate aggressively, or forgo augmentation in favor of collecting more real data. In all cases, measure the gain against a no-augmentation baseline on held-out data, because augmentation that fails to help is augmentation that is quietly hurting.
+
+### 6.5 Summary
+
+Text augmentation is a lever for the low-data regime, and its value comes from encoding a correct invariance. The methods form a spectrum from cheap surface edits through translation-based paraphrasing to model-driven rewriting, trading rising cost and fluency against the persistent danger of changing the very meaning the label depends on. The disciplined practitioner picks the lightest transformation that still adds useful variety, guards the tokens that carry the label, filters what the generator produces, and confirms the benefit empirically. Augmentation rewards skepticism: assume a transformation might be flipping labels until the validation numbers prove otherwise.
+
+## References
+
+1. Wei, J., and Zou, K. (2019). EDA: Easy Data Augmentation Techniques for Boosting Performance on Text Classification Tasks. https://arxiv.org/abs/1901.11196
+2. Kobayashi, S. (2018). Contextual Augmentation: Data Augmentation by Words with Paradigmatic Relations. https://arxiv.org/abs/1805.06201
+3. Wu, X., Lv, S., Zang, L., Han, J., and Hu, S. (2019). Conditional BERT Contextual Augmentation (CBERT). https://arxiv.org/abs/1812.06705
+4. Xie, Q., Dai, Z., Hovy, E., Luong, M., and Le, Q. (2020). Unsupervised Data Augmentation for Consistency Training. https://arxiv.org/abs/1904.12848
+5. Sennrich, R., Haddow, B., and Birch, A. (2016). Improving Neural Machine Translation Models with Monolingual Data (back-translation). https://arxiv.org/abs/1511.06709
+6. Anaby-Tavor, A., Carmeli, B., Goldbraich, E., et al. (2020). Do Not Have Enough Data? Deep Learning to the Rescue! (LAMBADA). https://arxiv.org/abs/1911.03118
+7. Feng, S. Y., Gangal, V., Wei, J., et al. (2021). A Survey of Data Augmentation Approaches for NLP. https://arxiv.org/abs/2105.03075
+8. Miller, G. A. (1995). WordNet: A Lexical Database for English. https://wordnet.princeton.edu/
+9. Bojanowski, P., Grave, E., Joulin, A., and Mikolov, T. (2017). Enriching Word Vectors with Subword Information (fastText). https://arxiv.org/abs/1607.04606
+10. Devlin, J., Chang, M., Lee, K., and Toutanova, K. (2019). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. https://arxiv.org/abs/1810.04805

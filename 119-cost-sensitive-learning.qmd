@@ -1,0 +1,166 @@
+# Cost-Sensitive Learning
+
+Most introductory treatments of classification assume that every mistake carries the same penalty. A false positive and a false negative are tallied together as a single error, and the learner is asked to minimize their count. This assumption is convenient and almost always wrong. Approving a fraudulent transaction does not cost the same as declining a legitimate one. Missing a malignant tumor is not interchangeable with ordering an unnecessary follow-up scan. Cost-sensitive learning is the body of theory and practice that takes these asymmetries seriously, replacing the goal of minimizing error count with the goal of minimizing expected cost. This chapter develops the cost matrix, derives the Bayes-optimal decision rule that follows from it, and surveys the methods that turn that rule into trained models. We close with worked considerations from fraud detection and clinical medicine, two domains where the cost of being wrong is measured in dollars and in lives.
+
+## 1. From Error Rates to Expected Cost
+
+### 1.1 The cost matrix
+
+Consider a classification problem with classes indexed by $i, j \in \{1, \dots, K\}$. The fundamental object of cost-sensitive learning is the cost matrix $C$, whose entry $C(i, j)$ specifies the cost incurred when an instance whose true class is $j$ is predicted to be class $i$. By convention the rows index the predicted label and the columns index the true label. For a binary problem with a positive class (say, fraud or disease) and a negative class, the matrix has four entries:
+
+$$
+C = \begin{pmatrix} C(0,0) & C(0,1) \\ C(1,0) & C(1,1) \end{pmatrix} = \begin{pmatrix} C_{TN} & C_{FN} \\ C_{FP} & C_{TP} \end{pmatrix}.
+$$
+
+Here $C_{FN} = C(0,1)$ is the cost of a false negative (predicting negative when the truth is positive), and $C_{FP} = C(1,0)$ is the cost of a false positive. Correct decisions usually carry small or zero cost, so $C_{TP}$ and $C_{TN}$ are often set to zero, though nothing in the theory requires this. In medicine a correct positive may still carry the cost of treatment, and in fraud a correct decline still annoys a misclassified-but-legitimate customer if the threshold is borderline.
+
+A cost matrix is called reasonable when the cost of a correct classification never exceeds the cost of an error for the same true class. If labeling a true positive correctly cost more than labeling it as a negative, no rational learner would ever predict the positive class. The condition $C(i,j) > C(j,j)$ for $i \neq j$ keeps the problem well posed.
+
+### 1.2 Conditional risk
+
+Suppose a probabilistic classifier supplies, for an input $x$, the posterior class probabilities $P(j \mid x)$. The expected cost of predicting label $i$ for that input, known as the conditional risk, is
+
+$$
+R(i \mid x) = \sum_{j=1}^{K} C(i, j)\, P(j \mid x).
+$$
+
+The Bayes-optimal decision is the label that minimizes this conditional risk:
+
+$$
+h^{*}(x) = \arg\min_{i} R(i \mid x) = \arg\min_{i} \sum_{j} C(i,j)\, P(j \mid x).
+$$
+
+When the cost matrix is the zero-one matrix, $C(i,j) = 1 - \mathbb{1}[i = j]$, this rule collapses to predicting the most probable class, recovering the familiar maximum-a-posteriori classifier. The power of the framework is that any asymmetry in $C$ tilts the decision boundary away from the probability-maximizing choice in a precisely quantified way.
+
+## 2. The Bayes-Optimal Threshold
+
+### 2.1 Deriving the threshold for binary problems
+
+For two classes the decision reduces to comparing two conditional risks. Write $p = P(1 \mid x)$ for the posterior probability of the positive class, so $P(0 \mid x) = 1 - p$. We predict positive when $R(1 \mid x) \le R(0 \mid x)$, that is when
+
+$$
+C_{TP}\, p + C_{FP}\,(1 - p) \;\le\; C_{FN}\, p + C_{TN}\,(1 - p).
+$$
+
+Rearranging to isolate $p$ yields the optimal threshold $p^{*}$ above which we should predict positive:
+
+$$
+p^{*} = \frac{C_{FP} - C_{TN}}{(C_{FP} - C_{TN}) + (C_{FN} - C_{TP})}.
+$$
+
+With the common simplification $C_{TP} = C_{TN} = 0$, this becomes the compact and memorable form
+
+$$
+p^{*} = \frac{C_{FP}}{C_{FP} + C_{FN}}.
+$$
+
+The interpretation is direct. If a false negative is nine times as costly as a false positive, then $p^{*} = 1 / (1 + 9) = 0.1$, and we should flag the positive class whenever its probability exceeds ten percent rather than fifty percent. Raising the cost of misses pushes the threshold down and makes the classifier more aggressive about predicting the expensive class.
+
+### 2.2 Why threshold moving requires calibration
+
+The threshold formula assumes that $p$ is a genuine probability. Many models output scores that rank instances correctly but are not calibrated, meaning the predicted $0.1$ does not correspond to a true positive rate of ten percent among instances scored at that level. Applying the Bayes threshold to uncalibrated scores produces decisions that are optimal in name only. Before threshold moving, scores should be calibrated, for example with Platt scaling, which fits a logistic transform to the scores, or isotonic regression, which fits a monotone step function. Tree ensembles and support vector machines are notorious for miscalibration, so this step is rarely optional in practice.
+
+```python
+# Conceptual: calibrate, then apply the cost-based threshold.
+calibrated = calibrate(model, validation_X, validation_y)  # Platt or isotonic
+p = calibrated.predict_proba(X)[:, 1]
+threshold = c_fp / (c_fp + c_fn)
+y_hat = (p >= threshold).astype(int)
+```
+
+### 2.3 Threshold moving versus retraining
+
+Threshold moving is attractive because it leaves the trained model untouched and adjusts only the final decision. It is provably optimal when the model produces correct posterior probabilities, and it lets a single model serve multiple cost regimes by swapping thresholds. Its limitation is that a model trained to minimize log loss on an imbalanced dataset may spend almost none of its capacity learning the minority region, so even a perfectly placed threshold operates on a poorly resolved probability surface. When that happens, the cost structure must enter training itself, which motivates the methods of the next section.
+
+## 3. Cost-Sensitive Training
+
+### 3.1 Rescaling and instance weighting
+
+The most widely used training-time technique is to weight each instance by the cost of misclassifying it. If positives cost $C_{FN}$ to miss and negatives cost $C_{FP}$ to falsely flag, we assign weight $C_{FN}$ to positive examples and $C_{FP}$ to negative examples, then minimize the weighted empirical risk
+
+$$
+\hat{R}(h) = \frac{1}{n} \sum_{k=1}^{n} w_k\, \ell\big(h(x_k), y_k\big), \qquad w_k = C(\,\cdot\,  y_k).
+$$
+
+This is the rescaling principle: a cost-sensitive problem with a given cost matrix is equivalent to a cost-insensitive problem on a dataset where each class is resampled or reweighted in proportion to its misclassification cost. Most modern libraries expose this directly through a `class_weight` parameter or per-sample weights, and gradient-based learners simply scale each example's gradient contribution by $w_k$.
+
+```python
+# Class-weighted training mirrors the cost ratio.
+weights = {0: c_fp, 1: c_fn}
+model.fit(X, y, class_weight=weights)
+```
+
+Resampling achieves a similar effect by oversampling the expensive class or undersampling the cheap one until the empirical class ratio matches the cost ratio. Resampling changes the data the model sees, whereas weighting changes the loss while keeping the data fixed; the two are theoretically interchangeable for losses that are linear in the per-instance term, but they differ in variance and in their interaction with stochastic optimization.
+
+### 3.2 Cost-sensitive loss functions
+
+A cleaner approach folds the cost matrix into the loss function so that the model optimizes expected cost end to end. For binary classification a weighted cross-entropy
+
+$$
+\ell(p, y) = -\,C_{FN}\, y \log p \;-\; C_{FP}\,(1 - y) \log(1 - p)
+$$
+
+penalizes errors on positives and negatives asymmetrically. In deep learning, the focal loss extends this idea by adding a modulating factor $(1 - p_t)^{\gamma}$ that down-weights easy, well-classified examples and concentrates learning on the hard minority cases, which is why it became standard for dense object detection where background examples vastly outnumber objects.
+
+When the full cost matrix varies per instance, as when each fraudulent transaction has a different dollar amount, the loss can carry example-specific costs rather than per-class constants. This example-dependent cost-sensitive learning is strictly more expressive than class weighting and matters whenever the cost of an error depends on the instance, not merely on its class.
+
+### 3.3 Cost-sensitive trees and ensembles
+
+Decision tree learners can be made cost sensitive at the splitting criterion, choosing splits that reduce expected cost rather than impurity, and at the leaf, labeling each leaf with the cost-minimizing class given the leaf's class distribution and the cost matrix. Boosting admits an elegant cost-sensitive variant: AdaCost and related algorithms modify the weight-update rule of AdaBoost so that misclassifying a high-cost example increases its weight more sharply, steering successive weak learners toward the expensive mistakes.
+
+## 4. Metalearning and Wrapper Methods
+
+### 4.1 MetaCost
+
+A central insight of cost-sensitive learning is that one can make an arbitrary error-based classifier cost sensitive without modifying its internals. MetaCost, introduced by Domingos, wraps any classifier in a procedure that relabels the training data according to the Bayes-optimal rule and then retrains on the relabeled data. The algorithm proceeds as follows. It learns an ensemble of classifiers on bootstrap resamples of the training set, uses the ensemble to estimate $P(j \mid x)$ for every training instance, then relabels each instance with the class that minimizes conditional risk $\sum_j C(i,j) P(j \mid x)$. A final model is trained on this relabeled set. The relabeling pushes class boundaries outward around expensive classes, so even a plain error-minimizing learner, trained on the new labels, behaves cost sensitively.
+
+```python
+# MetaCost skeleton.
+ensemble = [base.fit(resample(X, y)) for _ in range(m)]
+P = average_proba(ensemble, X)          # estimate posteriors
+relabel = argmin_over_i(C @ P.T)        # Bayes-optimal label per instance
+final_model = base.fit(X, relabel)      # retrain on relabeled data
+```
+
+### 4.2 Empirical thresholding and the empirical-cost view
+
+When calibration is doubtful, a robust alternative to the analytic threshold is empirical thresholding: sweep the decision threshold over a validation set and select the value that minimizes measured total cost. This sidesteps the calibration requirement because it optimizes the realized cost directly rather than trusting the probability values. The cost over a validation set of size $n$ is
+
+$$
+\text{Cost} = C_{FP}\cdot\text{FP} + C_{FN}\cdot\text{FN} + C_{TP}\cdot\text{TP} + C_{TN}\cdot\text{TN},
+$$
+
+and the chosen threshold is the one that minimizes this quantity. Empirical thresholding is the workhorse of production systems precisely because it is agnostic to how well the underlying scores are calibrated.
+
+### 4.3 Choosing a strategy
+
+These strategies form a rough hierarchy. If a model is well calibrated and costs are known, threshold moving is the simplest correct choice. If calibration is suspect, empirical thresholding recovers robustness at the price of a validation sweep. If the minority region is poorly resolved, training-time weighting or resampling improves the underlying probabilities. If costs vary per instance, example-dependent losses are required. And if the base learner cannot be modified, MetaCost provides a wrapper that achieves cost sensitivity through relabeling. In practice these are combined: weight during training to resolve the boundary, then tune the threshold empirically to lock in the operating point.
+
+## 5. Applications
+
+### 5.1 Fraud detection
+
+Card fraud is the canonical example-dependent cost problem. The cost of a missed fraud is roughly the transaction amount the issuer must reimburse, so $C_{FN}$ is not a constant but a per-instance value equal to the disputed sum. The cost of a false positive is subtler: a wrongly declined transaction costs the small operational expense of a fraud alert plus the much larger and harder to quantify cost of customer friction and attrition. Because legitimate transactions outnumber fraudulent ones by a factor of hundreds or thousands, accuracy is a useless metric; a model that approves everything achieves over ninety-nine percent accuracy while reimbursing every fraud loss.
+
+The practical pipeline calibrates the fraud score, then sets a per-transaction threshold using the transaction amount as $C_{FN}$, so that a five thousand dollar transaction is flagged at a far lower probability than a five dollar one. Because fraud distributions drift as adversaries adapt, both the model and the threshold are re-estimated frequently, and the operating point is chosen by minimizing realized monetary cost on recent labeled data rather than by any fixed probability cutoff.
+
+### 5.2 Medical diagnosis and screening
+
+Clinical classification is dominated by the asymmetry between false negatives and false positives. Missing a malignancy can be fatal, while a false positive typically triggers an additional test, with cost measured in money, radiation exposure, biopsy risk, and patient anxiety. The ratio $C_{FN} / C_{FP}$ in screening can easily reach ten or higher, which by the threshold formula pushes the positive-prediction threshold well below one half and makes screening tools deliberately oversensitive. This is a feature, not a defect: screening is designed to catch disease at the expense of follow-up workload, with a downstream confirmatory test absorbing the false positives.
+
+Three cautions apply. First, costs are rarely scalar and rarely agreed upon; the cost of a false negative depends on disease stage and treatability, and different stakeholders, namely patients, clinicians, and payers, weight outcomes differently. Second, costs are often dynamic, since a missed early-stage cancer becomes far more expensive as it advances, which argues for example-dependent rather than class-constant costs. Third, eliciting credible cost values is itself a research problem, frequently approached by reasoning backward from a clinically acceptable sensitivity to the implied cost ratio. The cost-sensitive framework does not invent these numbers, but it makes the consequences of any chosen numbers explicit and auditable.
+
+## 6. Evaluation Under Asymmetric Costs
+
+Accuracy is meaningless when costs are asymmetric and classes are imbalanced, so cost-sensitive systems are evaluated with metrics aligned to the decision. Total cost on a held-out set, computed with the operative cost matrix, is the most direct measure and should be reported whenever costs are known. When a single threshold is not yet fixed, ranking metrics such as the area under the precision-recall curve summarize performance across operating points and are far more informative than the area under the ROC curve in the heavily imbalanced regime, because precision responds to the prevalence of the minority class while the false positive rate does not. The decisive habit is to evaluate models on the cost they incur, not the errors they count, since two models with identical error rates can differ enormously in expected cost once the asymmetry is taken into account.
+
+## References
+
+1. Elkan, C. (2001). The Foundations of Cost-Sensitive Learning. Proceedings of IJCAI 2001. https://cseweb.ucsd.edu/~elkan/rescale.pdf
+2. Domingos, P. (1999). MetaCost: A General Method for Making Classifiers Cost-Sensitive. Proceedings of KDD 1999. https://homes.cs.washington.edu/~pedrod/papers/kdd99.pdf
+3. Lin, T.-Y., Goyal, P., Girshick, R., He, K., Dollar, P. (2017). Focal Loss for Dense Object Detection. Proceedings of ICCV 2017. https://arxiv.org/abs/1708.02002
+4. Fan, W., Stolfo, S., Zhang, J., Chan, P. (1999). AdaCost: Misclassification Cost-Sensitive Boosting. Proceedings of ICML 1999. https://www.cs.columbia.edu/~sal/hpapers/adacost.pdf
+5. Bahnsen, A. C., Aouada, D., Ottersten, B. (2015). Example-Dependent Cost-Sensitive Decision Trees. Expert Systems with Applications. https://albahnsen.github.io/files/Example-Dependent%20Cost-Sensitive%20Decision%20Trees.pdf
+6. Provost, F., Fawcett, T. (2001). Robust Classification for Imprecise Environments. Machine Learning, 42. https://link.springer.com/article/10.1023/A:1007601015854
+7. Niculescu-Mizil, A., Caruana, R. (2005). Predicting Good Probabilities with Supervised Learning. Proceedings of ICML 2005. https://www.cs.cornell.edu/~alexn/papers/calibration.icml05.crc.rev3.pdf
+8. He, H., Garcia, E. A. (2009). Learning from Imbalanced Data. IEEE Transactions on Knowledge and Data Engineering, 21(9). https://ieeexplore.ieee.org/document/5128907

@@ -1,0 +1,204 @@
+# Feature Engineering for Text
+
+Text is the most abundant and least structured data modality in modern machine learning. A document is a sequence of characters with no fixed length, no inherent numeric meaning, and no obvious alignment between examples. Before any statistical learner can operate on text, that sequence must be transformed into a finite vector of features. This transformation is the subject of feature engineering for text, and despite the dominance of large neural language models, the classical pipeline remains indispensable. It is fast, interpretable, cheap to deploy, and frequently competitive on the tasks that actually fill production backlogs.
+
+This chapter develops the classical text feature pipeline from first principles: tokenization, bag of words, n-grams, term weighting with TF-IDF, and the hashing trick for scale. It then builds a bridge to distributed representations, word and sentence embeddings, and closes with a sober account of when sparse classical features still outperform dense neural ones.
+
+## 1. From Characters to Tokens
+
+### 1.1 The tokenization problem
+
+A learner cannot consume raw bytes meaningfully, so the first step is to segment a string into discrete units called tokens. Tokenization sounds trivial in English, where whitespace approximates word boundaries, but it is full of decisions that materially affect downstream accuracy. Consider the string `"Don't email me at jane.doe@acme.co!"`. Should `Don't` be one token, two (`Do` and `n't`), or three? Is `jane.doe@acme.co` a single semantic unit or five fragments? Each choice changes the feature space.
+
+A simple regular expression tokenizer captures most word like spans:
+
+```python
+import re
+def tokenize(text):
+    return re.findall(r"[A-Za-z0-9']+", text.lower())
+```
+
+This lowercases, splits on non alphanumeric characters, and keeps apostrophes. It is crude but reproducible, and reproducibility matters more than linguistic elegance because the same function must run at training and inference time.
+
+### 1.2 Normalization choices
+
+Beyond segmentation, several normalization steps shrink the vocabulary and improve generalization. Lowercasing collapses `The` and `the`. Stemming reduces inflected forms to a root, so `running`, `runs`, and `ran` may all map toward `run` using a rule based algorithm such as the Porter stemmer. Lemmatization does the same but uses a dictionary and part of speech information to produce valid words, mapping `better` to `good`. Accent folding and Unicode normalization (NFKC) unify visually identical characters.
+
+Each normalization trades precision for recall in the feature space. Aggressive stemming can merge `university` and `universe`, destroying a useful distinction. The right level of normalization is empirical and task dependent, and it should be tuned with cross validation rather than assumed.
+
+### 1.3 Stop words and pruning
+
+Function words such as `the`, `of`, and `is` occur in nearly every document and carry little discriminative signal for many tasks. Removing a stop word list reduces dimensionality and noise. However, stop word removal is not universally beneficial. For sentiment, the word `not` is decisive, and for authorship attribution function word frequencies are among the strongest signals. Modern practice often retains stop words and lets the weighting scheme downweight them, which is more robust than a hard list.
+
+A related lever is frequency pruning. Tokens appearing in fewer than `min_df` documents are likely typos or noise, and tokens in more than `max_df` fraction of documents behave like stop words. Pruning both tails keeps the vocabulary compact and the model well conditioned.
+
+## 2. The Bag of Words Model
+
+### 2.1 Vector space representation
+
+The bag of words (BoW) model represents a document as the multiset of its tokens, discarding order entirely. Given a vocabulary $V = \{w_1, \dots, w_{|V|}\}$ extracted from the training corpus, a document $d$ becomes a vector $\mathbf{x}_d \in \mathbb{R}^{|V|}$ whose $j$th entry is the count of term $w_j$ in $d$:
+
+$$
+x_{d,j} = \text{tf}(w_j, d) = \sum_{t \in d} \mathbb{1}[t = w_j].
+$$
+
+Stacking all document vectors row wise yields the document term matrix $X \in \mathbb{R}^{n \times |V|}$. This matrix is the central object of classical text mining. It is extremely sparse, since any single document uses a tiny fraction of the global vocabulary, so it is stored in compressed sparse row format and the model never materializes the zeros.
+
+### 2.2 Why discarding order can work
+
+Throwing away word order seems reckless, yet BoW is a strong baseline for topic level tasks such as spam detection, document categorization, and many sentiment problems. The reason is that for these tasks the presence of certain words is nearly sufficient: an email containing `viagra`, `wire transfer`, and `urgent` is probably spam regardless of arrangement. The signal lives in the marginal token statistics, which BoW captures exactly. Tasks that hinge on syntax or compositional meaning, such as `the food was good but the service was not`, are where BoW begins to fail, and the next section partially repairs this.
+
+### 2.3 Geometry and similarity
+
+Once documents are vectors, similarity becomes geometry. The dominant measure is cosine similarity, which compares orientation rather than magnitude and so is robust to document length:
+
+$$
+\cos(\mathbf{x}, \mathbf{y}) = \frac{\mathbf{x} \cdot \mathbf{y}}{\lVert \mathbf{x} \rVert \, \lVert \mathbf{y} \rVert}.
+$$
+
+Cosine similarity on BoW or TF-IDF vectors underlies classical search ranking, nearest neighbor classification, and clustering. Its interpretability, every nonzero dimension corresponds to a literal word, is a property that dense embeddings sacrifice.
+
+## 3. N-grams and Local Order
+
+### 3.1 Capturing short phrases
+
+A bigram is an ordered pair of adjacent tokens, a trigram an ordered triple, and in general an n-gram is a contiguous window of $n$ tokens. By adding n-grams to the vocabulary, the BoW model recovers a limited but valuable amount of word order. The phrase `not good` becomes a single feature distinct from `good`, allowing a linear model to assign it negative weight. For the sentence `New York is not Los Angeles`, the bigrams `new york` and `los angeles` capture multiword entities that unigrams shatter.
+
+### 3.2 The dimensionality cost
+
+N-grams are powerful but expensive. If the unigram vocabulary has size $|V|$, the space of possible bigrams is $|V|^2$, and trigrams $|V|^3$. In practice most n-grams never occur, so the realized count grows roughly linearly with corpus size rather than combinatorially, but the feature matrix still explodes from tens of thousands of columns to millions. This drives memory pressure and overfitting risk, and it is the primary motivation for the hashing trick in Section 5.
+
+A common compromise is to include unigrams and bigrams (`ngram_range=(1,2)`) with aggressive `min_df` pruning, which captures the highest value local order while keeping the vocabulary manageable.
+
+### 3.3 Character n-grams
+
+N-grams need not be over words. Character n-grams, contiguous spans of characters, are remarkably robust. The word `engineering` yields character 4-grams `engi`, `ngin`, `gine`, and so on. Because they share substrings, character n-grams handle misspellings, morphological variation, and out of vocabulary words gracefully, and they require no language specific tokenizer. They are the workhorse of language identification, authorship attribution, and noisy social media text, and they are the conceptual ancestor of subword tokenization in neural models.
+
+## 4. Term Weighting with TF-IDF
+
+### 4.1 The intuition
+
+Raw counts overweight common words. A term appearing in every document discriminates nothing, while a rare term that appears in only a handful of documents is highly informative when it does. TF-IDF (term frequency times inverse document frequency) formalizes this by scaling each count by how surprising the term is across the corpus.
+
+### 4.2 The formulas
+
+The term frequency component measures local importance. A common variant uses sublinear scaling to dampen the effect of repetition:
+
+$$
+\text{tf}(t, d) = 1 + \log\big(\text{count}(t, d)\big) \quad \text{for } \text{count}(t,d) > 0.
+$$
+
+The inverse document frequency component measures global rarity. Let $n$ be the number of documents and $\text{df}(t)$ the number containing term $t$. A standard smoothed form is
+
+$$
+\text{idf}(t) = \log\frac{1 + n}{1 + \text{df}(t)} + 1.
+$$
+
+The TF-IDF weight is the product, and the resulting document vector is usually L2 normalized so that document length does not dominate:
+
+$$
+\text{tfidf}(t, d) = \text{tf}(t, d) \cdot \text{idf}(t), \qquad \hat{\mathbf{x}}_d = \frac{\mathbf{x}_d}{\lVert \mathbf{x}_d \rVert_2}.
+$$
+
+The smoothing constants prevent division by zero and bound the IDF of terms absent from training. The logarithm in IDF reflects a diminishing returns view of rarity, consistent with an information theoretic reading where $\text{idf}(t)$ approximates the self information of observing term $t$ in a randomly drawn document.
+
+### 4.3 Why it remains a strong baseline
+
+TF-IDF weighted vectors fed to a linear classifier such as logistic regression or a linear support vector machine form one of the most reliable baselines in applied natural language processing. The weighting is parameter free, the model is convex and trains in seconds on millions of documents, and the learned coefficients are directly inspectable. Before reaching for a transformer, a practitioner should establish this baseline, because surprisingly often it is within a point or two of far more expensive models, and it is the number every fancier method must beat.
+
+```python
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+vec = TfidfVectorizer(ngram_range=(1,2), min_df=5, sublinear_tf=True)
+X = vec.fit_transform(train_texts)
+clf = LogisticRegression(max_iter=1000).fit(X, train_labels)
+```
+
+## 5. The Hashing Trick
+
+### 5.1 Vocabularies do not scale
+
+The vectorizers above must build and store an explicit mapping from each term to a column index. For a streaming corpus or a vocabulary in the tens of millions, this dictionary becomes a memory and engineering bottleneck. It must be learned in a first pass, held in RAM, serialized, and kept consistent between training and serving. The hashing trick eliminates the dictionary entirely.
+
+### 5.2 Mechanism
+
+Feature hashing maps each token directly to a column index by applying a hash function $h$ and reducing modulo a fixed dimension $m$:
+
+$$
+j = h(t) \bmod m.
+$$
+
+The token's contribution is added to column $j$. To keep the expected inner product unbiased under collisions, a second hash $\xi(t) \in \{-1, +1\}$ supplies a sign, so the hashed feature is
+
+$$
+\phi_j(d) = \sum_{t \in d \,:\, h(t) \bmod m = j} \xi(t)\,\text{count}(t, d).
+$$
+
+The signed hashing yields an unbiased estimate of the original dot product, and the variance introduced by collisions is small when $m$ is chosen generously, for example $2^{20}$ or $2^{22}$.
+
+### 5.3 Trade-offs
+
+The hashing trick is stateless, single pass, fixed memory, and trivially parallel, which makes it ideal for online learning and very large scale pipelines. The cost is interpretability: two distinct terms can collide into the same column, and there is no inverse map from a column back to a word, so feature inspection and debugging become harder. IDF weighting is also awkward because document frequencies are not tracked, though approximate schemes exist. In practice the hashing trick is chosen when scale and statelessness dominate and interpretability is expendable.
+
+## 6. Bridge to Embeddings
+
+### 6.1 The fundamental limitation of sparse features
+
+Every representation so far treats words as atomic and orthogonal. In the BoW space the vectors for `physician` and `doctor` are exactly as dissimilar as `physician` and `banana`, because each word is its own dimension with no shared structure. This is the curse of one hot encoding: there is no notion of semantic proximity, and a model that has learned about `doctor` transfers nothing to `physician`. Synonymy, polysemy, and graded similarity are all invisible.
+
+### 6.2 Distributional semantics
+
+The escape route is the distributional hypothesis: words that occur in similar contexts tend to have similar meanings. If we represent a word by the statistics of the contexts it appears in, then `physician` and `doctor`, which keep similar company, end up with similar representations. Word embeddings operationalize this by mapping each word to a dense, low dimensional vector $\mathbf{v}_w \in \mathbb{R}^k$ with $k$ typically between 50 and 300, learned so that the geometry of the space reflects co occurrence statistics.
+
+Methods such as word2vec learn these vectors by training a shallow network to predict a word from its context (or vice versa), while GloVe factorizes a global co occurrence matrix. The famous result is that the resulting space supports analogical arithmetic, where
+
+$$
+\mathbf{v}_{\text{king}} - \mathbf{v}_{\text{man}} + \mathbf{v}_{\text{woman}} \approx \mathbf{v}_{\text{queen}},
+$$
+
+evidence that linear directions in the space encode interpretable semantic relations such as gender or pluralization. Crucially, these dense vectors are low dimensional and continuous, so a model can generalize across related words rather than memorizing each one.
+
+### 6.3 From words to documents and sentences
+
+Word vectors describe words, but most tasks need a representation of a whole document or sentence. The simplest bridge averages the word vectors in a text, optionally weighting each by its IDF so that informative words dominate:
+
+$$
+\mathbf{v}_d = \frac{1}{\sum_{t \in d} \text{idf}(t)} \sum_{t \in d} \text{idf}(t)\,\mathbf{v}_t.
+$$
+
+This averaged embedding is a strong and cheap document feature, but it again discards order and cannot disambiguate words whose meaning depends on context. Contextual sentence embeddings, produced by transformer encoders such as those in the Sentence-BERT family, address both issues. They feed the entire sentence through a network so that each token's vector depends on its neighbors, then pool into a single fixed length vector tuned so that semantically similar sentences land near each other under cosine similarity. The output is a dense embedding suitable for semantic search, clustering, retrieval, and as input features to a downstream classifier.
+
+The conceptual arc is therefore continuous. BoW is a sparse, exact, order free count vector. TF-IDF reweights it. Averaged word embeddings replace sparse counts with dense semantics but keep the bag assumption. Sentence embeddings restore context and order through a learned encoder. Each step trades interpretability and cost for semantic generalization.
+
+## 7. When Classical Features Still Win
+
+### 7.1 The honest comparison
+
+It is tempting to assume neural embeddings dominate everywhere, but the evidence is more nuanced, and several regimes favor the classical pipeline.
+
+Linear models over TF-IDF n-gram features are exceptionally strong on topic and keyword driven tasks: spam filtering, language identification, document routing, tagging, and many sentiment and intent classification problems. When the decisive signal is the presence of specific words or phrases, sparse features capture it directly and a linear model exploits it with no risk of underfitting the lexical cues. On standard topic classification benchmarks, a well tuned linear TF-IDF model is frequently within a small margin of a fine tuned transformer at a tiny fraction of the cost.
+
+### 7.2 Cost, latency, and operations
+
+Classical features win decisively on operational metrics. A TF-IDF plus linear model trains in seconds on a single CPU, serves predictions in microseconds, requires no GPU, has a memory footprint measured in megabytes, and produces coefficients an analyst can read to explain any decision. A transformer embedding pipeline demands accelerators, has higher per request latency, and is far harder to audit. In regulated domains where every decision must be explained, or in high throughput systems where latency and cost are binding constraints, the sparse linear model is often the responsible engineering choice.
+
+### 7.3 Data, domain, and robustness
+
+Embeddings shine when labeled data is scarce, because pretrained representations transfer knowledge from massive unlabeled corpora. But when labeled data is plentiful and in domain, the advantage narrows, since a linear model has enough signal to learn the task directly. Classical features also resist certain failure modes: they never hallucinate similarity, their behavior on a novel input is mechanically predictable, and they have no opaque dependence on pretraining data whose distribution may not match the deployment domain. For short, specialized, or highly technical vocabularies where general purpose embeddings were undertrained, character n-grams and TF-IDF can outperform off the shelf semantic vectors.
+
+### 7.4 A practical decision rule
+
+The mature workflow is not to choose ideologically but to layer. Always build the TF-IDF linear baseline first, because it is cheap and sets the bar. Reach for embeddings when the task requires semantic generalization beyond surface tokens, when synonymy and paraphrase matter, when labeled data is limited, or when the baseline plateaus below the required accuracy. Often the best production system concatenates both, sparse lexical features for precise keyword signal and dense embeddings for semantic coverage, giving the downstream model the strengths of each. Feature engineering for text did not end with the rise of embeddings; it absorbed them into a richer toolbox.
+
+## References
+
+1. Manning, C. D., Raghavan, P., and Schütze, H. *Introduction to Information Retrieval*. Cambridge University Press, 2008. https://nlp.stanford.edu/IR-book/
+2. Jurafsky, D. and Martin, J. H. *Speech and Language Processing*, 3rd edition draft. 2024. https://web.stanford.edu/~jurafsky/slp3/
+3. Sparck Jones, K. "A Statistical Interpretation of Term Specificity and Its Application in Retrieval." *Journal of Documentation*, 1972. https://www.emerald.com/insight/content/doi/10.1108/eb026526/full/html
+4. Weinberger, K., Dasgupta, A., Langford, J., Smola, A., and Attenberg, J. "Feature Hashing for Large Scale Multitask Learning." ICML, 2009. https://arxiv.org/abs/0902.2206
+5. Mikolov, T., Chen, K., Corrado, G., and Dean, J. "Efficient Estimation of Word Representations in Vector Space." 2013. https://arxiv.org/abs/1301.3781
+6. Pennington, J., Socher, R., and Manning, C. D. "GloVe: Global Vectors for Word Representation." EMNLP, 2014. https://nlp.stanford.edu/projects/glove/
+7. Reimers, N. and Gurevych, I. "Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks." EMNLP, 2019. https://arxiv.org/abs/1908.10084
+8. Wang, S. and Manning, C. D. "Baselines and Bigrams: Simple, Good Sentiment and Topic Classification." ACL, 2012. https://aclanthology.org/P12-2018/
+9. Pedregosa, F. et al. "Scikit-learn: Machine Learning in Python." *JMLR*, 2011. https://jmlr.org/papers/v12/pedregosa11a.html
+10. Joulin, A., Grave, E., Bojanowski, P., and Mikolov, T. "Bag of Tricks for Efficient Text Classification." EACL, 2017. https://arxiv.org/abs/1607.01759
