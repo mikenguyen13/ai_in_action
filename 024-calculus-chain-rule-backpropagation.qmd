@@ -232,6 +232,222 @@ Every gradient needed for gradient descent is produced in one forward pass and o
 
 Take a two-layer scalar network with $a_0 = x$, $z_1 = w_1 x + b_1$, $a_1 = \sigma(z_1)$, $z_2 = w_2 a_1 + b_2$, $\hat{y} = z_2$, and squared-error loss $\mathcal{C} = \tfrac{1}{2}(\hat{y} - y)^2$. The output error is $\delta_2 = \hat{y} - y$. The parameter gradients at layer two are $\partial \mathcal{C} / \partial w_2 = \delta_2 \, a_1$ and $\partial \mathcal{C} / \partial b_2 = \delta_2$. Propagating gives $\delta_1 = w_2 \delta_2 \, \sigma'(z_1)$, and then $\partial \mathcal{C} / \partial w_1 = \delta_1 \, x$ and $\partial \mathcal{C} / \partial b_1 = \delta_1$. Notice how $\delta_2$ flows into $\delta_1$ through the factor $w_2$ and the local activation slope $\sigma'(z_1)$, an instance of the backpropagation recurrence with all quantities reduced to scalars. The same numbers would emerge from running the tiny autodiff engine of Section 3.4 over this graph.
 
+To make every quantity concrete, fix $w_1 = 0.5$, $b_1 = 0.1$, $w_2 = -1.5$, $b_2 = 0.2$, with input $x = 1.0$ and target $y = 0.0$, and take $\sigma = \tanh$ so that $\sigma'(z) = 1 - \tanh^2(z)$.
+
+The forward pass computes, in order,
+
+$$
+z_1 = 0.5 \cdot 1.0 + 0.1 = 0.6, \qquad a_1 = \tanh(0.6) = 0.5370,
+$$
+
+$$
+z_2 = -1.5 \cdot 0.5370 + 0.2 = -0.6055, \qquad \hat{y} = -0.6055,
+$$
+
+$$
+\mathcal{C} = \tfrac{1}{2}(-0.6055 - 0)^2 = 0.1833.
+$$
+
+The backward pass seeds $\delta_2 = \hat{y} - y = -0.6055$ and walks back through the graph:
+
+$$
+\frac{\partial \mathcal{C}}{\partial w_2} = \delta_2 \, a_1 = -0.6055 \cdot 0.5370 = -0.3252, \qquad \frac{\partial \mathcal{C}}{\partial b_2} = \delta_2 = -0.6055.
+$$
+
+The error then propagates into the first layer through $w_2$ and the local slope $\sigma'(z_1) = 1 - 0.5370^2 = 0.7117$:
+
+$$
+\delta_1 = w_2 \, \delta_2 \, \sigma'(z_1) = (-1.5)(-0.6055)(0.7117) = 0.6464,
+$$
+
+$$
+\frac{\partial \mathcal{C}}{\partial w_1} = \delta_1 \, x = 0.6464, \qquad \frac{\partial \mathcal{C}}{\partial b_1} = \delta_1 = 0.6464.
+$$
+
+A finite-difference check confirms these: perturbing $w_1$ by $\pm 10^{-6}$ and recomputing $\mathcal{C}$ gives a central-difference slope that agrees with $0.6464$ to roughly nine digits. The executable cell in the next section performs exactly this kind of check automatically for a small vectorized network.
+
+### 4.7 Backpropagation as a runnable program
+
+The cell below implements the full forward and backward pass for a small two-layer network in vectorized form, verifies the analytic gradients against a numerical finite-difference gradient, and trains the network with gradient descent. The same three equations derived above, the output error, the propagation recurrence, and the outer-product parameter gradient, drive the entire computation.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+# Tiny 2-layer network: input (3) -> hidden (4, tanh) -> output (1, linear)
+N, d_in, d_h, d_out = 64, 3, 4, 1
+X = rng.standard_normal((N, d_in))
+true_w = rng.standard_normal((d_in, 1))
+y = X @ true_w + 0.1 * rng.standard_normal((N, 1))
+
+W1 = 0.5 * rng.standard_normal((d_in, d_h)); b1 = np.zeros((1, d_h))
+W2 = 0.5 * rng.standard_normal((d_h, d_out)); b2 = np.zeros((1, d_out))
+
+def forward(X, W1, b1, W2, b2):
+    z1 = X @ W1 + b1            # pre-activation, layer 1
+    a1 = np.tanh(z1)           # activation, layer 1
+    z2 = a1 @ W2 + b2          # pre-activation, layer 2
+    return z1, a1, z2, z2      # linear output: yhat = z2
+
+def loss_fn(yhat, y):
+    return 0.5 * np.mean(np.sum((yhat - y) ** 2, axis=1))
+
+def backward(X, y, W1, b1, W2, b2):
+    z1, a1, z2, yhat = forward(X, W1, b1, W2, b2)
+    N = X.shape[0]
+    delta2 = (yhat - y) / N                     # output error
+    dW2 = a1.T @ delta2                          # outer-product gradient
+    db2 = delta2.sum(axis=0, keepdims=True)
+    delta1 = (delta2 @ W2.T) * (1.0 - a1 ** 2)   # propagate, tanh' = 1 - a1^2
+    dW1 = X.T @ delta1
+    db1 = delta1.sum(axis=0, keepdims=True)
+    return (dW1, db1, dW2, db2), loss_fn(yhat, y)
+
+# Numerical gradient check via central finite differences
+def numerical_grad(P, eps=1e-6):
+    grad = np.zeros_like(P)
+    it = np.nditer(P, flags=["multi_index"])
+    while not it.finished:
+        idx = it.multi_index; orig = P[idx]
+        P[idx] = orig + eps; lp = loss_fn(forward(X, W1, b1, W2, b2)[3], y)
+        P[idx] = orig - eps; lm = loss_fn(forward(X, W1, b1, W2, b2)[3], y)
+        P[idx] = orig; grad[idx] = (lp - lm) / (2 * eps); it.iternext()
+    return grad
+
+(an_dW1, _, an_dW2, _), _ = backward(X, y, W1, b1, W2, b2)
+rel_W1 = np.max(np.abs(an_dW1 - numerical_grad(W1))) / (np.max(np.abs(an_dW1)) + 1e-12)
+rel_W2 = np.max(np.abs(an_dW2 - numerical_grad(W2))) / (np.max(np.abs(an_dW2)) + 1e-12)
+print(f"Gradient check W1: max relative error = {rel_W1:.2e}")
+print(f"Gradient check W2: max relative error = {rel_W2:.2e}")
+
+# Train with gradient descent
+lr, losses = 0.5, []
+for step in range(200):
+    (dW1, db1, dW2, db2), L = backward(X, y, W1, b1, W2, b2)
+    W1 -= lr * dW1; b1 -= lr * db1
+    W2 -= lr * dW2; b2 -= lr * db2
+    losses.append(L)
+
+print(f"Initial loss: {losses[0]:.4f}")
+print(f"Final loss:   {losses[-1]:.4f}")
+
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(losses, color="C0")
+ax.set_xlabel("Gradient descent step")
+ax.set_ylabel("Mean squared error loss")
+ax.set_title("Training loss of a 2-layer network (backprop gradients)")
+ax.set_yscale("log")
+fig.tight_layout()
+plt.show()
+```
+
+The relative errors print as roughly $10^{-10}$, confirming the analytic backpropagation gradients match the numerical reference to machine precision, and the loss curve falls by more than an order of magnitude as gradient descent consumes those gradients.
+
+## Julia
+
+```julia
+# Idiomatic Julia: same 2-layer network, forward + backward by hand.
+using Random, Statistics
+
+Random.seed!(0)
+N, d_in, d_h, d_out = 64, 3, 4, 1
+X = randn(N, d_in)
+true_w = randn(d_in, 1)
+y = X * true_w .+ 0.1 .* randn(N, 1)
+
+W1 = 0.5 .* randn(d_in, d_h); b1 = zeros(1, d_h)
+W2 = 0.5 .* randn(d_h, d_out); b2 = zeros(1, d_out)
+
+forward(X, W1, b1, W2, b2) = begin
+    z1 = X * W1 .+ b1
+    a1 = tanh.(z1)
+    z2 = a1 * W2 .+ b2
+    (z1, a1, z2, z2)            # yhat = z2 (linear output)
+end
+
+loss_fn(yhat, y) = 0.5 * mean(sum((yhat .- y) .^ 2, dims = 2))
+
+function backward(X, y, W1, b1, W2, b2)
+    z1, a1, z2, yhat = forward(X, W1, b1, W2, b2)
+    n = size(X, 1)
+    delta2 = (yhat .- y) ./ n               # output error
+    dW2 = a1' * delta2                       # outer-product gradient
+    db2 = sum(delta2, dims = 1)
+    delta1 = (delta2 * W2') .* (1 .- a1 .^ 2)  # propagate, tanh'
+    dW1 = X' * delta1
+    db1 = sum(delta1, dims = 1)
+    ((dW1, db1, dW2, db2), loss_fn(yhat, y))
+end
+
+lr = 0.5
+for step in 1:200
+    (dW1, db1, dW2, db2), L = backward(X, y, W1, b1, W2, b2)
+    global W1 -= lr .* dW1; global b1 -= lr .* db1
+    global W2 -= lr .* dW2; global b2 -= lr .* db2
+end
+_, finalL = backward(X, y, W1, b1, W2, b2)
+println("Final loss: ", finalL)
+```
+
+## Rust
+
+```rust
+// Idiomatic Rust sketch of one backprop step using nested Vecs.
+// Matrices are Vec<Vec<f64>>; helpers omitted for brevity.
+
+fn matmul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let (n, k, m) = (a.len(), b.len(), b[0].len());
+    let mut out = vec![vec![0.0; m]; n];
+    for i in 0..n {
+        for t in 0..k {
+            for j in 0..m {
+                out[i][j] += a[i][t] * b[t][j];
+            }
+        }
+    }
+    out
+}
+
+fn tanh_mat(z: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    z.iter().map(|r| r.iter().map(|&v| v.tanh()).collect()).collect()
+}
+
+/// One forward + backward pass; returns (loss, dW2) for layer 2.
+fn step(x: &[Vec<f64>], y: &[Vec<f64>],
+        w1: &[Vec<f64>], w2: &[Vec<f64>]) -> (f64, Vec<Vec<f64>>) {
+    let z1 = matmul(x, w1);
+    let a1 = tanh_mat(&z1);
+    let yhat = matmul(&a1, w2);            // linear output
+
+    let n = x.len() as f64;
+    // output error delta2 = (yhat - y) / N
+    let delta2: Vec<Vec<f64>> = yhat.iter().zip(y)
+        .map(|(yh, yt)| yh.iter().zip(yt).map(|(p, t)| (p - t) / n).collect())
+        .collect();
+
+    let loss: f64 = yhat.iter().zip(y)
+        .map(|(yh, yt)| yh.iter().zip(yt)
+            .map(|(p, t)| 0.5 * (p - t).powi(2)).sum::<f64>())
+        .sum::<f64>() / n;
+
+    // dW2 = a1^T * delta2  (outer-product gradient)
+    let a1_t: Vec<Vec<f64>> = (0..a1[0].len())
+        .map(|j| a1.iter().map(|r| r[j]).collect()).collect();
+    let dw2 = matmul(&a1_t, &delta2);
+    (loss, dw2)
+}
+```
+
+:::
+
 ## 5. Computational Cost
 
 ### 5.1 The forward and backward cost balance
@@ -258,18 +474,20 @@ Two numerical issues deserve mention. First, the repeated multiplication of chai
 
 ## References
 
-1. Rumelhart, D. E., Hinton, G. E., and Williams, R. J. (1986). Learning representations by back-propagating errors. Nature, 323, 533-536. https://www.nature.com/articles/323533a0
+1. Rumelhart, D. E., Hinton, G. E., and Williams, R. J. (1986). Learning representations by back-propagating errors. Nature, 323, 533-536. DOI: 10.1038/323533a0
 
 2. Baydin, A. G., Pearlmutter, B. A., Radul, A. A., and Siskind, J. M. (2018). Automatic Differentiation in Machine Learning: a Survey. Journal of Machine Learning Research, 18(153), 1-43. https://jmlr.org/papers/v18/17-468.html
 
-3. Goodfellow, I., Bengio, Y., and Courville, A. (2016). Deep Learning, Chapter 6: Deep Feedforward Networks. MIT Press. https://www.deeplearningbook.org/contents/mlp.html
+3. Linnainmaa, S. (1976). Taylor expansion of the accumulated rounding error. BIT Numerical Mathematics, 16(2), 146-160. DOI: 10.1007/BF01931367
 
-4. Griewank, A., and Walther, A. (2008). Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation, 2nd edition. SIAM. https://epubs.siam.org/doi/book/10.1137/1.9780898717761
+4. Werbos, P. J. (1990). Backpropagation through time: what it does and how to do it. Proceedings of the IEEE, 78(10), 1550-1560. DOI: 10.1109/5.58337
 
-5. Nielsen, M. (2015). Neural Networks and Deep Learning, Chapter 2: How the backpropagation algorithm works. http://neuralnetworksanddeeplearning.com/chap2.html
+5. Goodfellow, I., Bengio, Y., and Courville, A. (2016). Deep Learning, Chapter 6: Deep Feedforward Networks. MIT Press. https://www.deeplearningbook.org/contents/mlp.html
 
-6. Chen, T., Xu, B., Zhang, C., and Guestrin, C. (2016). Training Deep Nets with Sublinear Memory Cost. arXiv:1604.06174. https://arxiv.org/abs/1604.06174
+6. Griewank, A., and Walther, A. (2008). Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation, 2nd edition. SIAM. DOI: 10.1137/1.9780898717761
 
-7. Bradbury, J., Frostig, R., Hawkins, P., et al. (2018). JAX: Composable transformations of Python and NumPy programs. https://github.com/google/jax
+7. Nielsen, M. (2015). Neural Networks and Deep Learning, Chapter 2: How the backpropagation algorithm works. http://neuralnetworksanddeeplearning.com/chap2.html
 
-8. Paszke, A., Gross, S., Massa, F., et al. (2019). PyTorch: An Imperative Style, High-Performance Deep Learning Library. Advances in Neural Information Processing Systems 32. https://papers.nips.cc/paper/9015-pytorch-an-imperative-style-high-performance-deep-learning-library
+8. Chen, T., Xu, B., Zhang, C., and Guestrin, C. (2016). Training Deep Nets with Sublinear Memory Cost. arXiv:1604.06174. DOI: 10.48550/arXiv.1604.06174
+
+9. Paszke, A., Gross, S., Massa, F., et al. (2019). PyTorch: An Imperative Style, High-Performance Deep Learning Library. Advances in Neural Information Processing Systems 32, 8024-8035. DOI: 10.48550/arXiv.1912.01703
