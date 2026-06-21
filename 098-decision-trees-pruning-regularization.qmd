@@ -130,9 +130,27 @@ $$
 
 Breiman and colleagues proved two facts that make this construction powerful. First, for any value of $\alpha$ there is a unique smallest subtree of $T_{\max}$ that minimizes $R_\alpha$, so the criterion has a well defined solution everywhere. Second, that minimizer is always one of the $T_k$ in the sequence above. Each tree $T_k$ is optimal for the entire interval $\alpha \in [\alpha_k, \alpha_{k+1})$. The continuous one parameter family of optimization problems thus collapses to a small discrete set of candidate trees, which is what makes cost-complexity pruning tractable.
 
-### 3.4 An Illustration of the Sequence
+### 3.4 A Fully Worked Example
 
-Consider a branch whose root, if collapsed, would misclassify four additional training points but whose three leaves currently misclassify none. Its effective alpha is $4 / (3 - 1) = 2$. A sibling branch that saves five leaves at a cost of three errors has effective alpha $3 / (5 - 1) = 0.75$. The sibling is the weaker link and is pruned first, even though it removes more leaves, because the criterion rewards error efficiency per leaf rather than raw size. This is the precise sense in which weakest-link pruning differs from naively removing the largest branches.
+To see the weakest-link sequence emerge concretely, take a small tree $T_{\max}$ grown on $N = 200$ training points. We measure resubstitution error $R$ as the misclassification count, so $R(t)$ for an internal node is the number of points at $t$ not belonging to the majority class there. Suppose the tree has three internal nodes whose branch statistics are as follows.
+
+| Node | $R(t)$ collapsed | $R(T_t)$ kept | $\lvert \tilde{T}_t \rvert$ | $\alpha_{\mathrm{eff}}(t)$ |
+|------|-----------------|---------------|------------------------------|----------------------------|
+| $A$ (root) | $40$ | $8$ | $6$ | $(40-8)/(6-1) = 6.4$ |
+| $B$ | $14$ | $6$ | $3$ | $(14-6)/(3-1) = 4.0$ |
+| $C$ | $9$ | $6$ | $2$ | $(9-6)/(2-1) = 3.0$ |
+
+Each $\alpha_{\mathrm{eff}}$ follows directly from
+
+$$
+\alpha_{\mathrm{eff}}(t) = \frac{R(t) - R(T_t)}{\lvert \tilde{T}_t \rvert - 1}.
+$$
+
+The weakest link is the node with the smallest effective alpha, here node $C$ at $\alpha_{\mathrm{eff}} = 3.0$. As $\alpha$ rises from zero, $C$ is the first branch whose penalized cost of being kept exceeds its collapsed cost, so $C$ is pruned at $\alpha_1 = 3.0$. After collapsing $C$ the error and leaf counts of any ancestor change, the effective alphas are recomputed, and the next weakest link is pruned. The breakpoints are nondecreasing, $\alpha_1 \le \alpha_2 \le \cdots$, which is exactly the monotone sequence that indexes the nested subtrees.
+
+To check the criterion explicitly at node $C$, the kept branch costs $R_\alpha(T_C) = 6 + 2\alpha$ and the collapsed leaf costs $R_\alpha(C) = 9 + \alpha$. These are equal precisely when $9 + \alpha = 6 + 2\alpha$, that is $\alpha = 3$, confirming the formula. For $\alpha < 3$ the branch is worth keeping; for $\alpha > 3$ collapsing it lowers the penalized objective.
+
+The contrast with naive pruning is instructive. Node $B$ removes three leaves at a cost of eight errors, more total leaves removed than $C$, yet its effective alpha $4.0$ is larger, so it is pruned later. Weakest-link pruning rewards error efficiency per leaf rather than raw branch size, which is the precise sense in which it differs from simply deleting the largest branches. The runnable example in Section 6 reproduces this entire breakpoint sequence on a real dataset and plots the resulting tradeoff.
 
 ## 4. Minimal Cost-Complexity Tuning
 
@@ -171,7 +189,226 @@ The cost-complexity criterion $R_\alpha(T) = R(T) + \alpha \lvert \tilde{T} \rve
 
 Several practical points follow from the theory. First, post-pruning by cost-complexity generally outperforms pre-pruning on a single tree because it avoids the horizon effect, though it costs more to grow the full tree first. Second, pre-pruning and post-pruning are complementary rather than exclusive. Setting a modest `min_samples_leaf` before cost-complexity pruning bounds leaf variance and shrinks $T_{\max}$, which speeds the whole pipeline without harming the final fit. Third, when a tree is one base learner inside a random forest or gradient boosting ensemble, the calculus changes. Ensembles average away the variance of individual trees, so individual trees are deliberately left deep, and regularization shifts to ensemble level controls such as the number of trees, the learning rate, and subsampling. Single tree pruning matters most precisely when interpretability of one tree is the goal.
 
-## 5. Summary
+## 5. The Pruning Pipeline at a Glance
+
+The diagram below traces the full path from a fully grown tree to a deployed model, separating the offline pruning-sequence construction from the cross-validated selection of the operating point.
+
+```{mermaid}
+flowchart TD
+    A[Grow large tree T_max] --> B[Compute alpha_eff for every internal node]
+    B --> C{Find weakest link\nmin alpha_eff}
+    C --> D[Prune that branch to a leaf\nrecord breakpoint alpha_k]
+    D --> E{Only root left?}
+    E -- no --> B
+    E -- yes --> F[Nested sequence T_0 to T_m\nbreakpoints alpha_0 to alpha_m]
+    F --> G[k-fold cross-validate over alpha grid]
+    G --> H{Selection rule}
+    H -- min CV error --> I[alpha star]
+    H -- one standard error --> J[largest alpha within 1 SE]
+    I --> K[Refit pruned tree on full data]
+    J --> K
+    K --> L[Deploy single interpretable tree]
+```
+
+The loop on the left is purely combinatorial and runs once. The cross-validation on the right is the statistical step that turns the discrete family of candidate trees into a single defensible choice.
+
+## 6. Implementation and Verification
+
+The following cell is fully executable. It grows an unrestricted tree on a real classification dataset, extracts the cost-complexity pruning path, and plots two diagnostic figures: the number of leaves and effective alpha against the breakpoints, and the train versus test accuracy against the breakpoints. It prints a results table of the pruning sequence, selects $\alpha$ by cross-validation, and uses SymPy to verify the weakest-link indifference equation symbolically. A fixed seed makes every number reproducible.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sympy as sp
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.tree import DecisionTreeClassifier
+
+RNG = 20260620
+np.random.seed(RNG)
+
+# Load a real binary classification dataset (open data shipped with scikit-learn)
+data = load_breast_cancer()
+X, y = data.data, data.target
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.30, random_state=RNG, stratify=y
+)
+
+# Grow an unrestricted tree, then extract the cost-complexity pruning path
+base = DecisionTreeClassifier(random_state=RNG)
+path = base.cost_complexity_pruning_path(X_train, y_train)
+ccp_alphas, impurities = path.ccp_alphas, path.impurities
+
+# Fit one pruned tree per breakpoint alpha (drop the trivial root-only last point)
+ccp_alphas = ccp_alphas[:-1]
+trees = []
+for a in ccp_alphas:
+    t = DecisionTreeClassifier(random_state=RNG, ccp_alpha=a)
+    t.fit(X_train, y_train)
+    trees.append(t)
+
+n_leaves = [t.get_n_leaves() for t in trees]
+depths = [t.get_depth() for t in trees]
+train_acc = [t.score(X_train, y_train) for t in trees]
+test_acc = [t.score(X_test, y_test) for t in trees]
+
+# Cross-validate accuracy over the alpha grid to choose an operating point
+cv_means, cv_ses = [], []
+for a in ccp_alphas:
+    scores = cross_val_score(
+        DecisionTreeClassifier(random_state=RNG, ccp_alpha=a),
+        X_train, y_train, cv=5
+    )
+    cv_means.append(scores.mean())
+    cv_ses.append(scores.std() / np.sqrt(len(scores)))
+cv_means = np.array(cv_means)
+cv_ses = np.array(cv_ses)
+
+best_idx = int(np.argmax(cv_means))
+best_alpha = ccp_alphas[best_idx]
+
+# One standard error rule: largest alpha (smallest tree) within 1 SE of the best
+threshold = cv_means[best_idx] - cv_ses[best_idx]
+ose_candidates = np.where(cv_means >= threshold)[0]
+ose_idx = int(ose_candidates.max())
+ose_alpha = ccp_alphas[ose_idx]
+
+# Results table for the pruning sequence
+table = pd.DataFrame({
+    "ccp_alpha": np.round(ccp_alphas, 6),
+    "n_leaves": n_leaves,
+    "depth": depths,
+    "train_acc": np.round(train_acc, 4),
+    "test_acc": np.round(test_acc, 4),
+    "cv_mean": np.round(cv_means, 4),
+    "cv_se": np.round(cv_ses, 4),
+})
+pd.set_option("display.width", 120)
+print("Cost-complexity pruning sequence")
+print(table.to_string(index=False))
+print()
+print(f"Unpruned tree: {n_leaves[0]} leaves, depth {depths[0]}, "
+      f"test accuracy {test_acc[0]:.4f}")
+print(f"CV-best alpha = {best_alpha:.6f} -> {n_leaves[best_idx]} leaves, "
+      f"test accuracy {test_acc[best_idx]:.4f}")
+print(f"One-SE alpha  = {ose_alpha:.6f} -> {n_leaves[ose_idx]} leaves, "
+      f"test accuracy {test_acc[ose_idx]:.4f}")
+
+# SymPy check of the weakest-link indifference equation from Section 3.4:
+# R(t) + alpha = R(T_t) + alpha * |leaves|, solved for alpha.
+alpha, Rt, RTt, m = sp.symbols("alpha R_t R_Tt m", positive=True)
+indifference = sp.Eq(Rt + alpha, RTt + alpha * m)
+alpha_eff = sp.solve(indifference, alpha)[0]
+print()
+print("SymPy weakest-link solution: alpha_eff =", alpha_eff)
+# Verify against the node C numbers from the worked example (R_t=9, R_Tt=6, m=2)
+alpha_eff_C = alpha_eff.subs({Rt: 9, RTt: 6, m: 2})
+print("Worked-example node C alpha_eff =", alpha_eff_C)
+assert alpha_eff_C == 3, "SymPy check failed for worked example"
+print("SymPy check passed: closed form matches alpha_eff(C) = 3")
+
+# Figure 1: number of leaves and effective alpha against breakpoints
+fig1, ax1 = plt.subplots(figsize=(7, 4.5))
+ax1.plot(ccp_alphas, n_leaves, marker="o", color="tab:blue",
+         label="number of leaves")
+ax1.set_xlabel("effective alpha (ccp_alpha)")
+ax1.set_ylabel("number of leaves", color="tab:blue")
+ax1.tick_params(axis="y", labelcolor="tab:blue")
+ax2 = ax1.twinx()
+ax2.plot(ccp_alphas, depths, marker="s", color="tab:red",
+         label="tree depth")
+ax2.set_ylabel("tree depth", color="tab:red")
+ax2.tick_params(axis="y", labelcolor="tab:red")
+ax1.set_title("Pruning path: tree size shrinks as alpha grows")
+fig1.tight_layout()
+
+# Figure 2: train vs test vs CV accuracy against breakpoints
+fig2, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(ccp_alphas, train_acc, marker="o", label="train accuracy")
+ax.plot(ccp_alphas, test_acc, marker="s", label="test accuracy")
+ax.errorbar(ccp_alphas, cv_means, yerr=cv_ses, marker="^",
+            capsize=3, label="5-fold CV accuracy")
+ax.axvline(best_alpha, color="green", linestyle="--",
+           label=f"CV-best alpha = {best_alpha:.4f}")
+ax.axvline(ose_alpha, color="purple", linestyle=":",
+           label=f"one-SE alpha = {ose_alpha:.4f}")
+ax.set_xlabel("effective alpha (ccp_alpha)")
+ax.set_ylabel("accuracy")
+ax.set_title("Accuracy vs alpha: the U-shaped generalization curve")
+ax.legend(loc="lower left", fontsize=8)
+fig2.tight_layout()
+
+plt.show()
+```
+
+The two figures jointly visualize the regularization story of this chapter. The first shows that increasing $\alpha$ monotonically collapses the tree from many leaves toward the root. The second shows the consequence for generalization: training accuracy is highest for the unpruned tree, but test and cross-validated accuracy peak at an intermediate $\alpha$ and then fall as pruning becomes too aggressive, tracing the U-shaped curve from Section 1.2. The CV-best and one-standard-error selections mark two principled operating points on that curve.
+
+### 6.1 The Same Path in Other Languages
+
+The cost-complexity idea is not specific to scikit-learn. The tabset below shows the core path-extraction and pruning step in three ecosystems. The Python tab is the executable reference above in miniature; the Julia and Rust tabs are idiomatic equivalents.
+
+::: {.panel-tabset}
+
+## Python executable
+
+```{python}
+from sklearn.tree import DecisionTreeClassifier
+
+# Extract breakpoints, then fit one pruned tree at a chosen alpha
+clf = DecisionTreeClassifier(random_state=20260620)
+breakpoints = clf.cost_complexity_pruning_path(X_train, y_train).ccp_alphas
+chosen = float(breakpoints[len(breakpoints) // 2])
+pruned = DecisionTreeClassifier(random_state=20260620, ccp_alpha=chosen)
+pruned.fit(X_train, y_train)
+print(f"chosen alpha = {chosen:.6f}, leaves = {pruned.get_n_leaves()}, "
+      f"test acc = {pruned.score(X_test, y_test):.4f}")
+```
+
+## Julia
+
+```julia
+# DecisionTree.jl exposes post-pruning via merge_leaves / prune_tree.
+using DecisionTree
+
+model = DecisionTreeClassifier()           # unrestricted growth
+fit!(model, X_train, y_train)
+
+# Prune leaves whose combined purity exceeds a threshold (analogous knob to alpha).
+# Larger threshold collapses more branches, shrinking the tree.
+pruned = prune_tree(model.root.node, 0.9)
+acc = sum(apply_tree(pruned, x) == y for (x, y) in zip(eachrow(X_test), y_test)) /
+      length(y_test)
+println("pruned test accuracy = ", round(acc, digits = 4))
+```
+
+## Rust
+
+```rust
+// linfa-trees grows CART-style trees; complexity is controlled at fit time
+// via min_weight_split / min_weight_leaf / max_depth (pre-pruning analogs).
+use linfa::prelude::*;
+use linfa_trees::DecisionTree;
+
+fn main() {
+    let (train, test) = linfa_datasets::iris().split_with_ratio(0.7);
+
+    // Tighter constraints play the role of a larger alpha: a smaller tree.
+    let model = DecisionTree::params()
+        .min_weight_leaf(5.0)
+        .max_depth(Some(4))
+        .fit(&train)
+        .expect("tree fits");
+
+    let pred = model.predict(&test);
+    let acc = pred.confusion_matrix(&test).unwrap().accuracy();
+    println!("constrained test accuracy = {acc:.4}");
+}
+```
+
+:::
+
+## 7. Summary
 
 Decision trees overfit because greedy impurity reduction will partition the data until leaves are pure, yielding low bias and high variance. Pre-pruning combats this by constraining growth through maximum depth, minimum sample counts, and minimum impurity decrease, at the cost of susceptibility to the horizon effect. Cost-complexity pruning grows a full tree and prunes it back by minimizing $R(T) + \alpha \lvert \tilde{T} \rvert$, producing a nested sequence of subtrees indexed by the weakest-link breakpoints. The complexity parameter $\alpha$ is then chosen by cross-validation, often with the one standard error rule, selecting the simplest tree that generalizes well. Understood as a regularized objective, pruning takes its place alongside ridge and lasso as a principled control on the bias variance tradeoff.
 

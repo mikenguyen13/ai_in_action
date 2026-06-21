@@ -30,6 +30,24 @@ return best observed (x, y) in D
 
 The two design choices that define a BO method are the surrogate model and the acquisition function. The remainder of this chapter develops each in turn.
 
+```{mermaid}
+flowchart LR
+    A[Initial design<br/>Sobol or LHS points] --> B[Fit GP surrogate<br/>posterior mean and variance]
+    B --> C[Optimize acquisition<br/>argmax over the domain]
+    C --> D[Evaluate expensive f<br/>observe noisy value]
+    D --> E{Budget left?}
+    E -->|yes| B
+    E -->|no| F[Return best observed point]
+```
+
+Formally we may cast BO as a sequential decision problem. With a budget of $N$ evaluations and a value-of-information view, the Bayes-optimal policy maximizes the expected best value at termination,
+
+$$
+\max_{\pi}\; \mathbb{E}\!\left[\max_{i \le N} f(\mathbf{x}_i)\right],
+$$
+
+where the expectation is over the prior on $f$ and over observation noise. This full lookahead is intractable because it requires solving a dynamic program with a continuous state. The acquisition functions developed below are tractable one-step (myopic) approximations to this ideal policy.
+
 ## 2. Surrogate Models: Gaussian Processes
 
 A surrogate model must do more than interpolate observed points. It must quantify uncertainty, because the acquisition function needs to know not just the predicted value at an untried $\mathbf{x}$ but how confident that prediction is. The Gaussian process (GP) is the default surrogate precisely because it delivers a full predictive distribution in closed form.
@@ -52,7 +70,15 @@ where $\ell$ is a length scale and $\sigma_f^2$ a signal variance. The Matern 5/
 
 ### 2.2 Posterior Inference
 
-Suppose we have observations $\mathbf{y} = (y_1, \ldots, y_n)^\top$ at inputs $X = (\mathbf{x}_1, \ldots, \mathbf{x}_n)$ with independent Gaussian noise of variance $\sigma_n^2$. Let $K$ be the $n \times n$ matrix with entries $K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$, and let $\mathbf{k}_*(\mathbf{x}) = (k(\mathbf{x}, \mathbf{x}_1), \ldots, k(\mathbf{x}, \mathbf{x}_n))^\top$. The posterior at a test point $\mathbf{x}$ is Gaussian with mean and variance
+Suppose we have observations $\mathbf{y} = (y_1, \ldots, y_n)^\top$ at inputs $X = (\mathbf{x}_1, \ldots, \mathbf{x}_n)$ with independent Gaussian noise of variance $\sigma_n^2$. Let $K$ be the $n \times n$ matrix with entries $K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$, and let $\mathbf{k}_*(\mathbf{x}) = (k(\mathbf{x}, \mathbf{x}_1), \ldots, k(\mathbf{x}, \mathbf{x}_n))^\top$. The derivation starts from the GP prior, which makes the test value $f_* = f(\mathbf{x})$ and the noisy training targets jointly Gaussian,
+
+$$
+\begin{bmatrix} \mathbf{y} \\ f_* \end{bmatrix}
+\sim \mathcal{N}\!\left(\mathbf{0},\;
+\begin{bmatrix} K + \sigma_n^2 I & \mathbf{k}_* \\ \mathbf{k}_*^\top & k(\mathbf{x},\mathbf{x}) \end{bmatrix}\right).
+$$
+
+Conditioning a joint Gaussian on a subvector is a standard identity: if $(\mathbf{a},\mathbf{b})$ are jointly Gaussian, then $\mathbf{b}\mid\mathbf{a}$ has mean $\boldsymbol{\mu}_b + \Sigma_{ba}\Sigma_{aa}^{-1}(\mathbf{a}-\boldsymbol{\mu}_a)$ and covariance $\Sigma_{bb} - \Sigma_{ba}\Sigma_{aa}^{-1}\Sigma_{ab}$. Applying it with $\mathbf{a}=\mathbf{y}$ and $\mathbf{b}=f_*$ gives the posterior at a test point $\mathbf{x}$, a Gaussian with mean and variance
 
 $$
 \mu_n(\mathbf{x}) = \mathbf{k}_*(\mathbf{x})^\top \left(K + \sigma_n^2 I\right)^{-1} \mathbf{y},
@@ -82,6 +108,18 @@ The matrix inversion in the posterior costs $O(n^3)$, which is harmless for the 
 
 The acquisition function turns the surrogate's posterior into a concrete decision about where to sample. Every useful acquisition function trades off exploitation, querying where $\mu_n(\mathbf{x})$ predicts good values, against exploration, querying where $\sigma_n(\mathbf{x})$ is large. We adopt the convention of maximizing $f$, and write $f^+ = \max_i y_i$ for the best value observed so far.
 
+```{mermaid}
+flowchart TD
+    P[GP posterior at x] --> M[Mean mu_n of x<br/>exploitation signal]
+    P --> S[Std sigma_n of x<br/>exploration signal]
+    M --> A[Acquisition function]
+    S --> A
+    A --> PI[PI: Phi of standardized gap]
+    A --> EI[EI: mean term plus uncertainty term]
+    A --> UCB[UCB: mu plus sqrt beta times sigma]
+    A --> TS[Thompson: argmax of a posterior draw]
+```
+
 ### 3.1 Probability of Improvement
 
 The earliest acquisition function, probability of improvement (PI), asks how likely a point is to beat the incumbent by at least a margin $\xi \ge 0$:
@@ -102,6 +140,21 @@ $$
 
 for $\sigma_n(\mathbf{x}) > 0$, and $\alpha_{\text{EI}}(\mathbf{x}) = 0$ otherwise, where $\phi$ is the standard normal density. The two terms have a clean reading. The first rewards a high posterior mean (exploitation), and the second rewards high posterior uncertainty (exploration). EI requires no tuning to behave reasonably, with $\xi = 0$ a common default, which is a large part of why it remains the workhorse acquisition function.
 
+To derive the closed form, write the posterior at $\mathbf{x}$ as $f \sim \mathcal{N}(\mu, \sigma^2)$ with $\mu = \mu_n(\mathbf{x})$ and $\sigma = \sigma_n(\mathbf{x})$, and let $\tau = f^+ + \xi$ be the improvement threshold. By definition
+
+$$
+\alpha_{\text{EI}} = \mathbb{E}\bigl[\max(f - \tau, 0)\bigr] = \int_{\tau}^{\infty} (f - \tau)\,\frac{1}{\sigma}\,\phi\!\left(\frac{f - \mu}{\sigma}\right)\,df.
+$$
+
+Substitute $u = (f - \mu)/\sigma$, so $f = \mu + \sigma u$, $df = \sigma\,du$, and the lower limit becomes $-z$ with $z = (\mu - \tau)/\sigma$:
+
+$$
+\alpha_{\text{EI}} = \int_{-z}^{\infty} (\mu - \tau + \sigma u)\,\phi(u)\,du
+= (\mu - \tau)\!\int_{-z}^{\infty}\!\phi(u)\,du \;+\; \sigma\!\int_{-z}^{\infty}\! u\,\phi(u)\,du.
+$$
+
+The first integral is $1 - \Phi(-z) = \Phi(z)$ by symmetry. The second uses $\phi'(u) = -u\,\phi(u)$, so $\int_{-z}^{\infty} u\,\phi(u)\,du = [-\phi(u)]_{-z}^{\infty} = \phi(-z) = \phi(z)$. Collecting terms recovers $\alpha_{\text{EI}} = (\mu - \tau)\Phi(z) + \sigma\phi(z)$, exactly the formula above. The executable cell below verifies this identity symbolically with SymPy.
+
 ### 3.3 Upper Confidence Bound
 
 The GP upper confidence bound (UCB) takes an optimistic view, scoring each point by an upper quantile of its posterior:
@@ -110,7 +163,7 @@ $$
 \alpha_{\text{UCB}}(\mathbf{x}) = \mu_n(\mathbf{x}) + \beta_t^{1/2}\,\sigma_n(\mathbf{x}).
 $$
 
-The parameter $\beta_t$ controls the exploration weight directly and transparently. Its great virtue is theoretical: Srinivas and colleagues showed that with a suitable schedule for $\beta_t$, growing logarithmically in the iteration count, GP-UCB achieves sublinear cumulative regret, meaning the average gap to the optimum vanishes as the budget grows. This gives UCB a firmer regret-bound footing than EI, though in practice the prescribed $\beta_t$ is often conservative and tuned down.
+The parameter $\beta_t$ controls the exploration weight directly and transparently. The decomposition makes the exploration-exploitation tradeoff explicit: the term $\mu_n(\mathbf{x})$ is pure exploitation, the term $\beta_t^{1/2}\sigma_n(\mathbf{x})$ is pure exploration, and $\beta_t$ is the exchange rate between them. Setting $\beta_t = 0$ collapses UCB to greedy mean maximization, which can stall in a local optimum, while a large $\beta_t$ degenerates to near-uniform exploration. Its great virtue is theoretical: Srinivas and colleagues showed that with a suitable schedule for $\beta_t$, growing logarithmically in the iteration count, GP-UCB achieves sublinear cumulative regret, meaning the average gap to the optimum vanishes as the budget grows. Concretely, the cumulative regret $R_T = \sum_{t=1}^{T} \bigl(f(\mathbf{x}^\star) - f(\mathbf{x}_t)\bigr)$ satisfies $R_T = O^\star(\sqrt{T\,\gamma_T\,\beta_T})$ with high probability, where $\gamma_T$ is the maximum information gain after $T$ rounds. Because $R_T / T \to 0$, the procedure is no-regret. This gives UCB a firmer regret-bound footing than EI, though in practice the prescribed $\beta_t$ is often conservative and tuned down.
 
 ### 3.4 Thompson Sampling
 
@@ -129,6 +182,219 @@ A more recent family targets information directly. Entropy search and predictive
 ### 3.6 Optimizing the Acquisition Function
 
 A subtlety that newcomers underestimate: the acquisition function is itself a function over $\mathcal{X}$ that must be maximized at every iteration. It is cheap to evaluate but usually multimodal and non-convex. Standard practice combines a coarse search, evaluating the acquisition on many quasi-random points, with local refinement by a gradient-based optimizer such as L-BFGS started from the best candidates, repeated from several restarts. Getting this inner optimization right matters, because a poorly maximized acquisition function silently degrades the whole procedure.
+
+### 3.7 Worked Implementation
+
+The following code runs a complete Bayesian optimization loop on a one-dimensional objective with a GP surrogate and expected improvement. It plots the surrogate and the acquisition function at every iteration, draws UCB and Thompson-sampling views of the final posterior, prints a results table, and verifies the EI closed form symbolically with SymPy. For real projects the open-source libraries [Optuna](https://optuna.org/) and [scikit-optimize](https://scikit-optimize.github.io/) automate this same loop with mature search spaces, pruners, and visualizations.
+
+::: {.panel-tabset}
+
+## Python executable
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel
+import sympy as sp
+
+rng = np.random.default_rng(0)
+
+# --- SymPy check of the closed-form Expected Improvement formula ---
+# EI = E[max(f - f_plus, 0)] for f ~ N(mu, sigma^2), threshold = f_plus + xi.
+t, mu_s, sigma_s, fp, xi = sp.symbols(
+    "t mu sigma f_plus xi", real=True, positive=True)
+phi = lambda u: sp.exp(-u**2 / 2) / sp.sqrt(2 * sp.pi)
+Phi = lambda u: (1 + sp.erf(u / sp.sqrt(2))) / 2
+pdf = phi((t - mu_s) / sigma_s) / sigma_s
+threshold = fp + xi
+integral = sp.integrate((t - threshold) * pdf, (t, threshold, sp.oo))
+z_sym = (mu_s - fp - xi) / sigma_s
+closed_form = (mu_s - fp - xi) * Phi(z_sym) + sigma_s * phi(z_sym)
+print("SymPy EI check (integral - closed form) =",
+      sp.simplify(integral - closed_form))
+
+# --- 1D objective to maximize ---
+def objective(x):
+    return np.sin(3 * x) + 0.5 * np.sin(7 * x) - 0.1 * (x - 0.7) ** 2
+
+bounds = (-1.0, 2.0)
+grid = np.linspace(bounds[0], bounds[1], 600).reshape(-1, 1)
+noise = 1e-3
+
+def expected_improvement(mu, std, f_plus, xi=0.01):
+    std = np.maximum(std, 1e-9)
+    imp = mu - f_plus - xi
+    z = imp / std
+    ei = imp * norm.cdf(z) + std * norm.pdf(z)
+    ei[std < 1e-9] = 0.0
+    return ei
+
+kernel = ConstantKernel(1.0, (1e-2, 1e2)) * Matern(length_scale=0.3, nu=2.5)
+X = rng.uniform(bounds[0], bounds[1], size=(3, 1))
+y = objective(X).ravel()
+
+n_iter = 6
+fig, axes = plt.subplots(n_iter, 2, figsize=(12, 3 * n_iter))
+history = []
+
+for i in range(n_iter):
+    gp = GaussianProcessRegressor(kernel=kernel, alpha=noise, normalize_y=True,
+                                  n_restarts_optimizer=5, random_state=0)
+    gp.fit(X, y)
+    mu, std = gp.predict(grid, return_std=True)
+    f_plus = y.max()
+    ei = expected_improvement(mu, std, f_plus)
+    x_next = grid[np.argmax(ei)]
+    y_next = objective(x_next).item()
+
+    history.append({"iter": i + 1, "n_obs": len(X),
+                    "x_next": float(x_next[0]), "y_next": float(y_next),
+                    "best_y": float(max(f_plus, y_next)),
+                    "max_EI": float(ei.max())})
+
+    ax_gp, ax_ac = axes[i]
+    ax_gp.plot(grid, objective(grid), "k--", lw=1, label="objective")
+    ax_gp.plot(grid, mu, "C0", label="GP mean")
+    ax_gp.fill_between(grid.ravel(), mu - 1.96 * std, mu + 1.96 * std,
+                       color="C0", alpha=0.2, label="95% CI")
+    ax_gp.scatter(X, y, c="k", zorder=5, label="observations")
+    ax_gp.axvline(x_next[0], color="C3", ls=":", label="next x")
+    ax_gp.set_title(f"Iteration {i + 1}: GP surrogate")
+    if i == 0:
+        ax_gp.legend(fontsize=7, loc="lower left")
+    ax_ac.plot(grid, ei, "C2")
+    ax_ac.axvline(x_next[0], color="C3", ls=":")
+    ax_ac.set_title(f"Iteration {i + 1}: Expected Improvement")
+
+    X = np.vstack([X, x_next.reshape(1, -1)])
+    y = np.append(y, y_next)
+
+fig.tight_layout()
+
+# --- UCB and Thompson sampling on the final posterior ---
+gp = GaussianProcessRegressor(kernel=kernel, alpha=noise, normalize_y=True,
+                              n_restarts_optimizer=5, random_state=0)
+gp.fit(X, y)
+mu, std = gp.predict(grid, return_std=True)
+beta = 2.0
+ucb = mu + np.sqrt(beta) * std
+samples = gp.sample_y(grid, n_samples=3, random_state=1)
+
+fig2, (axu, axt) = plt.subplots(1, 2, figsize=(12, 4))
+axu.plot(grid, mu, "C0", label="GP mean")
+axu.plot(grid, ucb, "C1", label=f"UCB (beta={beta})")
+axu.fill_between(grid.ravel(), mu - 1.96 * std, mu + 1.96 * std,
+                color="C0", alpha=0.2)
+axu.scatter(X, y, c="k", zorder=5)
+axu.set_title("Upper Confidence Bound")
+axu.legend(fontsize=8)
+for k in range(samples.shape[1]):
+    axt.plot(grid, samples[:, k], lw=1, label=f"posterior draw {k + 1}")
+axt.plot(grid, mu, "k--", lw=1.5, label="GP mean")
+axt.set_title("Thompson sampling: posterior function draws")
+axt.legend(fontsize=8)
+fig2.tight_layout()
+
+results = pd.DataFrame(history)
+print("\nBayesian optimization trace (Expected Improvement):")
+print(results.to_string(index=False))
+
+true_opt = grid[np.argmax(objective(grid))][0]
+print(f"\nTrue optimum on grid:  x* = {true_opt:.4f}, f* = {objective(true_opt):.4f}")
+best_idx = np.argmax(y)
+print(f"BO best found:         x  = {X[best_idx, 0]:.4f}, y  = {y[best_idx]:.4f}")
+print(f"Optimality gap:        {objective(true_opt) - y[best_idx]:.4e}")
+print("\nPractice with the open-source tools Optuna and scikit-optimize.")
+
+plt.show()
+```
+
+## Julia
+
+```julia
+using GaussianProcesses, Distributions, Random, Printf
+Random.seed!(0)
+
+objective(x) = sin(3x) + 0.5sin(7x) - 0.1(x - 0.7)^2
+lo, hi = -1.0, 2.0
+grid = collect(range(lo, hi; length=600))
+
+# Expected improvement (maximization), threshold f_plus + xi
+function ei(mu, sd, fplus; xi=0.01)
+    sd = max.(sd, 1e-9)
+    z = (mu .- fplus .- xi) ./ sd
+    (mu .- fplus .- xi) .* cdf.(Normal(), z) .+ sd .* pdf.(Normal(), z)
+end
+
+X = lo .+ (hi - lo) .* rand(3)
+y = objective.(X)
+
+for it in 1:6
+    gp = GP(reshape(X, 1, :), y, MeanZero(), Matern(5//2, 0.0, 0.0), -3.0)
+    mu, var = predict_y(gp, reshape(grid, 1, :))
+    sd = sqrt.(max.(var, 0.0))
+    a = ei(mu, sd, maximum(y))
+    xn = grid[argmax(a)]
+    yn = objective(xn)
+    @printf("iter %d  x_next=%.4f  y_next=%.4f  best=%.4f\n",
+            it, xn, yn, max(maximum(y), yn))
+    push!(X, xn); push!(y, yn)
+end
+
+xs = argmax(y)
+@printf("Best found: x=%.4f  y=%.4f\n", X[xs], y[xs])
+```
+
+## Rust
+
+```rust
+// Sketch: 1D Bayesian optimization with a GP surrogate and expected
+// improvement. Uses the `friedrich` GP crate and `statrs` for the normal.
+use friedrich::gaussian_process::GaussianProcess;
+use friedrich::kernel::Matern2;
+use statrs::distribution::{ContinuousCDF, Continuous, Normal};
+
+fn objective(x: f64) -> f64 {
+    (3.0 * x).sin() + 0.5 * (7.0 * x).sin() - 0.1 * (x - 0.7).powi(2)
+}
+
+fn ei(mu: f64, sd: f64, f_plus: f64, xi: f64) -> f64 {
+    let n = Normal::new(0.0, 1.0).unwrap();
+    let sd = sd.max(1e-9);
+    let z = (mu - f_plus - xi) / sd;
+    (mu - f_plus - xi) * n.cdf(z) + sd * n.pdf(z)
+}
+
+fn main() {
+    let (lo, hi) = (-1.0_f64, 2.0_f64);
+    let grid: Vec<f64> = (0..600).map(|i| lo + (hi - lo) * i as f64 / 599.0).collect();
+    let mut xs: Vec<Vec<f64>> = vec![vec![-0.5], vec![0.4], vec![1.3]];
+    let mut ys: Vec<f64> = xs.iter().map(|x| objective(x[0])).collect();
+
+    for it in 0..6 {
+        let gp = GaussianProcess::builder(xs.clone(), ys.clone())
+            .set_kernel(Matern2::default())
+            .fit();
+        let f_plus = ys.iter().cloned().fold(f64::MIN, f64::max);
+        let (mut best_a, mut best_x) = (f64::MIN, grid[0]);
+        for &g in &grid {
+            let mu = gp.predict(&vec![g]);
+            let var = gp.predict_variance(&vec![g]);
+            let a = ei(mu, var.max(0.0).sqrt(), f_plus, 0.01);
+            if a > best_a { best_a = a; best_x = g; }
+        }
+        let y_next = objective(best_x);
+        println!("iter {} x_next={:.4} y_next={:.4}", it + 1, best_x, y_next);
+        xs.push(vec![best_x]);
+        ys.push(y_next);
+    }
+}
+```
+
+:::
 
 ## 4. Hyperparameter Tuning Applications
 
@@ -161,7 +427,8 @@ Bayesian optimization is the method of choice when evaluations are expensive, gr
 ## References
 
 1. Brochu, E., Cora, V. M., and de Freitas, N. (2010). A Tutorial on Bayesian Optimization of Expensive Cost Functions. https://arxiv.org/abs/1012.2599
-2. Shahriari, B., Swersky, K., Wang, Z., Adams, R. P., and de Freitas, N. (2016). Taking the Human Out of the Loop: A Review of Bayesian Optimization. https://ieeexplore.ieee.org/document/7352306
+2. Shahriari, B., Swersky, K., Wang, Z., Adams, R. P., and de Freitas, N. (2016). Taking the Human Out of the Loop: A Review of Bayesian Optimization. Proceedings of the IEEE. DOI: 10.1109/JPROC.2015.2494218
+13. Mockus, J. (1975). On Bayesian Methods for Seeking the Extremum. Optimization Techniques IFIP Technical Conference. DOI: 10.1007/3-540-07165-2_55
 3. Rasmussen, C. E., and Williams, C. K. I. (2006). Gaussian Processes for Machine Learning. https://gaussianprocess.org/gpml/
 4. Snoek, J., Larochelle, H., and Adams, R. P. (2012). Practical Bayesian Optimization of Machine Learning Algorithms. https://arxiv.org/abs/1206.2944
 5. Srinivas, N., Krause, A., Kakade, S., and Seeger, M. (2010). Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design. https://arxiv.org/abs/0912.3995
