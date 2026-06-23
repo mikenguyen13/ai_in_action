@@ -50,14 +50,22 @@ $$
 
 By interpolating, SMOTE expands the minority region into a smoother manifold instead of a set of spikes, which reduces the overfitting seen with naive duplication.
 
-```python
-# Conceptual SMOTE, not production code
-for x_i in minority:
-    neighbors = k_nearest(x_i, minority, k)
-    x_nn = random_choice(neighbors)
-    lam = uniform(0, 1)
-    synthetic.append(x_i + lam * (x_nn - x_i))
-```
+#### A precise statement of the algorithm
+
+Fix the minority set $\mathcal{M} = \{x_1, \dots, x_m\} \subset \mathbb{R}^d$ and a neighbor count $k$. For each base point $x_i$ let $\mathcal{N}_k(x_i)$ be the set of its $k$ nearest minority neighbors under the Euclidean metric, with ties broken by point index so the neighborhood is well defined. To draw one synthetic example we sample a neighbor uniformly, $x_{nn} \sim \mathrm{Uniform}\big(\mathcal{N}_k(x_i)\big)$, and an interpolation coefficient $\lambda \sim \mathrm{Uniform}(0,1)$, then set
+
+$$
+x_{\text{new}} = x_i + \lambda\,(x_{nn} - x_i) = (1-\lambda)\,x_i + \lambda\,x_{nn}.
+$$
+
+The second form makes the geometry explicit: $x_{\text{new}}$ is a convex combination of $x_i$ and $x_{nn}$, so every synthetic point lies on the line segment joining a minority example to one of its near neighbors and therefore inside the convex hull of $\mathcal{M}$. Conditioned on the chosen pair, each coordinate is uniformly distributed along the segment,
+
+$$
+\mathbb{E}[x_{\text{new}} \mid x_i, x_{nn}] = \tfrac{1}{2}(x_i + x_{nn}), \qquad
+\operatorname{Var}[x_{\text{new}} \mid x_i, x_{nn}] = \tfrac{1}{12}\,(x_{nn} - x_i)^{\odot 2},
+$$
+
+where $\odot 2$ is the elementwise square. The expected synthetic point is the midpoint of the segment and its spread grows with the squared edge length, which is why SMOTE densifies sparse minority regions more aggressively than tight clusters. Summing over the $m$ base points and their neighborhoods, the synthetic distribution is a uniform mixture over the union of these segments, a piecewise-linear approximation to the minority manifold.
 
 SMOTE has well known limitations. It interpolates in feature space, so it assumes the space between two minority points is itself minority, which fails when classes overlap and produces synthetic points inside majority territory. It treats all minority points alike, including noisy outliers. It also struggles with high dimensional data and with categorical features, since linear interpolation is meaningless for unordered categories.
 
@@ -193,6 +201,84 @@ is a single balanced summary that ranges from minus one to one and only scores h
 A disciplined workflow for an imbalanced problem proceeds in a fixed order. First, fix evaluation before touching the model: choose average precision, balanced accuracy, or a cost weighted metric, and split data so the test fold keeps the natural prior. Second, establish a baseline with class weights, since reweighting is cheap and often closes most of the gap. Third, if the minority class is small and the feature space is well behaved, add resampling such as SMOTE or a SMOTE plus cleaning combination, always inside the cross validation loop. Fourth, tune the decision threshold on validation data against the operating objective rather than accepting $0.5$. Fifth, recalibrate probabilities if any resampling altered the training prior, and verify calibration before trusting score based decisions.
 
 The recurring theme is that imbalance is a problem of objectives and decisions, not only of data. The label distribution shapes what the loss rewards, what the threshold should be, and which metric tells the truth. Address all three and the rarity of the positive class becomes a property to exploit rather than an obstacle that quietly defeats an otherwise competent model.
+
+## 7. Reference Implementation
+
+The companion libraries ship a small, validated SMOTE in all three languages of this book. Python is the executed reference (`pip install -e .` from the repository root exposes the `aiinaction` package); the Julia package `AIInAction` and the Rust crate `aiinaction` mirror the identical public API and are checked at parity in CI. To make the three agree numerically, all randomness flows through one shared linear-congruential generator rather than each language's native RNG, so a given seed yields bit-for-bit identical synthetic points everywhere.
+
+The public surface is four functions: `euclidean` (distance), `k_nearest` (deterministic neighbor lookup with index tie-breaking), `smote_sample` (one interpolation step), and `smote` (the full generator). The example below oversamples a four-point minority cluster, producing synthetic points that all lie on segments between neighboring minority examples.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch118_smote import euclidean, k_nearest, smote
+
+minority = [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [3.0, 1.0]]
+
+# Two nearest minority neighbors of point 0 (ties broken by index).
+print("neighbors of point 0:", k_nearest(minority, 0, k=2))
+print("distance (0,0)->(3,4):", euclidean([0.0, 0.0], [3.0, 4.0]))
+
+# Synthesize four new minority examples; the seed makes this reproducible.
+synthetic = smote(minority, n_synthetic=4, k=2, seed=42)
+for i, p in enumerate(synthetic):
+    print(f"synthetic[{i}] = [{p[0]:.6f}, {p[1]:.6f}]")
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch118Smote
+
+minority = [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [3.0, 1.0]]
+
+# Julia uses 1-based indexing: point 0 above is index 1 here.
+println("neighbors of point 1: ", k_nearest(minority, 1, 2))   # -> [2, 3]
+println("distance (0,0)->(3,4): ", euclidean([0.0, 0.0], [3.0, 4.0]))
+
+synthetic = smote(minority, 4; k = 2, seed = 42)
+for (i, p) in enumerate(synthetic)
+    println("synthetic[$i] = ", round.(p, digits = 6))
+end
+# synthetic[1] = [0.17625, 0.0]
+# synthetic[2] = [1.222554, 0.777446]
+# synthetic[3] = [2.025664, 0.025664]
+# synthetic[4] = [2.76308, 1.0]
+```
+
+## Rust
+
+```rust
+use aiinaction::ch118_smote::{euclidean, k_nearest, smote};
+
+fn main() {
+    let minority = vec![
+        vec![0.0, 0.0],
+        vec![1.0, 1.0],
+        vec![2.0, 0.0],
+        vec![3.0, 1.0],
+    ];
+
+    // Two nearest neighbors of point 0 (0-based, like Python).
+    println!("neighbors of point 0: {:?}", k_nearest(&minority, 0, 2).unwrap()); // [1, 2]
+    println!("distance: {}", euclidean(&[0.0, 0.0], &[3.0, 4.0]).unwrap());      // 5.0
+
+    let synthetic = smote(&minority, 4, 2, 42).unwrap();
+    for (i, p) in synthetic.iter().enumerate() {
+        println!("synthetic[{}] = [{:.6}, {:.6}]", i, p[0], p[1]);
+    }
+    // synthetic[0] = [0.176250, 0.000000]
+    // synthetic[1] = [1.222554, 0.777446]
+    // synthetic[2] = [2.025664, 0.025664]
+    // synthetic[3] = [2.763080, 1.000000]
+}
+```
+
+:::
+
+All three produce the same four synthetic points to floating-point tolerance, which the cross-language CI fixtures assert. For production work on real datasets prefer the battle-tested `imbalanced-learn` library; the implementation here is a transparent, dependency-light reference for understanding exactly what SMOTE computes.
 
 ## References
 

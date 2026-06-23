@@ -106,7 +106,13 @@ c_j = \frac{\sum_{i} u_{ij}^{\,m}\, x_i}{\sum_{i} u_{ij}^{\,m}}, \qquad
 u_{ij} = \frac{1}{\sum_{l=1}^{k} \left( \dfrac{\lVert x_i - c_j \rVert}{\lVert x_i - c_l \rVert} \right)^{\frac{2}{m-1}}} .
 $$
 
-As $m \to 1^{+}$ the memberships harden toward zero or one and the method approaches K-Means. As $m$ grows the memberships flatten toward $1/k$ and clusters blur together. A value of $m = 2$ is the common default.
+The membership update is worth deriving, since it is the only place the simplex constraint bites. Fix the centroids and write $d_{ij}^2 = \lVert x_i - c_j \rVert^2$. For a single point $i$ the constrained subproblem is $\min_{u_i} \sum_j u_{ij}^m d_{ij}^2$ subject to $\sum_j u_{ij} = 1$. Introduce a Lagrange multiplier $\lambda_i$ and form $\mathcal{L} = \sum_j u_{ij}^m d_{ij}^2 - \lambda_i\!\left(\sum_j u_{ij} - 1\right)$. Stationarity gives $m\, u_{ij}^{m-1} d_{ij}^2 = \lambda_i$, hence
+
+$$
+u_{ij} = \left(\frac{\lambda_i}{m\, d_{ij}^2}\right)^{\frac{1}{m-1}} \propto \left(\frac{1}{d_{ij}^2}\right)^{\frac{1}{m-1}}.
+$$
+
+Normalizing so the memberships sum to one across $j$ eliminates $\lambda_i$ and yields exactly the distance ratio formula above. The membership of point $i$ in cluster $j$ is therefore an inverse-distance weighting raised to the power $1/(m-1)$, softmaxed over clusters. As $m \to 1^{+}$ the exponent $2/(m-1) \to \infty$ and the memberships harden toward zero or one, so the method approaches K-Means. As $m$ grows the memberships flatten toward $1/k$ and clusters blur together. A value of $m = 2$ is the common default, for which the exponent is simply $2$.
 
 ```text
 init memberships U randomly, rows summing to 1
@@ -159,6 +165,154 @@ clean Gaussian-like clusters standard k-means
 ```
 
 In practice these choices compose. One might seed a kernel method with mini-batch centers, use bisecting splits with a robust median update, or post process fuzzy memberships to detect outliers before a final hard pass. The unifying lesson is that the alternating assign and update template of K-Means is a flexible scaffold, and each extension swaps in a different notion of distance, representative, data access, assignment, or partition structure to fit the data and constraints at hand. Selecting the right variant begins with diagnosing which of Lloyd's assumptions your data breaks.
+
+## 8. Reference Implementation
+
+The companion libraries ship the building blocks of every variant in this chapter across all three languages of the book. Python is the executed reference (`pip install -e .` from the repository root exposes the `aiinaction` package); the Julia package `AIInAction` and the Rust crate `aiinaction` mirror the identical public API and are checked at parity in CI. To keep the three numerically identical, each routine is deterministic in its inputs: initialization is supplied by the caller as explicit centroids or indices rather than drawn from a random number generator, so the same call yields the same answer in every language.
+
+The public surface decomposes the alternating template into reusable pieces: `lloyd_step` and `inertia` for the Lloyd core; `mini_batch_update` for one Sculley stochastic step; `kmedians_centroid` for the L1-optimal representative; `pam_assign_cost` for k-medoids assignment on an arbitrary dissimilarity matrix; `rbf_kernel_matrix` and `kernel_assignment_distances` for kernel K-Means via the kernel trick; `fuzzy_memberships` and `fuzzy_centroids` for the c-means alternating updates; and `bisecting_split` for one divisive 2-means bisection. The example below exercises one representative routine from each family on the same two well-separated blobs.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch124_kmeans_variants import (
+    lloyd_step, inertia, mini_batch_update, kmedians_centroid,
+    pam_assign_cost, rbf_kernel_matrix, kernel_assignment_distances,
+    fuzzy_memberships, fuzzy_centroids, bisecting_split,
+)
+
+X = [[0.0, 0.0], [1.0, 0.5], [0.5, 1.0], [8.0, 8.0], [9.0, 8.5], [8.5, 9.0]]
+
+# Lloyd: one assign-and-update step from a coarse initialization.
+labels, centroids = lloyd_step(X, [[0.0, 0.0], [9.0, 9.0]])
+print("lloyd labels :", labels)
+print("centroids    :", centroids)
+print("inertia      : %.4f" % inertia(X, centroids))
+
+# Mini-batch: one stochastic update absorbing a 4-point batch.
+mb_c, mb_cnt = mini_batch_update(
+    [[0.0, 0.0], [10.0, 10.0]], [0.0, 0.0],
+    [[1.0, 1.0], [9.0, 9.0], [2.0, 0.0], [8.0, 10.0]],
+)
+print("mini-batch   :", mb_c, "counts", mb_cnt)
+
+# K-medians: coordinatewise median ignores the y-outlier 100.
+print("k-median     :", kmedians_centroid([[1.0, 5.0], [2.0, 100.0], [3.0, 6.0]]))
+
+# K-medoids: nearest-medoid assignment on a dissimilarity matrix.
+D = [[0.0, 2.0, 5.0, 9.0], [2.0, 0.0, 4.0, 7.0],
+     [5.0, 4.0, 0.0, 3.0], [9.0, 7.0, 3.0, 0.0]]
+pam_lab, pam_cost = pam_assign_cost(D, medoid_indices=[0, 3])
+print("PAM labels   :", pam_lab, "cost", pam_cost)
+
+# Kernel: RBF feature-space distances under a hard assignment.
+K = rbf_kernel_matrix([[0.0], [0.2], [5.0], [5.2]], gamma=0.5)
+kd = kernel_assignment_distances(K, [0, 0, 1, 1], n_clusters=2)
+print("kernel d(pt0):", [round(float(v), 6) for v in kd[0]])
+
+# Fuzzy c-means: graded memberships and their weighted centers.
+XF = [[0.0], [1.0], [5.0], [6.0]]
+U = fuzzy_memberships(XF, [[0.5], [5.5]], m=2.0)
+print("fuzzy U(pt0) :", [round(v, 6) for v in U[0]])
+print("fuzzy centers:", [round(c[0], 6) for c in fuzzy_centroids(XF, U, m=2.0)])
+
+# Bisecting: a single 2-means split to begin a divisive hierarchy.
+bl, _, sse = bisecting_split(
+    [[0.0, 0.0], [0.5, 0.3], [8.0, 8.0], [8.4, 7.6]], [[0.0, 0.0], [8.0, 8.0]])
+print("bisect labels:", bl, "sse %.4f" % sse)
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch124KMeansVariants
+
+X = [0.0 0.0; 1.0 0.5; 0.5 1.0; 8.0 8.0; 9.0 8.5; 8.5 9.0]
+
+# Julia uses matrices and 1-based labels.
+labels, centroids = lloyd_step(X, [0.0 0.0; 9.0 9.0])
+println("lloyd labels : ", labels)            # [1, 1, 1, 2, 2, 2]
+println("inertia      : ", inertia(X, centroids))   # 2.0
+
+mb_c, mb_cnt = mini_batch_update([0.0 0.0; 10.0 10.0], [0.0, 0.0],
+                                 [1.0 1.0; 9.0 9.0; 2.0 0.0; 8.0 10.0])
+println("mini-batch   : ", mb_c)              # [1.5 0.5; 8.5 9.5]
+
+println("k-median     : ", kmedians_centroid([1.0 5.0; 2.0 100.0; 3.0 6.0]))  # [2.0, 6.0]
+
+D = [0.0 2.0 5.0 9.0; 2.0 0.0 4.0 7.0; 5.0 4.0 0.0 3.0; 9.0 7.0 3.0 0.0]
+pam_lab, pam_cost = pam_assign_cost(D, [1, 4])
+println("PAM labels   : ", pam_lab, " cost ", pam_cost)   # [1, 1, 2, 2] cost 5.0
+
+K = rbf_kernel_matrix(reshape([0.0, 0.2, 5.0, 5.2], 4, 1), 0.5)
+kd = kernel_assignment_distances(K, [1, 1, 2, 2], 2)
+println("kernel d(pt1): ", round.(kd[1, :], digits = 6))  # [0.009901, 1.990094]
+
+XF = reshape([0.0, 1.0, 5.0, 6.0], 4, 1)
+U = fuzzy_memberships(XF, reshape([0.5, 5.5], 2, 1), 2.0)
+println("fuzzy U(pt1) : ", round.(U[1, :], digits = 6))   # [0.991803, 0.008197]
+
+bl, _, sse = bisecting_split([0.0 0.0; 0.5 0.3; 8.0 8.0; 8.4 7.6], [0.0 0.0; 8.0 8.0])
+println("bisect labels: ", bl, " sse ", round(sse, digits = 4))  # [1, 1, 2, 2] sse 0.33
+```
+
+## Rust
+
+```rust
+use aiinaction::ch124_kmeans_variants::{
+    lloyd_step, inertia, mini_batch_update, kmedians_centroid,
+    pam_assign_cost, rbf_kernel_matrix, kernel_assignment_distances,
+    fuzzy_memberships, fuzzy_centroids, bisecting_split,
+};
+
+fn main() {
+    let x = vec![
+        vec![0.0, 0.0], vec![1.0, 0.5], vec![0.5, 1.0],
+        vec![8.0, 8.0], vec![9.0, 8.5], vec![8.5, 9.0],
+    ];
+
+    let (labels, centroids) = lloyd_step(&x, &[vec![0.0, 0.0], vec![9.0, 9.0]]).unwrap();
+    println!("lloyd labels : {:?}", labels);                 // [0, 0, 0, 1, 1, 1]
+    println!("inertia      : {:.4}", inertia(&x, &centroids).unwrap()); // 2.0000
+
+    let (mb_c, _) = mini_batch_update(
+        &[vec![0.0, 0.0], vec![10.0, 10.0]], &[0.0, 0.0],
+        &[vec![1.0, 1.0], vec![9.0, 9.0], vec![2.0, 0.0], vec![8.0, 10.0]],
+    ).unwrap();
+    println!("mini-batch   : {:?}", mb_c);                   // [[1.5, 0.5], [8.5, 9.5]]
+
+    let km = kmedians_centroid(&[vec![1.0, 5.0], vec![2.0, 100.0], vec![3.0, 6.0]]).unwrap();
+    println!("k-median     : {:?}", km);                     // [2.0, 6.0]
+
+    let d = vec![
+        vec![0.0, 2.0, 5.0, 9.0], vec![2.0, 0.0, 4.0, 7.0],
+        vec![5.0, 4.0, 0.0, 3.0], vec![9.0, 7.0, 3.0, 0.0],
+    ];
+    let (pam_lab, pam_cost) = pam_assign_cost(&d, &[0, 3]).unwrap();
+    println!("PAM labels   : {:?} cost {}", pam_lab, pam_cost); // [0, 0, 1, 1] cost 5
+
+    let k = rbf_kernel_matrix(&[vec![0.0], vec![0.2], vec![5.0], vec![5.2]], 0.5).unwrap();
+    let kd = kernel_assignment_distances(&k, &[0, 0, 1, 1], 2).unwrap();
+    println!("kernel d(pt0): [{:.6}, {:.6}]", kd[0][0], kd[0][1]); // [0.009901, 1.990094]
+
+    let xf = vec![vec![0.0], vec![1.0], vec![5.0], vec![6.0]];
+    let u = fuzzy_memberships(&xf, &[vec![0.5], vec![5.5]], 2.0).unwrap();
+    println!("fuzzy U(pt0) : [{:.6}, {:.6}]", u[0][0], u[0][1]); // [0.991803, 0.008197]
+    let _ = fuzzy_centroids(&xf, &u, 2.0).unwrap();
+
+    let (bl, _, sse) = bisecting_split(
+        &[vec![0.0, 0.0], vec![0.5, 0.3], vec![8.0, 8.0], vec![8.4, 7.6]],
+        &[vec![0.0, 0.0], vec![8.0, 8.0]],
+    ).unwrap();
+    println!("bisect labels: {:?} sse {:.4}", bl, sse);      // [0, 0, 1, 1] sse 0.3300
+}
+```
+
+:::
+
+All three implementations agree on the shared fixtures to a 1e-9 tolerance, which the cross-language CI suite asserts. For production clustering at scale prefer mature libraries: scikit-learn ships tuned `KMeans`, `MiniBatchKMeans`, and `BisectingKMeans`, `scikit-learn-extra` provides `KMedoids`, and `scikit-fuzzy` implements c-means. The code here is a transparent, dependency-light reference that exposes exactly what each variant computes.
 
 ## References
 

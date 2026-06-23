@@ -108,6 +108,24 @@ $$
 
 The update is driven by the residual between the observed one-hot label and the predicted probability, exactly mirroring the binary case. This residual structure is why softmax regression trains so robustly: at the optimum the predicted class proportions match the empirical proportions along every feature direction.
 
+To see exactly where this gradient comes from, work through one example $i$ and write $z_k = \beta_{0k} + \beta_k^\top x_i$. The per-example loss is the negative log likelihood $L_i = -\sum_{k} y_{ik} \log p_k$. The softmax derivative is the workhorse identity
+
+$$
+\frac{\partial p_k}{\partial z_m} = p_k\,(\delta_{km} - p_m),
+\qquad \delta_{km} = \begin{cases} 1 & k = m \\ 0 & k \neq m. \end{cases}
+$$
+
+Substituting into the chain rule and using $\sum_k y_{ik} = 1$ collapses the sum dramatically:
+
+$$
+\frac{\partial L_i}{\partial z_m}
+= -\sum_{k} \frac{y_{ik}}{p_k}\, \frac{\partial p_k}{\partial z_m}
+= -\sum_{k} y_{ik}(\delta_{km} - p_m)
+= p_m - y_{im}.
+$$
+
+So the gradient of the cross-entropy with respect to the logit is simply *predicted minus observed*. Because $z_m$ depends on $\beta_m$ through $\partial z_m / \partial \beta_m = x_i$, the chain rule gives $\partial L_i / \partial \beta_m = (p_m - y_{im})\, x_i$, and summing over the dataset (with a sign flip to match the log likelihood above) recovers the boxed gradient. Stacking the per-class logit residuals into a matrix $P - Y \in \mathbb{R}^{n \times K}$, the full weight gradient is the single matrix product $X^\top (P - Y)$, which is exactly what the implementations below compute.
+
 ```python
 # conceptual softmax regression objective
 Z = X @ W + b                 # (n, K) logits
@@ -131,6 +149,89 @@ The $L_2$ penalty shrinks coefficients toward zero and resolves both the separab
 ### 4.5 When to Prefer the Native Model
 
 Multinomial logistic regression is generally the better default when probability estimates matter, because it produces coherent, mutually exclusive probabilities from a single convex objective and yields directly interpretable log odds ratios. The reduction methods retain an edge when the base learner is not naturally multiclass, when classes can be added incrementally without refitting everything, or when the per-problem modularity simplifies engineering. For ordinary logistic regression there is rarely a reason to prefer one-vs-rest over the native multinomial fit on statistical grounds.
+
+### 4.6 A Worked Implementation
+
+The companion packages ship a tested, from-scratch softmax regression so you can reproduce every number here rather than treat the model as a black box. The Python package `aiinaction` is installable (`pip install -e .` from the repository root), with mirrored implementations in the Julia package `AIInAction` and the Rust crate `aiinaction`. All three expose the same small API, `softmax`, `cross_entropy`, and a `SoftmaxRegression` estimator with `fit` / `predict_proba` / `predict`, and they are checked against identical shared fixtures in CI so the three agree to within `1e-9`.
+
+The example below fits the model on a tiny three-class dataset in the plane. Classes are encoded as 0, 1, 2, and the estimator infers $K$ from the labels, runs full-batch gradient descent on the cross-entropy, and returns coherent simplex probabilities.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch088_softmax_regression import (
+    SoftmaxRegression,
+    softmax,
+    cross_entropy,
+)
+
+# Row-wise softmax is numerically stable (subtracts the per-row max).
+print("softmax([[1,2,3]]) =", softmax([[1.0, 2.0, 3.0]])[0].round(4))
+
+# A tiny 3-class problem in the plane (labels are 0, 1, 2).
+X = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+     [1.0, 1.0], [2.0, 2.0], [2.0, 0.0]]
+y = [0, 1, 2, 1, 2, 1]
+
+model = SoftmaxRegression(learning_rate=0.5, n_iter=200).fit(X, y)
+
+print("classes inferred:", model.n_classes)
+print("predictions:     ", model.predict(X).tolist())
+print("P(y | x=[0,0]):  ", model.predict_proba([[0.0, 0.0]])[0].round(4))
+print("train log loss:  ", round(cross_entropy(model.predict_proba(X), y), 4))
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch088SoftmaxRegression
+
+# Row-wise softmax (labels are 0-based to match the other languages).
+softmax([1.0 2.0 3.0])              # => 1x3 probabilities summing to 1
+
+X = [0.0 0.0; 1.0 0.0; 0.0 1.0;
+     1.0 1.0; 2.0 2.0; 2.0 0.0]
+y = [0, 1, 2, 1, 2, 1]
+
+model = fit!(SoftmaxRegression(; learning_rate=0.5, n_iter=200), X, y)
+
+model.n_classes                     # => 3
+predict(model, X)                   # => [0, 1, 2, 1, 2, 1]
+predict_proba(model, reshape([0.0, 0.0], 1, 2))   # P(y | x=[0,0])
+cross_entropy(predict_proba(model, X), y)         # train log loss
+```
+
+## Rust
+
+```rust
+use aiinaction::ch088_softmax_regression::{softmax, cross_entropy, SoftmaxRegression};
+
+fn main() {
+    // Row-wise stable softmax.
+    let p = softmax(&vec![vec![1.0, 2.0, 3.0]]).unwrap();
+    println!("softmax = {:?}", p[0]);
+
+    let x = vec![
+        vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0],
+        vec![1.0, 1.0], vec![2.0, 2.0], vec![2.0, 0.0],
+    ];
+    let y = vec![0usize, 1, 2, 1, 2, 1];
+
+    let mut model = SoftmaxRegression::new(0.5, 200, 0.0).unwrap();
+    model.fit(&x, &y).unwrap();
+
+    println!("classes:     {}", model.n_classes);          // 3
+    println!("predictions: {:?}", model.predict(&x).unwrap());
+    println!("P(y|[0,0]):  {:?}", model.predict_proba(&vec![vec![0.0, 0.0]]).unwrap()[0]);
+    println!("log loss:    {}", cross_entropy(&model.predict_proba(&x).unwrap(), &y).unwrap());
+}
+```
+
+:::
+
+All three recover the same predictions `[0, 1, 2, 1, 2, 1]` and the same probability vector for the origin, $P(y \mid x = [0,0]) \approx [0.8222,\ 0.1654,\ 0.0124]$, confirming the cross-language parity that the test suites enforce.
 
 ## 5. Calibration of Multiclass Probabilities
 

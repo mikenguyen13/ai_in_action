@@ -34,6 +34,35 @@ The per-center step size $\eta = 1/v_j$ implements an online mean: after a centr
 
 Two practical notes. First, initialization still matters; seeding with $k$-means++ on a modest subsample preserves the approximation guarantee while keeping seeding cheap. Second, because updates are stochastic, the objective is noisy across steps, so convergence is judged by a moving average of center displacement rather than exact stationarity.
 
+### Why the $1/v_j$ step yields the running mean
+
+The mini-batch rule is exactly stochastic gradient descent on the $k$-means objective restricted to one center. Fix a center $c_j$ and let $x_1, x_2, \dots$ be the stream of points assigned to it in arrival order. The contribution of those points to the objective is $f(c) = \tfrac{1}{2}\sum_{i} \lVert x_i - c \rVert^2$, whose gradient with respect to $c$ after seeing the $t$-th point is $\nabla_t = c - x_t$. Taking a step $c \leftarrow c - \eta_t \nabla_t$ with $\eta_t = 1/t$ gives the recurrence
+
+$$
+c^{(t)} = \left(1 - \tfrac{1}{t}\right) c^{(t-1)} + \tfrac{1}{t}\, x_t .
+$$
+
+We claim $c^{(t)} = \tfrac{1}{t}\sum_{i=1}^{t} x_i$, the running mean. Induct on $t$. The base case $c^{(1)} = x_1$ holds. Assuming $c^{(t-1)} = \tfrac{1}{t-1}\sum_{i=1}^{t-1} x_i$,
+
+$$
+c^{(t)} = \frac{t-1}{t}\cdot \frac{1}{t-1}\sum_{i=1}^{t-1} x_i + \frac{1}{t} x_t
+= \frac{1}{t}\sum_{i=1}^{t} x_i .
+$$
+
+So with $v_j$ acting as the per-center counter $t$, each centroid is the exact mean of every point it has ever absorbed. The mini-batch only changes *which* points are revealed at each step, not the averaging identity, which is why the method tracks full-batch Lloyd so closely while touching a vanishing fraction of the data per update.
+
+### The CF radius identity
+
+The BIRCH radius of Section 4 is computable from the triple $(N, \vec{LS}, SS)$ alone. With centroid $\bar{x} = \vec{LS}/N$, the mean squared distance of members to the centroid expands as
+
+$$
+R^2 = \frac{1}{N}\sum_{i=1}^{N} \lVert x_i - \bar{x} \rVert^2
+= \frac{1}{N}\sum_{i=1}^{N} \lVert x_i \rVert^2 - 2\,\bar{x}\!\cdot\!\frac{1}{N}\sum_{i=1}^{N} x_i + \lVert \bar{x} \rVert^2
+= \frac{SS}{N} - \lVert \bar{x} \rVert^2 ,
+$$
+
+since the cross term collapses to $2\lVert\bar{x}\rVert^2$. Substituting $\bar{x} = \vec{LS}/N$ gives $R^2 = SS/N - \lVert \vec{LS} \rVert^2 / N^2$, the formula the code below implements. Because $N$, $\vec{LS}$, and $SS$ are each additive, two subclusters merge by summing their triples, and the radius of the union follows with no rescan of the underlying points.
+
 ## 3. Streaming Clustering
 
 In the streaming model points arrive one at a time, memory is bounded, and we may store only a summary. The canonical guarantee comes from the **doubling or merge-and-reduce** framework: maintain a small set of weighted representatives (a coreset), and whenever the buffer fills, summarize it into a coarser level, much like binary counter carries.
@@ -131,6 +160,107 @@ Guidance by regime:
 - **Quadratic comparison cost or density methods:** canopy blocking and grid or ANN neighbor search.
 
 The recurring theme is that scale is bought with a small, additive, mergeable summary and a controlled approximation factor $\varepsilon$. Once cluster statistics are reduced to mergeable sufficient statistics, single-pass, streaming, and distributed variants all become rearrangements of the same summarize then merge skeleton.
+
+## 9. Reference Implementation
+
+The four building blocks of this chapter ship as the installable, tested module `ch133_clustering_at_scale`, available identically in Python (`aiinaction`), Julia (`AIInAction`), and Rust (`aiinaction`). Each routine that samples takes an explicit integer `seed` and draws from a small shared linear congruential generator, so all three languages produce byte-identical results on the fixtures below; the cross-language CI suite asserts agreement to $10^{-9}$.
+
+The example clusters nine points that fall into three well-separated groups. We summarize them with a BIRCH clustering feature, recover its centroid and radius, block them into canopies, seed three centers with k-means$\parallel$, and refine with mini-batch $k$-means.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch133_clustering_at_scale import (
+    ClusteringFeature,
+    mini_batch_kmeans,
+    canopy_clustering,
+    kmeans_parallel_init,
+    inertia,
+)
+
+points = [
+    [0.0, 0.0], [0.2, 0.1], [0.1, 0.2],
+    [5.0, 5.0], [5.2, 4.9], [4.9, 5.1],
+    [0.0, 5.0], [0.1, 4.8], [-0.1, 5.2],
+]
+
+# BIRCH clustering feature: additive (N, LS, SS) summary.
+cf = ClusteringFeature.from_points(points)
+print("CF N =", cf.n, "centroid =", [round(v, 3) for v in cf.centroid()])
+print("CF radius =", round(cf.radius(), 4))
+
+# Canopy blocking with squared-distance thresholds T1 > T2.
+print("canopies:", canopy_clustering(points, t1=2.0, t2=1.0, seed=7))
+
+# Scalable k-means|| seeding, then mini-batch refinement.
+seeds = kmeans_parallel_init(points, 3, oversampling=2.0, n_rounds=3, seed=123)
+final = mini_batch_kmeans(points, seeds, batch_size=4, n_iter=20, seed=42)
+for c in final:
+    print("center:", [round(v, 4) for v in c])
+print("inertia:", round(inertia(points, final), 6))
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch133ClusteringAtScale
+
+points = [
+    [0.0, 0.0], [0.2, 0.1], [0.1, 0.2],
+    [5.0, 5.0], [5.2, 4.9], [4.9, 5.1],
+    [0.0, 5.0], [0.1, 4.8], [-0.1, 5.2],
+]
+
+cf = cf_from_points(points)
+println("CF N = ", cf.n, " centroid = ", round.(centroid(cf), digits=3))
+println("CF radius = ", round(radius(cf), digits=4))
+
+println("canopies: ", canopy_clustering(points; t1=2.0, t2=1.0, seed=7))
+
+seeds = kmeans_parallel_init(points, 3; oversampling=2.0, n_rounds=3, seed=123)
+final = mini_batch_kmeans(points, seeds; batch_size=4, n_iter=20, seed=42)
+for c in final
+    println("center: ", round.(c, digits=4))
+end
+println("inertia: ", round(inertia(points, final), digits=6))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch133_clustering_at_scale::{
+    canopy_clustering, inertia, kmeans_parallel_init, mini_batch_kmeans,
+    ClusteringFeature,
+};
+
+fn main() {
+    let points = vec![
+        vec![0.0, 0.0], vec![0.2, 0.1], vec![0.1, 0.2],
+        vec![5.0, 5.0], vec![5.2, 4.9], vec![4.9, 5.1],
+        vec![0.0, 5.0], vec![0.1, 4.8], vec![-0.1, 5.2],
+    ];
+
+    let cf = ClusteringFeature::from_points(&points).unwrap();
+    println!("CF N = {} centroid = {:?}", cf.n, cf.centroid().unwrap());
+    println!("CF radius = {:.4}", cf.radius().unwrap());
+
+    let canopies = canopy_clustering(&points, 2.0, 1.0, 7).unwrap();
+    println!("canopies: {:?}", canopies);
+
+    let seeds = kmeans_parallel_init(&points, 3, 2.0, 3, 123).unwrap();
+    let final_centers = mini_batch_kmeans(&points, &seeds, 4, 20, 42).unwrap();
+    for c in &final_centers {
+        println!("center: {:?}", c);
+    }
+    println!("inertia: {:.6}", inertia(&points, &final_centers).unwrap());
+}
+```
+
+:::
+
+All three implementations share the same API surface and the same deterministic sampler, so they return identical centroids, canopies, and seeds. Install the package for your language and import `ch133_clustering_at_scale` to reuse these routines directly.
 
 ## References
 

@@ -160,7 +160,123 @@ Storing the full pairwise distance matrix requires $O(n^2)$ memory, which is usu
 
 When $n$ is too large for exact methods, common strategies include clustering a representative sample and assigning the rest by nearest cluster, running a fast flat method such as k-means to produce a few thousand micro clusters and then applying hierarchical clustering to those, or restricting merges to a sparse neighborhood graph so that only local distances are ever considered. Each sacrifices some exactness for tractability, and the right choice depends on whether the priority is the full tree or only a partition near a particular granularity.
 
-## 6. Practical Guidance
+## 6. A Worked Derivation: Ward From the Lance Williams Update
+
+It is worth seeing exactly why the Ward merge cost reduces to the closed form quoted in Section 2.4 and how that closed form is consistent with the Lance Williams coefficients, since the two appear unrelated at first glance.
+
+Start from the error sum of squares of a cluster, $\text{ESS}(C) = \sum_{x \in C} \lVert x - \mu_C \rVert^2$ with centroid $\mu_C = \frac{1}{|C|}\sum_{x \in C} x$. A standard identity rewrites this without reference to the centroid:
+
+$$
+\text{ESS}(C) = \frac{1}{2|C|} \sum_{x \in C} \sum_{y \in C} \lVert x - y \rVert^2 .
+$$
+
+When we merge $C_a$ and $C_b$, the change in total ESS is $\Delta = \text{ESS}(C_a \cup C_b) - \text{ESS}(C_a) - \text{ESS}(C_b)$. Substituting the centroid form of each term and simplifying, every within $C_a$ and within $C_b$ contribution cancels, leaving only the cross term, which collapses to
+
+$$
+\Delta(C_a, C_b) = \frac{n_a n_b}{n_a + n_b} \, \lVert \mu_{C_a} - \mu_{C_b} \rVert^2 ,
+$$
+
+the closed form of Section 2.4. Now define the working dissimilarity that the algorithm actually stores as $D(C_a, C_b) = \Delta(C_a, C_b)$, a squared quantity. Expanding $\Delta(C_a \cup C_b, C_k)$ in terms of $\Delta(C_a, C_k)$, $\Delta(C_b, C_k)$ and $\Delta(C_a, C_b)$ and matching coefficients yields exactly the Ward row of the Lance Williams table:
+
+$$
+\alpha_a = \frac{n_a + n_k}{n_a + n_b + n_k}, \quad \alpha_b = \frac{n_b + n_k}{n_a + n_b + n_k}, \quad \beta = \frac{-n_k}{n_a + n_b + n_k}, \quad \gamma = 0 .
+$$
+
+This is why a correct Ward implementation runs the recurrence on squared distances and reports $\sqrt{\Delta}$ as the dendrogram height: the recurrence is exact only in the squared metric, while the displayed height is conventionally the Euclidean distance between the merged centroids scaled by the size factor. The reference implementation below follows precisely this rule, which is what lets it reproduce the SciPy linkage matrix to machine precision.
+
+## 7. Reference Implementation
+
+The companion libraries ship a dependency-free agglomerative clustering routine in all three languages. Each returns a linkage matrix in the SciPy row format `[node_a, node_b, height, size]`: original points carry ids `0 .. n-1`, and the merge formed at step `t` is given id `n + t`. The same Lance Williams recurrence drives single, complete, average, and Ward linkage, and the three implementations agree to within `1e-9` on shared fixtures. Install the package for your language ([`aiinaction`](https://pypi.org) for Python, the `AIInAction` Julia package, and the `aiinaction` Rust crate) and the snippets below run as written.
+
+We cluster five points, three near the origin and two near $(10, 10)$, and read off the merge structure and a two cluster cut.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch125_agglomerative_clustering import (
+    linkage_matrix,
+    fcluster,
+    cophenetic_distances,
+)
+
+points = [
+    [0.0, 0.0],
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [10.0, 10.0],
+    [10.0, 11.0],
+]
+
+Z = linkage_matrix(points, linkage="ward")
+print("Ward linkage matrix [a, b, height, size]:")
+for row in Z:
+    a, b, h, size = row
+    print(f"  {int(a)} + {int(b)}  height={h:.4f}  size={int(size)}")
+
+print("Two-cluster cut:", fcluster(Z, n_clusters=2))
+
+coph = cophenetic_distances(Z)
+print(f"Cophenetic distance between point 0 and point 3: {coph[0][3]:.4f}")
+```
+
+The first two merges (heights of 1) pull together the two tight groups; the final merge, at a much larger height, joins them only because the algorithm must. The two cluster cut recovers the obvious split, and the large cophenetic distance between a point near the origin and a point near $(10, 10)$ confirms that the tree kept them apart until the very end.
+
+## Julia
+
+```julia
+using AIInAction.Ch125AgglomerativeClustering
+
+points = [
+    [0.0, 0.0],
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [10.0, 10.0],
+    [10.0, 11.0],
+]
+
+Z = linkage_matrix(points, "ward")
+for row in Z
+    println("  ", Int(row[1]), " + ", Int(row[2]),
+            "  height=", round(row[3], digits=4), "  size=", Int(row[4]))
+end
+
+println("Two-cluster cut: ", fcluster(Z, 2))   # [0, 0, 0, 1, 1]
+```
+
+## Rust
+
+```rust
+use aiinaction::ch125_agglomerative_clustering::{linkage_matrix, fcluster};
+
+fn main() {
+    let points = vec![
+        vec![0.0, 0.0],
+        vec![1.0, 0.0],
+        vec![0.0, 1.0],
+        vec![10.0, 10.0],
+        vec![10.0, 11.0],
+    ];
+
+    let z = linkage_matrix(&points, "ward").unwrap();
+    for row in &z {
+        println!(
+            "  {} + {}  height={:.4}  size={}",
+            row[0] as usize, row[1] as usize, row[2], row[3] as usize
+        );
+    }
+
+    // [0, 0, 0, 1, 1]
+    println!("Two-cluster cut: {:?}", fcluster(&z, 2).unwrap());
+}
+```
+
+:::
+
+All three print the identical linkage matrix and the same `[0, 0, 0, 1, 1]` cut, which is exactly the parity the shared test fixtures enforce.
+
+## 8. Practical Guidance
 
 A few recommendations consolidate the preceding material. Use Ward linkage with Euclidean distance as a default when clusters are expected to be compact and of similar size, since it behaves predictably and parallels k-means. Reach for single linkage only when elongated or irregular cluster shapes are expected, and watch for chaining. Prefer average or complete linkage when a balance between the extremes is wanted. Always inspect the dendrogram before cutting, since the merge heights reveal whether the data has clear structure or whether any cut would be arbitrary. Validate the chosen cut with an index such as the silhouette score or the cophenetic correlation rather than trusting a single visual impression. Finally, respect the quadratic cost: confirm that $n$ is small enough for the full distance matrix, and switch to sampling or micro clustering before it is not.
 

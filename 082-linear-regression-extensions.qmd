@@ -129,6 +129,35 @@ until converged
 
 The Huber estimator has good local robustness but its breakdown point is still low because the linear tail does not fully reject extreme outliers. Redescending losses such as Tukey's biweight, whose $\psi$ returns to zero for very large residuals, reject gross outliers entirely at the cost of a nonconvex objective and sensitivity to initialization.
 
+### 4.2.1 Why IRLS solves the Huber problem
+
+The IRLS recipe is not a heuristic; it is the exact stationarity condition of the M-estimation objective rewritten as a weighted least squares problem. Minimizing $J(\beta) = \sum_i \rho_\delta(r_i)$ with $r_i = y_i - x_i^\top\beta$ requires the gradient to vanish:
+
+$$
+\nabla_\beta J = -\sum_{i=1}^n \psi_\delta(r_i)\, x_i = 0,
+\qquad \psi_\delta(r) = \rho_\delta'(r) = \operatorname{clip}(r, -\delta, \delta).
+$$
+
+The key algebraic trick is to write the bounded score as a residual times a data-dependent weight. Define
+
+$$
+w_i \;=\; \frac{\psi_\delta(r_i)}{r_i} \;=\; \min\!\left(1, \frac{\delta}{|r_i|}\right),
+$$
+
+so that $\psi_\delta(r_i) = w_i\, r_i$ exactly (for $|r_i| \le \delta$ the weight is one and the term is quadratic; for $|r_i| > \delta$ the weight shrinks like $1/|r_i|$ so the contribution is capped at $\delta$). Substituting turns the stationarity condition into
+
+$$
+\sum_{i=1}^n w_i\, r_i\, x_i = 0
+\quad\Longleftrightarrow\quad
+X^\top W (y - X\beta) = 0
+\quad\Longleftrightarrow\quad
+X^\top W X\,\beta = X^\top W y,
+$$
+
+which is precisely the weighted normal equations with $W = \operatorname{diag}(w_1,\dots,w_n)$. Because the weights depend on $\beta$ through the residuals, we iterate: fix the weights from the current residuals, solve the linear WLS subproblem, recompute residuals and weights, and repeat. Since the Huber loss is convex with a Lipschitz score, this fixed-point iteration is a special case of a majorize-minimize scheme and converges to the global minimizer. In practice the residuals are first divided by a robust scale estimate $\hat\sigma$ (we use the MAD, $1.4826 \cdot \operatorname{median}_i |r_i - \operatorname{median}(r)|$) so that $\delta$ is expressed in standard-deviation units and the procedure is equivariant under rescaling of $y$.
+
+The same template yields quantile regression: the pinball loss $\rho_\tau$ has subgradient $\psi_\tau(r) = \tau - \mathbb{1}[r<0]$, and writing $w_i = (\tau \text{ or } 1-\tau)/|r_i|$ recovers a reweighted least squares iteration whose fixed point is the conditional-quantile fit (a small floor $\varepsilon$ on $|r_i|$ keeps the weights finite at near-zero residuals).
+
 ### 4.3 RANSAC
 
 Random Sample Consensus (RANSAC) takes a different, combinatorial route to robustness and achieves a high breakdown point even when outliers are abundant. Rather than downweighting outliers, it seeks the largest subset of inliers consistent with a model. The algorithm repeatedly samples a minimal subset of points, just enough to fit the model, fits on that subset, and counts how many of the remaining points fall within a residual threshold of the fit. The fit with the largest consensus set wins, and a final estimate is computed on all its inliers.
@@ -225,6 +254,75 @@ Basis expansion scales poorly with input dimension: a tensor product of $M$ func
 ## 7. Synthesis
 
 The extensions in this chapter form a coherent toolkit organized by which OLS assumption they relax. Weighted and generalized least squares address the error covariance, handling heteroscedasticity and correlation respectively, and both reduce to OLS after whitening. Robust regression, through Huber M-estimation and RANSAC, addresses heavy tailed contamination by bounding or rejecting the influence of outliers. Quantile regression replaces the conditional mean with conditional quantiles via the asymmetric pinball loss, exposing the full shape of the response distribution. Basis function expansion relaxes linearity in the inputs while keeping linearity in the parameters, so the entire estimation apparatus carries over. Crucially these tools compose: one can fit a robust quantile spline under a generalized error covariance, because each modification touches a different and orthogonal part of the modeling pipeline. The enduring lesson is that the linear model is far more flexible than the OLS textbook suggests, and that understanding which assumption a given dataset violates points directly to the right extension.
+
+## 8. Implementation
+
+The companion libraries ship a small, dependency-light implementation of these estimators that is identical across Python, Julia, and Rust. The module `ch082_robust_regression` exposes `fit_ols`, `fit_wls`, `fit_gls`, `fit_huber` (the core Huber IRLS routine), `fit_quantile`, and a `vandermonde` basis expansion, all built on a shared weighted-normal-equations engine and a from-scratch Gaussian-elimination solver. They are part of the installable `aiinaction` (Python), `AIInAction` (Julia), and `aiinaction` (Rust) packages, and the cross-language parity tests assert that all three agree to within floating-point tolerance on the fixtures used below.
+
+The example contaminates a clean line $y = 1 + 2x$ with a single gross outlier. Ordinary least squares is dragged badly toward the bad point, while the Huber fit recovers the underlying line almost exactly, illustrating the bounded-influence property derived in Section 4.2.1.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch082_robust_regression import fit_ols, fit_huber
+
+# Clean line y = 1 + 2x for x = 0..5, with index 3 contaminated (7 -> 20).
+X = [[1.0, float(i)] for i in range(6)]
+y = [1.0, 3.0, 5.0, 20.0, 9.0, 11.0]
+
+ols = fit_ols(X, y)
+huber = fit_huber(X, y, delta=1.345)
+
+print(f"OLS   coefficients : intercept={ols[0]:.4f}, slope={ols[1]:.4f}")
+print(f"Huber coefficients : intercept={huber.coef[0]:.4f}, slope={huber.coef[1]:.4f}")
+print(f"Huber converged in {huber.n_iter} iterations (scale={huber.scale:.2e})")
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch082RobustRegression
+
+# Clean line y = 1 + 2x for x = 0..5, with index 3 contaminated (7 -> 20).
+X = [[1.0, Float64(i)] for i in 0:5]
+y = [1.0, 3.0, 5.0, 20.0, 9.0, 11.0]
+
+ols   = fit_ols(X, y)
+huber = fit_huber(X, y; delta=1.345)
+
+println("OLS   coefficients : intercept=$(round(ols[1], digits=4)), slope=$(round(ols[2], digits=4))")
+println("Huber coefficients : intercept=$(round(huber.coef[1], digits=4)), slope=$(round(huber.coef[2], digits=4))")
+println("Huber converged in $(huber.n_iter) iterations")
+# OLS   coefficients : intercept=2.2381, slope=2.3714
+# Huber coefficients : intercept=1.0,    slope=2.0
+```
+
+## Rust
+
+```rust
+use aiinaction::ch082_robust_regression::{fit_ols, fit_huber};
+
+fn main() {
+    // Clean line y = 1 + 2x for x = 0..5, with index 3 contaminated (7 -> 20).
+    let x: Vec<Vec<f64>> = (0..6).map(|i| vec![1.0, i as f64]).collect();
+    let y = vec![1.0, 3.0, 5.0, 20.0, 9.0, 11.0];
+
+    let ols = fit_ols(&x, &y).unwrap();
+    let huber = fit_huber(&x, &y, 1.345, 100, 1e-10).unwrap();
+
+    println!("OLS   coefficients : intercept={:.4}, slope={:.4}", ols[0], ols[1]);
+    println!("Huber coefficients : intercept={:.4}, slope={:.4}", huber.coef[0], huber.coef[1]);
+    println!("Huber converged in {} iterations", huber.n_iter);
+    // OLS   coefficients : intercept=2.2381, slope=2.3714
+    // Huber coefficients : intercept=1.0000, slope=2.0000
+}
+```
+
+:::
+
+The same `fit_wls`, `fit_gls`, and `fit_quantile` entry points cover the heteroscedastic, correlated-error, and conditional-quantile cases, and feeding a `vandermonde` design matrix into any estimator fits a model that is nonlinear in the inputs while remaining linear in the coefficients (Section 6).
 
 ## References
 

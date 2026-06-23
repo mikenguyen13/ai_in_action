@@ -68,6 +68,117 @@ EDA exposes two main knobs: alpha, which controls the fraction of words changed 
 
 EDA is attractive because it is fast, dependency-light, and model-agnostic. It is most appropriate for topic and intent classification on short texts where word order and fine lexical choice carry little of the signal. It is a poor fit for tasks where syntax or precise wording is the signal, including natural language inference, question answering, sequence labeling such as named entity recognition, and any task with span-level labels, because shuffling and deleting tokens corrupt the alignment between tokens and labels.
 
+### 3.5 A formal model of the four operations
+
+To reason precisely about dosage and expected change, fix a sentence as an ordered token sequence $x = (w_1, \dots, w_L)$ of length $L$. Each EDA operation is a random map $T \colon \mathcal{X} \to \mathcal{X}$ governed by a hyperparameter, and the augmentation set is $\{T(x)\}$ sampled $n_{\text{aug}}$ times.
+
+**Synonym replacement and random swap.** Both are controlled by $\alpha \in [0, 1]$, and the per-sentence count of edits is
+
+$$
+n = \max\bigl(1, \operatorname{round}(\alpha L)\bigr).
+$$
+
+The floor of $1$ guarantees that a nonzero $\alpha$ always produces at least one edit even on very short sentences, while the linear growth in $L$ keeps the *fraction* of perturbed tokens roughly constant across sentence lengths. For synonym replacement, if $S(w)$ is the synonym set of word $w$ and edits are drawn uniformly with replacement from the eligible positions $E = \{i : S(w_i) \neq \varnothing\}$, then the probability that a particular eligible position $i$ is left untouched after $n$ draws is $\left(1 - \tfrac{1}{|E|}\right)^{n}$, so the expected number of *distinct* positions actually changed is
+
+$$
+\mathbb{E}[\,\#\text{changed}\,] = |E|\left[1 - \left(1 - \frac{1}{|E|}\right)^{n}\right] \le n,
+$$
+
+with equality only as $|E| \to \infty$. Sampling with replacement therefore touches strictly fewer distinct words than $n$ in expectation, an effect that matters on short inputs.
+
+**Random deletion.** Each token is dropped independently with probability $p$, so the surviving length $L'$ is a sum of independent Bernoulli indicators and
+
+$$
+\mathbb{E}[L'] = (1 - p) L, \qquad \operatorname{Var}[L'] = p(1 - p) L.
+$$
+
+The probability that the operation deletes *everything* is $p^{L}$; the reference algorithm intercepts this event and keeps one random token, which is why $L' \ge 1$ always. The chance that a specific salient token (a negation, say) is destroyed is exactly $p$, independent of $L$, which is the crux of why deletion is the riskiest operation for label preservation: its danger does not shrink as sentences grow.
+
+**Random insertion** raises $L$ to $L + n$ without removing information, which is why it is the gentlest of the four for meaning preservation. None of the four operations changes the multiset of *content* in a way that a bag-of-words model cannot absorb, except deletion, which is the only one that can remove evidence outright. This formalizes the qualitative ranking in section 3.2.
+
+### 3.6 Determinism and reproducibility
+
+The reference library below makes every random decision flow from a single explicit pseudo-random stream: a 32-bit Park-Miller linear congruential generator with state update $s_{k+1} = 16807 \, s_k \bmod (2^{31} - 1)$. Seeding the stream fixes the entire augmentation, which is what lets the Python, Julia, and Rust implementations produce byte-identical output on the same seed. This is more than a convenience: reproducible augmentation is what makes an ablation honest, because it removes sampling noise as a confound when you compare $\alpha$ values or $n_{\text{aug}}$ settings.
+
+## EDA in the AI in Action library
+
+The four operations and the `eda` orchestrator are shipped in the installable companion packages so you can reproduce the math above and drop them into a pipeline. Each language exposes the same small API (`tokenize`, `synonym_replacement`, `random_insertion`, `random_swap`, `random_deletion`, `eda`) backed by the same deterministic generator and the same fixed synonym table, so a given seed yields identical augmentations in all three. Install the Python package with `pip install -e .` from the repository root; the Julia package lives in `julia/AIInAction` and the Rust crate in `rust/aiinaction`.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch071_eda import (
+    Lcg,
+    synonym_replacement,
+    random_deletion,
+    eda,
+)
+
+sentence = "the quick movie was good and fast"
+
+# Individual operations, each driven by a seeded generator.
+print("SR:", synonym_replacement(sentence.split(), 2, Lcg(1)))
+print("RD:", random_deletion(sentence.split(), 0.3, Lcg(4)))
+
+# The full EDA recipe: num_aug sentences via the SR, RI, RS, RD round-robin.
+for s in eda(sentence, seed=123, num_aug=4):
+    print(s)
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch071Eda
+
+sentence = "the quick movie was good and fast"
+toks = split(sentence)
+
+println("SR: ", synonym_replacement(toks, 2, Lcg(1)))
+println("RD: ", random_deletion(toks, 0.3, Lcg(4)))
+
+for s in eda(sentence; seed=123, num_aug=4)
+    println(s)
+end
+# SR: ["the", "quick", "feature", "was", "good", "and", "rapid"]
+# the quick feature was good and fast
+# the quick movie was good rapid and fast
+# the quick movie was good and fast
+# the quick movie was good and fast
+```
+
+## Rust
+
+```rust
+use aiinaction::ch071_eda::{eda, random_deletion, synonym_replacement, tokenize, EdaConfig, Lcg};
+
+fn main() {
+    let sentence = "the quick movie was good and fast";
+    let toks = tokenize(sentence).unwrap();
+
+    let mut r1 = Lcg::new(1);
+    println!("SR: {:?}", synonym_replacement(&toks, 2, &mut r1).unwrap());
+
+    let mut r4 = Lcg::new(4);
+    println!("RD: {:?}", random_deletion(&toks, 0.3, &mut r4).unwrap());
+
+    let cfg = EdaConfig { seed: 123, num_aug: 4, ..Default::default() };
+    for s in eda(sentence, &cfg).unwrap() {
+        println!("{s}");
+    }
+}
+// SR: ["the", "quick", "feature", "was", "good", "and", "rapid"]
+// the quick feature was good and fast
+// the quick movie was good rapid and fast
+// the quick movie was good and fast
+// the quick movie was good and fast
+```
+
+:::
+
+All three share the fixtures in `tests/test_ch071_eda.py`, `julia/AIInAction/test/test_ch071_eda.jl`, and the inline Rust `#[cfg(test)]` module, and the CI parity suite asserts they agree exactly.
+
 ## 4. Back-Translation
 
 ### 4.1 The core idea
