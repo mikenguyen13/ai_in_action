@@ -10,7 +10,7 @@ Solves
 by cyclic coordinate descent with soft thresholding, fitting an unpenalized
 intercept by centering internally. Mirrors the Python module
 `aiinaction.ch086_elastic_net` and the Rust module `aiinaction::ch086_elastic_net`;
-the shared fixtures in `test/test_Ch086ElasticNet.jl` match the Python/Rust
+the shared fixtures in `test/test_ch086_elastic_net.jl` match the Python/Rust
 suites to keep the three at parity.
 """
 module Ch086ElasticNet

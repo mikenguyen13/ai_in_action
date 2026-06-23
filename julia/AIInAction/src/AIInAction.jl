@@ -53,4 +53,20 @@ end # module Metrics
 
 using .Metrics
 
+include("ch071_eda.jl")
+include("ch082_robust_regression.jl")
+include("ch083_basis_regression.jl")
+include("ch086_elastic_net.jl")
+include("ch088_softmax_regression.jl")
+include("ch089_softmax_regression.jl")
+include("ch118_smote.jl")
+include("ch124_kmeans_variants.jl")
+include("ch125_agglomerative_clustering.jl")
+include("ch126_diana.jl")
+include("ch130_gmm_em.jl")
+include("ch131_spectral_clustering.jl")
+include("ch132_clustering_validation.jl")
+include("ch133_clustering_at_scale.jl")
+include("ch136_pca.jl")
+
 end # module AIInAction

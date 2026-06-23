@@ -77,6 +77,22 @@ pub mod metrics {
     }
 }
 
+pub mod ch071_eda;
+pub mod ch082_robust_regression;
+pub mod ch083_basis_regression;
+pub mod ch086_elastic_net;
+pub mod ch088_softmax_regression;
+pub mod ch089_softmax_regression;
+pub mod ch118_smote;
+pub mod ch124_kmeans_variants;
+pub mod ch125_agglomerative_clustering;
+pub mod ch126_diana;
+pub mod ch130_gmm_em;
+pub mod ch131_spectral_clustering;
+pub mod ch132_clustering_validation;
+pub mod ch133_clustering_at_scale;
+pub mod ch136_pca;
+
 #[cfg(test)]
 mod tests {
     use super::metrics::*;

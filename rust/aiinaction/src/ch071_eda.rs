@@ -8,11 +8,10 @@
 //! other two implementations; the shared fixtures in the tests below match the
 //! Python/Julia suites.
 
-pub mod ch071_eda {
-    //! EDA operations and a deterministic generator.
+// EDA operations and a deterministic generator.
 
-    const LCG_MOD: u64 = 2_147_483_647; // 2**31 - 1
-    const LCG_MULT: u64 = 16_807;
+const LCG_MOD: u64 = 2_147_483_647; // 2**31 - 1
+const LCG_MULT: u64 = 16_807;
 
     /// Returns the deterministic, ordered synonym candidates for a word, or an
     /// empty slice if the (lowercased) word is not in the fixed table.
@@ -252,11 +251,10 @@ pub mod ch071_eda {
         }
         Ok(out)
     }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::ch071_eda::*;
+    use super::*;
 
     // Shared fixtures: identical to the Python and Julia test suites.
     fn toks() -> Vec<String> {
