@@ -155,6 +155,139 @@ def one_cycle(t, T, eta_max, eta_min, peak=0.3):
 
 In practice one-cycle is configured by setting $\eta_{\max}$ from a range test, choosing the fraction of training spent ramping up (often 25 to 30 percent), and setting the initial and final rates one to two orders of magnitude below $\eta_{\max}$. Because it bundles warmup, a high-rate regularizing phase, and aggressive final decay into a single schedule, one-cycle is a strong default when the total iteration budget is fixed in advance.
 
+### 6.1 A Unified Derivation of the Cosine-Based Schedules
+
+The cosine annealing, warmup-then-cosine, and one-cycle schedules are all built from a single primitive: a half-cosine interpolant between two endpoints. Define the **cosine ease**
+
+$$
+\phi(p) = \tfrac{1}{2}\bigl(1 + \cos(\pi p)\bigr), \qquad p \in [0, 1],
+$$
+
+which decreases smoothly and monotonically from $\phi(0) = 1$ to $\phi(1) = 0$, with zero derivative at both endpoints since $\phi'(p) = -\tfrac{\pi}{2}\sin(\pi p)$ vanishes at $p \in \{0, 1\}$. Those vanishing endpoint slopes are exactly what give cosine schedules their characteristic gentle takeoff and soft landing, and they are why warmup and decay legs can be spliced together without a kink at the handoff.
+
+Every schedule below is then an affine map of $\phi$ applied to a phase variable $p(t) \in [0,1]$.
+
+**Cosine annealing.** Take $p(t) = t/T$ directly. The rate is the interpolant from $\eta_{\max}$ down to $\eta_{\min}$:
+
+$$
+\eta_t = \eta_{\min} + (\eta_{\max} - \eta_{\min})\,\phi\!\left(\tfrac{t}{T}\right)
+= \eta_{\min} + \tfrac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\tfrac{\pi t}{T}\right).
+$$
+
+At the midpoint $t = T/2$ we get $\phi(\tfrac12) = \tfrac12$, so $\eta_{T/2} = (\eta_{\max} + \eta_{\min})/2$ exactly, the steepest point of the descent.
+
+**Warmup then cosine.** Splice a linear ramp on $[0, T_w]$ with a cosine descent whose phase is the *remaining* fraction $p(t) = (t - T_w)/(T - T_w)$:
+
+$$
+\eta_t =
+\begin{cases}
+\eta_{\text{start}} + (\eta_{\max} - \eta_{\text{start}})\,\dfrac{t}{T_w}, & t < T_w, \\[8pt]
+\eta_{\min} + (\eta_{\max} - \eta_{\min})\,\phi\!\left(\dfrac{t - T_w}{T - T_w}\right), & t \ge T_w.
+\end{cases}
+$$
+
+Continuity at the handoff is automatic: the ramp reaches $\eta_{\max}$ at $t = T_w$ and $\phi(0) = 1$ gives the cosine leg the same value $\eta_{\max}$ there.
+
+**One-cycle.** Use $\phi$ on *both* legs, with the ascending leg taking the reflected ease $1 - \phi$. With peak position $t_1 = \rho\,T$ for a warmup fraction $\rho \in (0,1)$,
+
+$$
+\eta_t =
+\begin{cases}
+\eta_{\min} + (\eta_{\max} - \eta_{\min})\bigl(1 - \phi(\tfrac{t}{t_1})\bigr), & t \le t_1, \\[6pt]
+\eta_{\min} + (\eta_{\max} - \eta_{\min})\,\phi\!\left(\dfrac{t - t_1}{T - t_1}\right), & t > t_1,
+\end{cases}
+$$
+
+since $1 - \phi(0) = 0$ and $1 - \phi(1) = 1$ make the first leg rise smoothly from $\eta_{\min}$ to $\eta_{\max}$. The momentum schedule is the *same* construction in antiphase: replace $(\eta_{\min}, \eta_{\max})$ with $(\mu_{\max}, \mu_{\min})$ and the curve descends while the rate climbs and vice versa, so that the product of large rate and small momentum keeps the effective step $\eta/(1-\mu)$ bounded through the mid-training peak. The implementation below realizes all four functions ($\eta$ for the three schedules plus the antiphase $\mu$) as thin wrappers around this single ease.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch198_lr_schedules import (
+    cosine_annealing,
+    warmup_cosine,
+    one_cycle,
+    one_cycle_momentum,
+)
+
+T = 10  # total optimization steps in this toy run
+
+# Cosine annealing from 0.2 down to a small floor.
+cos = [round(cosine_annealing(t, T, eta_max=0.2, eta_min=0.01), 4) for t in range(T + 1)]
+print("cosine        :", cos)
+
+# Linear warmup (3 steps) then cosine decay to zero.
+wc = [round(warmup_cosine(t, warmup_steps=3, total_steps=T, eta_max=0.5), 4) for t in range(T + 1)]
+print("warmup_cosine :", wc)
+
+# One-cycle: ramp up to 1.0 over the first 30% of training, then anneal back.
+oc = [round(one_cycle(t, T, eta_max=1.0, eta_min=0.04, pct_start=0.3), 4) for t in range(T + 1)]
+print("one_cycle     :", oc)
+
+# The antiphase momentum that pairs with one-cycle (low when LR peaks).
+mom = [round(one_cycle_momentum(t, T, pct_start=0.3), 4) for t in range(T + 1)]
+print("momentum      :", mom)
+
+peak = max(range(T + 1), key=lambda t: one_cycle(t, T, 1.0, 0.04, 0.3))
+print(f"LR peaks at step {peak}; momentum there = {mom[peak]}")
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch198LrSchedules
+
+T = 10
+
+cos = [round(cosine_annealing(t, T, 0.2, 0.01); digits=4) for t in 0:T]
+println("cosine        : ", cos)
+
+wc = [round(warmup_cosine(t, 3, T, 0.5); digits=4) for t in 0:T]
+println("warmup_cosine : ", wc)
+
+oc = [round(one_cycle(t, T, 1.0, 0.04, 0.3); digits=4) for t in 0:T]
+println("one_cycle     : ", oc)
+
+mom = [round(one_cycle_momentum(t, T, 0.95, 0.85, 0.3); digits=4) for t in 0:T]
+println("momentum      : ", mom)
+```
+
+## Rust
+
+```rust
+use aiinaction::ch198_lr_schedules::{
+    cosine_annealing, warmup_cosine, one_cycle, one_cycle_momentum,
+};
+
+fn main() {
+    let t_total = 10i64;
+
+    let cos: Vec<f64> = (0..=t_total)
+        .map(|t| cosine_annealing(t, t_total, 0.2, 0.01).unwrap())
+        .collect();
+    println!("cosine        : {:?}", cos);
+
+    let wc: Vec<f64> = (0..=t_total)
+        .map(|t| warmup_cosine(t, 3, t_total, 0.5, 0.0, 0.0).unwrap())
+        .collect();
+    println!("warmup_cosine : {:?}", wc);
+
+    let oc: Vec<f64> = (0..=t_total)
+        .map(|t| one_cycle(t, t_total, 1.0, Some(0.04), 0.3).unwrap())
+        .collect();
+    println!("one_cycle     : {:?}", oc);
+
+    let mom: Vec<f64> = (0..=t_total)
+        .map(|t| one_cycle_momentum(t, t_total, 0.95, 0.85, 0.3).unwrap())
+        .collect();
+    println!("momentum      : {:?}", mom);
+}
+```
+
+:::
+
 ## 7. Choosing and Combining Schedules
 
 Several practical principles emerge. First, the peak learning rate matters more than the precise shape of the schedule; a range test to locate the largest stable rate is worth running before committing to any policy. Second, warmup is nearly always beneficial for large batches, adaptive optimizers, and transformer-style architectures, and rarely harmful, so a short linear warmup is a safe default. Third, the appropriate horizon depends on the total compute budget, and schedules tied to that budget (cosine, one-cycle) avoid the milestone-tuning fragility of step decay.

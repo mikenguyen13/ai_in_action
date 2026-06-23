@@ -52,6 +52,28 @@ $$
 
 which in vector form is $p - q$, the difference between the predicted distribution and the one-hot target. This is the same elegant form that appears in logistic and linear regression with their canonical link functions, and it is no coincidence: the softmax is the canonical link for the categorical distribution in the exponential family, and the predicted-minus-target gradient is a general property of such models. Because the gradient is bounded in magnitude by one per coordinate and never saturates to zero when the prediction is wrong, the softmax cross-entropy supplies strong learning signal even when the model is confidently incorrect, which is one reason it is preferred over a mean squared error applied to softmax outputs.
 
+### 2.3 Deriving the gradient
+
+The clean predicted-minus-target form is worth deriving explicitly, because the cancellation that produces it is the reason the loss is so well behaved. Start from the Jacobian of the softmax. Writing $p_k = \mathrm{softmax}(z)_k$ and differentiating $p_k = e^{z_k} / \sum_j e^{z_j}$,
+
+$$
+\frac{\partial p_k}{\partial z_i} = p_k\,(\delta_{ki} - p_i),
+$$
+
+where $\delta_{ki}$ is the Kronecker delta. The diagonal terms $i = k$ give $p_k(1 - p_k)$ and the off-diagonal terms give $-p_k p_i$, so the softmax Jacobian is $\mathrm{diag}(p) - p p^\top$, a symmetric positive semidefinite matrix. Now differentiate the loss $\ell = -\log p_y$ through this Jacobian:
+
+$$
+\frac{\partial \ell}{\partial z_i}
+= -\frac{1}{p_y}\frac{\partial p_y}{\partial z_i}
+= -\frac{1}{p_y}\,p_y\,(\delta_{yi} - p_i)
+= p_i - \delta_{yi}
+= p_i - q_i.
+$$
+
+The factor $1/p_y$ cancels exactly against the $p_y$ from the Jacobian, which is precisely why the softmax and the logarithm are paired: the log undoes the normalization that the softmax introduces, leaving a residual that depends on the prediction error alone. The same calculation done directly on the fused form $\ell = \mathrm{LSE}(z) - z_y$ is shorter still, since $\partial \mathrm{LSE}/\partial z_i = e^{z_i}/\sum_j e^{z_j} = p_i$ and $\partial(-z_y)/\partial z_i = -\delta_{yi}$, giving $p_i - q_i$ immediately.
+
+For a batch of $N$ examples the averaged loss has gradient $\tfrac{1}{N}\sum_i (p_i - q_i)$ per example, that is the matrix $(P - Q)/N$ whose rows are the per-example residuals. Under label smoothing the only change is that the hard target $q$ becomes the smoothed $q'$, so the gradient is $(P - Q')/N$; every row still sums to zero because $p$ and $q'$ are both distributions, which is the discrete analogue of the constraint that gradients of a normalized objective are tangent to the simplex.
+
 ## 3. Numerical Stability of Log-Sum-Exp
 
 ### 3.1 Why the naive form fails
@@ -164,7 +186,102 @@ so up to a constant the smoothing term is a KL divergence from the model to unif
 
 A short checklist captures the operational consequences of the theory. Keep network outputs in logit space and let the loss function apply the softmax or sigmoid internally, so that the stabilized log-sum-exp and softplus forms are used. Choose softmax cross-entropy for mutually exclusive classes and summed binary cross-entropy with logits for independent multilabel outputs. Reach for positive weighting or focal loss when the class distribution is skewed. Apply label smoothing with a small $\epsilon$ such as $0.1$ to curb overconfidence and improve calibration, but reconsider it when training teachers for distillation. Finally, when a training run produces NaNs early, suspect an unstable hand rolled softmax or a loss fed probabilities instead of logits before suspecting the data.
 
-## 7. Summary
+## 7. A From-Scratch Implementation
+
+The companion `aiinaction` libraries ship a small, stable softmax cross-entropy in all three languages of the book. The module `ch184_softmax_ce` exposes four functions that operate directly on a logit matrix of shape $(N, K)$: `softmax` and `log_softmax` (the stabilized link functions), `cross_entropy_loss` (the fused mean loss, with optional `label_smoothing`), and `cross_entropy_grad` (the predicted-minus-target gradient $(P - Q')/N$). Each call validates its inputs, subtracts the per-row maximum before exponentiating, and never takes the logarithm of a probability. The three implementations agree to floating-point tolerance on the shared fixtures below; the only surface difference is that Julia uses 1-based class indices while Python and Rust use 0-based ones.
+
+The example below scores three samples over three classes. The gradient rows sum to zero, and the loss with label smoothing $\epsilon = 0.1$ is slightly larger than the hard-target loss, reflecting the confidence penalty.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch184_softmax_ce import (
+    softmax, log_softmax, cross_entropy_loss, cross_entropy_grad,
+)
+
+# Three samples, three classes. Logits live in R^K and are unconstrained.
+Z = [[2.0, 1.0, 0.1],
+     [0.5, 2.5, 0.3],
+     [1.0, 1.0, 1.0]]
+labels = [0, 1, 2]  # 0-based true class per row
+
+p = softmax(Z)
+print("softmax row 0:        ", [round(v, 4) for v in p[0]])
+print("rows sum to one:      ", [round(float(s), 6) for s in p.sum(axis=1)])
+
+loss = cross_entropy_loss(Z, labels)
+loss_ls = cross_entropy_loss(Z, labels, label_smoothing=0.1)
+print(f"mean cross-entropy:    {loss:.6f}")
+print(f"with label smoothing:  {loss_ls:.6f}")
+
+g = cross_entropy_grad(Z, labels)
+print("gradient (P - Q)/N:")
+for row in g:
+    print("  ", [round(float(v), 4) for v in row])
+print("each gradient row sums to ~0:",
+      [round(float(s), 12) for s in g.sum(axis=1)])
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch184SoftmaxCE
+
+# Same fixture; Julia uses 1-based class indices.
+Z = [2.0 1.0 0.1
+     0.5 2.5 0.3
+     1.0 1.0 1.0]
+labels = [1, 2, 3]
+
+p = softmax(Z)
+println("softmax row 1: ", round.(p[1, :], digits=4))
+
+loss    = cross_entropy_loss(Z, labels)
+loss_ls = cross_entropy_loss(Z, labels; label_smoothing=0.1)
+println("mean cross-entropy:   ", round(loss, digits=6))
+println("with label smoothing: ", round(loss_ls, digits=6))
+
+g = cross_entropy_grad(Z, labels)  # (P - Q)/N
+println("gradient row sums: ", round.(vec(sum(g; dims=2)), digits=12))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch184_softmax_ce::{
+    softmax, cross_entropy_loss, cross_entropy_grad,
+};
+
+fn main() {
+    // Same fixture; Rust uses 0-based class indices.
+    let z = vec![
+        vec![2.0, 1.0, 0.1],
+        vec![0.5, 2.5, 0.3],
+        vec![1.0, 1.0, 1.0],
+    ];
+    let labels = [0usize, 1, 2];
+
+    let p = softmax(&z).unwrap();
+    println!("softmax row 0: {:?}", p[0]);
+
+    let loss = cross_entropy_loss(&z, &labels, 0.0).unwrap();
+    let loss_ls = cross_entropy_loss(&z, &labels, 0.1).unwrap();
+    println!("mean cross-entropy:   {:.6}", loss);
+    println!("with label smoothing: {:.6}", loss_ls);
+
+    let g = cross_entropy_grad(&z, &labels, 0.0).unwrap(); // (P - Q)/N
+    for row in &g {
+        let s: f64 = row.iter().sum();
+        println!("row sum {:.12}", s);
+    }
+}
+```
+
+:::
+
+## 8. Summary
 
 Cross-entropy is the maximum likelihood objective for classification, and its two principal forms, softmax cross-entropy for multiclass problems and binary cross-entropy with logits for binary and multilabel problems, both produce the clean predicted-minus-target gradient that drives stable learning. The mathematical expressions hide numerical landmines that the shift trick for log-sum-exp and the absolute value form of softplus defuse, which is why fused logit-consuming loss functions are the norm. Label smoothing trades a small amount of confidence for better calibration and more regular representations, at the cost of fine grained inter-class information that some downstream uses still require. Understanding these objectives at the level of their gradients and their floating point behavior is what separates a model that trains from one that diverges.
 

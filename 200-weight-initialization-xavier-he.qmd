@@ -180,7 +180,96 @@ nn.init.zeros_(layer.bias)
 
 A final caveat is that normalization layers and residual connections have shifted some of the burden that initialization once carried alone. Batch normalization, layer normalization, and carefully scaled residual branches all stabilize variance during training, which makes networks more forgiving of imperfect initialization. Even so, the right starting variance still accelerates early training and remains essential in architectures without normalization, in very deep stacks, and whenever training must be reproducible and robust. The variance argument that produced Xavier and He continues to inform newer schemes, including the residual-aware and transformer-specific initializers that scale weights by depth.
 
-## 7. Summary
+## 7. Reference Implementation
+
+The `aiinaction` companion library ships a small, dependency-free implementation of both schemes in Python, Julia, and Rust. It exposes two layers of API. The first computes the *theoretical* scale of a scheme: `xavier_scale(fan_in, fan_out)` and `he_scale(fan)` return the matching Gaussian standard deviation $\sigma_W$ and the half-width $r = \sigma_W\sqrt{3}$ of the equivalent uniform support $U(-r, r)$. The second layer *samples* an actual weight matrix of shape `(fan_out, fan_in)` via `xavier_normal`, `xavier_uniform`, `he_normal`, and `he_uniform`. The helper `calculate_gain` returns the nonlinearity-dependent gain $g$ discussed in Section 5.
+
+Sampling is built on a self-contained, deterministic SplitMix64 generator feeding a Box-Muller transform, so a fixed seed yields the *identical* weight matrix across all three languages, not merely matching summary statistics. This makes the examples below reproducible bit-for-bit and lets the cross-language parity tests assert agreement to $10^{-9}$.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+from aiinaction.ch200_weight_init import (
+    calculate_gain, xavier_scale, he_scale, he_normal, xavier_normal,
+)
+
+fan_in, fan_out = 256, 128
+
+# Theoretical scales for a tanh layer (Xavier) and a ReLU layer (He).
+xs = xavier_scale(fan_in, fan_out, gain=calculate_gain("tanh"))
+hs = he_scale(fan_in, gain=calculate_gain("relu"))
+print(f"Xavier(tanh) std = {xs.std:.6f}, uniform bound = {xs.bound:.6f}")
+print(f"He(relu)     std = {hs.std:.6f}, uniform bound = {hs.bound:.6f}")
+
+# Sample a real He-initialized weight matrix and check the empirical variance
+# against the 2 / fan_in target.
+W = he_normal(fan_in, fan_out, seed=0)
+print(f"W shape          = {W.shape}")
+print(f"empirical var(W) = {W.var():.6f}")
+print(f"target 2/fan_in  = {2.0 / fan_in:.6f}")
+
+# The deterministic seed makes the first few weights reproducible everywhere.
+print("first row, 3 weights:", np.round(xavier_normal(3, 2, seed=42)[0], 6))
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch200WeightInit
+
+fan_in, fan_out = 256, 128
+
+xs = xavier_scale(fan_in, fan_out; gain=calculate_gain("tanh"))
+hs = he_scale(fan_in; gain=calculate_gain("relu"))
+println("Xavier(tanh) std = ", round(xs.std; digits=6),
+        ", uniform bound = ", round(xs.bound; digits=6))
+println("He(relu)     std = ", round(hs.std; digits=6),
+        ", uniform bound = ", round(hs.bound; digits=6))
+
+W = he_normal(fan_in, fan_out; seed=0)          # (fan_out, fan_in)
+target = 2.0 / fan_in
+println("empirical var(W) = ", round(sum(abs2, W .- sum(W) / length(W)) / length(W); digits=6))
+println("target 2/fan_in  = ", round(target; digits=6))
+
+# Same deterministic seed -> same weights as Python and Rust.
+println("first row: ", round.(xavier_normal(3, 2; seed=42)[1, :]; digits=6))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch200_weight_init::{
+    calculate_gain, xavier_scale, he_scale, he_normal, xavier_normal, FanMode,
+};
+
+fn main() {
+    let (fan_in, fan_out) = (256usize, 128usize);
+
+    let xs = xavier_scale(fan_in, fan_out, calculate_gain("tanh", None).unwrap()).unwrap();
+    let hs = he_scale(fan_in, calculate_gain("relu", None).unwrap()).unwrap();
+    println!("Xavier(tanh) std = {:.6}, uniform bound = {:.6}", xs.std, xs.bound);
+    println!("He(relu)     std = {:.6}, uniform bound = {:.6}", hs.std, hs.bound);
+
+    // (fan_out, fan_in) He-initialized matrix with the ReLU gain sqrt(2).
+    let w = he_normal(fan_in, fan_out, 2.0_f64.sqrt(), FanMode::FanIn, 0).unwrap();
+    let flat: Vec<f64> = w.iter().flatten().copied().collect();
+    let mean = flat.iter().sum::<f64>() / flat.len() as f64;
+    let var = flat.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / flat.len() as f64;
+    println!("empirical var(W) = {:.6}", var);
+    println!("target 2/fan_in  = {:.6}", 2.0 / fan_in as f64);
+
+    // Same seed -> identical weights across all three languages.
+    let first = xavier_normal(3, 2, 1.0, 42).unwrap();
+    println!("first row: {:?}", first[0]);
+}
+```
+
+:::
+
+## 8. Summary
 
 The unifying idea is that initialization should preserve variance, both forward through the activations and backward through the gradients. The variance of a sum of $n$ independent weighted signals scales as $n\,\sigma_W^2$, so the weight variance must scale as $1/n$. Xavier initialization applies this to symmetric activations and compromises between fan-in and fan-out with $\sigma_W^2 = 2/(n_{\text{in}} + n_{\text{out}})$. He initialization adds a factor of two, $\sigma_W^2 = 2/n_{\text{in}}$, to compensate for the half of the signal that ReLU discards. Picking the scheme that matches the nonlinearity is one of the cheapest and highest-leverage decisions in building a trainable deep network.
 

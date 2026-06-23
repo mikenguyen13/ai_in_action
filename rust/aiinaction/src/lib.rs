@@ -93,6 +93,35 @@ pub mod ch132_clustering_validation;
 pub mod ch133_clustering_at_scale;
 pub mod ch136_pca;
 
+pub mod ch137_kernel_pca;
+pub mod ch138_fastica;
+pub mod ch139_nmf;
+pub mod ch143_isomap;
+pub mod ch145_anomaly;
+pub mod ch146_lof;
+pub mod ch150_association_rules;
+pub mod ch155_pr_curves;
+pub mod ch157_regression_metrics;
+pub mod ch161_calibration;
+pub mod ch162_ranking_metrics;
+pub mod ch163_ir_metrics;
+pub mod ch164_clustering_metrics;
+pub mod ch165_mcnemar;
+pub mod ch169_bootstrap;
+pub mod ch184_softmax_ce;
+pub mod ch186_forward_propagation;
+pub mod ch187_backprop;
+pub mod ch192_momentum;
+pub mod ch193_nesterov;
+pub mod ch194_adagrad;
+pub mod ch195_rmsprop;
+pub mod ch197_adamw;
+pub mod ch198_lr_schedules;
+pub mod ch200_weight_init;
+pub mod ch201_batch_norm;
+pub mod ch202_layer_norm;
+pub mod ch204_dropout;
+
 #[cfg(test)]
 mod tests {
     use super::metrics::*;

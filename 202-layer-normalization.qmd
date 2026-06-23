@@ -100,6 +100,26 @@ $$
 
 where $\delta_{ij}$ is the Kronecker delta. The second term removes the component of the incoming gradient that points along the activation direction, so gradients that would merely rescale $x$ are suppressed. This is the mechanism by which normalization keeps the effective learning dynamics insensitive to activation magnitude, and the analogous expression for layer norm additionally removes the component along the all-ones direction.
 
+To see where this Jacobian comes from, write $r^2 = \tfrac{1}{d}\sum_k x_k^2 + \epsilon$ so that $y_i = \gamma_i x_i / r$. Differentiating $r$ gives $\partial r / \partial x_j = x_j / (d\, r)$, and the quotient rule then yields
+
+$$
+\frac{\partial y_i}{\partial x_j}
+= \gamma_i \frac{\partial}{\partial x_j}\!\left(\frac{x_i}{r}\right)
+= \gamma_i \frac{\delta_{ij}\, r - x_i \,(x_j / (d\, r))}{r^2}
+= \frac{\gamma_i}{r}\left(\delta_{ij} - \frac{x_i x_j}{d\, r^2}\right),
+$$
+
+which is the displayed formula. The matrix $J = \partial y / \partial x$ is, up to the diagonal gain, a rank-one downdate $\tfrac{1}{r}\big(I - \hat{x}\hat{x}^{\top}/d\big)$ where $\hat{x} = x / r$, confirming that the single direction it annihilates is $x$ itself.
+
+For full layer norm, the same calculation with the additional mean-subtraction produces a projection that removes two directions. Writing $\hat{x}_i = (x_i - \mu)/s$ with $s = \sqrt{\sigma^2 + \epsilon}$, the Jacobian of the normalization (before the affine map) is
+
+$$
+\frac{\partial \hat{x}_i}{\partial x_j}
+= \frac{1}{s}\left(\delta_{ij} - \frac{1}{d} - \frac{\hat{x}_i \hat{x}_j}{d}\right),
+$$
+
+so it projects the incoming gradient orthogonally to both the all-ones vector $\mathbf{1}$ (the $-1/d$ term, from recentering) and the activation direction $\hat{x}$ (the final term, from rescaling). RMSNorm keeps only the second projection, which is exactly the sense in which it is the "rescaling-only" simplification of layer norm.
+
 ## 5. Pre-Norm Versus Post-Norm Placement
 
 ### 5.1 The two arrangements
@@ -157,7 +177,76 @@ x_norm = (x - mean) / sqrt(var + eps)              # reduce in float32
 y      = gamma * x_norm + beta
 ```
 
-## 7. Summary
+## 7. Reference Implementation
+
+The companion libraries provide a from-scratch implementation of both operators in Python, Julia, and Rust under the module `ch202_layer_norm`. Each exposes four functions: `layer_norm` and `rms_norm` for a single feature vector, and `apply_layer_norm` and `apply_rms_norm` for normalizing every row of a matrix independently. The variance in `layer_norm` is the population variance (`ddof=0`), matching the convention used in deep-learning frameworks, and the `eps` is added inside the square root as discussed in the implementation notes. The three implementations are checked against identical fixtures so they agree to within floating-point tolerance.
+
+The shared example below normalizes the vector $x = (2, 4, 6, 8)$ with gain $\gamma = (1.5, 0.5, 1.0, 2.0)$ and bias $\beta = (0.1, -0.2, 0.0, 0.3)$.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch202_layer_norm import layer_norm, rms_norm
+
+x = [2.0, 4.0, 6.0, 8.0]
+gamma = [1.5, 0.5, 1.0, 2.0]
+beta = [0.1, -0.2, 0.0, 0.3]
+
+ln_plain = layer_norm(x)
+ln_affine = layer_norm(x, gamma, beta)
+rms_plain = rms_norm(x)
+
+print("LayerNorm (gamma=1, beta=0):", [round(float(v), 6) for v in ln_plain])
+print("mean, var of LN output     :",
+      round(float(sum(ln_plain) / len(ln_plain)), 12),
+      round(float(sum(v * v for v in ln_plain) / len(ln_plain)), 6))
+print("LayerNorm (affine)         :", [round(float(v), 6) for v in ln_affine])
+print("RMSNorm   (gamma=1)        :", [round(float(v), 6) for v in rms_plain])
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch202LayerNorm
+
+x     = [2.0, 4.0, 6.0, 8.0]
+gamma = [1.5, 0.5, 1.0, 2.0]
+beta  = [0.1, -0.2, 0.0, 0.3]
+
+ln_plain  = layer_norm(x)
+ln_affine = layer_norm(x; gamma=gamma, beta=beta)
+rms_plain = rms_norm(x)
+
+println("LayerNorm (gamma=1, beta=0): ", round.(ln_plain; digits=6))
+println("LayerNorm (affine)         : ", round.(ln_affine; digits=6))
+println("RMSNorm   (gamma=1)        : ", round.(rms_plain; digits=6))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch202_layer_norm::{layer_norm, rms_norm};
+
+fn main() {
+    let x: [f64; 4] = [2.0, 4.0, 6.0, 8.0];
+    let gamma: [f64; 4] = [1.5, 0.5, 1.0, 2.0];
+    let beta: [f64; 4] = [0.1, -0.2, 0.0, 0.3];
+
+    let ln_plain = layer_norm(&x, None, None, 1e-5).unwrap();
+    let ln_affine = layer_norm(&x, Some(&gamma), Some(&beta), 1e-5).unwrap();
+    let rms_plain = rms_norm(&x, None, 1e-5).unwrap();
+
+    println!("LayerNorm (gamma=1, beta=0): {:?}", ln_plain);
+    println!("LayerNorm (affine)         : {:?}", ln_affine);
+    println!("RMSNorm   (gamma=1)        : {:?}", rms_plain);
+}
+```
+
+:::
+
+## 8. Summary
 
 Layer normalization replaced the batch axis of batch normalization with the feature axis, yielding a per-example operation that is indifferent to batch size and sequence length and therefore ideal for recurrent and attention-based models. Its invariance to shift and scale stabilizes the residual stream that defines a transformer. RMSNorm pares the method down to its rescaling core, dropping mean subtraction for a cheaper, equally effective normalization that now serves as the default in many leading models. The placement of the normalization, pre-norm versus post-norm, controls gradient flow and representation scale: pre-norm buys trainability at depth and has become standard, while post-norm and its modern descendants preserve tighter scale control. Together these choices form a small but decisive part of the recipe behind contemporary large-scale sequence models.
 

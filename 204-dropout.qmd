@@ -131,6 +131,96 @@ A few empirical rules organize the practice of dropout. Retention probabilities 
 
 Crucially, dropout must be disabled at test time, whether by switching the framework to evaluation mode or by ensuring the inverted scaling is applied during training. Forgetting this is among the most common sources of a mysterious gap between validation behavior during training and behavior at deployment. As architectures have grown, the role of dropout has shifted: in large transformers it is applied at modest rates to attention weights and feed forward activations and now coexists with other regularizers such as weight decay, label smoothing, and heavy data augmentation, but the core idea of training under random structural noise remains a standard tool.
 
+## 9. Reference Implementation
+
+The shared library `aiinaction` ships a small, from-scratch implementation of inverted dropout. The only delicate part of a *reproducible* implementation is the randomness: to compare a mask across languages we must fix the random number stream exactly. The library does this with a tiny 64-bit linear congruential generator (LCG) using the Numerical Recipes constants,
+
+$$
+s_{t+1} = \big(a\, s_t + c\big) \bmod 2^{64}, \qquad a = 6364136223846793005,\ c = 1442695040888963407,
+$$
+
+and forms each uniform draw $u_t \in [0, 1)$ from the top 53 bits of the state, $u_t = \lfloor s_{t+1} / 2^{11} \rfloor / 2^{53}$. Unit $i$ is retained when $u_i < p$ and assigned the inverted-dropout value $1/p$; otherwise it is zeroed. Because the generator is specified bit for bit, the Python, Julia, and Rust implementations drop exactly the same units given the same seed, and the parity tests assert this on shared fixtures. The expectation property $\mathbb{E}[\tilde{h}_i] = h_i$ is verified empirically by averaging masked outputs over many seeds.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch204_dropout import inverted_dropout, bernoulli_mask
+import numpy as np
+
+# Hidden activations from some layer.
+h = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+p = 0.5  # retention probability; 1 - p = 0.5 is dropped
+
+masked, mask = inverted_dropout(h, p, seed=42)
+print("mask   :", mask.tolist())
+print("masked :", masked.tolist())
+
+# Inverted-dropout guarantee: averaging over many independent masks
+# recovers the original activations (E[mask * h] = h).
+acc = np.zeros(len(h))
+trials = 20000
+for seed in range(trials):
+    out, _ = inverted_dropout(h, p, seed=seed)
+    acc += out
+print("avg over seeds:", np.round(acc / trials, 3).tolist())
+
+# At test time we run the full network with no mask and no rescaling:
+print("test-time      :", h)
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch204Dropout
+
+h = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+p = 0.5
+
+masked, mask = inverted_dropout(h, p, 42)
+println("mask   : ", mask)
+println("masked : ", masked)
+
+# Averaging over independent masks recovers h.
+acc = zeros(length(h))
+trials = 20000
+for seed in 0:(trials - 1)
+    out, _ = inverted_dropout(h, p, seed)
+    acc .+= out
+end
+println("avg over seeds: ", round.(acc ./ trials; digits=3))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch204_dropout::inverted_dropout;
+
+fn main() {
+    let h = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let p = 0.5;
+
+    let (masked, mask) = inverted_dropout(&h, p, 42).unwrap();
+    println!("mask   : {:?}", mask);
+    println!("masked : {:?}", masked);
+
+    // Averaging over independent masks recovers h.
+    let trials = 20_000u64;
+    let mut acc = [0.0f64; 8];
+    for seed in 0..trials {
+        let (out, _) = inverted_dropout(&h, p, seed).unwrap();
+        for j in 0..8 {
+            acc[j] += out[j];
+        }
+    }
+    let avg: Vec<f64> = acc.iter().map(|a| (a / trials as f64 * 1000.0).round() / 1000.0).collect();
+    println!("avg over seeds: {:?}", avg);
+}
+```
+
+:::
+
 ## References
 
 1. Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I., and Salakhutdinov, R. "Dropout: A Simple Way to Prevent Neural Networks from Overfitting." Journal of Machine Learning Research, 2014. https://jmlr.org/papers/v15/srivastava14a.html

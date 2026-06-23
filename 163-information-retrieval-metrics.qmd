@@ -135,7 +135,111 @@ MRR is the right metric for known item search and question answering, where the 
 
 A useful mental map: use $P@k$ and $R@k$ to communicate operating points to stakeholders; use MAP when relevance is binary and full ranking quality matters; use NDCG when relevance is graded; use MRR when a single right answer is the goal.
 
-## 8. Offline versus Online Evaluation
+## 8. Reference Implementation
+
+The metrics above are short to implement exactly, and doing so removes any ambiguity about edge cases (an empty relevant set, a cutoff $k$ larger than the list, a query with no relevant hit). The `aiinaction` companion library ships parity-tested implementations in Python, Julia, and Rust; all three agree on shared numeric fixtures to within $10^{-9}$.
+
+A few design choices are worth making explicit, because they are exactly the places where two well-meaning implementations silently disagree:
+
+- **Cutoff clamping.** When $k$ exceeds the list length, $P@k$ uses the available length as its denominator rather than $k$. This keeps $P@k \in [0, 1]$ and matches the natural reading "precision over the documents we actually returned."
+- **Recall's denominator.** $R@k$ divides by $|R_q|$, supplied separately as `num_relevant`, because relevant documents may live beyond the returned prefix and must still count against recall. The implementation rejects a `num_relevant` smaller than the number of relevant labels actually present, which would otherwise produce a recall above $1$.
+- **AP and missing recall.** Average precision divides the sum of prefix precisions at hits by $|R_q|$, so a relevant document that is never retrieved contributes nothing to the numerator while still inflating the denominator. With the binary ranking $\langle 1,0,1,1,0,1\rangle$ and $|R_q| = 5$,
+  $$
+  \mathrm{AP} = \frac{P@1 + P@3 + P@4 + P@6}{5} = \frac{1 + \tfrac{2}{3} + \tfrac{3}{4} + \tfrac{4}{6}}{5} \approx 0.6167,
+  $$
+  lower than the $0.7708$ it would score if the divisor were the four hits found, which is precisely the recall penalty.
+- **NDCG normalization.** The ideal DCG is computed by sorting the *judged pool* in decreasing grade order; when relevant documents exist beyond the returned list, pass that pool explicitly as `ideal_grades` so the denominator reflects the true best ranking rather than just the returned grades.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch163_ir_metrics import (
+    precision_at_k, recall_at_k, average_precision,
+    dcg_at_k, ndcg_at_k, reciprocal_rank,
+    mean_average_precision, mean_reciprocal_rank,
+)
+
+# A single ranked query: binary relevance labels in rank order (top first).
+ranking = [1, 0, 1, 1, 0, 1]   # relevant at ranks 1, 3, 4, 6
+num_relevant = 5               # one relevant doc was never retrieved
+
+print(f"P@3   = {precision_at_k(ranking, 3):.4f}")
+print(f"R@3   = {recall_at_k(ranking, 3, num_relevant):.4f}")
+print(f"AP    = {average_precision(ranking, num_relevant):.4f}")
+print(f"RR    = {reciprocal_rank(ranking):.4f}")
+
+# Graded relevances for DCG / NDCG (and the full judged pool for the ideal).
+grades = [3, 2, 3, 0, 1, 2]
+ideal_pool = [3, 3, 2, 2, 1, 0]
+print(f"DCG@3 = {dcg_at_k(grades, 3):.4f}")
+print(f"NDCG@3 = {ndcg_at_k(grades, 3):.4f}")
+print(f"NDCG@6 (pool) = {ndcg_at_k(grades, 6, ideal_grades=ideal_pool):.4f}")
+
+# Aggregate over a small query set.
+query_set = [[1, 0, 1, 1, 0, 1], [0, 1, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1]]
+print(f"MAP   = {mean_average_precision(query_set):.4f}")
+print(f"MRR   = {mean_reciprocal_rank(query_set):.4f}")
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch163IrMetrics
+
+ranking = [1, 0, 1, 1, 0, 1]   # relevant at ranks 1, 3, 4, 6
+num_relevant = 5
+
+println("P@3   = ", precision_at_k(ranking, 3))
+println("R@3   = ", recall_at_k(ranking, 3, num_relevant))
+println("AP    = ", average_precision(ranking; num_relevant=num_relevant))
+println("RR    = ", reciprocal_rank(ranking))
+
+grades = [3, 2, 3, 0, 1, 2]
+ideal_pool = [3, 3, 2, 2, 1, 0]
+println("DCG@3 = ", dcg_at_k(grades, 3))
+println("NDCG@3 = ", ndcg_at_k(grades, 3))
+println("NDCG@6 (pool) = ", ndcg_at_k(grades, 6; ideal_grades=ideal_pool))
+
+query_set = [[1, 0, 1, 1, 0, 1], [0, 1, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1]]
+println("MAP   = ", mean_average_precision(query_set))
+println("MRR   = ", mean_reciprocal_rank(query_set))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch163_ir_metrics::*;
+
+fn main() {
+    let ranking = [1, 0, 1, 1, 0, 1]; // relevant at ranks 1, 3, 4, 6
+    let num_relevant = 5;
+
+    println!("P@3   = {:.4}", precision_at_k(&ranking, 3).unwrap());
+    println!("R@3   = {:.4}", recall_at_k(&ranking, 3, num_relevant).unwrap());
+    println!("AP    = {:.4}", average_precision(&ranking, Some(num_relevant)).unwrap());
+    println!("RR    = {:.4}", reciprocal_rank(&ranking).unwrap());
+
+    let grades = [3, 2, 3, 0, 1, 2];
+    let ideal_pool = [3, 3, 2, 2, 1, 0];
+    println!("DCG@3 = {:.4}", dcg_at_k(&grades, 3).unwrap());
+    println!("NDCG@3 = {:.4}", ndcg_at_k(&grades, 3, None).unwrap());
+    println!("NDCG@6 (pool) = {:.4}", ndcg_at_k(&grades, 6, Some(&ideal_pool)).unwrap());
+
+    let query_set = vec![
+        vec![1, 0, 1, 1, 0, 1],
+        vec![0, 1, 0, 0, 1, 0],
+        vec![0, 0, 0, 0, 0, 1],
+    ];
+    println!("MAP   = {:.4}", mean_average_precision(&query_set, None).unwrap());
+    println!("MRR   = {:.4}", mean_reciprocal_rank(&query_set).unwrap());
+}
+```
+
+:::
+
+## 9. Offline versus Online Evaluation
 
 Everything so far is offline evaluation: metrics computed against a fixed corpus, a fixed query set, and fixed relevance judgments. Offline evaluation is reproducible, cheap to rerun, and ideal for rapid iteration and model selection. Its weaknesses are equally clear. Judgments are incomplete, so unjudged but genuinely relevant documents are scored as non relevant, biasing comparisons against systems that surface novel documents. Judgments may also be stale, drifting away from current user intent as the world and the corpus change. Most fundamentally, offline metrics encode an assumed model of relevance and user behavior that may not match what real users actually do.
 
@@ -145,7 +249,7 @@ Online evaluation has its own hazards. Behavioral signals are noisy proxies for 
 
 In practice the two regimes are complementary and used in sequence. Teams iterate quickly offline using MAP or NDCG to filter a large space of candidate models down to a few promising ones, validating that offline gains correlate with the online metrics that actually matter. They then run online A/B tests or interleaving experiments on the survivors to confirm that offline improvements translate into better real world behavior before shipping. The persistent risk is metric divergence, where offline gains fail to move online metrics; tracking and minimizing this gap is a core discipline of any serious search team.
 
-## 9. Summary
+## 10. Summary
 
 Retrieval evaluation moves from set based precision and recall, through the rank aware cutoff metrics $P@k$ and $R@k$, to the precision recall curve, and finally to the scalar summaries MAP for binary relevance and NDCG for graded relevance, with MRR serving single answer tasks. These offline metrics are indispensable for fast iteration but rest on assumed relevance models and incomplete judgments. Online evaluation through A/B testing and interleaving measures what users actually do and supports causal conclusions, at the cost of noise, position bias, and traffic requirements. Mature systems use both: offline metrics to search the model space efficiently, online experiments to validate that those gains are real.
 

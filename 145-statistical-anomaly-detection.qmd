@@ -161,7 +161,156 @@ with shape parameter $\xi$ and scale parameter $\beta$. The shape $\xi$ governs 
 
 The appeal is that extreme value theory makes no global distributional assumption; it characterizes only the tail, which is exactly the region anomaly detection cares about. Methods such as Streaming Peaks Over Threshold adapt this machinery to online settings, updating the fitted tail as data arrive and setting data driven thresholds without manual tuning, which is why the approach has become popular for automatic monitoring of streaming metrics.
 
-## 5. Choosing a Method in Practice
+## 5. A Reference Implementation
+
+The four detectors above are compact enough to build from first principles, and doing so makes the statistical content concrete. This section assembles them into a small library: standardized z-scores, the squared Mahalanobis distance with a chi-square threshold, a Gaussian kernel density estimate, and the Grubbs test with its exact order-statistic critical value. The shared library `aiinaction` ships the same API in Python, Julia, and Rust, and a cross-language test suite pins all three to identical numbers on the fixtures used below.
+
+### 5.1 Two Derivations the Code Depends On
+
+Two results in the earlier sections are stated without proof but are needed to turn the formulas into calibrated thresholds, so we derive them here.
+
+**The mean squared Mahalanobis distance over the sample.** Write the centered data matrix as $X_c \in \mathbb{R}^{n \times d}$ with rows $x_i - \bar{x}$, and let $S = \tfrac{1}{n-1} X_c^\top X_c$ be the sample covariance. The average squared Mahalanobis distance of the training rows is
+
+$$
+\frac{1}{n} \sum_{i=1}^{n} (x_i - \bar{x})^\top S^{-1} (x_i - \bar{x})
+= \frac{1}{n} \sum_{i=1}^{n} \operatorname{tr}\!\big( S^{-1} (x_i - \bar{x})(x_i - \bar{x})^\top \big),
+$$
+
+using the scalar identity $a^\top M a = \operatorname{tr}(M a a^\top)$. Pulling the trace out of the sum and recognizing $\sum_i (x_i - \bar{x})(x_i - \bar{x})^\top = (n-1) S$ gives
+
+$$
+\frac{1}{n}\operatorname{tr}\!\Big( S^{-1} \sum_{i=1}^{n} (x_i - \bar{x})(x_i - \bar{x})^\top \Big)
+= \frac{1}{n}\operatorname{tr}\!\big( S^{-1} (n-1) S \big)
+= \frac{(n-1)}{n}\operatorname{tr}(I_d) = \frac{d(n-1)}{n}.
+$$
+
+So the sample mean of $D^2$ is exactly $d(n-1)/n$, approaching the population value $d$ (the mean of $\chi^2_d$) as $n$ grows. The test suite asserts this identity exactly, which is a strong end-to-end check on the covariance, its inverse, and the quadratic form all at once.
+
+**The Grubbs critical value from a Student-$t$ quantile.** Under the null that all $n$ points are i.i.d. normal, the two-sided Grubbs statistic $G = \max_i |x_i - \bar{x}| / s$ rejects at level $\alpha$ when
+
+$$
+G > \frac{n-1}{\sqrt{n}} \sqrt{ \frac{t^2}{\,n - 2 + t^2\,} }, \qquad t = t_{1 - \alpha/(2n),\; n-2},
+$$
+
+where $t_{q, \nu}$ is the upper-$q$ quantile of the Student-$t$ distribution with $\nu$ degrees of freedom. The $\alpha/(2n)$ in the quantile is a Bonferroni correction for testing the most extreme of $n$ points across both tails. The implementation computes the $t$ quantile by inverting the Student-$t$ CDF, which it expresses through the regularized incomplete beta function $I_x(a,b)$ and inverts by bisection; the chi-square quantile used for Mahalanobis thresholds is obtained the same way from the regularized lower incomplete gamma $P(s,x)$. Both special functions are coded from scratch so the three languages return bit-comparable quantiles rather than relying on three different library implementations.
+
+### 5.2 The Library in Three Languages
+
+The example fits each detector on a small batch with one planted outlier and prints the scores and decisions.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch145_anomaly import (
+    zscores, zscore_flags, mahalanobis_sq, gaussian_kde,
+    grubbs_test, chi2_ppf,
+)
+
+# Univariate batch: six ordinary readings and one spike.
+x = [10.0, 12.0, 11.0, 13.0, 9.0, 11.5, 40.0]
+z = zscores(x)
+print("z-scores:   ", [round(float(v), 3) for v in z])
+print("flagged |z|>3:", zscore_flags(x, threshold=3.0).tolist())
+
+# Grubbs test on a smaller batch: is the most extreme point a real outlier?
+g = grubbs_test([1.0, 2.0, 1.5, 1.8, 2.2, 5.0], alpha=0.05)
+print(f"Grubbs G={g.statistic:.4f}  crit={g.critical_value:.4f}  "
+      f"outlier={g.is_outlier} at index {g.index}")
+
+# Multivariate: score an off-ridge point against a correlated cloud.
+X = [[2.0, 1.0], [3.0, 2.0], [4.0, 2.5],
+     [5.0, 4.0], [6.0, 5.0], [2.5, 6.0]]
+d2_train = mahalanobis_sq(X)
+d2_point = mahalanobis_sq(X, [[10.0, 1.0]])[0]
+thresh = chi2_ppf(0.95, df=2)
+print(f"train D^2 mean: {sum(d2_train)/len(d2_train):.4f}  "
+      f"(d*(n-1)/n = {2*5/6:.4f})")
+print(f"new point D^2={d2_point:.3f}  chi2_0.95,2={thresh:.3f}  "
+      f"anomaly={d2_point > thresh}")
+
+# Nonparametric density at a cluster point vs. the outlier.
+dens = gaussian_kde([1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 10.0],
+                    [2.5, 10.0], bandwidth=1.0)
+print("KDE density at [2.5, 10.0]:", [round(float(v), 4) for v in dens])
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch145Anomaly
+
+x = [10.0, 12.0, 11.0, 13.0, 9.0, 11.5, 40.0]
+z = zscores(x)
+println("z-scores:    ", round.(z, digits=3))
+println("flagged |z|>3: ", zscore_flags(x; threshold=3.0))
+
+g = grubbs_test([1.0, 2.0, 1.5, 1.8, 2.2, 5.0]; alpha=0.05)
+println("Grubbs G=", round(g.statistic, digits=4),
+        "  crit=", round(g.critical_value, digits=4),
+        "  outlier=", g.is_outlier, " at index ", g.index)  # 1-based
+
+X = [2.0 1.0; 3.0 2.0; 4.0 2.5; 5.0 4.0; 6.0 5.0; 2.5 6.0]
+d2_train = mahalanobis_sq(X)
+d2_point = mahalanobis_sq(X, [10.0 1.0])[1]
+thresh = chi2_ppf(0.95, 2)
+println("train D^2 mean: ", round(sum(d2_train) / length(d2_train), digits=4))
+println("new point D^2=", round(d2_point, digits=3),
+        "  chi2_0.95,2=", round(thresh, digits=3),
+        "  anomaly=", d2_point > thresh)
+
+dens = gaussian_kde([1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 10.0],
+                    [2.5, 10.0]; bandwidth=1.0)
+println("KDE density at [2.5, 10.0]: ", round.(dens, digits=4))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch145_anomaly::{
+    zscores, zscore_flags, mahalanobis_sq, gaussian_kde, grubbs_test, chi2_ppf,
+};
+
+fn main() {
+    let x = [10.0, 12.0, 11.0, 13.0, 9.0, 11.5, 40.0];
+    let z = zscores(&x).unwrap();
+    println!("z-scores:    {:?}", z);
+    println!("flagged |z|>3: {:?}", zscore_flags(&x, 3.0).unwrap());
+
+    let g = grubbs_test(&[1.0, 2.0, 1.5, 1.8, 2.2, 5.0], 0.05).unwrap();
+    println!(
+        "Grubbs G={:.4}  crit={:.4}  outlier={} at index {}",
+        g.statistic, g.critical_value, g.is_outlier, g.index
+    );
+
+    let x_mahal = vec![
+        vec![2.0, 1.0], vec![3.0, 2.0], vec![4.0, 2.5],
+        vec![5.0, 4.0], vec![6.0, 5.0], vec![2.5, 6.0],
+    ];
+    let d2_train = mahalanobis_sq(&x_mahal, &[]).unwrap();
+    let d2_point = mahalanobis_sq(&x_mahal, &[vec![10.0, 1.0]]).unwrap()[0];
+    let thresh = chi2_ppf(0.95, 2).unwrap();
+    let mean: f64 = d2_train.iter().sum::<f64>() / d2_train.len() as f64;
+    println!("train D^2 mean: {:.4}", mean);
+    println!(
+        "new point D^2={:.3}  chi2_0.95,2={:.3}  anomaly={}",
+        d2_point, thresh, d2_point > thresh
+    );
+
+    let dens = gaussian_kde(
+        &[1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 10.0], &[2.5, 10.0], Some(1.0),
+    )
+    .unwrap();
+    println!("KDE density at [2.5, 10.0]: {:?}", dens);
+}
+```
+
+:::
+
+The three implementations are validated against one shared fixture set to a tolerance of $10^{-9}$. The only cross-language caveat is cosmetic: the Grubbs `index` is 0-based in Python and Rust but 1-based in Julia, so the planted outlier reports at index 5 in the former two and index 6 in Julia.
+
+## 6. Choosing a Method in Practice
 
 No single method dominates, and the right choice follows from the structure of the data. When the background is plausibly unimodal and roughly Gaussian, the z-score and the Mahalanobis distance are efficient, interpretable, and cheap, and their robust variants handle moderate contamination. When the density is multimodal or oddly shaped and the dimension is low, kernel density estimation captures structure that no parametric family can, while histogram based scores offer a fast approximation when speed dominates accuracy. When the goal is a defensible statement about whether a specific extreme point is a genuine outlier, the Grubbs test and its generalizations supply calibrated significance, and when the application centers on rare tail events in a stream, extreme value theory models the tail without committing to a global shape.
 
