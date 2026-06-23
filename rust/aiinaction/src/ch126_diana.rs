@@ -255,7 +255,7 @@ mod tests {
     // Shared fixture: 1-D points {1,2,3,20,21,22}, d = absolute difference.
     // Identical to the Python and Julia test suites.
     fn fixture() -> Vec<Vec<f64>> {
-        let pts = [1.0, 2.0, 3.0, 20.0, 21.0, 22.0];
+        let pts: [f64; 6] = [1.0, 2.0, 3.0, 20.0, 21.0, 22.0];
         let n = pts.len();
         (0..n)
             .map(|i| (0..n).map(|j| (pts[i] - pts[j]).abs()).collect())
