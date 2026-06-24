@@ -2,11 +2,26 @@
 
 Geospatial data carries information that few other modalities possess: every observation is anchored to a location on the surface of the Earth, and that location relates to every other location through distance, adjacency, and containment. A machine learning model that treats latitude and longitude as two ordinary numeric columns discards almost all of this structure. The art of geospatial feature engineering is to surface the relationships that location implies, encode them as model ready features, and do so without violating the geometry of a curved planet. This chapter develops the foundations and the practical tooling for that task, moving from coordinate systems through distance metrics, spatial joins, geohashing, proximity and density features, and finally the diagnostics of spatial autocorrelation.
 
+A consistent pipeline ties these stages together. The diagram below shows the typical flow from raw coordinates to model ready features and an honest evaluation.
+
+```{mermaid}
+flowchart TD
+    A["Raw lat lon in WGS84 EPSG 4326"] --> B["Reproject to local metric CRS"]
+    B --> C["Distance and area features"]
+    A --> D["Spatial join to context layers"]
+    A --> E["Discretize with geohash H3 or S2"]
+    C --> F["Proximity density and lag features"]
+    D --> F
+    E --> F
+    F --> G["Model with spatial cross validation"]
+    F --> H["Diagnose with Moran I and LISA"]
+```
+
 ## 1. Coordinate Systems and Projections
 
 ### 1.1 Geographic Coordinates and the Geodetic Datum
 
-A geographic coordinate system describes position on an ellipsoidal model of the Earth using latitude $\phi$ and longitude $\lambda$, both measured in degrees. The most widely used reference frame is the World Geodetic System 1984 (WGS84), identified by the code EPSG:4326, which underlies the Global Positioning System and the bulk of consumer location data. Latitude ranges over $[-90^\circ, 90^\circ]$ and longitude over $[-180^\circ, 180^\circ]$.
+A geographic coordinate system describes position on an ellipsoidal model of the Earth using latitude $\phi$ and longitude $\lambda$, both measured in degrees. A *datum* fixes the reference ellipsoid (its size and flattening) and its orientation relative to the Earth, so identical latitude and longitude values under two different datums can name points tens of meters apart. The most widely used datum and reference frame is the World Geodetic System 1984 (WGS84), identified by the code EPSG:4326, which underlies the Global Positioning System and the bulk of consumer location data. Latitude ranges over $[-90^\circ, 90^\circ]$ and longitude over $[-180^\circ, 180^\circ]$. The WGS84 ellipsoid has equatorial radius $a = 6378137$ m and flattening $f = 1/298.257223563$, so it is very nearly but not exactly a sphere.
 
 The critical property to internalize is that geographic coordinates are angular, not linear. One degree of latitude corresponds to roughly 111 kilometers everywhere, but one degree of longitude shrinks toward the poles according to
 
@@ -20,7 +35,9 @@ At the equator a degree of longitude is about 111 km; at $60^\circ$ latitude it 
 
 A projected coordinate system maps the curved surface onto a plane so that Euclidean geometry becomes locally valid and coordinates are expressed in meters. No projection preserves area, shape, distance, and direction simultaneously; each trades one property for another. For feature engineering the most useful family is the Universal Transverse Mercator (UTM) system, which divides the globe into 60 zones each six degrees of longitude wide. Within a zone, planar distance computed with the ordinary formula is accurate to a fraction of a percent, which is sufficient for most modeling.
 
-A common and disciplined workflow is to store data in EPSG:4326 for interoperability, then reproject to an appropriate local projection (a UTM zone, a national grid, or a web friendly system such as EPSG:3857) before computing any planar distance or area feature.
+A common and disciplined workflow is to store data in EPSG:4326 for interoperability, then reproject to an appropriate local projection (a UTM zone, a national grid, or a web friendly system such as EPSG:3857) before computing any planar distance or area feature. A caution about EPSG:3857, the Web Mercator system used by most slippy map tiles: it is conformal (it preserves local angles) but badly distorts area away from the equator, inflating polygons near the poles by a factor of $1/\cos^2\phi$. It is fine as a display backdrop and as a tile index, but it is a poor choice for distance or area features outside low latitudes. Prefer an equal area or local projection for those.
+
+The free and open PROJ library, exposed through `pyproj` and through GeoPandas, performs these transformations, and the EPSG registry catalogs the codes. The UTM zone for a given longitude $\lambda$ in degrees is $\lfloor (\lambda + 180)/6 \rfloor + 1$, which is a convenient way to pick a metric CRS automatically for point data confined to one zone.
 
 ```python
 import geopandas as gpd
@@ -60,6 +77,12 @@ def haversine(lat1, lon1, lat2, lon2, R=6371.0):
 
 The function is fully vectorized, so distances from one query point to a million candidates cost a single array expression.
 
+**Worked example.** Take Paris at $(\phi_1, \lambda_1) = (48.8566^\circ, 2.3522^\circ)$ and London at $(\phi_2, \lambda_2) = (51.5074^\circ, -0.1278^\circ)$. Converting to radians, $\Delta\phi = 0.04626$ and $\Delta\lambda = -0.04328$. Then
+$$
+a = \sin^2(0.02313) + \cos(0.8527)\cos(0.8989)\sin^2(-0.02164) \approx 5.35\times 10^{-4} + 0.4135 \cdot 4.68\times 10^{-4} \approx 7.29\times 10^{-4},
+$$
+and $d = 2 \cdot 6371 \cdot \arcsin(\sqrt{7.29\times 10^{-4}}) \approx 343$ km, which matches the published great circle distance to within the precision of the rounded inputs. The geodesic distance on the WGS84 ellipsoid for the same pair is about $344$ km, so the spherical approximation errs here by roughly $0.3$ percent, a difference that is negligible for most feature engineering and material only for survey grade work.
+
 ### 2.2 Choosing Among Distance Definitions
 
 Several distance notions coexist, and the correct choice depends on the application.
@@ -68,7 +91,7 @@ The Euclidean distance on projected coordinates, $\sqrt{(x_2 - x_1)^2 + (y_2 - y
 
 The haversine or great circle distance is appropriate for global or continental scale data where any single projection would introduce unacceptable error.
 
-The Vincenty and Karney geodesic distances account for the Earth's flattening on the WGS84 ellipsoid and reach millimeter accuracy. They cost more per evaluation and matter when surveying grade precision is required.
+The Vincenty and Karney geodesic distances account for the Earth's flattening on the WGS84 ellipsoid and reach millimeter accuracy. They cost more per evaluation and matter when surveying grade precision is required. Karney's algorithm is the modern default because it always converges, whereas the older Vincenty iteration can fail to converge for nearly antipodal points (reference 4). The relative error of the spherical haversine against the ellipsoidal geodesic is bounded by roughly the flattening $f \approx 0.0034$, so it stays under about a third of a percent anywhere on Earth.
 
 For routing and accessibility problems, none of these straight line measures is the right feature. The relevant quantity is network distance or travel time along a road or transit graph, which can differ from straight line distance by a factor of two or more in dense urban environments. When the downstream task concerns human movement, a network distance feature derived from a routing engine usually dominates any geometric distance.
 
@@ -86,7 +109,17 @@ which removes the date line discontinuity and gives tree based and distance base
 
 ### 3.1 Predicates and Semantics
 
-A spatial join associates records from two layers based on a geometric relationship rather than a shared key. The relationship is expressed through a topological predicate. The most common predicates are `intersects`, `contains`, `within`, `touches`, and `crosses`, formalized by the Dimensionally Extended nine Intersection Model (DE-9IM). The canonical feature engineering use is point in polygon assignment: given a set of GPS pings and a set of administrative polygons, attach to each ping the neighborhood, census tract, or sales territory that contains it.
+A spatial join associates records from two layers based on a geometric relationship rather than a shared key. The relationship is expressed through a topological predicate. The most common predicates are `intersects`, `contains`, `within`, `touches`, and `crosses`. These are formalized by the Dimensionally Extended nine Intersection Model (DE-9IM), which classifies the relationship between two geometries $A$ and $B$ by the dimension (empty, point, line, or area, encoded as $\{-1,0,1,2\}$) of the nine pairwise intersections of their interiors $I$, boundaries $\partial$, and exteriors $E$:
+
+$$
+\begin{pmatrix}
+\dim(I_A \cap I_B) & \dim(I_A \cap \partial B) & \dim(I_A \cap E_B) \\
+\dim(\partial A \cap I_B) & \dim(\partial A \cap \partial B) & \dim(\partial A \cap E_B) \\
+\dim(E_A \cap I_B) & \dim(E_A \cap \partial B) & \dim(E_A \cap E_B)
+\end{pmatrix}.
+$$
+
+Each named predicate is a pattern over this matrix. For instance, $A$ `within` $B$ requires that the interiors intersect ($\dim(I_A \cap I_B) \ge 0$) and that no part of $A$ lies in the exterior of $B$ ($I_A \cap E_B$ and $\partial A \cap E_B$ both empty). Understanding the predicates as patterns explains why they are not all mutually exclusive and why `intersects` is the most permissive (it holds whenever any of the interior or boundary intersections is non empty). The canonical feature engineering use is point in polygon assignment: given a set of GPS pings and a set of administrative polygons, attach to each ping the neighborhood, census tract, or sales territory that contains it.
 
 ```python
 joined = gpd.sjoin(points, polygons, predicate="within", how="left")
@@ -179,11 +212,19 @@ $$
 I = \frac{n}{\sum_{i}\sum_{j} w_{ij}} \cdot \frac{\sum_{i}\sum_{j} w_{ij}\,(x_i - \bar{x})(x_j - \bar{x})}{\sum_{i}(x_i - \bar{x})^2}.
 $$
 
-Its value lies near $1$ for strong positive autocorrelation (clustering of similar values), near $-1$ for negative autocorrelation (a checkerboard of dissimilar neighbors), and near the expected value $-1/(n-1)$, approximately zero, under spatial randomness. Significance is assessed by permutation: the observed $I$ is compared against a null distribution generated by randomly reshuffling values across locations.
+Its value lies near $1$ for strong positive autocorrelation (clustering of similar values), near $-1$ for negative autocorrelation (a checkerboard of dissimilar neighbors), and near the expected value under spatial randomness. Writing $S_0 = \sum_i \sum_j w_{ij}$ for the sum of weights, the form of the statistic is a ratio of a weighted cross product of deviations to the total variance, structurally a spatial analogue of a Pearson correlation between each value and the average of its neighbors. Under the null hypothesis of no spatial structure, the expected value is
+$$
+\mathbb{E}[I] = -\frac{1}{n-1},
+$$
+which is slightly negative and tends to zero as $n$ grows. The closed form variance under the randomization assumption is also known, so a $z$ score $z = (I - \mathbb{E}[I]) / \sqrt{\operatorname{Var}[I]}$ gives an analytic test. In practice significance is more often assessed by permutation: the observed $I$ is compared against a null distribution generated by randomly reshuffling values across locations, holding $W$ fixed, which makes no distributional assumption and is robust to non normal data. A pseudo $p$ value is the fraction of permuted statistics at least as extreme as the observed one.
 
 ### 6.3 Local Indicators and Engineered Features
 
-Global Moran's I gives one number for an entire region, but autocorrelation often varies across space. Local Indicators of Spatial Association (LISA), such as local Moran's I, decompose the global statistic into a per location contribution, identifying hot spots (high values surrounded by high values), cold spots, and spatial outliers (a high value amid low neighbors). These local statistics are themselves excellent features, flagging each observation's relationship to its surroundings.
+Global Moran's I gives one number for an entire region, but autocorrelation often varies across space. Local Indicators of Spatial Association (LISA), such as local Moran's I, decompose the global statistic into a per location contribution. With $z_i = x_i - \bar{x}$ and $m_2 = \frac{1}{n}\sum_i z_i^2$, the local Moran statistic at location $i$ is
+$$
+I_i = \frac{z_i}{m_2} \sum_{j} w_{ij}\, z_j,
+$$
+and the global $I$ is proportional to the average of the $I_i$. The sign and magnitude classify each location into one of four quadrants: high value with high neighbors (a hot spot), low with low (a cold spot), high with low neighbors or low with high (spatial outliers). These identify clustering and discontinuity directly. The local statistics are themselves excellent features, flagging each observation's relationship to its surroundings. When testing many locations, the per location $p$ values should be corrected for multiple comparisons, for example with a false discovery rate adjustment, before they are read as significant clusters.
 
 The most direct way to exploit autocorrelation in a feature pipeline is the spatially lagged variable. For each location $i$, the spatial lag of $x$ is the weighted average of its neighbors,
 
@@ -208,7 +249,24 @@ print(moran.I, moran.p_sim)
 
 The same dependence that makes spatial lags predictive also breaks standard model evaluation. Random train test splits place neighboring, and therefore correlated, observations on both sides of the split, allowing the model to memorize local conditions and inflating reported accuracy. The remedy is spatial cross validation, in which folds are defined by spatial blocks or clusters so that the validation set is geographically separated from the training set. Reported performance under spatial blocking is a far more honest estimate of how the model will behave at genuinely new locations, and any geospatial feature engineering effort should pair its features with a spatially aware validation scheme.
 
-## 7. Practical Summary
+## 7. When to Use What, and Common Pitfalls
+
+A few decisions recur often enough to deserve explicit guidance.
+
+*Choosing a distance.* Use planar Euclidean distance on a local projection when all data fits inside one UTM zone or national grid, which covers most city and regional models. Use haversine when data spans zones or the globe and a third of a percent error is acceptable. Reserve ellipsoidal geodesics for survey precision. Reach for network distance or travel time whenever the outcome concerns human movement, since straight line distance can mislead by a factor of two in dense street grids.
+
+*Choosing a discretization.* Geohash is convenient when string prefixes and lexicographic range scans are wanted, for example in a key value store. Prefer H3 or S2 when neighbor structure matters, because hexagonal adjacency is unambiguous and cell areas are more uniform. Always pick the resolution to match the spatial scale of the phenomenon, not the precision of the raw coordinates.
+
+The pitfalls below cause silent, hard to debug errors.
+
+- Computing `.area` or `.length` on unprojected EPSG:4326 geometry yields square or linear degrees, which are meaningless and vary with latitude.
+- Treating a degree of longitude as a fixed distance, which overstates east west separation away from the equator by the factor $1/\cos\phi$.
+- Aggregating features by geohash without accounting for the edge problem, where points meters apart fall in different cells and lose their shared prefix.
+- Building areal features at an arbitrary unit and ignoring the modifiable areal unit problem, so conclusions change with the aggregation scale.
+- Leaking spatial information through a random train test split, which places correlated neighbors on both sides and inflates measured accuracy.
+- Using Web Mercator (EPSG:3857) for area features at high latitude, where the area distortion grows as $1/\cos^2\phi$.
+
+## 8. Practical Summary
 
 Effective geospatial feature engineering follows a consistent discipline. Store coordinates in a known datum and reproject to a local metric system before computing any planar distance or area. Use the haversine or geodesic distance when data crosses projection zones, and prefer network distance when the task concerns human movement. Encode location for models through metric or spherical transforms rather than raw degrees. Exploit spatial joins, accelerated by R-tree indexing, to attach contextual attributes, and use nearest neighbor joins to manufacture distance features. Discretize with geohash, H3, or S2 to enable bucketing and neighbor aggregation. Build proximity, count, and kernel density features at deliberately chosen scales, mindful of the modifiable areal unit problem. Finally, measure spatial autocorrelation with Moran's I and its local variants, harvest spatial lags as features, and validate with spatial blocking so that the model's reported skill reflects its true generalization across space.
 

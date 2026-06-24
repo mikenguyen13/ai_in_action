@@ -10,6 +10,15 @@ The catch is that AI abstractions are unusually leaky. Performance, which is the
 
 A second reason to think in layers is portability versus performance. The higher you write your code, the more portable it is and the less control you have. The lower you write it, the faster it can run and the more it locks you to a vendor. Every serious AI decision sits somewhere on this spectrum, and naming the layers makes the spectrum legible.
 
+It is worth defining the central terms precisely, because they recur at every layer.
+
+- **Throughput** is the rate of useful work, measured in floating-point operations per second (FLOP/s) for compute, in bytes per second for memory and network, or in requests or tokens per second for serving.
+- **Latency** is the time from issuing a request to receiving its result. Throughput and latency are distinct: a system can have high throughput and high latency at once, for example by processing large batches.
+- **Arithmetic intensity** is the ratio of arithmetic operations to bytes moved from memory, with units of FLOP per byte. It is the single number that determines whether a kernel is limited by computation or by memory traffic.
+- **Utilization** is achieved throughput divided by peak throughput. A model achieving forty percent of an accelerator's peak FLOP/s has forty percent compute utilization. Low utilization is the normal state of affairs, and most performance engineering is the work of raising it.
+
+These four quantities, plus capacity (how many bytes a device can hold), are the vocabulary in which every tradeoff in this chapter is ultimately denominated.
+
 The figure below shows the canonical stack as a vertical diagram. Read it from the bottom, where electrons move, to the top, where users interact.
 
 ```{mermaid}
@@ -48,11 +57,37 @@ The graphics processing unit (GPU) became the workhorse of deep learning because
 
 The tensor processing unit (TPU), designed by Google, is an application-specific integrated circuit built around a large systolic array for matrix multiplication (2). Where a GPU is a flexible parallel processor, a TPU is a more specialized device that trades generality for efficiency on the narrow workload of neural network math. Neural processing units (NPUs) bring similar ideas to edge and mobile devices, prioritizing energy efficiency for on-device inference.
 
-### 2.2 Interconnect and Scale
+### 2.2 The Roofline Model: When Memory Is the Limit
+
+The recurring claim that AI is bound by memory rather than arithmetic can be made precise with the roofline model, a simple but powerful performance bound (15). Consider a kernel that performs $W$ floating-point operations while moving $Q$ bytes between the accelerator's compute units and its memory. Define its arithmetic intensity as
+
+$$
+I = \frac{W}{Q} \quad \text{(FLOP per byte)}.
+$$
+
+Let $\pi$ denote the device's peak compute rate in FLOP/s and $\beta$ its peak memory bandwidth in bytes/s. The time to run the kernel is bounded below by whichever resource is the bottleneck, so the achievable throughput in FLOP/s obeys
+
+$$
+P \;\le\; \min\bigl(\pi,\; \beta \cdot I\bigr).
+$$
+
+The two terms cross at the **ridge point** $I^\* = \pi / \beta$. A kernel with $I < I^\*$ is **memory-bound**: it cannot use the full compute capacity because it spends its time waiting on memory, and the only way to speed it up is to move fewer bytes (better data reuse, higher precision packing, fusion) or to move them faster. A kernel with $I > I^\*$ is **compute-bound** and is limited by the arithmetic units themselves.
+
+The ridge point of modern accelerators is high. A device with roughly $1 \times 10^{15}$ FLOP/s of low-precision compute and roughly $3 \times 10^{12}$ bytes/s of memory bandwidth has $I^\* \approx 300$ FLOP per byte. Many important kernels fall well below this. A matrix multiplication of two large square matrices has intensity that grows with the matrix dimension and is comfortably compute-bound, which is why dense training saturates accelerators well. By contrast, the per-token work of autoregressive decoding, an elementwise activation, or a small batched attention step has low intensity and lands on the memory-bound slope. This single inequality explains why so much of the engineering described in later sections, paged attention, quantization, operator fusion, and high-bandwidth memory, is aimed at the byte-movement term $Q$ and the bandwidth $\beta$ rather than at raw arithmetic.
+
+### 2.3 Interconnect and Scale
 
 A single accelerator is rarely enough for frontier models. Training a large language model requires hundreds or thousands of devices cooperating, which makes the interconnect a first-class part of the hardware layer. NVLink connects GPUs within a server at high bandwidth, while InfiniBand or specialized Ethernet fabrics connect servers within a cluster. The efficiency of distributed training depends heavily on how fast gradients can be exchanged across this fabric, so interconnect topology is as important as per-chip throughput.
 
-### 2.3 Tradeoffs at the Hardware Layer
+The cost of synchronization can be quantified. Data-parallel training requires an **all-reduce** of the gradients after every step, summing each parameter's gradient across all $p$ devices and returning the result to each. A naive implementation would send the full gradient buffer to a central node and incur traffic proportional to $p$. The standard ring all-reduce instead arranges devices in a ring and pipelines the reduction, so that each device sends and receives only
+
+$$
+2 \,\frac{p-1}{p}\, M \;\approx\; 2M \quad \text{bytes}
+$$
+
+where $M$ is the size of the gradient buffer in bytes. The remarkable property is that this per-device cost is essentially independent of $p$: it approaches $2M$ as the cluster grows, so bandwidth, not device count, sets the floor on communication time (16). With link bandwidth $\beta_{\text{net}}$, the all-reduce takes roughly $2M / \beta_{\text{net}}$ seconds, and the fraction of each training step lost to communication is this time divided by the step time. Keeping that fraction small is the reason interconnect bandwidth is engineered as aggressively as compute, and the reason gradient compression, overlapping communication with backward computation, and topology-aware collective algorithms all exist.
+
+### 2.4 Tradeoffs at the Hardware Layer
 
 The dominant tradeoff is generality versus efficiency. CPUs are the most general and the least efficient per watt for dense linear algebra. GPUs occupy a productive middle ground, flexible enough to run arbitrary research code yet fast enough for production. TPUs and other ASICs push toward maximum efficiency at the cost of flexibility and ecosystem breadth. A second tradeoff is capital versus operating cost: owning accelerators is expensive up front but can be cheaper at scale than renting from a cloud provider, while renting offers elasticity at a premium. Memory capacity is the constraint practitioners feel most acutely, because a model that does not fit on a device forces either smaller batches, model parallelism, or quantization.
 
@@ -83,6 +118,14 @@ The tradeoff at this layer is invisible to most users by design, but it is enorm
 ## 5. Layer 4: Deep Learning Frameworks
 
 The framework layer is where most practitioners spend their time. A framework provides three things: an n-dimensional tensor type with operations that dispatch to the numerical libraries below, automatic differentiation so that gradients need not be derived by hand, and a set of building blocks for constructing and training models.
+
+The middle item deserves a precise statement, because it is the mathematical engine of the whole field. Automatic differentiation (autodiff) is not numerical differentiation by finite differences, and it is not symbolic differentiation that manipulates formulas. It is the systematic application of the chain rule to the elementary operations recorded while a program runs. A framework represents a model as a composition of differentiable primitives $f = f_L \circ \cdots \circ f_2 \circ f_1$. By the chain rule the Jacobian of the whole is the product of the per-layer Jacobians,
+
+$$
+J_f = J_{f_L} \, J_{f_{L-1}} \cdots J_{f_1}.
+$$
+
+Training needs the gradient of a scalar loss with respect to many parameters, which is a vector-Jacobian product. **Reverse-mode** autodiff, known in this setting as backpropagation, evaluates this product right to left, propagating a single vector backward through the recorded operations. Its cost is a small constant multiple of the cost of the forward evaluation, independent of the number of parameters, which is exactly why it scales to networks with billions of weights. The price is memory: the intermediate activations needed for the backward pass must be stored, which makes activation memory a first-order constraint and motivates techniques such as gradient checkpointing that trade recomputation for storage. This asymmetry, cheap gradients but expensive activation memory, is felt at every layer above.
 
 ### 5.1 PyTorch
 
@@ -118,7 +161,23 @@ The Hugging Face Hub has become the de facto registry for sharing pretrained mod
 
 ### 7.2 Serving Runtimes
 
-Serving a large model efficiently is a specialized problem, particularly for autoregressive language models whose generation is memory-bound and sequential. Purpose-built inference servers address this. vLLM introduced PagedAttention, which manages the key-value cache like virtual memory and sharply raises throughput by allowing many requests to share GPU memory efficiently (12). Hugging Face Text Generation Inference, NVIDIA Triton Inference Server, TorchServe, and KServe provide production features such as dynamic batching, multi-model hosting, and standardized inference protocols. The dominant tradeoffs are latency versus throughput (batching more requests raises throughput but can raise per-request latency) and cost versus quality (quantization and smaller models cut cost at some risk to accuracy).
+Serving a large model efficiently is a specialized problem, particularly for autoregressive language models whose generation is memory-bound and sequential. The reason is a direct consequence of the roofline model. Generating one token of output requires reading every model weight from memory exactly once to compute a single forward pass. For a model with $N$ parameters stored at $b$ bytes each, decoding a single sequence moves about $bN$ bytes but performs only about $2N$ FLOP, an arithmetic intensity near $2/b$, which is tiny. Single-stream decoding therefore sits far down the memory-bound slope, and its speed is set almost entirely by memory bandwidth: the time per token is approximately $bN / \beta$, where $\beta$ is the device bandwidth.
+
+This analysis also reveals the cure. The weights are read once per forward pass regardless of how many sequences are processed together, so **batching** many requests into one forward pass amortizes that fixed byte-movement cost across many tokens, raising arithmetic intensity and pushing the kernel back toward the compute-bound region where the accelerator is well used. The obstacle is the per-request **key-value cache**, the stored attention keys and values that grow with sequence length and consume the memory that batching needs. Purpose-built inference servers address exactly this. vLLM introduced PagedAttention, which manages the key-value cache like virtual memory in pages, eliminates fragmentation, and allows many requests to share GPU memory efficiently, which in turn allows much larger batches and sharply higher throughput (12). Hugging Face Text Generation Inference, NVIDIA Triton Inference Server, TorchServe, and KServe provide production features such as continuous (dynamic) batching, multi-model hosting, and standardized inference protocols.
+
+The dominant tradeoffs are latency versus throughput (batching more requests raises throughput but can raise the time an individual request waits and is processed) and cost versus quality (quantization and smaller models cut cost at some risk to accuracy).
+
+### 7.3 Worked Example: Reading the Stack Through One Number
+
+Consider serving a 7 billion parameter language model on a single accelerator with peak bandwidth $\beta = 3 \times 10^{12}$ bytes/s. The example is illustrative; the point is the method, not the exact figures.
+
+Store the weights in 16-bit precision, so $b = 2$ bytes and the weights occupy $bN = 2 \times 7 \times 10^9 = 1.4 \times 10^{10}$ bytes, about 14 GB. A single decoding stream must read all of this per token, so the lower bound on time per token is
+
+$$
+t \;\approx\; \frac{bN}{\beta} \;=\; \frac{1.4 \times 10^{10}}{3 \times 10^{12}} \;\approx\; 4.7 \times 10^{-3}\ \text{s},
+$$
+
+roughly 210 tokens per second as a bandwidth ceiling for one stream, before any overhead. Now quantize the weights to 8 bits, $b = 1$. The bytes moved per token halve, the weights occupy about 7 GB, and the bandwidth ceiling roughly doubles to about 420 tokens per second. This is the concrete mechanism behind the claim that quantization helps inference: its primary benefit for memory-bound decoding is not fewer FLOP but fewer bytes moved, which is the quantity the roofline says actually governs the latency. The freed memory also leaves room for a larger key-value cache and hence larger batches, compounding the throughput gain. The same single number, arithmetic intensity, that classified the kernel in Layer 1 thus dictates a Layer 6 serving decision, an illustration of how tightly the layers are coupled.
 
 ## 8. Layer 7: Orchestration and MLOps
 
@@ -138,7 +197,38 @@ This layer has developed its own emerging stack. Orchestration libraries such as
 
 The power of the stack comes from its composition, and a single inference request illustrates the cooperation. A user types a question into a chat application at layer 8. The application embeds the query and retrieves context from a vector store at the application layer, then issues a request to a serving runtime at layer 6. The runtime, perhaps vLLM, schedules the request, manages its key-value cache, and invokes a model defined in a framework at layer 4. The framework dispatches the model's matrix multiplications and attention operations to numerical libraries at layer 3, such as cuBLAS and cuDNN. Those libraries issue work through the CUDA runtime at layer 2, which drives the GPU at layer 1, where tensor cores finally multiply the numbers. The generated tokens travel back up the same chain. Meanwhile, layer 7 has provisioned the hardware, deployed the model, and is recording metrics for the whole transaction.
 
+The diagram below traces that request as it descends the stack and the generated tokens as they return.
+
+```{mermaid}
+flowchart TD
+    U["User question"]
+    A["Layer 8: chat app embeds query and retrieves context"]
+    S["Layer 6: serving runtime schedules request and manages KV cache"]
+    F["Layer 4: framework runs model forward pass"]
+    N["Layer 3: cuBLAS and cuDNN compute matmul and attention"]
+    D["Layer 2: CUDA runtime issues work to the device"]
+    H["Layer 1: tensor cores multiply the numbers"]
+    U --> A --> S --> F --> N --> D --> H
+    H -. "generated tokens travel back up" .-> U
+```
+
 Two cross-cutting principles govern the whole edifice. First, the binding constraint is usually memory, not arithmetic, which is why so much engineering at every layer (quantization, paged attention, HBM, prefetching pipelines) targets the movement and storage of data rather than the speed of computation. Second, abstractions leak in the direction of performance: a practitioner can ignore the lower layers right up until performance, cost, or memory forces them to look down, at which point a working model of the entire stack becomes indispensable. The stack is therefore best understood not as a set of independent choices but as a coupled system in which decisions at one layer ripple through all the others.
+
+## 11. When to Look Down the Stack, and Common Pitfalls
+
+A practitioner does not need to optimize every layer at once. The discipline is knowing which layer the current problem lives in, because effort spent at the wrong layer is wasted.
+
+**When to descend.** Stay high in the stack by default, since higher layers are more portable and more productive. Descend only when a measured constraint forces it. If latency or cost is unacceptable, first identify whether the workload is memory-bound or compute-bound using the arithmetic-intensity test, because the two require opposite remedies. A memory-bound decode is helped by quantization, fusion, and a better key-value cache (Layers 1, 3, and 6), and not at all by a faster matrix-multiply algorithm. A compute-bound training step is helped by higher-precision tensor cores and better tiling, and barely at all by bandwidth tricks. If a single device cannot hold the model, the choice between quantization, model parallelism, and a larger accelerator is again a Layer 1 through Layer 6 decision driven by memory capacity.
+
+**Common pitfalls.**
+
+- **Profiling the wrong layer.** Blaming the framework for slowness that is actually a starved data pipeline (Layer 5) or a memory-bound kernel (Layer 1) is the most frequent mistake. Always measure utilization before optimizing; low GPU utilization usually points to the data path or to a memory bound, not to the model code.
+- **Ignoring the data path.** A surprising fraction of real training failures and slowdowns trace to Layer 5 rather than the model. An accelerator idle while it waits for the next batch is pure waste.
+- **Premature low-level optimization.** Writing custom kernels before confirming the kernel is the bottleneck trades large effort for small gains. Reach for compilers (`torch.compile`, XLA, Triton) before hand-written device code.
+- **Mistaking quantization's mechanism.** Quantization speeds memory-bound inference chiefly by moving fewer bytes, not by reducing arithmetic. Expecting it to help a compute-bound workload, or applying it without measuring the accuracy cost, leads to disappointment.
+- **Underestimating lock-in and decay.** Choosing the lowest, most vendor-specific layer for a marginal speedup can trap a project on one accelerator. Deploying without Layer 7 monitoring lets a model degrade silently as data drifts.
+
+The unifying lesson is diagnostic: name the layer, measure the binding resource, and apply the remedy that matches it.
 
 ## References
 
@@ -169,3 +259,7 @@ Two cross-cutting principles govern the whole edifice. First, the binding constr
 13. Moritz, P., et al. "Ray: A Distributed Framework for Emerging AI Applications." Proceedings of the 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2018. https://arxiv.org/abs/1712.05889
 
 14. Zaharia, M., et al. "Accelerating the Machine Learning Lifecycle with MLflow." IEEE Data Engineering Bulletin, vol. 41, no. 4, 2018. https://mlflow.org/
+
+15. Williams, S., Waterman, A., and Patterson, D. "Roofline: An Insightful Visual Performance Model for Multicore Architectures." Communications of the ACM, vol. 52, no. 4, 2009, pp. 65-76. https://doi.org/10.1145/1498765.1498785
+
+16. Sergeev, A., and Del Balso, M. "Horovod: Fast and Easy Distributed Deep Learning in TensorFlow." arXiv preprint, 2018. https://arxiv.org/abs/1802.05799

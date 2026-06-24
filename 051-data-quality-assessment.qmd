@@ -4,6 +4,18 @@ Every machine learning system inherits the quality of the data it consumes. A mo
 
 The central premise is that quality is not a property of data in the abstract but a relationship between data and an intended use. A timestamp precise to the second is excellent for transaction reconciliation and irrelevant for a yearly demographic summary. Assessment, therefore, always carries an implicit clause: fit for what purpose. We make that clause explicit throughout.
 
+The assessment loop developed in this chapter has a fixed shape, summarized below. Each stage produces an artifact that the next stage consumes, and the loop closes by feeding detected defects back into refined rules.
+
+```{mermaid}
+flowchart LR
+    A["Profile the data"] --> B["Score the dimensions"]
+    B --> C["Design metrics and thresholds"]
+    C --> D["Validate at boundaries"]
+    D --> E["Monitor for drift"]
+    E --> F["Detect anomalies"]
+    F --> A
+```
+
 ## 1. Foundations and the Fitness for Use Principle
 
 ### 1.1 Data Quality as a Relation, Not an Attribute
@@ -17,6 +29,8 @@ Q_{\text{agg}}(D, U) = \sum_{i=1}^{k} w_i \, q_i, \qquad \sum_{i=1}^{k} w_i = 1 
 $$
 
 The weights are part of the assessment design and should be documented, because they are where business judgment enters.
+
+Two properties of this aggregation deserve emphasis. First, the weighted sum is a compensatory aggregation: a high score on one dimension can mask a low score on another. When a dimension is non negotiable (a single duplicated payment is unacceptable regardless of how complete or timely the data is), a compensatory mean is the wrong model, and a conjunctive aggregation such as $Q_{\text{agg}} = \min_i q_i$ or a gate ($Q_{\text{agg}} = 0$ if any $q_i$ falls below a hard floor) reflects the requirement better. Second, because each $q_i \in [0,1]$ and the weights are convex ($w_i \ge 0$, $\sum_i w_i = 1$), the aggregate is itself bounded in $[0,1]$ and is monotone in every dimension, so improving any single dimension can never lower the reported score. Choosing between the compensatory and conjunctive forms is itself a design decision driven by $U$.
 
 ### 1.2 The Cost Asymmetry of Late Detection
 
@@ -84,7 +98,18 @@ $$
 \text{Uniqueness} = \frac{E}{N} .
 $$
 
-The hard part is estimating $E$, because duplicates are frequently not exact copies. "Robert Smith, 12 Oak St" and "Bob Smith, 12 Oak Street" denote one person across two records. Detecting such cases is the province of entity resolution and record linkage, which compare records with similarity functions and cluster matches [5]. Blocking strategies reduce the quadratic comparison cost by only comparing records that share a coarse key.
+The hard part is estimating $E$, because duplicates are frequently not exact copies. "Robert Smith, 12 Oak St" and "Bob Smith, 12 Oak Street" denote one person across two records. Detecting such cases is the province of entity resolution and record linkage, which compare records with similarity functions and cluster matches [5]. A pair of records is declared a match when a similarity score $\text{sim}(r_i, r_j)$ exceeds a threshold $\tau$, and the choice of $\tau$ trades two errors against each other. Treating the set of true duplicate pairs as the positive class, the quality of a linkage is measured by precision (the fraction of declared matches that are genuine) and recall (the fraction of genuine matches that are found):
+
+$$
+\text{Precision} = \frac{|\text{true matches found}|}{|\text{matches declared}|}, \qquad
+\text{Recall} = \frac{|\text{true matches found}|}{|\text{true matches}|} .
+$$
+
+Raising $\tau$ favors precision at the expense of recall, and lowering it does the reverse, so the operating point should be chosen by which error is costlier for the use case. Naive pairwise comparison is $O(N^2)$, which is infeasible for large datasets; blocking strategies reduce the cost by only comparing records that share a coarse key (a name prefix, a postal sector), trading a small loss of recall for a large reduction in comparisons.
+
+### 2.7 Interactions Among the Dimensions
+
+The dimensions are defined separately so they can be measured independently, but they are not orthogonal in practice, and reasoning about their interactions prevents both double counting and blind spots. Validity is a necessary but not sufficient condition for accuracy: an invalid value cannot be accurate, but a valid value need not be accurate, so validity bounds accuracy from above. Completeness and accuracy can trade off through imputation, where filling a missing value raises completeness while potentially lowering accuracy if the imputed value is wrong. Uniqueness failures corrupt completeness and consistency simultaneously, because duplicate entities both overstate population counts and create opportunities for the duplicates to disagree. A useful discipline is to assess validity and completeness first (they are cheap and gate the others), then consistency and uniqueness, and only then accuracy against a reference, since accuracy is the most expensive to establish and the most affected by failures in the cheaper dimensions.
 
 ## 3. Data Profiling
 
@@ -134,6 +159,8 @@ which is bounded in $[0,1]$ and trivially interpretable as a pass rate. Ratios a
 
 Aggregate metrics hide localized failure. Computing a metric within meaningful segments (by region, by acquisition channel, by time window) exposes problems that the global average dilutes. Formally, for a partition of the data into segments $S_1, \dots, S_g$, the segment scores $q^{(1)}, \dots, q^{(g)}$ are reported alongside the global score, and the minimum across segments often matters more than the mean. Weighting by business impact further refines this: a defect in a field that drives pricing should count more than a defect in a cosmetic field, which is exactly what the weights $w_i$ in Section 1.1 encode.
 
+**Worked example.** Suppose the `email` field is $99\%$ complete across one million customer records, comfortably above a $0.98$ threshold. Partition the records by revenue decile. Within the top decile (100{,}000 records contributing the majority of revenue), suppose 8{,}000 emails are missing, so segment completeness there is $1 - 8{,}000/100{,}000 = 0.92$. Because the other nine deciles are nearly perfect, the global score still reads $1 - 10{,}000/1{,}000{,}000 = 0.99$. The global metric passes while the segment that matters most fails. Reporting $\min_g q^{(g)} = 0.92$ alongside the mean would have surfaced the problem immediately. This is the operational reason to report the worst segment, not just the average: defects are rarely distributed uniformly, and the segments where they concentrate are often the segments that drive value.
+
 ### 4.3 Thresholds and Service Level Objectives
 
 A metric becomes operational only when paired with a threshold that distinguishes acceptable from unacceptable. These thresholds are best expressed as data quality service level objectives, for example "completeness of `email` must exceed $0.98$, measured daily." Setting thresholds is a negotiation between the cost of remediation and the cost of defects, informed by the profiled baseline. A threshold far above the historical norm guarantees constant false alarms; one far below guarantees that real degradations pass unnoticed.
@@ -166,17 +193,31 @@ $$
 \text{PSI} = \sum_{b=1}^{B} \left( p_b - q_b \right) \ln \frac{p_b}{q_b},
 $$
 
-where $p_b$ and $q_b$ are the proportions of records in bin $b$ for the current and reference distributions respectively. A common rule of thumb treats $\text{PSI} < 0.1$ as stable, $0.1 \le \text{PSI} < 0.25$ as moderate shift warranting investigation, and $\text{PSI} \ge 0.25$ as significant shift [9]. Note that the PSI summand is the same per bin quantity that appears in the symmetrized Kullback Leibler divergence, which is why it behaves as a distance between distributions. Volume anomalies (a daily load arriving at half its usual row count) and schema changes (a column silently renamed upstream) are detected by analogous monitors on counts and metadata.
+where $p_b$ and $q_b$ are the proportions of records in bin $b$ for the current and reference distributions respectively. A common rule of thumb treats $\text{PSI} < 0.1$ as stable, $0.1 \le \text{PSI} < 0.25$ as moderate shift warranting investigation, and $\text{PSI} \ge 0.25$ as significant shift [9]. The connection to information theory is exact: with $p$ and $q$ as the two binned distributions, the PSI is the symmetrized Kullback Leibler divergence,
+
+$$
+\text{PSI} = \sum_{b=1}^{B} (p_b - q_b) \ln \frac{p_b}{q_b} = D_{\text{KL}}(p \,\|\, q) + D_{\text{KL}}(q \,\|\, p),
+$$
+
+which is why it behaves as a symmetric measure of distributional distance and is always nonnegative, equalling zero only when the two distributions are identical. Two practical cautions follow from the formula. The logarithm diverges when a bin is empty in one distribution but not the other ($q_b = 0$ with $p_b > 0$), so bins are usually defined with a small floor or merged until every bin has support in the reference. And the PSI value depends on the binning: too few bins hide shifts within a bin, while too many bins make the statistic noisy under small samples. Fixing the bin edges from the reference distribution and reusing them across all future comparisons keeps the metric meaningful over time. Volume anomalies (a daily load arriving at half its usual row count) and schema changes (a column silently renamed upstream) are detected by analogous monitors on counts and metadata.
 
 ### 5.4 Anomaly Detection for Unforeseen Problems
 
 Rules and drift monitors both require anticipating what to watch. For the residual class of problems nobody specified, unsupervised anomaly detection flags records or aggregates that deviate from learned normal behavior. Simple control charts on quality metrics, flagging any daily score beyond $\mu \pm 3\sigma$ of its trailing distribution, catch a surprising fraction of incidents with minimal machinery. The principle is layered defense: declarative rules for the known, drift monitors for the gradual, and anomaly detection for the unforeseen, with each layer catching what the previous one misses.
+
+### 5.5 When to Use Which Layer, and Common Pitfalls
+
+The three detection layers are complementary, and choosing the wrong one for a given failure mode is a frequent mistake. Declarative rules are the right tool whenever the admissible values are known in advance (formats, ranges, keys, referential integrity); they are cheap, deterministic, and double as documentation, but they are blind to anything nobody thought to encode. Drift monitors are the right tool when individual values stay valid while the population shifts, which is exactly the regime that silently degrades models without tripping any rule; their pitfall is sensitivity to binning and to a poorly chosen reference window, and they raise false alarms around legitimate seasonal change unless the baseline accounts for it. Anomaly detection is the catch all for the unforeseen, but it is the least interpretable and the most prone to alert fatigue, so it is best reserved for the residual after rules and drift monitors have absorbed the predictable cases.
+
+Several pitfalls cut across all layers. Alert fatigue is the dominant failure: thresholds set too tight produce a stream of false positives that trains responders to ignore the channel, so thresholds should be calibrated against the profiled baseline and tuned by observed false alarm rates. A second pitfall is monitoring proxies instead of outcomes, for example alerting on row count while the field that actually drives a decision degrades unmonitored. A third is the silent reference, where a drift baseline is itself computed from already corrupted data, so the monitor compares bad to bad and reports stability. Guarding against these is less about tooling and more about tying every monitor to a use case and a named owner, which is the subject of the next section.
 
 ## 6. Organizational Practice and Synthesis
 
 ### 6.1 Observability and Ownership
 
 Tooling alone does not produce quality; ownership does. The emerging discipline of data observability treats data health like system health, with continuous monitoring across freshness, volume, schema, distribution, and lineage, and with clear ownership for responding to alerts [10]. Lineage is essential because it answers the question that follows every detected defect: what downstream tables, dashboards, and models are affected, and who must be notified. Without lineage, a detected problem is a fact in search of a remedy.
+
+Mature open source tools cover most of the assessment loop without proprietary licensing. For declarative expectations, Great Expectations and Soda Core let validation rules be versioned and run in the pipeline. For profiling, the open source ydata-profiling library generates the single column and correlation profiles of Section 3 from a pandas frame, and a few lines of pandas and numpy suffice for ad hoc null fractions and quantiles. For transformation level testing, dbt tests express uniqueness, not null, and referential checks as part of the model build. For drift, the open source Evidently library computes population stability and distribution comparisons, and lineage is captured by the OpenLineage and OpenMetadata projects. Reaching for these before a commercial platform keeps the assessment transparent and reproducible, which are themselves quality properties.
 
 ### 6.2 Assessment as a Continuous Loop
 

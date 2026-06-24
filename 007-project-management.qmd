@@ -2,9 +2,13 @@
 
 ## Introduction
 
-Python project management has evolved significantly over the years, with tools like `pip`, `virtualenv`, `conda`, and `poetry` each attempting to solve different aspects of dependency management and environment isolation. In 2024, a new tool called `uv` emerged from Astral, the team behind `ruff`, promising to revolutionize Python package management with unprecedented speed and simplicity. Written in Rust, `uv` represents a paradigm shift in how we manage Python projects, combining the functionality of multiple tools into a single, cohesive experience.
+Python project management has evolved significantly over the years, with tools like `pip`, `virtualenv`, `conda`, and `poetry` each attempting to solve different aspects of dependency management and environment isolation. In 2024, a tool called `uv` emerged from Astral, the team behind `ruff`, aiming to consolidate Python package management with a focus on speed and simplicity. Written in Rust, `uv` combines the functionality of several previously separate tools into a single, cohesive experience.
 
-In this chapter, we'll explore `uv` comprehensively, covering everything from basic installation to advanced workflows for machine learning and AI development. For ML/AI work, where managing complex dependencies and ensuring reproducibility across different environments is critical, `uv` provides an elegant solution to streamline your development workflow.
+At its heart, project management answers three coupled questions. First, *which* versions of which packages should be installed so that every package's stated requirements are simultaneously satisfied. Second, *how* to record that answer so it can be reproduced exactly on another machine months or years later. Third, *where* to place the resulting packages so that one project's choices do not corrupt another's. The first question is a constraint-satisfaction problem (dependency resolution), the second is the lock-file mechanism, and the third is environment isolation. The rest of this chapter treats each in turn, then layers on the surrounding toolchain (linting, type checking, testing, and documentation) that turns a reproducible environment into a disciplined workflow.
+
+For machine learning and AI work, where managing deep dependency graphs and ensuring bit-for-bit reproducibility across environments is critical, getting these three questions right is the difference between an experiment that replicates and one that silently drifts. The chapter is organized to be read linearly the first time and used as a reference thereafter, moving from installation, through the formal resolution problem, to concrete ML workflows and the full development stack.
+
+All of the tooling discussed here is mature, free, and open source. `uv`, `ruff`, `pytest`, `mypy`, and `quarto` are permissively licensed and develop in the open, so nothing in this workflow depends on a paid service or a proprietary registry.
 
 ## Why `uv` Matters for Machine Learning and AI
 
@@ -93,6 +97,82 @@ Where you previously needed to coordinate these separate tools, `uv` provides a 
 3.  **Batteries Included**: Unlike tools that require plugins or additional configuration, `uv` works out of the box for common workflows.
 
 4.  **Standards Compliant**: `uv` follows Python packaging standards (PEP 517, PEP 621, etc.), ensuring compatibility with the broader ecosystem.
+
+## The Dependency Resolution Problem
+
+The single hardest thing a package manager does is *resolution*: choosing one concrete version for every package such that every constraint is satisfied at once. The chapter's claims that `uv` uses "a proper resolver" and that `pip` historically had "resolver issues" only make sense once we state the problem precisely. This section does that, then explains why the problem is genuinely hard and how modern resolvers cope.
+
+### A precise statement
+
+Let $P = \{p_1, \dots, p_n\}$ be the set of packages reachable from your project's direct requirements. For each package $p_i$ let $V_i = \{v_{i,1}, v_{i,2}, \dots\}$ be the finite set of versions available on the index, plus a distinguished symbol $\bot$ meaning "not installed." A *solution* is an assignment
+
+$$
+\sigma : P \to V_i \cup \{\bot\}, \qquad \sigma(p_i) \in V_i \cup \{\bot\},
+$$
+
+that selects at most one version of each package. Dependencies are constraints between these choices. A typical requirement, "package `a` at version $v$ depends on `numpy >= 1.24, < 2.0`," becomes the logical implication
+
+$$
+\bigl(\sigma(\texttt{a}) = v\bigr) \;\Rightarrow\; \sigma(\texttt{numpy}) \in [1.24,\, 2.0).
+$$
+
+The project's own direct dependencies are unconditional constraints of the same form. A solution is *valid* when every such implication holds and every selected version's own dependencies are themselves satisfied (the constraint set is closed under reachability). Resolution is the search for a valid $\sigma$ in which every package required by the project is assigned a real version rather than $\bot$.
+
+::: {.callout-note}
+## Definition: the version-selection constraint problem
+
+Given packages with versioned, conditional dependency constraints, decide whether a valid assignment $\sigma$ exists, and if so return one. Optional refinements ask for the assignment that is *newest* under some preference order, for example lexicographically maximal versions, which is what users usually want.
+:::
+
+### Why it is hard
+
+Each package's "which version" choice is a discrete variable, and the implications above are exactly propositional clauses. Encode "package $p$ is at version $v$" as a Boolean variable $x_{p,v}$, add clauses enforcing that at most one version per package is chosen, and translate each dependency implication into a disjunction. The result is a Boolean satisfiability (SAT) instance, and conversely SAT instances can be encoded as dependency graphs. Boolean satisfiability is the canonical NP-complete problem [@cook1971complexity], so version selection inherits that worst-case hardness: no known algorithm solves every instance in time polynomial in the number of packages and versions. The same reduction underlies the formal study of package managers in the Linux distribution world [@abate2015modular], where the problem was analyzed long before it reached the Python ecosystem.
+
+Two ecosystem realities make the worst case bite in practice:
+
+-   **Diamond dependencies.** Project `A` depends on `B` and `C`; both `B` and `C` depend on `D`, but with overlapping-or-disjoint version ranges. The resolver must find a version of `D` acceptable to both, and the feasible window can be empty.
+
+-   **Backtracking blowups.** A naive resolver picks versions greedily, discovers a conflict deep in the tree, and must undo many choices. Without learning from the conflict it can revisit the same dead end repeatedly, which is the behavior older `pip` resolvers were criticized for.
+
+### How modern resolvers cope
+
+`uv` (like Dart's `pub` and the `poetry` resolver) uses the **PubGrub** algorithm, an adaptation of conflict-driven clause learning (CDCL) from the SAT-solving literature. The key idea is that when the search hits an incompatibility, it does not merely backtrack one step. It derives a new, more general *incompatibility* (a learned clause) that summarizes *why* the dead end occurred, then uses that clause to prune the rest of the search and to explain the failure to the user. The clear "Because package-a depends on numpy<2.0 and package-b depends on numpy>=2.0, ..." messages shown later in this chapter are these learned incompatibilities rendered as English.
+
+Three properties matter in practice and are worth stating as expectations rather than guarantees of speed:
+
+1.  **Completeness.** If a valid assignment exists, the resolver finds one; if none exists, it reports a genuine conflict rather than installing a broken set. This is the property `pip`'s historical resolver lacked.
+
+2.  **Determinism.** Given the same inputs (the same `pyproject.toml`, the same index state), resolution returns the same assignment. Determinism is what makes the lock file meaningful: it is the serialized $\sigma$.
+
+3.  **Best-effort optimality.** Among valid assignments the resolver prefers the newest versions consistent with your constraints, so you get bug fixes "for free" without manual pinning.
+
+```{mermaid}
+flowchart TD
+    start["Direct requirements from pyproject.toml"]
+    start --> pick["Pick a candidate version for the next package"]
+    pick --> check["Check it against all active constraints"]
+    check -->|"compatible"| more{"More packages to assign"}
+    check -->|"conflict"| learn["Derive a learned incompatibility"]
+    learn --> back["Backjump past the real cause"]
+    back --> pick
+    more -->|"yes"| pick
+    more -->|"no"| done["Valid assignment, write uv.lock"]
+```
+
+### Worked example: an unsatisfiable diamond
+
+Suppose your project requires two packages with the following published constraints.
+
+| Package | Version | Requires |
+|---------|---------|----------|
+| `vision` | 1.0 | `numpy >= 1.24, < 2.0` |
+| `fastmath` | 3.0 | `numpy >= 2.0` |
+
+There is no single `numpy` version in both $[1.24, 2.0)$ and $[2.0, \infty)$, since those intervals are disjoint. The resolver assigns `vision==1.0`, propagates `numpy < 2.0`, then tries `fastmath==3.0`, which propagates `numpy >= 2.0`. The two clauses about `numpy` are jointly unsatisfiable, so the resolver records the incompatibility "`vision==1.0` and `fastmath==3.0` cannot coexist" and reports it. The fix is not a resolver flag but a real engineering decision: relax a bound (does `fastmath` have an older release that accepts `numpy < 2.0`?), drop one dependency, or wait for an upstream release that widens its range. The resolver's value is that it tells you exactly which two requirements collide, instead of installing whichever it reached last and leaving you to debug an import error at runtime.
+
+### When to worry, and when not to
+
+For the overwhelming majority of projects, resolution completes in well under a second and you never think about any of this. The theory matters at the moments when it does not: when a `uv sync` suddenly cannot find a solution, when adding one package forces a cascade of downgrades, or when CI resolves differently from your laptop. In those moments the right mental model is the one above. The resolver is searching a constraint problem, conflicts are facts about your dependency graph rather than bugs in the tool, and the lock file is the artifact that freezes a known-good solution so the search never has to run again on the deployment path.
 
 ## Basic Project Workflow
 
@@ -266,6 +346,20 @@ This tells us:
 -   The specific wheel file and its hash for verification
 
 **Important**: You should commit `uv.lock` to version control. This ensures anyone cloning your repository can recreate your exact environment, which is critical when sharing trained models or reproducing experimental results.
+
+### What the lock file does and does not guarantee
+
+It helps to be precise about the kind of reproducibility a lock file buys, because it is often overstated. The lock file is the serialized resolution $\sigma$ from the previous section, together with a cryptographic hash of every artifact. It pins three things and leaves a fourth to you.
+
+-   **Version reproducibility.** Every transitive package is fixed to one exact version. Two `uv sync` runs from the same lock file install the same version numbers. This is the property that protects against silent drift when an upstream package publishes a new release.
+
+-   **Artifact integrity.** Each wheel is recorded with a SHA-256 hash. On install, `uv` verifies the downloaded bytes against the recorded hash, so a corrupted download or a tampered mirror is detected rather than installed. Formally, if $h$ is the recorded hash and $\hat{h}$ is the hash of the bytes actually fetched, installation proceeds only when $h = \hat{h}$.
+
+-   **Source provenance.** The index URL and, for Git or local dependencies, the exact commit or path are recorded, so you know precisely where each artifact came from.
+
+-   **What it does not pin: the platform.** A lock file selects wheels for a target platform and Python version. The same lock can resolve to different wheels on Linux versus macOS, or on CPython 3.11 versus 3.12, because those are genuinely different binaries (a manylinux wheel is not a macOS wheel). For deep learning this is the usual source of "works on my machine" surprises: a CUDA-enabled `torch` wheel and a CPU-only one are different artifacts. The lock file makes the *choice* deterministic per platform; it does not make a GPU appear on a CPU-only host. The later sections on CUDA variants address this directly.
+
+A useful way to think about it: the lock file removes nondeterminism from the resolver and from the network, leaving only the deliberate, declared variation across platforms and hardware.
 
 ## Running Python with `uv`
 
@@ -492,7 +586,7 @@ dependencies = [
 
 ### Resolving Dependency Conflicts
 
-When dependencies conflict, `uv` provides clear error messages. For example, if package A requires `numpy<2.0` but package B requires `numpy>=2.0`, `uv` will report:
+When dependencies conflict, `uv` provides clear error messages. These messages are the learned incompatibilities from the resolution algorithm discussed earlier rendered in English: the resolver is reporting a fact about your dependency graph, not failing arbitrarily. For example, if package A requires `numpy<2.0` but package B requires `numpy>=2.0`, `uv` will report:
 
 ```         
 error: No solution found when resolving dependencies:

@@ -2,6 +2,25 @@
 
 Most machine learning projects begin not with a model but with a question: where will the data come from? Curated benchmark datasets are convenient, but the interesting problems almost always require data that nobody has packaged for you. The web is the largest reservoir of such data, and web scraping is the practice of programmatically extracting structured information from it. This chapter develops the technical foundations of scraping alongside the legal, ethical, and operational discipline that separates a responsible data acquisition pipeline from a reckless one.
 
+::: {.callout-note title="Definitions"}
+**Web scraping** is the automated extraction of structured data from documents intended primarily for human consumption, most commonly HTML pages. It is distinct from two adjacent activities. **Crawling** is the automated discovery and traversal of a link graph, deciding which URLs to visit next; a scraper that follows links is also a crawler, but a scraper given a fixed list of URLs is not. **Data acquisition via an API** is the retrieval of data through an interface the publisher designed for programmatic access, returning a machine readable format such as JSON with a documented schema. Scraping is the fallback you reach for when no such interface exists, and it inherits a corresponding fragility, because you are consuming a presentation layer that the publisher is free to change at any time without notice.
+:::
+
+A useful mental model is that a scraping pipeline is a function from a set of seed URLs to a validated dataset, composed of four stages that recur throughout this chapter: **fetch** (issue HTTP requests and obtain response bodies), **parse** (turn markup into candidate fields), **validate** (reject records that fail a schema), and **store** (persist with provenance). Each stage has its own failure modes, and the engineering challenge is that the function must remain correct when any stage fails for a meaningful fraction of inputs.
+
+```{mermaid}
+%%| label: fig-pipeline
+%%| fig-cap: "The four stages of a scraping pipeline and the failure path that keeps a single bad page from aborting a large run."
+flowchart LR
+    SEED["Seed URLs"] --> FETCH["Fetch over HTTP"]
+    FETCH --> PARSE["Parse markup to fields"]
+    PARSE --> VALIDATE["Validate against schema"]
+    VALIDATE -->|pass| STORE["Store with provenance"]
+    VALIDATE -->|fail| QUARANTINE["Quarantine for inspection"]
+    FETCH -->|transient error| RETRY["Backoff and retry"]
+    RETRY --> FETCH
+```
+
 ## 1. The HTTP Foundation
 
 Every scraper, no matter how sophisticated, ultimately speaks HTTP. Understanding the protocol is the difference between writing code that works by accident and writing code you can reason about when it fails.
@@ -139,6 +158,22 @@ def polite_get(session, url, base_delay=1.0):
 
 For higher throughput, a token bucket limiter caps the average rate while permitting short bursts, which is gentler than a rigid per request sleep and easier to tune to a target requests per second.
 
+::: {.callout-tip title="The token bucket, precisely"}
+A token bucket is defined by two parameters: a refill rate $r$ in tokens per second and a capacity $b$ in tokens. The bucket fills continuously at rate $r$ up to a maximum of $b$ tokens, and each request consumes one token; a request that finds the bucket empty must wait. If $T(t)$ denotes the token count at time $t$, then between request arrivals the dynamics are
+
+$$
+T(t + \Delta t) = \min\bigl(b,\; T(t) + r\,\Delta t\bigr),
+$$
+
+and each accepted request decrements $T$ by one. Over any window of length $W$ the number of admitted requests $N(W)$ satisfies
+
+$$
+N(W) \le rW + b,
+$$
+
+so the **long run average rate** is bounded by $r$ while the **burst size** is bounded by $b$. Setting $b = 1$ recovers a strict one request per $1/r$ seconds spacing; larger $b$ tolerates short clusters, which is useful when a page yields several follow up requests at once. Choosing $r$ below the rate at which the server begins returning 429 responses, and keeping $b$ small, gives you throughput without tripping defenses.
+:::
+
 ### 4.2 Concurrency With Restraint
 
 Concurrency multiplies throughput but also multiplies the load you place on a server. The key constraint is per host concurrency: even with a large worker pool, limit the number of simultaneous connections to any single domain to a small number, often just one or two, while allowing many hosts to be crawled in parallel. Asynchronous frameworks such as `asyncio` with `aiohttp` make this pattern efficient, but the politeness logic, not the raw capability, should govern how hard you push.
@@ -146,6 +181,14 @@ Concurrency multiplies throughput but also multiplies the load you place on a se
 ### 4.3 Backoff and Server Signals
 
 Servers tell you when you are going too fast, and a polite scraper listens. A 429 (too many requests) or 503 (service unavailable) response is an explicit request to slow down, and many include a `Retry-After` header naming the number of seconds to wait. On such responses, and on transient network errors, apply exponential backoff: wait one second, then two, then four, with jitter, up to a ceiling, before giving up. Retrying immediately at full speed after a rejection is the behavior of a hostile client.
+
+The backoff schedule is worth stating precisely. On the $k$-th retry, starting from $k = 0$, the base delay grows geometrically as $d_k = \min(d_{\max},\, d_0 \cdot 2^{k})$, capped at a ceiling $d_{\max}$ so the wait does not diverge. Pure geometric backoff alone is insufficient when many clients (or many workers in one scraper) are throttled at the same instant, because they all retry in lockstep and collide again, a phenomenon known as the **thundering herd**. The fix is to add randomization. With **full jitter** the actual wait is drawn uniformly,
+
+$$
+W_k \sim \mathrm{Uniform}\bigl(0,\; \min(d_{\max},\, d_0 \cdot 2^{k})\bigr),
+$$
+
+which spreads the retries of a synchronized cohort across the whole interval and decorrelates them. Full jitter both shortens the expected time to first success and reduces the peak instantaneous load on the recovering server compared with fixed exponential backoff, an effect documented in detail in the Amazon Web Services analysis of backoff and jitter (reference 11). When the response carries an explicit `Retry-After`, that value overrides the computed schedule, because it is the server stating its own preference.
 
 ```python
 def fetch_with_backoff(session, url, max_retries=5):
@@ -191,6 +234,25 @@ with sync_playwright() as p:
 
 Browser automation is powerful but expensive: it consumes far more memory and time per page, it is harder to scale, and it is more fragile. The cardinal mistake is to wait a fixed number of seconds for content to load; instead, wait on an explicit condition, such as the appearance of a specific selector or a network idle state, so the scraper adapts to varying load times.
 
+### 5.4 A Worked Decision
+
+Suppose you need the prices of ten thousand products from a catalogue site. The decision procedure below, applied once per template of page, determines the cheapest approach that actually works, and you should always prefer the option highest in this list that succeeds.
+
+```{mermaid}
+%%| label: fig-decision
+%%| fig-cap: "Choosing the cheapest acquisition method that works. Each downward step costs more in time, memory, and fragility."
+flowchart TD
+    START["Need data from a page"] --> API{"Official API exists?"}
+    API -->|yes| USEAPI["Use the API"]
+    API -->|no| RAW{"Data present in raw HTML?"}
+    RAW -->|yes| PARSE["Fetch and parse HTML"]
+    RAW -->|no| BACKEND{"Page calls a JSON backend?"}
+    BACKEND -->|yes| CALLJSON["Call the backend endpoint"]
+    BACKEND -->|no| BROWSER["Drive a headless browser"]
+```
+
+Concretely, you first check the developer documentation for an official API; a catalogue with an affiliate or partner program often has one, and it is the sanctioned path. Failing that, you fetch one product page with `requests` and grep the raw bytes for a known price. If the digits are there, a fetch and parse pipeline at one to two requests per second, paced by a token bucket, finishes ten thousand pages in a few hours with a tiny memory footprint. If the raw HTML is an empty shell, you open the browser developer tools, watch the network tab as the page loads, and almost always find a request to an endpoint such as `/api/v2/products/{id}` returning clean JSON; replicating that call directly is faster and more stable than any HTML parsing. Only if the data is genuinely synthesized in the browser, with no single backing endpoint, do you fall to driving a headless browser, accepting its order of magnitude higher cost per page and reserving it for the pages that truly require it.
+
 ## 6. Building Robust Scrapers
 
 A one off script that extracts a page is a toy. A scraper that runs for hours across thousands of pages, survives network failures, and produces clean data is an engineering artifact, and the gap between the two is robustness.
@@ -211,6 +273,28 @@ Decide early how raw and parsed data will be stored. A durable pattern is to sav
 
 Sites change without warning, and a scraper that ran perfectly yesterday can silently return empty fields today. Instrument the pipeline so that a sudden drop in the fill rate of a field, a spike in 403 responses, or a surge in validation failures raises an alert. These signals usually mean the site was redesigned or has begun blocking you, and catching them early is the difference between losing an hour of data and losing a month. Treat a scraper as a living system that requires maintenance, not a script you write once and forget.
 
+The most informative single metric is the **fill rate** of each field, the fraction of fetched pages from which the field was successfully extracted. Let $\hat{p}$ be the fill rate observed over a batch of $n$ pages and $p_0$ the historical baseline. Because each page either yields the field or does not, $\hat{p}$ is a sample proportion, and for moderately large $n$ its sampling distribution is approximately normal with standard error $\sqrt{p_0(1 - p_0)/n}$. A drop is statistically significant at roughly the two sigma level when
+
+$$
+\hat{p} < p_0 - 2\sqrt{\frac{p_0(1 - p_0)}{n}}.
+$$
+
+This guards against two failure modes of naive alerting. Without accounting for $n$, a small batch will trip the alarm on ordinary noise, drowning you in false positives; with it, the threshold automatically widens for small samples and tightens for large ones. As a concrete example, if a field historically fills at $p_0 = 0.98$ and a batch of $n = 500$ pages shows $\hat{p} = 0.93$, the standard error is $\sqrt{0.98 \cdot 0.02 / 500} \approx 0.0063$, so the observed value sits roughly eight standard errors below baseline. That is far beyond noise and almost certainly signals a layout change that broke the selector. Alerting on this statistic, rather than on a hand picked absolute threshold, keeps the monitor sensitive to real breakage while quiet during normal operation.
+
+### 6.5 When to Scrape, and Common Pitfalls
+
+Scraping is the right tool when the data you need is published on the web, no API exposes it, and the cost of fragility is acceptable relative to the value of the data. It is the wrong tool when an official API exists (use it), when the content sits behind an access control you would have to bypass (a legal and ethical line, not merely a technical one), or when the data is sensitive personal information you have no lawful basis to collect. The most common pitfalls, each of which has appeared earlier in this chapter, are worth collecting in one place:
+
+- **Fragile selectors** tied to layout position rather than semantic anchors, which break on the first redesign.
+- **Ignoring status codes**, so that error pages are parsed as if they were real content.
+- **No backoff**, so that a transient 429 or 503 turns into an escalating hammering that earns an IP ban.
+- **Fixed sleeps instead of explicit waits** in browser automation, which are simultaneously too slow on fast loads and too fast on slow ones.
+- **No checkpointing**, so that a crash three hours into a run discards all completed work.
+- **No provenance**, so that when a parser bug is found later, the affected records cannot be identified or reprocessed.
+- **No monitoring**, so that a silent selector break is discovered only weeks later when the dataset is needed.
+
+Avoiding these is most of what separates a scraper that survives in production from one that works once in a demonstration.
+
 ## 7. Conclusion
 
 Web scraping is deceptively simple to begin and genuinely difficult to do well. The technical core, issuing HTTP requests and parsing HTML, can be learned in an afternoon, but the surrounding discipline takes longer to internalize: choosing resilient selectors, honoring `robots.txt`, navigating an uncertain legal landscape, pacing requests with restraint, handling dynamic pages efficiently, and engineering for the failures that scale guarantees. The practitioners who acquire data successfully over the long term are not those who scrape the fastest but those who scrape the most carefully, treating the sites they depend on as resources to be preserved rather than exploited. For the machine learning engineer, that care is what turns the chaotic, sprawling web into a dependable source of training data.
@@ -227,3 +311,4 @@ Web scraping is deceptively simple to begin and genuinely difficult to do well. 
 8. "Scrapy: An Open Source Web Crawling Framework." https://docs.scrapy.org/
 9. Mozilla. "HTTP Headers." MDN Web Docs. https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers
 10. "Schema.org Structured Data Vocabulary." https://schema.org/
+11. Brooker, M. "Exponential Backoff and Jitter." Amazon Web Services Architecture Blog, 2015. https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/

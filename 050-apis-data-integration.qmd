@@ -2,11 +2,25 @@
 
 Modern AI systems rarely live on a single tidy spreadsheet. The data that fuels a model arrives from a payments processor, a CRM, a clickstream service, a weather feed, and an internal database, each speaking its own dialect and enforcing its own rules. The discipline of pulling those sources together into one clean, trustworthy dataset is data integration, and the primary tool for the job is the Application Programming Interface, or API. This chapter treats APIs as a practical engineering concern. We cover the two dominant query styles, REST and GraphQL, then the cross cutting concerns that determine whether your pipeline survives contact with production: authentication, pagination, rate limits, retries, webhooks, and streaming. We close by assembling several sources into a single coherent table.
 
+The throughline of the chapter is reliability under uncertainty. Every external dependency can fail, slow down, change shape, or lie about its state, and a data pipeline is only as trustworthy as its weakest interaction with the outside world. Where the topic admits a precise treatment, we give the underlying model: the consistency guarantees of a pagination scheme, the queueing behavior of a rate limiter, the expected wait of a backoff policy, and the delivery semantics of a webhook. These are not decoration. They are the difference between a feature column that is silently wrong and one you can defend.
+
+::: callout-note
+## Learning objectives
+After this chapter you should be able to read an unfamiliar API contract and predict where it will fail, choose between REST and GraphQL with a stated reason, implement correct cursor pagination and retry logic, reason quantitatively about rate limits and exponential backoff, secure a webhook receiver, and combine several heterogeneous sources into one validated, reproducible table with explicit join semantics.
+:::
+
 ## 1. Why APIs Matter for Data Work
 
 ### 1.1 The integration problem
 
 A practitioner who wants to train a churn model needs subscription history, support tickets, product usage, and billing events. Each of these lives behind a different system owned by a different team or vendor. An API is a contract that lets one program request data or actions from another without knowing the internals. The contract specifies endpoints, accepted inputs, output shapes, and error conventions. When you respect the contract you get predictable data; when you ignore it you get silent corruption that surfaces three weeks later as a mysteriously skewed feature.
+
+::: callout-tip
+## Definition: API contract
+An *API contract* is the externally observable agreement between a provider and a consumer. Formally it is a tuple of the set of valid requests, the mapping from a request to the set of permitted responses, and the invariants that hold across calls (for example, idempotency of a GET, or eventual visibility of a write). The contract is deliberately silent about implementation, which is precisely what lets the provider change internals without breaking you, and what forbids you from depending on undocumented behavior you happened to observe once.
+:::
+
+It helps to name two opposing forces that integration must reconcile. *Coupling* is how strongly your code depends on another system's details; a well designed API minimizes coupling by exposing a stable contract over a changing implementation. *Cohesion* is how well the data you assemble forms a single coherent whole. Integration work is the act of importing data across many low coupling interfaces and then raising the cohesion of the result into one analysis ready table.
 
 ### 1.2 The shape of an HTTP API
 
@@ -18,6 +32,20 @@ Host: api.example.com
 Authorization: Bearer <token>
 Accept: application/json
 ```
+
+Two properties of HTTP methods deserve precise names because the rest of the chapter leans on them. A method is *safe* if it does not alter server state, so GET is safe while POST is not. A method is *idempotent* if performing it once and performing it many times leave the server in the same state. GET, PUT, and DELETE are idempotent; POST in general is not. These are not pedantic distinctions. They tell you exactly which requests you may retry blindly after a timeout (the idempotent ones) and which you must retry only with a deduplication key, a point that returns when we discuss retries and webhooks.
+
+The space of outcomes is worth classifying once, because correct error handling is just a function on the status code. The table below partitions the response space into the actions your code should take.
+
+| Class | Examples | Meaning | Correct action |
+|---|---|---|---|
+| 2xx | 200, 201, 204 | Success | Parse and trust the body |
+| 3xx | 301, 304 | Redirect or unchanged | Follow or reuse cache |
+| 4xx (client) | 400, 401, 403, 404 | Your request is wrong | Fix and do not retry blindly |
+| 4xx (throttle) | 429 | Rate limit exceeded | Back off, then retry |
+| 5xx | 500, 502, 503 | Server failed | Retry transient ones with backoff |
+
+The single most important line in the table is the split inside the 4xx range. A 429 is transient and should be retried after a delay, whereas a 400 or 404 is a defect in your request that no amount of retrying will cure.
 
 ## 2. REST APIs
 
@@ -46,6 +74,8 @@ Always set a timeout. A request without one can hang forever when a server stall
 
 REST is simple, cacheable, and universally understood. Its weakness is shape mismatch. To assemble a customer view you may call `/customers/4821`, then `/customers/4821/invoices`, then `/customers/4821/tickets`, three round trips for one logical record. This is the N plus one problem, and it grows expensive across thousands of records. The opposite failure also appears: an endpoint returns fifty fields when you need three, wasting bandwidth and parsing time. These two frictions, under fetching and over fetching, are exactly what the next style was designed to solve.
 
+The N plus one cost is worth quantifying because it dominates wall clock time. Suppose you want $N$ customers and each requires one parent call plus $k$ sub resource calls. A naive client issues $N(1+k)$ requests, and if requests are serialized at latency $\ell$ per round trip the job takes about $N(1+k)\,\ell$. With $N = 10{,}000$, $k = 2$, and $\ell = 50$ ms that is roughly $1{,}500$ seconds, or twenty five minutes, almost all of it spent waiting on the network rather than transferring data. Two remedies attack the two factors: batching or a list endpoint cuts $N$ by returning many records per call, and concurrency divides the wall clock by the number of in flight requests the rate limit allows. GraphQL attacks $k$ directly by collapsing the sub resource calls into one.
+
 ## 3. GraphQL APIs
 
 ### 3.1 One endpoint, declared queries
@@ -71,6 +101,17 @@ The flexibility has a price. Caching is harder because every query can differ, s
 ### 3.3 Choosing between REST and GraphQL
 
 There is no universal winner. Choose REST when the API is simple, caching matters, or the provider only offers REST. Choose GraphQL when you assemble complex nested records, when network round trips are costly, or when different consumers need different field subsets from the same graph. In practice you will consume both within a single project, so fluency in each is the realistic goal.
+
+| Concern | REST | GraphQL |
+|---|---|---|
+| Endpoints | Many, one per resource | One, typically `/graphql` |
+| Fetch shape | Fixed per endpoint | Client declares fields |
+| Over and under fetch | Common | Largely eliminated |
+| HTTP caching | Easy, URL keyed | Hard, body keyed |
+| Error signaling | Status code | 200 with `errors` array |
+| Server cost control | Per endpoint design | Depth limits, cost analysis |
+
+The error signaling row is the trap that catches data engineers most often. A REST client can lean on the status code, but a GraphQL client must inspect the `errors` array in the body even on an HTTP 200, because a partially failed query returns the fields it could resolve alongside the errors for the ones it could not. Trusting the status code alone in GraphQL silently ingests incomplete records.
 
 ## 4. Authentication
 
@@ -100,9 +141,18 @@ No API returns a million rows in one response, so large collections are split in
 
 Offset pagination uses `?limit=100&offset=300` to request rows 301 through 400. It is easy to reason about and supports jumping to an arbitrary page. Its flaw is instability: if rows are inserted or deleted while you page, the window shifts and you can skip or duplicate records. It also degrades on large offsets because the database must count past every skipped row.
 
+The instability is concrete, not hypothetical. Imagine the collection is ordered and you have just read rows at offsets $0$ through $99$. If a new row is inserted ahead of your position before you request offset $100$, every later row shifts down by one index, so the row that was at logical offset $100$ is now at $101$ and you read offset $100$, which is the row you already saw at the boundary. You get a *duplicate*. If instead a row ahead of you is deleted, every later row shifts up by one and the row that would have been at offset $100$ is now at offset $99$, inside the page you already finished, so you *skip* it. The defect is structural: offset pagination assumes a stable index into a set that is concurrently mutating. The deeper performance cost is that most databases implement `OFFSET m` by generating and discarding the first $m$ rows, so reading the final page of an $n$ row table costs work proportional to $n$ and the whole scan costs work proportional to $n^2/(2 \cdot \text{page size})$.
+
 ### 5.3 Cursor pagination
 
 Cursor pagination returns an opaque token pointing at the last item seen, and you pass it back to fetch the next page. It is stable under concurrent writes and performant at any depth, which is why most modern APIs prefer it. The loop terminates when the response stops returning a next cursor.
+
+The reason cursors are stable is that they encode a position in a *total order* rather than a count. If the collection is sorted by a strictly increasing, immutable key such as a creation timestamp combined with a tie breaking identifier, then "give me the next page after key $c$" is the query `WHERE key > c ORDER BY key LIMIT p`. This query is well defined regardless of inserts or deletes elsewhere in the table, and the database can satisfy it with an index seek to $c$ rather than a scan, so each page costs work proportional to the page size $p$ rather than to the offset. The price is the loss of random access: you cannot jump to page $500$ without walking pages $1$ through $499$, because a cursor names a row, not an index. For a data extraction job that reads every page in order, that trade is almost always correct.
+
+::: callout-warning
+## Pitfall: an unstable sort key breaks cursors
+Cursor stability requires that the sort key be immutable and that the ordering be total. If you paginate by a mutable field such as `updated_at`, a row whose timestamp changes mid scan can jump ahead of your cursor and be read twice, or behind it and be skipped, reintroducing the exact defect cursors were meant to avoid. Always paginate on an append only key, and break ties with the primary identifier so the order is total.
+:::
 
 ```python
 cursor, rows = None, []
@@ -122,6 +172,8 @@ Whichever style you use, set a sane page size, handle the empty final page, and 
 
 Providers cap how many requests you may send per unit of time to protect their infrastructure and to enforce fairness across customers. Exceed the cap and you receive HTTP 429 Too Many Requests. Well behaved APIs publish your remaining budget in response headers such as `X-RateLimit-Remaining` and tell you when the window resets. They frequently include a `Retry-After` header naming the seconds to wait. Reading these headers proactively lets you slow down before you are blocked rather than after.
 
+Most rate limiters are a *token bucket*, and understanding the model tells you exactly how fast you may go. The bucket holds up to $b$ tokens and refills at a steady rate of $r$ tokens per second. Each request removes one token; if the bucket is empty the request is rejected with a 429. The parameters have a clean interpretation: $r$ is your sustained throughput, the rate you can hold indefinitely, while $b$ is your burst capacity, the number of requests you may fire back to back after an idle period. If you send at an average rate $\lambda$ requests per second, you stay within budget as long as $\lambda \le r$; the bucket absorbs short spikes up to size $b$ but cannot rescue a sustained overload. The practical consequence is that a client which paces itself to just under $r$, for example by sleeping $1/r$ seconds between requests, will essentially never see a 429, whereas a client that empties the bucket in a burst and then hammers the empty bucket spends most of its time blocked. When the provider exposes remaining tokens in a header, you can implement this pacing directly by slowing down as the remaining count approaches zero.
+
 ### 6.2 Retrying transient failures
 
 Not every failure is permanent. A 429, a 503 Service Unavailable, or a dropped connection is transient and worth retrying. A 400 Bad Request or a 404 Not Found is permanent and retrying it only wastes effort. Your retry logic must distinguish the two and retry only the transient class.
@@ -129,6 +181,10 @@ Not every failure is permanent. A 429, a 503 Service Unavailable, or a dropped c
 ### 6.3 Exponential backoff with jitter
 
 Retrying immediately and in lockstep makes congestion worse, because every client retries at the same instant and creates a thundering herd. The remedy is exponential backoff: wait one second, then two, then four, doubling each time up to a ceiling. Add random jitter so that many clients do not synchronize. Always honor an explicit `Retry-After` header over your own computed delay.
+
+The doubling is not arbitrary. On attempt $n$ (counting from zero) the base delay is $d_n = \min(d_0 \cdot 2^n,\ d_{\max})$, an exponential schedule capped at a ceiling $d_{\max}$ so a long outage does not push a retry hours into the future. Exponential growth matters because if a server is overloaded and clients retry on a fixed interval, the retry traffic never relents and the server cannot recover; geometric backoff makes the aggregate retry rate decay quickly, giving the server room to drain its queue.
+
+Jitter addresses a separate failure. Suppose $m$ clients all fail at the same instant, say when a shared dependency blips, and all back off by the identical deterministic delay. They then retry at the same instant, recreating the very spike that caused the failure, a synchronized thundering herd. Adding randomness spreads the retries out. With *full jitter*, where each client waits a uniform random time in $[0, d_n]$, the retries of the $m$ clients are scattered across the whole interval, and the expected wait per attempt is $d_n/2$ while the synchronization is broken. The recommended practice from large scale operators, documented in the well known analysis of backoff and jitter by Brooker, is full jitter precisely because it both decorrelates clients and keeps the average delay modest. An explicit `Retry-After` from the server always wins over your computed delay, because the server knows when its window resets and you are only guessing.
 
 ```python
 for attempt in range(6):
@@ -152,6 +208,8 @@ Everything so far has been pull based: you ask, the server answers. Webhooks inv
 A webhook endpoint is a public URL on the open internet, so you must verify that an incoming request genuinely came from the expected provider. Providers sign each payload with a shared secret, placing a signature in a header. Your handler recomputes the signature over the raw body and rejects the request if it does not match. Skipping this check lets anyone forge events into your pipeline.
 
 Two more rules keep webhook handling reliable. Respond quickly, ideally under a few seconds, by acknowledging receipt and processing the payload asynchronously on a queue, because slow handlers cause the provider to time out and retry. Design for idempotency, because providers deliver at least once and will occasionally send the same event twice. Deduplicate on the event identifier so a repeated delivery does not double count a transaction.
+
+The reason for the idempotency rule is a fundamental fact about delivery semantics. A sender that wants to guarantee delivery over an unreliable network must retry until it sees an acknowledgement, and if the acknowledgement itself is lost the sender retries an event the receiver already processed. This yields *at least once* delivery, which is what virtually every webhook provider promises. The only way to recover *exactly once* end to end behavior is for the receiver to be idempotent: it records each processed event identifier and ignores any identifier it has seen. Formally, if $f$ is your processing function and $g$ deduplicates by event id, then $g$ makes the composition satisfy $g(f, e) = g(f, e, e, \dots)$ for any number of repeated deliveries of event $e$, which is exactly the property that protects you from double counting a payment when the same event arrives twice.
 
 ### 7.3 Webhooks and polling together
 
@@ -189,6 +247,18 @@ With the mechanics in hand, the goal is one analysis ready table built from many
 
 Sources rarely share a clean key. The CRM identifies a customer by email, billing by an internal numeric identifier, and the product database by a UUID. Integration requires a mapping that resolves these to one canonical entity. Where no shared key exists you fall back to entity resolution, matching on combinations of fields such as normalized email plus name. Decide explicitly how to handle records that match in one source but are absent in another, because an inner join silently drops them while an outer join preserves them with nulls. That choice changes your dataset and must be deliberate.
 
+Entity resolution is best framed as a classification problem with measurable error, not a yes or no string comparison. For each candidate pair of records you compute a similarity and predict match or non match. The two error modes have asymmetric costs. A *false positive* merges two distinct customers into one, contaminating every downstream feature for both. A *false negative* fails to link two records for the same customer, splitting their history and undercounting. Borrowing from classification, precision is the fraction of predicted matches that are true, $\text{precision} = \tfrac{TP}{TP + FP}$, and recall is the fraction of true matches you found, $\text{recall} = \tfrac{TP}{TP + FN}$. Tuning the match threshold trades one against the other. Because a false positive corrupts data irreversibly while a false negative merely leaves a record unlinked, most integration pipelines tune for high precision and route low confidence pairs to a manual review queue rather than auto merging them.
+
+The choice of join is the other lever, and the table below makes its effect on row count explicit so you choose it deliberately rather than by habit.
+
+| Join | Rows kept | Use when |
+|---|---|---|
+| Inner | Only entities present in both sources | You need fully populated records and dropping partials is acceptable |
+| Left | All from the primary source, nulls for the rest | The primary source defines your population |
+| Full outer | Every entity from either source | You must not lose any record and can tolerate nulls |
+
+An inner join silently shrinks your dataset, which is dangerous because the shrinkage correlates with data quality: the customers missing from billing might be exactly the new signups you most want to model. State the join and its consequence in the pipeline, and log the row counts before and after so a sudden drop is visible rather than silent.
+
 ### 9.3 Quality, lineage, and reproducibility
 
 A clean dataset is not merely joined; it is trustworthy. Run validation checks for uniqueness of keys, acceptable value ranges, and non null required fields, and quarantine rows that fail rather than letting them poison downstream features. Record lineage so every column traces back to its source, fetch time, and transformation, which is indispensable when a number looks wrong. Make the pipeline reproducible by versioning both the code and the extracted raw snapshots, so a result from last month can be regenerated exactly. Idempotent loads, where rerunning the pipeline produces the same table rather than duplicating rows, round out a pipeline you can trust and operate without fear.
@@ -196,6 +266,36 @@ A clean dataset is not merely joined; it is trustworthy. Run validation checks f
 ### 9.4 A reference pipeline
 
 Putting the pieces together, a dependable integration job authenticates with scoped short lived credentials, paginates each REST or GraphQL source with cursors, retries transient failures with jittered backoff while honoring rate limit headers, receives webhooks for low latency events and reconciles them against a scheduled pull, ingests any true streams with bounded buffers, and finally normalizes, joins, validates, and loads the result idempotently with full lineage. None of these steps is exotic on its own. Reliability comes from applying all of them consistently, because the weakest link, a missing timeout or an unverified webhook, is where real pipelines break.
+
+The diagram below traces the flow of data from heterogeneous sources to a single trustworthy table, showing where each cross cutting concern attaches.
+
+```{mermaid}
+flowchart TD
+    REST["REST source with cursor paging"] --> RAW["Raw landing zone, persisted unchanged"]
+    GQL["GraphQL source, fields declared"] --> RAW
+    WH["Webhook receiver, signature verified"] --> RAW
+    STREAM["Stream consumer, bounded buffer"] --> RAW
+    RECON["Scheduled reconciliation pull"] --> RAW
+    RAW --> NORM["Normalize: UTC, currency, enums, flatten"]
+    NORM --> JOIN["Resolve entities and join on canonical key"]
+    JOIN --> VALID["Validate: keys unique, ranges, non null"]
+    VALID --> LOAD["Idempotent load with lineage"]
+    VALID --> QUAR["Quarantine failed rows"]
+```
+
+### 9.5 A worked example
+
+Concreteness helps. Suppose you are building a daily churn feature table keyed by customer. Three sources feed it. The CRM is a REST API keyed by lowercase email, paginated by an offset that you replace with cursor paging on `created_at` plus `id`. Billing is a GraphQL API keyed by an internal integer `account_id`, returning invoices and a current plan. Stripe sends a webhook on every `invoice.payment_failed` event, signed with a shared secret.
+
+The extraction step pulls the full CRM and billing snapshots into a raw landing zone, pacing each below its token bucket rate $r$ and retrying 429 and 5xx responses with full jitter. The webhook receiver verifies the signature on the raw body, deduplicates on Stripe's event id, and appends the event to the raw zone. Because a webhook can be missed during a deploy, a nightly reconciliation pull of the last forty eight hours of billing events backfills any gaps.
+
+Normalization converts every timestamp to UTC, maps the CRM status strings `active`, `ACTIVE`, and the integer `1` to a single canonical `active`, and flattens the nested invoice array into one row per invoice. The join must bridge email to `account_id`, which no source provides directly, so a small mapping table built once by entity resolution on normalized email links the two. The pipeline performs a left join from the CRM population onto billing, so a brand new customer with no invoices yet is retained with null billing fields rather than dropped, and it logs the row count before and after the join. Validation then asserts that customer ids are unique, that monthly recurring revenue is non negative, and that the join key is non null, quarantining any violating row. The final load is idempotent: rerunning today's job overwrites today's partition rather than appending, so a retry after a crash produces the same table. Every column carries lineage back to its source and fetch time, so when a churn number looks wrong next month you can trace it to the exact extraction that produced it.
+
+### 9.6 When to use what, and the common pitfalls
+
+A short decision summary closes the loop. Reach for *REST* by default and for *GraphQL* when nested assembly or selective fields dominate. Prefer *cursor pagination* over offset whenever the source supports it, and only accept offset for small, static collections. Use *webhooks* for low latency event capture but always pair them with a *reconciliation pull* for completeness. Use *streaming* only for genuinely unbounded sources, and never without a bounded buffer.
+
+The recurring pitfalls are worth stating plainly, because they account for most real failures: a request without a timeout that freezes the pipeline; treating all non success responses identically and retrying a permanent 400; trusting a GraphQL 200 without reading its `errors` array; paginating on a mutable sort key; retrying without jitter and synchronizing a thundering herd; an unverified webhook that lets forged events in; an unbounded stream buffer that exhausts memory; and a silent inner join that drops exactly the records you cared about. Every one of these is cheap to prevent and expensive to discover after the fact.
 
 ## References
 
@@ -211,3 +311,4 @@ Putting the pieces together, a dependable integration job authenticates with sco
 10. Apache Kafka, "Introduction." https://kafka.apache.org/intro
 11. Python Software Foundation and Requests project, "Requests: HTTP for Humans." https://requests.readthedocs.io/
 12. Kleppmann, M., "Designing Data Intensive Applications." https://dataintensive.net/
+13. Brooker, M., "Exponential Backoff And Jitter," AWS Architecture Blog. https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/

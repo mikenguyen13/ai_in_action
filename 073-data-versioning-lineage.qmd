@@ -1,6 +1,12 @@
 # Data Versioning and Lineage
 
-Machine learning systems are defined as much by their data as by their code. A model is a function of the dataset it was trained on, the hyperparameters chosen, and the code that wires everything together. Software engineers have spent decades building disciplined practices around versioning code, yet the data that flows through machine learning pipelines is frequently treated as a mutable, unversioned blob sitting in a bucket somewhere. This asymmetry is the source of a large fraction of the reproducibility crises that plague production machine learning. This chapter examines why data versioning matters, how content addressing and hashing provide the technical foundation for reliable versioning, which tools implement these ideas at scale, how lineage tracking connects datasets to the artifacts derived from them, and how teams assemble all of this into reproducible datasets for machine learning.
+Machine learning systems are defined as much by their data as by their code. A trained model is best understood as a deterministic function of four ingredients: the dataset, the preprocessing and training code, the hyperparameters, and the random seed. We can write this dependence explicitly as
+
+$$
+\theta = \mathcal{T}(D,\; c,\; h,\; s),
+$$
+
+where $\theta$ is the fitted model, $D$ is the exact training dataset, $c$ is the code, $h$ are the hyperparameters, $s$ is the seed, and $\mathcal{T}$ is the training procedure. Reproducing $\theta$ requires pinning all four arguments. Software engineers have spent decades building disciplined practices around versioning $c$ and $h$, yet the data $D$ that flows through machine learning pipelines is frequently treated as a mutable, unversioned blob sitting in a bucket somewhere. This asymmetry is the source of a large fraction of the reproducibility failures that plague production machine learning, and it is a concrete instance of the data dependency debt described in the technical debt literature on machine learning systems (reference 12). This chapter examines why data versioning matters, how content addressing and hashing provide the technical foundation for reliable versioning, which mature open source tools implement these ideas at scale, how lineage tracking connects datasets to the artifacts derived from them, and how teams assemble all of this into reproducible datasets for machine learning.
 
 ## 1. Why Data Versioning Matters for Reproducibility
 
@@ -24,14 +30,22 @@ Beyond debugging, rigorous data versioning supports several concrete capabilitie
 
 ### 2.1 The Core Idea
 
-Content addressing means that an object is identified by a cryptographic hash of its contents rather than by a location or a human assigned name. If you compute the SHA-256 digest of a file, you get a 256 bit value that is, for all practical purposes, unique to those exact bytes. Change a single bit and the hash changes completely. This property is what makes content addressing useful: the identifier is the fingerprint of the data itself.
+Content addressing means that an object is identified by a cryptographic hash of its contents rather than by a location or a human assigned name. Formally, let $H : \{0,1\}^* \to \{0,1\}^n$ be a cryptographic hash function mapping arbitrary byte strings to fixed length digests of $n$ bits. The address of an object with bytes $x$ is simply $H(x)$. For SHA-256 we have $n = 256$. The function $H$ is required to be deterministic, fast to compute, preimage resistant (given a digest it is infeasible to find an $x$ that produces it), and collision resistant (it is infeasible to find distinct $x \ne y$ with $H(x) = H(y)$). These properties are what make the digest a usable identity: change a single bit of $x$ and, by the avalanche property, roughly half the output bits flip, so the address is, for all practical purposes, unique to those exact bytes.
 
 ```text
 content = bytes of the file
 address = SHA256(content)  ->  e3b0c44298fc1c149afbf4c8996fb924...
 ```
 
-This is the same idea that underlies Git, which addresses every blob, tree, and commit by its SHA-1 (now migrating to SHA-256) hash. It is the same idea behind the InterPlanetary File System and behind every modern data versioning tool. Once you accept content addressing, several useful properties follow almost for free.
+**How safe is "for all practical purposes"?** Treating the digest as a unique identity is an engineering bet on collision resistance, and we can quantify it. If digests were uniformly distributed over the $2^n$ possible values, then by the birthday bound the probability that a collection of $k$ distinct objects contains at least one accidental collision is approximately
+
+$$
+p(k) \approx 1 - e^{-k^2 / 2^{\,n+1}} \approx \frac{k^2}{2^{\,n+1}} \quad \text{for } k \ll 2^{n/2}.
+$$
+
+For $n = 256$ and even an astronomically large $k = 10^{18}$ objects, this probability is on the order of $10^{-39}$, far below the probability of an undetected hardware error in the storage itself. This is why content addressed systems treat a matching hash as proof of equality. Note that this argument concerns *accidental* collisions. SHA-1, the original Git hash, has $n = 160$ and is no longer resistant to *adversarial* collisions, which is why Git is migrating to SHA-256; for protection against a malicious actor who deliberately crafts colliding inputs, only a hash with no known collision attack should be used.
+
+This is the same idea that underlies Git, which addresses every blob, tree, and commit by its hash (reference 10). It is the same idea behind the InterPlanetary File System (reference 11) and behind every modern data versioning tool. Once you accept content addressing, several useful properties follow almost for free.
 
 ### 2.2 Deduplication and Integrity
 
@@ -39,11 +53,21 @@ Because the address is derived from the content, two identical files produce the
 
 Content addressing also gives you integrity verification for free. When you read an object back, you recompute its hash and compare it to the address you requested. If they match, the bytes are intact. If they do not, the data is corrupt or has been tampered with. This is why content addressed stores are sometimes called verifiable.
 
+**Worked example.** Consider a 100 GB dataset split into 4 MB chunks, giving roughly 25{,}000 chunks. Suppose ten experiment branches each modify a different 40 MB region (ten chunks each) of this dataset. A naive per version copy stores $11 \times 100 = 1100$ GB (the original plus ten full copies). With chunk level content addressing, the unchanged chunks are shared by reference and stored once, so the total is the original 100 GB plus $10 \times 40\,\text{MB} = 400\,\text{MB}$ of changed chunks, about 100.4 GB. The storage cost has collapsed from eleven copies to one copy plus the deltas, a reduction of roughly $11\times$, and it improves as the number of branches grows because the shared base is amortized across all of them.
+
 ### 2.3 Immutability and the Merkle Structure
 
 Content addressed objects are immutable by construction. You cannot change the contents without changing the address, so any reference to a specific hash always points to the same bytes forever. Mutable concepts such as branches and tags are layered on top as pointers that can be moved to reference different immutable objects over time.
 
-When you address a collection of objects, you build a Merkle tree or Merkle directed acyclic graph. A directory is represented as a list of names paired with the hashes of their contents, and that list is itself hashed. The result is that a single root hash captures the entire state of a possibly enormous dataset. Comparing two dataset versions reduces to comparing root hashes, and finding what changed reduces to walking down the tree until the hashes diverge. This is precisely how Git computes diffs efficiently and how data versioning tools detect changes across massive trees without scanning every byte.
+When you address a collection of objects, you build a Merkle tree or Merkle directed acyclic graph (reference 13). Define the hash of an internal node recursively as the hash of the concatenation of its children's hashes:
+
+$$
+H(\text{node}) = H\big( H(c_1) \,\|\, H(c_2) \,\|\, \cdots \,\|\, H(c_m) \big),
+$$
+
+where the $c_i$ are the node's children (subdirectories or chunks) and $\|$ denotes byte concatenation. A leaf is the hash of its raw content. The result is that a single root hash captures the entire state of a possibly enormous dataset: any change to any leaf propagates up through every ancestor and alters the root.
+
+This recursive structure makes change detection cheap. To compare two versions you compare their root hashes; if they are equal, the trees are identical and no further work is needed. If they differ, you descend only into the children whose hashes differ and prune entire subtrees whose hashes match. For a balanced tree of $N$ leaves in which $d$ leaves changed, the number of nodes that must be visited is $O(d \log N)$ rather than $O(N)$. A change to one file in a billion file dataset is located in a handful of hash comparisons rather than a billion. This is precisely how Git computes diffs efficiently and how data versioning tools detect changes across massive trees without scanning every byte.
 
 ```text
 root_hash
@@ -51,6 +75,8 @@ root_hash
  |- labels/     -> hash_B
  |- splits/     -> hash_C   (only this changed in v2)
 ```
+
+The same structure delivers sub file deduplication. By splitting a large file into chunks with a content defined chunking scheme, where chunk boundaries are placed at byte positions whose rolling hash matches a pattern rather than at fixed offsets, an edit that inserts bytes near the start of a file shifts only the chunk that contains the edit. The remaining chunks keep their boundaries and therefore their hashes, so a new version that appends a day of records to a billion row table stores only the new and changed chunks. This is the principle behind content defined chunking systems and is the reason appending to a versioned dataset costs storage proportional to the delta, not to the whole.
 
 ## 3. Tools for Data Versioning
 
@@ -106,7 +132,15 @@ Time travel is the feature most relevant to versioning. Because the log records 
 
 ### 3.4 Choosing Among Them
 
-These tools are not strictly competitors, since they target different layers. DVC versions files and pipelines in a Git centric workflow and shines for experiment reproducibility. lakeFS versions an entire object store with branch and merge semantics and shines for data engineering governance. Delta Lake and its peers version tabular data with transactional guarantees and shine for the analytics and feature engineering layer. Many production stacks use more than one, for example Delta tables for the warehouse and DVC to pin the specific extract that fed a training run.
+These tools are not strictly competitors, since they target different layers. The following summarizes where each fits and the failure mode of misapplying it.
+
+| Tool | Granularity | Best for | Pitfall of misuse |
+| --- | --- | --- | --- |
+| DVC | files and directories | experiment reproducibility, Git centric teams | awkward for many concurrent writers to one store |
+| lakeFS | object store paths | branch and merge governance over a data lake | adds an access layer in front of all reads |
+| Delta Lake (and Iceberg, Hudi) | tabular rows and snapshots | transactional tables, time travel for analytics | not a fit for opaque blobs or arbitrary files |
+
+DVC versions files and pipelines in a Git centric workflow and shines for experiment reproducibility. lakeFS versions an entire object store with branch and merge semantics and shines for data engineering governance. Delta Lake and its peers version tabular data with transactional guarantees and shine for the analytics and feature engineering layer. The layers compose rather than compete: many production stacks use more than one, for example Delta tables for the warehouse and DVC to pin the specific extract that fed a training run. All four named tools are mature, free, and open source, so the choice can be driven by where your data already lives rather than by licensing.
 
 ## 4. Lineage Tracking
 
@@ -114,7 +148,22 @@ These tools are not strictly competitors, since they target different layers. DV
 
 Lineage is the record of how a data artifact came to be. It answers questions of provenance: which upstream sources fed this table, which transformation produced this feature, which dataset version trained this model, and which model version generated this prediction. Where versioning gives you the ability to name and retrieve a specific state, lineage gives you the graph that connects those states across the pipeline.
 
-A lineage graph is a directed acyclic graph whose nodes are datasets, transformations, models, and runs, and whose edges express the consumed by and produced by relationships. Tracing forward from a node tells you the downstream impact of a change, which is essential for impact analysis when a source is found to be faulty. Tracing backward from a model or a prediction tells you exactly what produced it, which is essential for debugging and for audit.
+A lineage graph is a directed acyclic graph $G = (V, E)$ whose nodes $V$ are versioned artifacts (datasets, models, predictions) and process runs (transformations, training jobs), and whose directed edges $E$ express the consumed by and produced by relationships, with edges pointing from an input to the run that consumes it and from a run to the output it produces. The acyclicity reflects the physical fact that an artifact cannot be its own ancestor. Tracing forward (the set of nodes reachable from a node along directed edges) gives the downstream impact of a change, which is essential for impact analysis when a source is found to be faulty. Tracing backward (the set of ancestors) gives exactly what produced an artifact, which is essential for debugging and for audit.
+
+```{mermaid}
+flowchart LR
+  raw["raw export d4e5f6"] --> clean["cleaning job"]
+  clean --> feat["features.churn v42"]
+  feat --> split["split job seed 1337"]
+  split --> trn["train split"]
+  split --> val["val split"]
+  trn --> train["training run"]
+  val --> train
+  train --> model["churn_clf v3"]
+  model --> pred["production prediction"]
+```
+
+Reading the diagram backward from the prediction recovers the complete provenance chain: the prediction came from model version 3, which was trained on a specific train and validation split, which were derived deterministically from feature table version 42, which a cleaning job produced from a named raw export. Because every node names an immutable version, each step in this chain can be retrieved and re-executed exactly.
 
 ### 4.2 Coarse Grained and Fine Grained Lineage
 
@@ -158,7 +207,15 @@ The seed matters as much as the data. Many preprocessing and training steps are 
 
 ### 5.2 Immutable Splits and Leakage
 
-Train, validation, and test splits must themselves be versioned and immutable. A frequent and subtle bug is to regenerate splits with a random shuffle on each run, which means a record that was in the test set yesterday may be in the training set today. This makes metrics incomparable across experiments and can leak test information into training over time as you tune against a moving target. The discipline is to compute splits once, version them as first class artifacts, and reference them by version in every experiment. Deterministic, hash based assignment of records to splits is a robust technique: assign a record to a split based on a hash of its stable identifier, so the same record always lands in the same split even as the dataset grows.
+Train, validation, and test splits must themselves be versioned and immutable. A frequent and subtle bug is to regenerate splits with a random shuffle on each run, which means a record that was in the test set yesterday may be in the training set today. This makes metrics incomparable across experiments and can leak test information into training over time as you tune against a moving target. The discipline is to compute splits once, version them as first class artifacts, and reference them by version in every experiment.
+
+Deterministic, hash based assignment of records to splits is a robust technique that achieves stability without storing an explicit membership list. Map each record's stable identifier $\text{id}$ to a bucket using a hash and a modulus,
+
+$$
+b(\text{id}) = H(\text{id}) \bmod M,
+$$
+
+then assign the record to the train, validation, or test set according to which contiguous range of buckets $b(\text{id})$ falls in. With $M = 100$ buckets, sending buckets $0$ through $79$ to train, $80$ through $89$ to validation, and $90$ through $99$ to test yields an 80/10/10 split. This scheme has three desirable properties. First, it is **stable**: the same identifier always lands in the same split because $H$ is deterministic, so the assignment is reproducible from the identifier alone with nothing to version beyond the rule itself. Second, it is **append safe**: a record added next month is assigned by the same rule and cannot silently migrate an existing record across the boundary. Third, because a good hash distributes identifiers near uniformly over the buckets, the realized split proportions concentrate around the target as the dataset grows. The one caveat is that the identifier must be a genuine entity key. If records that must stay together (for example all rows for one user) share a key, hash on that grouping key rather than on the row, otherwise correlated rows leak across the boundary and inflate test metrics.
 
 ### 5.3 Snapshots Versus Live Queries
 
@@ -166,7 +223,15 @@ Training directly against a live table or a live SQL query is a reproducibility 
 
 ### 5.4 Feature Stores and Point in Time Correctness
 
-Feature stores add a temporal dimension to reproducibility. When you assemble a training set, each feature value must reflect what was known at the time of the label, not what is known now. Joining current feature values onto historical labels leaks future information and inflates offline metrics, a failure that collapses in production. Point in time correct joins, supported by feature store frameworks such as Feast and by the time travel capability of table formats, ensure that each training row sees only the feature values that were valid as of its event timestamp. Versioning the feature definitions alongside the feature values completes the picture, so that the logic that computed a feature is reproducible together with the data.
+Feature stores add a temporal dimension to reproducibility. When you assemble a training set, each feature value must reflect what was known at the time of the label, not what is known now. Joining current feature values onto historical labels leaks future information and inflates offline metrics, a failure that collapses in production.
+
+We can state the correctness condition precisely. Suppose each label event has a timestamp $t_{\text{label}}$, and each feature value carries an event time $t_{\text{feature}}$ (when the underlying fact occurred) and an availability time $t_{\text{avail}}$ (when it became readable by the serving system). A point in time correct join selects, for each label, the most recent feature value satisfying
+
+$$
+t_{\text{avail}} \le t_{\text{label}},
+$$
+
+namely $\arg\max\{\, t_{\text{feature}} : t_{\text{avail}} \le t_{\text{label}} \,\}$. Using $t_{\text{feature}}$ rather than $t_{\text{avail}}$ in the constraint is a common and subtle error: a fact may have *occurred* before the label yet only become *available* afterward because of pipeline latency, and training on it leaks information the model will not have at inference time. Feature store frameworks such as Feast (reference 9), together with the time travel capability of table formats, implement this as built-in functionality. Versioning the feature definitions alongside the feature values completes the picture, so that the transformation logic that computed a feature is reproducible together with the data it produced.
 
 ### 5.5 Putting It Together
 
@@ -194,3 +259,4 @@ Data versioning brings to data the discipline that source control brought to cod
 10. Git Internals on Git Objects and Content Addressing. https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
 11. InterPlanetary File System (IPFS) Documentation on Content Addressing. https://docs.ipfs.tech/concepts/content-addressing/
 12. Sculley, D. et al. Hidden Technical Debt in Machine Learning Systems. NeurIPS 2015. https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html
+13. Merkle, R. C. A Digital Signature Based on a Conventional Encryption Function. Advances in Cryptology, CRYPTO '87, LNCS 293, Springer, pp. 369 to 378. https://doi.org/10.1007/3-540-48184-2_32

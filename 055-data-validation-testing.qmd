@@ -2,7 +2,13 @@
 
 Machine learning systems inherit the quality of the data that flows through them. A model trained on corrupted features, a feature store populated with stale records, or a serving pipeline fed malformed input will produce confident and wrong predictions. Unlike a software bug that throws an exception, a data quality defect often passes silently through every layer of a system until it surfaces as degraded business metrics weeks later. Data validation and testing exist to make these defects loud, early, and cheap to fix.
 
-This chapter treats data as a first class artifact that deserves the same engineering discipline applied to source code. We examine the spectrum of validation techniques, from rigid schema enforcement to probabilistic statistical checks, survey the dominant open source tooling, and discuss how validation behaves differently in batch and streaming production pipelines.
+This chapter treats data as a first class artifact that deserves the same engineering discipline applied to source code. We examine the spectrum of validation techniques, from rigid schema enforcement to probabilistic statistical checks, survey the dominant open source tooling, and discuss how validation behaves differently in batch and streaming production pipelines. Where the topic warrants precision, we state the underlying mathematics: the drift statistics in particular have exact definitions and properties that determine when each is appropriate.
+
+::: callout-note
+## What this chapter covers
+
+A layered model of data testing. Schema validation pins down structure, constraint checks encode domain logic, statistical validation guards distributions, and data unit tests verify the transformation code itself. We then place these checks in a production pipeline, formalize the drift metrics that statistical validation relies on, and close with a pragmatic strategy for growing a validation suite without drowning in maintenance.
+:::
 
 ## 1. Why Data Validation Matters
 
@@ -17,6 +23,8 @@ The cost of a data defect grows with the distance it travels before detection. C
 Practitioners commonly decompose data quality into several dimensions. **Completeness** asks whether required values are present. **Validity** asks whether values conform to their expected type and format. **Consistency** asks whether related values agree with each other across tables or time. **Accuracy** asks whether values reflect reality, which is the hardest dimension to test automatically. **Timeliness** asks whether data arrived within its expected window. **Uniqueness** asks whether records that should be distinct are in fact distinct.
 
 A mature validation strategy maps each dimension to concrete, automatable checks. Completeness becomes a null count threshold. Validity becomes a type and regex check. Uniqueness becomes a primary key duplication check. Accuracy usually requires a trusted reference source or human review, so teams often approximate it with plausibility bounds.
+
+It helps to see these dimensions as predicates over a dataset. Let $D$ be a dataset, viewed as a multiset of records drawn from a record space $\mathcal{R}$. A check is a function $c : \mathcal{R}^{*} \to \{0, 1\}$ that returns $1$ when the dataset satisfies the property and $0$ otherwise. Schema and constraint checks are *deterministic* predicates: they evaluate the same way every time on the same input. Statistical checks are *distributional* predicates: they compare a summary of $D$ against a reference and pass only when the discrepancy stays within a tolerance. This distinction, deterministic versus distributional, is the organizing axis of the chapter, because it dictates how a check is written, where it can run, and how its failures should be interpreted.
 
 ## 2. Schema Validation
 
@@ -107,9 +115,41 @@ Statistical validation compares the shape of incoming data against an expected p
 
 ### 4.2 Distributional Checks and Drift
 
-The core technique is to summarize a column with statistics, the mean, standard deviation, quantiles, null fraction, and cardinality, then compare those summaries against a baseline. When the deviation exceeds a threshold, the check fails or raises an alert.
+The core technique is to summarize a column with statistics, the mean, standard deviation, quantiles, null fraction, and cardinality, then compare those summaries against a baseline. When the deviation exceeds a threshold, the check fails or raises an alert. Drift is the phenomenon being detected: the distribution of a column in the current window has moved away from the distribution it had in a trusted reference window. Several standard metrics quantify how far it has moved, and they differ in what they assume about the data and in how they weight discrepancies.
 
-For detecting whether two distributions differ, practitioners use tests and metrics such as the Kolmogorov Smirnov statistic for continuous columns, the chi squared test for categorical columns, the population stability index for binned distributions, and the Jensen Shannon divergence for comparing probability distributions. These quantify drift between a reference window and a current window.
+**Kolmogorov Smirnov statistic.** For a continuous column, the two sample Kolmogorov Smirnov (KS) statistic measures the largest gap between two empirical cumulative distribution functions. If $F_r$ is the empirical CDF of the reference sample and $F_c$ that of the current sample, then
+
+$$
+D_{\mathrm{KS}} = \sup_{x} \, \bigl| F_r(x) - F_c(x) \bigr|.
+$$
+
+The statistic lies in $[0, 1]$, is zero only when the two empirical CDFs coincide, and is invariant to any monotone reparameterization of $x$ because it depends only on ranks. Under the null hypothesis that both samples come from the same continuous distribution, the rescaled statistic has a known limiting distribution, which yields a $p$ value. The KS test is sensitive to shifts in location and scale but comparatively insensitive to differences in the tails, since the supremum of the CDF gap is usually attained near the center of the distribution.
+
+**Chi squared test.** For a categorical column with $k$ categories, partition both samples into category counts. Let $O_i$ be the observed count of category $i$ in the current sample and $E_i$ the count expected if the current sample followed the reference proportions. The statistic
+
+$$
+\chi^2 = \sum_{i=1}^{k} \frac{(O_i - E_i)^2}{E_i}
+$$
+
+follows, under the null hypothesis of no change, an approximate chi squared distribution with $k - 1$ degrees of freedom. The approximation degrades when expected counts are small, a common rule of thumb requires $E_i \geq 5$ for every category, so rare categories should be merged before applying the test.
+
+**Population stability index.** The population stability index (PSI) is the workhorse of production drift monitoring because it produces a single, threshold friendly number. Bin the column into $B$ buckets (for a continuous column, fixed quantile edges from the reference; for a categorical column, one bucket per category). Let $p_i$ be the fraction of reference records in bucket $i$ and $q_i$ the fraction of current records in the same bucket. Then
+
+$$
+\mathrm{PSI} = \sum_{i=1}^{B} (q_i - p_i) \, \ln\!\frac{q_i}{p_i}.
+$$
+
+PSI is symmetric in its two arguments and non negative, reaching zero only when $q_i = p_i$ for every bucket. It is in fact the symmetrized relative entropy between the two binned distributions, sometimes written $\mathrm{PSI} = D_{\mathrm{KL}}(q \,\|\, p) + D_{\mathrm{KL}}(p \,\|\, q)$, where $D_{\mathrm{KL}}$ is the Kullback Leibler divergence. A widely used convention treats $\mathrm{PSI} < 0.1$ as no material shift, $0.1 \leq \mathrm{PSI} < 0.25$ as a moderate shift worth investigating, and $\mathrm{PSI} \geq 0.25$ as a significant shift. Empty buckets force a division by zero, so implementations add a small floor $\epsilon$ to every $p_i$ and $q_i$, which is why bucket counts and the choice of $\epsilon$ must be fixed and recorded for the metric to be reproducible.
+
+**Jensen Shannon divergence.** When you want a bounded, smooth distance between two probability distributions $P$ and $Q$, the Jensen Shannon divergence is a good choice. With $M = \tfrac{1}{2}(P + Q)$ the average distribution,
+
+$$
+\mathrm{JSD}(P \,\|\, Q) = \tfrac{1}{2} D_{\mathrm{KL}}(P \,\|\, M) + \tfrac{1}{2} D_{\mathrm{KL}}(Q \,\|\, M).
+$$
+
+Unlike KL divergence, JSD is symmetric, is always finite (the averaged $M$ never assigns zero probability where $P$ or $Q$ is positive), and lies in $[0, \ln 2]$ when using natural logarithms or $[0, 1]$ when using base two logarithms. Its square root is a true metric, the Jensen Shannon distance, which makes it convenient when drift scores are compared or thresholded across many columns.
+
+The practical takeaway is that these metrics answer slightly different questions. KS and chi squared come with hypothesis tests and $p$ values, which tempt teams to treat drift as a binary significance decision; but with large samples even a trivial, harmless shift becomes statistically significant, so a raw $p$ value is a poor production gate. PSI and JSD instead report an effect size on a fixed scale, which is what a monitoring dashboard actually needs.
 
 ```python
 from scipy.stats import ks_2samp
@@ -119,11 +159,24 @@ if p_value < 0.01:
     raise DataDriftError(f"feature distribution shifted, KS p={p_value:.4f}")
 ```
 
-### 4.3 The Threshold Problem
+### 4.3 A Worked PSI Calculation
+
+Suppose a feature is bucketed into four bins. The reference window and the current window distribute their mass across those bins as follows.
+
+| Bucket | Reference $p_i$ | Current $q_i$ | $q_i - p_i$ | $\ln(q_i / p_i)$ | Contribution |
+|--------|-----------------|---------------|-------------|------------------|--------------|
+| 1 | 0.40 | 0.25 | -0.15 | -0.470 | 0.0705 |
+| 2 | 0.30 | 0.30 | 0.00 | 0.000 | 0.0000 |
+| 3 | 0.20 | 0.25 | 0.05 | 0.223 | 0.0112 |
+| 4 | 0.10 | 0.20 | 0.10 | 0.693 | 0.0693 |
+
+Summing the contributions gives $\mathrm{PSI} \approx 0.151$. By the conventional bands this falls in the moderate range, $0.1 \leq \mathrm{PSI} < 0.25$, so the column warrants investigation but does not on its own justify halting the pipeline. Notice that bucket 2 contributes exactly zero because its mass is unchanged, while bucket 4 contributes heavily despite a modest absolute change of $0.10$, because the log ratio amplifies a doubling of probability. This asymmetric weighting, large relative changes in small buckets dominate the score, is the defining behavior of PSI and the reason rare buckets must be sized carefully.
+
+### 4.4 The Threshold Problem
 
 Statistical validation introduces a tuning challenge absent from deterministic checks. Set thresholds too tight and the pipeline alerts on normal seasonal variation, training the team to ignore alarms. Set them too loose and genuine drift slips through. There is no universally correct threshold. Effective teams derive thresholds empirically by replaying historical data and measuring how often each candidate threshold would have fired, then tuning so that alerts correlate with real incidents rather than noise. Statistical checks should be treated as monitoring signals that often warrant investigation rather than hard gates that block deployment.
 
-### 4.4 Validating Against Reference Data
+### 4.5 Validating Against Reference Data
 
 A powerful pattern compares a derived dataset against an independent source of truth. If a feature pipeline computes daily active users, an independent analytics warehouse should report a closely matching count. Reconciliation checks of this kind catch logic bugs that no internal consistency check could find, because they compare two independent computations of the same quantity.
 
@@ -211,7 +264,23 @@ The ecosystem extends beyond these two. Soda offers a declarative checks languag
 
 Validation in production is about placement as much as technique. The standard pattern places gates at every boundary where data changes ownership: at ingestion, where external data enters the system; after each major transformation, where bugs are introduced; and before serving, where bad data would directly harm users or models. Validating only at the end leaves you knowing that something broke without knowing where. Validating at each boundary localizes failures to a specific stage.
 
-A widely used architecture routes data through quality zones, often named for metals. Raw data lands in a bronze zone with minimal validation. Cleaned and conformed data moves to a silver zone after passing schema and constraint checks. Business level aggregates reach a gold zone only after statistical validation confirms they look reasonable. Each promotion between zones is a validation gate.
+A widely used architecture routes data through quality zones, often named for metals. Raw data lands in a bronze zone with minimal validation. Cleaned and conformed data moves to a silver zone after passing schema and constraint checks. Business level aggregates reach a gold zone only after statistical validation confirms they look reasonable. Each promotion between zones is a validation gate, and a record that fails a gate is diverted rather than silently promoted.
+
+```{mermaid}
+flowchart LR
+    SRC["External source"] --> G1{"Schema gate"}
+    G1 -->|"pass"| BRONZE["Bronze zone raw"]
+    G1 -->|"fail"| Q1["Quarantine"]
+    BRONZE --> G2{"Constraint gate"}
+    G2 -->|"pass"| SILVER["Silver zone conformed"]
+    G2 -->|"fail"| Q2["Quarantine"]
+    SILVER --> G3{"Statistical gate"}
+    G3 -->|"pass"| GOLD["Gold zone aggregates"]
+    G3 -->|"alert"| MON["Monitoring and review"]
+    GOLD --> SERVE["Serving and models"]
+```
+
+The gates are ordered from cheapest and strictest to most expensive and most forgiving. The schema gate is a hard structural check at the boundary. The constraint gate adds domain logic. The statistical gate, placed last, is usually a monitoring signal rather than a hard stop, which is why its failure edge routes to review rather than to quarantine.
 
 ### 7.2 Fail Fast versus Quarantine
 
@@ -249,6 +318,20 @@ Once boundary schemas are in place, layer additional validation where incidents 
 
 Every validation rule is code that must be maintained, and an overzealous suite that fires constantly on benign variation trains a team to ignore it, which is worse than having no validation at all. The goal is not maximal coverage but calibrated coverage, where each check that fires reliably signals a real problem worth a human's attention. Periodically auditing which checks have fired, which have never fired, and which fire so often they are ignored keeps the suite healthy and trusted.
 
+### 8.4 When to Use Each Layer, and the Pitfalls of Each
+
+The four validation layers are not interchangeable, and a healthy strategy reaches for each where it is strongest.
+
+Reach for **schema validation** at every boundary where data enters or changes ownership. It is cheap, declarative, and catches the structural defects that cause the loudest downstream failures. Its pitfall is over strictness: a schema that rejects any unexpected column will halt a pipeline when an upstream team adds a harmless field, so reserve strict mode for boundaries where unexpected columns genuinely signal a problem.
+
+Reach for **constraint checks** when domain logic constrains values beyond their type, especially for cross field invariants that no schema can express. Their pitfall is brittleness, a constraint encoding an assumption that was only ever approximately true (every order has a positive amount, every user has exactly one country) will fire on legitimate edge cases and erode trust.
+
+Reach for **statistical validation** to catch the collectively wrong data that passes every per record check. Its pitfalls are the threshold problem and the significance trap. Tune thresholds against replayed history rather than guessing, prefer effect size metrics such as PSI and JSD over raw $p$ values for production gates, and treat most statistical checks as monitoring signals rather than hard blocks.
+
+Reach for **data unit tests** to verify the transformation code itself, in continuous integration, against fixed fixtures. Their pitfall is fixture rot, a fixture that no longer resembles production data will pass while the real pipeline breaks, so refresh fixtures from sampled production records and include the edge cases that past incidents revealed.
+
+The deepest pitfall spans all four layers: a validation suite that fires constantly on benign variation trains a team to ignore it, which is strictly worse than no validation at all. Calibrated coverage, where every firing check reliably signals a real problem, is the goal, not maximal coverage.
+
 ## References
 
 1. Great Expectations Documentation. https://docs.greatexpectations.io/
@@ -263,3 +346,6 @@ Every validation rule is code that must be maintained, and an overzealous suite 
 10. Apache Avro Schema Specification. https://avro.apache.org/docs/current/specification/
 11. Confluent Schema Registry Documentation. https://docs.confluent.io/platform/current/schema-registry/index.html
 12. Great Expectations, "Data Docs." https://docs.greatexpectations.io/docs/reference/learn/terms/data_docs/
+13. Massey, F. J. "The Kolmogorov-Smirnov Test for Goodness of Fit." Journal of the American Statistical Association, 1951. https://doi.org/10.1080/01621459.1951.10500769
+14. Lin, J. "Divergence Measures Based on the Shannon Entropy." IEEE Transactions on Information Theory, 1991. https://doi.org/10.1109/18.61115
+15. Gama et al., "A Survey on Concept Drift Adaptation." ACM Computing Surveys, 2014. https://doi.org/10.1145/2523813

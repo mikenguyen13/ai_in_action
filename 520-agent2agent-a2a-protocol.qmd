@@ -1,10 +1,23 @@
+---
+execute:
+  enabled: false
+---
+
 # The Agent2Agent (A2A) Protocol: Cross-Vendor Agent Interoperability
 
 ## 1. Introduction and Motivation
 
 The Model Context Protocol, treated in the previous chapter, solved one half of the agent integration problem: how a single agent reaches the tools, data, and resources it needs to act. It says nothing, however, about how *one agent collaborates with another*. As organizations moved from single assistants to fleets of specialized agents in 2025, a billing agent, a logistics agent, a customer-history agent, each built by a different team on a different framework, often hosted by a different vendor, a second integration problem emerged with the same combinatorial shape as the one MCP addressed for tools.
 
-Consider an enterprise running $N$ agents that must cooperate. Without a shared standard, every pair that needs to collaborate requires a bespoke integration: a custom API contract, a custom authentication handshake, a custom message format. The number of integrations grows as $O(N^2)$, and worse, each integration leaks implementation details across organizational and trust boundaries that should remain opaque. A logistics agent should be able to ask a customer-history agent "is this customer eligible for expedited shipping?" without either side exposing its prompts, its model, its private tools, or its internal reasoning.
+Consider an enterprise running $N$ agents that must cooperate. Without a shared standard, every pair that needs to collaborate requires a bespoke integration: a custom API contract, a custom authentication handshake, a custom message format. If every agent may in principle talk to every other, the number of distinct pairwise integrations is the number of unordered pairs,
+
+$$
+\binom{N}{2} = \frac{N(N-1)}{2} = \Theta(N^2),
+$$
+
+so the integration burden grows quadratically in the fleet size. Adding the $(N{+}1)$-th agent forces up to $N$ new one-off connectors, each of which must be built, secured, tested, and maintained. A shared protocol collapses this to a hub-and-spoke shape: each agent implements the standard exactly once, against the protocol rather than against its peers, so onboarding the $(N{+}1)$-th agent is $O(1)$ work and the total integration surface is $\Theta(N)$. This is the same combinatorial argument that justifies any interoperability standard, from USB to HTTP, and it is precisely the argument the Model Context Protocol made for the agent-to-tool axis.
+
+Worse than the count, each bespoke integration leaks implementation details across organizational and trust boundaries that should remain opaque. A logistics agent should be able to ask a customer-history agent "is this customer eligible for expedited shipping?" without either side exposing its prompts, its model, its private tools, or its internal reasoning.
 
 The **Agent2Agent (A2A) Protocol** is an open standard for exactly this: discovery, capability advertisement, task delegation, and result streaming *between* autonomous agents, across vendor and framework boundaries. Google Cloud announced A2A on April 9, 2025, with more than fifty launch partners, and donated it to the **Linux Foundation** on June 23, 2025, where it became the vendor-neutral, community-governed Agent2Agent Protocol Project. By its one-year mark the protocol counted over 150 supporting organizations and had reached enterprise production use across the major cloud platforms.
 
@@ -122,7 +135,20 @@ stateDiagram-v2
     end note
 ```
 
-The core six states, `submitted`, `working`, `input-required`, `completed`, `failed`, `canceled`, describe the common path. The current spec adds `rejected` (the agent declines the task outright), `auth-required` (the agent needs additional credentials before proceeding), and `unknown`. Terminal states (`completed`, `failed`, `canceled`, `rejected`) end the task; it cannot be restarted, only superseded by a new task. The `input-required` state is what makes A2A suitable for human-in-the-loop and multi-turn workflows: a remote agent can pause, request clarification, and resume.
+The core six states, `submitted`, `working`, `input-required`, `completed`, `failed`, `canceled`, describe the common path. The current spec adds `rejected` (the agent declines the task outright), `auth-required` (the agent needs additional credentials before proceeding), and `unknown`. The `input-required` state is what makes A2A suitable for human-in-the-loop and multi-turn workflows: a remote agent can pause, request clarification, and resume.
+
+It is useful to state the lifecycle precisely as a finite state machine. Let the task be a tuple $(Q, q_0, F, \delta)$ where $Q$ is the set of states above, $q_0 = \texttt{submitted}$ is the unique initial state, and
+
+$$
+F = \{\,\texttt{completed},\ \texttt{failed},\ \texttt{canceled},\ \texttt{rejected}\,\}
+$$
+
+is the set of **terminal** states. The transition relation $\delta$ encodes the edges in the diagram. Two properties matter for implementers.
+
+- **Terminality (absorption).** For every $f \in F$ there is no outgoing transition, $\delta(f, \cdot) = \varnothing$. A task that has reached a terminal state cannot be restarted or mutated; it can only be superseded by a *new* task with a fresh ID. This makes a terminal `Task` object safe to cache, log, and forward as an immutable record.
+- **Progress is monotone toward termination, with bounded back-edges.** The only cycles are the explicit handshake loops, `working` $\leftrightarrow$ `input-required` and `working` $\leftrightarrow$ `auth-required`, which a client closes by supplying the requested input or credentials. Every other path moves strictly closer to a terminal state. A well-behaved client therefore models a task as a future that is guaranteed to resolve, provided it answers the back-edge requests; an unanswered `input-required` is the canonical way a task stalls, so production clients set a timeout on it.
+
+The `unknown` state is not a phase of the lifecycle but a *reporting* value: it is what a server returns when it cannot determine a task's state, for example after a restart that lost in-memory state for a task whose ID it no longer recognizes. Clients should treat `unknown` as non-terminal and re-query rather than assume failure.
 
 ### 4.4 Messages, Parts, and Artifacts
 
@@ -188,6 +214,14 @@ The remote agent responds with a task in `submitted` state, then, because the Ag
 A2A is designed to be secure by default and treats authentication exactly as a conventional enterprise web API would. The Agent Card's `securitySchemes` declare what the client must present, API key, HTTP Bearer token, OAuth 2.0, OpenID Connect, or mutual TLS, using the same vocabulary as OpenAPI. Critically, **credentials travel in HTTP headers, never inside A2A message payloads**. A client authenticates the transport (`Authorization: Bearer …`); the protocol body carries only task content. This separation keeps secrets out of logs, traces, and the artifacts that may be forwarded to other agents.
 
 Opacity reinforces the trust model. Because a remote agent never exposes its internal tools or reasoning, granting another organization's agent access to yours does not hand it your data sources or prompts, only the declared skills, mediated by your authentication and authorization. Trust is established at the connection boundary and scoped to advertised capabilities.
+
+It is worth stating opacity precisely, because it is the property that makes cross-vendor delegation tractable. Let a remote agent have internal state $I$ (its system prompt, model identity, memory, MCP servers, intermediate reasoning) and a declared interface consisting of its Agent Card $C$ and the artifacts $A$ it returns. Opacity is the requirement that the information a client observes is a function of the interface alone,
+
+$$
+\mathrm{view}_{\text{client}} \subseteq \sigma(C, A),
+$$
+
+where $\sigma(C, A)$ is the information generated by the declared card and the returned artifacts, and never of $I$ directly. Two consequences follow. First, a client can integrate an agent it does not control and cannot inspect, which is what makes the standard usable *across* organizations. Second, the blast radius of a compromised or malicious peer is bounded by what the interface exposes: it can return bad artifacts, but it cannot read your prompts or reach your tools, because those were never in its view. Opacity is thus simultaneously a usability property and a containment property. The practical caveat is that opacity constrains only the protocol surface, not the application logic above it: if your agent copies a private value into an outbound artifact, opacity will not stop the leak. Treat artifacts as the declassification boundary and review what flows into them.
 
 ## 7. Implementation with the Python SDK
 
@@ -256,11 +290,30 @@ A2A's move to the Linux Foundation is central to its credibility as a *neutral* 
 
 The ecosystem spans framework integrations (LangGraph/LangChain, CrewAI, Google's Agent Development Kit, Microsoft Semantic Kernel) and a broad adopter list drawn from the original launch: Atlassian, Box, Cohere, Intuit, MongoDB, PayPal, Salesforce, SAP, ServiceNow, UKG, Workday, UiPath, and many others, alongside the major systems integrators. Notably, IBM's competing Agent Communication Protocol merged into A2A in September 2025, a consolidation discussed in the landscape chapter and a strong signal that A2A had become the de facto agent-to-agent standard.
 
-## 9. Limitations and Open Questions
+## 9. When to Use A2A, and Common Pitfalls
+
+A2A is not the right hammer for every nail. The choice among a plain in-process function call, an MCP tool call, and an A2A delegation turns on *who owns the work* and *what boundary it crosses*.
+
+- **Use a direct function or library call** when the capability lives inside your own agent's process and trust domain. There is no boundary to cross, so adding a protocol only adds latency and serialization cost.
+- **Use MCP** when your single agent needs a *tool, data source, or resource*: a database, a code interpreter, a search index. MCP models the callee as a capability the agent invokes and is responsible for. The vertical axis.
+- **Use A2A** when the work belongs to *another autonomous agent*, typically owned by a different team or vendor, that you should not model as a function and whose internals you neither see nor control. The horizontal axis. The tell is opacity: if you genuinely cannot (and should not) know how the other side does the work, it is a peer, not a tool.
+
+A useful rule of thumb: if the answer to "could I reasonably reimplement this myself if I had the source?" is yes, it is probably a tool (MCP); if it is "no, that is someone else's agent with its own judgment and private context," it is a peer (A2A).
+
+Common pitfalls in practice:
+
+- **Putting credentials in the message body.** Secrets belong in HTTP headers, never in a `TextPart` or `DataPart`. Payloads get logged, traced, and forwarded to downstream agents; headers do not.
+- **Polling instead of streaming or webhooks.** For active tasks subscribe to the SSE stream; for long-running tasks register a push-notification webhook. Tight polling of `tasks/get` wastes both sides' resources and still adds latency.
+- **Ignoring the back-edge states.** A client that does not handle `input-required` and `auth-required` will hang on any task that needs clarification or step-up authentication. Always set a timeout on these states.
+- **Assuming a single transport.** An agent advertises a `preferredTransport` and may list `additionalInterfaces`; a robust client reads the card and negotiates rather than hard-coding JSON-RPC.
+- **Treating a remote agent as deterministic.** Peers are autonomous and may be non-deterministic, rate-limited, or temporarily degraded. Delegation should be idempotent where possible and defensive about partial or `unknown` results.
+- **Leaking private state through artifacts.** As noted in the security section, opacity protects the protocol surface, not your own application logic. Review what your executor writes into outbound artifacts.
+
+## 10. Limitations and Open Questions
 
 A2A is young, and several aspects remain in motion. The specification's version numbering advanced quickly across late 2025 and early 2026 (the detailed multi-transport behavior was specified in the v0.3 line, with a subsequent 1.0 milestone); implementers should pin to a specific spec version and verify the current tag. The gRPC and REST bindings, and the Go and Rust SDKs, are post-launch additions not present in the original announcement. Deeper questions are inherently harder: how to establish trust and reputation among agents that have never interacted, how to attribute responsibility when a chain of delegated tasks produces a bad outcome, and how to bill and meter cross-organizational agent work. The payments dimension of that last question is precisely what the next chapter, on the Agent Payments Protocol, addresses.
 
-## 10. Conclusion
+## 11. Conclusion
 
 A2A is the horizontal counterpart to MCP's vertical integration: where MCP connects an agent to its tools, A2A connects agents to one another. Its core machinery is deliberately conventional, Agent Cards for discovery, a stateful Task lifecycle, modality-agnostic Messages and Artifacts, JSON-RPC/gRPC/REST transports over HTTPS, SSE and webhooks for long-running work, precisely so that it can ride on existing enterprise infrastructure. Its opacity principle makes cross-vendor collaboration tractable by bounding what any peer can see. And its donation to the Linux Foundation, together with the absorption of competing standards, established it as the neutral substrate on which the multi-agent web is being built. The protocols that layer above it for commerce, and the broader landscape of standards that surround it, are the subjects of the following chapters.
 

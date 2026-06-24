@@ -4,6 +4,12 @@ Every machine learning system begins with a decision that is too often made impl
 
 This chapter develops a working taxonomy of data types, examines the structural properties that distinguish them, surveys the storage formats that practitioners actually use, and shows how each data type drives concrete modeling choices.
 
+### A Unifying View: Data as Functions on Index Sets
+
+A productive way to see past the surface variety is to treat every data type as a function defined on some index set. Tabular data is a function on an unordered set of columns. Text is a function on a totally ordered set of positions, $x : \{1, \ldots, T\} \to V$ for a vocabulary $V$. An image is a function on a two dimensional grid, $x : \{1, \ldots, H\} \times \{1, \ldots, W\} \to \mathbb{R}^C$. Audio is a function on a regularly spaced one dimensional grid. A graph is a function on a vertex set equipped with an adjacency relation rather than a fixed coordinate system. Under this lens, the central question for any data type is the symmetry group of its index set, the set of transformations that leave the meaning of the data unchanged. The right model is the one whose hypothesis class is invariant or equivariant under exactly that group. This is the modern geometric deep learning perspective (reference 11), and it explains in one sentence why convolutions suit images (translation symmetry), permutation invariant aggregators suit sets and graphs (no canonical ordering), and causal attention suits sequences (a directed order that must be respected).
+
+A symmetry is a transformation $g$ of the index set such that the prediction target is unchanged when the input is transformed by $g$. A function $f$ is *invariant* if $f(g \cdot x) = f(x)$ and *equivariant* if $f(g \cdot x) = g \cdot f(x)$. Image classification wants invariance to translation, since a cat shifted ten pixels right is still a cat. Image segmentation wants equivariance, since the output mask must shift with the input. Matching this group structure to the model is the single most reliable inductive bias in applied machine learning.
+
 ## 1. Structured Versus Unstructured Data
 
 ### 1.1 The Classic Dichotomy
@@ -11,6 +17,8 @@ This chapter develops a working taxonomy of data types, examines the structural 
 The oldest and coarsest distinction is between structured and unstructured data. Structured data has a predefined schema. Each record conforms to a fixed set of fields, each field has a declared type, and the meaning of a value is given by its position in the schema. A relational database table is the canonical example. Unstructured data lacks such a schema at the level of raw bytes. A photograph is a grid of pixel intensities, a document is a sequence of characters, and an audio clip is a sequence of amplitude samples. The semantic content is present, but it is not laid out in named, typed fields.
 
 The dichotomy is useful but leaky. A great deal of practical data is better called semi structured. JSON and XML documents carry structure through nesting and keys, yet the schema may vary from record to record and may be deeply hierarchical rather than flat. Log lines, emails, and HTML pages all mix rigid structure with free text. For this reason it is more productive to think of a spectrum of structure rather than a binary, and to ask of any dataset: where does the structure live, and how much of the predictive signal it contains is exposed by that structure?
+
+It helps to separate three layers that are often conflated. The *physical* layer is the byte layout on disk or wire (CSV rows, a PNG, a Parquet column chunk). The *logical* layer is the schema or type: a relation with named typed columns, a tensor of a given shape, a graph with typed edges. The *semantic* layer is the meaning a human or model assigns to the values. Structured data is precisely data whose logical layer is explicit and fixed in advance. Unstructured data has a trivial logical layer (a flat array of bytes or samples) but rich semantics that a model must recover. Semi structured data has a logical layer that is present but variable. Most engineering pain comes from confusing these layers, for example treating a JSON blob as a single opaque string when its keys in fact carry the schema.
 
 ### 1.2 Why the Distinction Matters for Modeling
 
@@ -35,6 +43,16 @@ row_id  age  income   region   churned
 3       29   41000    south    0
 ```
 
+### 2.3 Worked Example: Encoding a Categorical Column
+
+Consider the `region` column above, a nominal categorical with no natural order. The three common encodings illustrate the trade space. One hot encoding maps each of $K$ categories to a unit basis vector in $\mathbb{R}^K$, so `west`, `east`, and `south` become $(1,0,0)$, $(0,1,0)$, $(0,0,1)$. This is lossless and order free but explodes dimensionality when $K$ is large and produces a sparse design matrix. Target encoding replaces a category with a statistic of the target conditioned on that category, for instance the smoothed mean churn rate
+
+$$
+\hat{\theta}_k = \frac{n_k \bar{y}_k + \alpha \bar{y}}{n_k + \alpha},
+$$
+
+where $n_k$ is the count of rows in category $k$, $\bar{y}_k$ is the in category target mean, $\bar{y}$ is the global mean, and $\alpha$ is a smoothing strength that shrinks small categories toward the global prior. This keeps dimensionality at one column but leaks the target and must therefore be fit inside cross validation folds, never on the full data, to avoid optimistic bias. Learned embeddings map each category to a trainable vector in $\mathbb{R}^m$ with $m \ll K$, which a neural network can tune end to end and which lets similar categories sit near one another. The pitfall common to all three is the unseen category at inference time, which one hot drops, target encoding sends to the global prior, and embeddings handle with a reserved unknown slot. Tree ensembles such as CatBoost sidestep much of this by handling categoricals natively with an ordered target statistic that is robust to leakage.
+
 ## 3. Text Data
 
 ### 3.1 Structure and Semantics
@@ -51,7 +69,7 @@ $$
 \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V,
 $$
 
-which lets each token aggregate information from any other token regardless of distance, directly addressing the long range dependency problem. The quadratic cost of attention in sequence length is the central engineering tension, and it motivates much of the research into efficient and sparse attention variants. The discreteness of text also means that generation is framed as classification over the vocabulary at each step, with a cross entropy loss.
+which lets each token aggregate information from any other token regardless of distance, directly addressing the long range dependency problem. Here $Q$, $K$, and $V$ are the query, key, and value projections of the input, and $d_k$ is the key dimension, with the scaling by $\sqrt{d_k}$ keeping the dot products in a range where the softmax has usable gradients. The cost is $O(T^2 d)$ in time and $O(T^2)$ in memory for sequence length $T$, which is the central engineering tension and motivates much of the research into efficient and sparse attention variants. Self attention is permutation equivariant by construction, so positional information must be injected separately through positional encodings; without them the model would treat a sentence as a bag of tokens. The discreteness of text also means that generation is framed as classification over the vocabulary at each step, optimized with a cross entropy loss whose minimization is equivalent to maximizing the likelihood of the training corpus.
 
 ## 4. Image Data
 
@@ -61,7 +79,13 @@ An image is a regular grid of pixels. A color image is a tensor of shape $H \tim
 
 ### 4.2 Modeling Implications
 
-These two properties motivate the convolution. A convolutional layer applies the same small filter across all spatial positions, which builds in translation equivariance and shares parameters efficiently. Stacking convolutions with pooling builds a hierarchy from edges to textures to parts to objects. Convolutional networks dominated computer vision for a decade.
+These two properties motivate the convolution. A convolutional layer applies the same small filter across all spatial positions. For a single channel input $x$ and a $k \times k$ kernel $w$, the output at position $(i, j)$ is
+
+$$
+(x * w)_{i,j} = \sum_{a=1}^{k} \sum_{b=1}^{k} x_{i+a,\, j+b}\, w_{a,b},
+$$
+
+and because the same weights $w$ are reused at every location, the layer is exactly translation equivariant: shifting the input shifts the output identically. This weight sharing is also what makes convolutions parameter efficient, since a layer needs only $k^2$ weights per channel pair regardless of image size, whereas a fully connected layer over an $H \times W$ image would need parameters proportional to $H^2 W^2$. Stacking convolutions with pooling builds a hierarchy from edges to textures to parts to objects, and the effective receptive field grows with depth so that deep layers see large regions of the image. Convolutional networks dominated computer vision for a decade.
 
 The Vision Transformer reframed images as sequences by splitting them into fixed size patches, embedding each patch, and feeding the sequence to a transformer. With sufficient data and pretraining, this approach matches or exceeds convolutional networks, trading the strong locality prior for greater flexibility and scale. The lesson is general: strong architectural priors help when data is scarce, while flexible architectures win when data is abundant. Either way, the high dimensionality of pixels, where a modest image holds hundreds of thousands of values, makes representation learning essential, since raw pixels are a poor feature space for any classical method.
 
@@ -148,6 +172,36 @@ Pulling the threads together, the data type determines a chain of decisions. The
 
 The mature practitioner reads a dataset's type as a specification. It tells them which inductive biases to build in, which storage format will keep the pipeline fast, which leakage risks to guard against, and which family of models is likely to repay the effort of tuning. The most common and costly errors in applied machine learning are not subtle failures of optimization but mismatches between the structure of the data and the assumptions of the method. Getting the data type right, in both representation and storage, is the foundation on which everything else is built.
 
+The following diagram traces the chain from a structural property of the data to a default modeling family. It is a heuristic starting point, not a law, and abundant data plus pretraining can always justify replacing a strong prior with a more flexible architecture.
+
+```{mermaid}
+flowchart TD
+    A["What is the index structure of the data"] --> B["Unordered fields, mixed types"]
+    A --> C["Total order over positions"]
+    A --> D["Regular spatial grid"]
+    A --> E["Vertices with adjacency"]
+    B --> B1["Tabular: gradient boosted trees"]
+    C --> C1["Text or time series: sequence models and attention"]
+    D --> D1["Image or audio spectrogram: convolutions or patch transformers"]
+    E --> E1["Graph: message passing networks"]
+```
+
+### 10.1 When to Use and Common Pitfalls
+
+A compact decision table summarizes the defaults and the traps. The recurring theme is that the index structure and its symmetry group fix the inductive bias, while the access pattern fixes the storage format.
+
+| Data type | Default model family | Storage default | Most common pitfall |
+|---|---|---|---|
+| Tabular | Gradient boosted trees | Parquet | Target leakage from encodings or aggregations fit on full data |
+| Text | Transformer with subword tokens | JSON or Parquet | Tokenization mismatch between training and inference |
+| Image | Convolutional net or patch transformer | Binary formats with metadata | Forgetting normalization statistics used at training time |
+| Audio | Spectrogram front end plus vision or sequence model | Compressed binary | Sampling rate mismatch and aliasing above the Nyquist limit |
+| Video | Three dimensional convolutions or factorized attention | Compressed binary | Processing every frame at full resolution, exhausting the compute budget |
+| Graph | Message passing network | Adjacency lists or edge tables | Treating a dense adjacency when the graph is sparse, or ignoring permutation invariance |
+| Time series | ARIMA baseline, then recurrent, convolutional, or transformer | Parquet | Random splits that leak the future into the past |
+
+The single most expensive mistake across all types is leakage, the silent contamination of training with information unavailable at prediction time. It hides in target encodings fit on the whole dataset, in features computed across a train test boundary, and in random shuffles of inherently ordered data. A model that scores well in offline evaluation and then fails in production has almost always learned from a leak. Auditing the data pipeline for leakage repays more than nearly any architectural refinement.
+
 ## References
 
 1. Apache Parquet documentation. https://parquet.apache.org/docs/
@@ -160,3 +214,4 @@ The mature practitioner reads a dataset's type as a specification. It tells them
 8. Hyndman, R. and Athanasopoulos, G. Forecasting: Principles and Practice. https://otexts.com/fpp3/
 9. Radford, A. et al. Robust Speech Recognition via Large Scale Weak Supervision (Whisper). 2022. https://arxiv.org/abs/2212.04356
 10. The JSON Data Interchange Standard (ECMA 404). https://www.json.org/
+11. Bronstein, M., Bruna, J., Cohen, T., and Velickovic, P. Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges. 2021. https://arxiv.org/abs/2104.13478

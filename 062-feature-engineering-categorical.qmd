@@ -8,6 +8,8 @@ Categorical variables are pervasive in applied machine learning. Customer identi
 
 A categorical variable takes values from a finite or countably infinite set of discrete levels $\mathcal{C} = \{c_1, c_2, \dots, c_K\}$, where the labels themselves carry no inherent arithmetic meaning. We distinguish nominal variables, whose levels have no natural order (color, country, payment method), from ordinal variables, whose levels admit a meaningful ranking (education level, satisfaction rating, T-shirt size). A third practically important axis is cardinality. A variable with a handful of levels (blood type) behaves very differently from one with millions of levels (user identifier). High cardinality is where naive encodings break down, and most of the interesting engineering lives there.
 
+Formally, an encoder is a map $\psi : \mathcal{C} \to \mathbb{R}^d$ that sends each level to a numeric vector. The art of categorical feature engineering is choosing $\psi$ so that the geometry it imposes on $\mathcal{C}$ matches the structure the downstream model can exploit. The relevant scale of measurement is worth naming precisely. A nominal variable supports only the equality relation, so any valid encoding must be invariant to a relabeling of the levels (a permutation of $\mathcal{C}$). An ordinal variable additionally supports an order relation $\preceq$, so a valid encoding should be monotone in that order, but differences between codes carry no guaranteed meaning. This taxonomy, due to Stevens, is the formal reason that integer codes are appropriate for ordinal data and dangerous for nominal data: an integer code silently asserts an interval scale that the data does not support.
+
 ### 1.2 Why Encoding Choice Matters
 
 Encoding is not a neutral preprocessing step. It interacts with the model family, the cardinality of the variable, the size of the training set, and the risk of information leakage. Three tensions recur throughout this chapter.
@@ -15,6 +17,20 @@ Encoding is not a neutral preprocessing step. It interacts with the model family
 The first is dimensionality versus expressiveness. One-hot encoding is faithful but explodes the feature count for high cardinality variables. The second is bias versus variance. Encodings that summarize a category by its relationship to the target reduce dimensionality dramatically but introduce variance for rare categories and bias if estimated carelessly. The third is leakage versus fidelity. The most powerful supervised encodings use the target, which means they can silently leak label information into features unless the estimation respects strict separation between the rows used to fit the encoder and the rows used to fit the model.
 
 A useful mental model is that every encoder is a small statistical estimator embedded inside your pipeline, and it inherits all the usual concerns about overfitting, regularization, and validation.
+
+The diagram below summarizes the decision that the rest of the chapter develops in detail.
+
+```{mermaid}
+flowchart TD
+    A["Categorical variable"] --> B{"Genuine order?"}
+    B -->|"Yes"| C["Integer or contrast encoding"]
+    B -->|"No"| D{"Cardinality"}
+    D -->|"Low, under 50 levels"| E["One-hot or dummy encoding"]
+    D -->|"High"| F{"Model and constraints"}
+    F -->|"Linear or tree, batch"| G["Leakage-safe target encoding"]
+    F -->|"Streaming or tight memory"| H["Feature hashing"]
+    F -->|"Neural net, ample data"| I["Learned entity embeddings"]
+```
 
 ## 2. One-Hot and Dummy Encoding
 
@@ -70,19 +86,37 @@ where $n_k$ is the number of training rows in category $k$. For binary classific
 
 ### 4.2 Smoothing Toward the Prior
 
-Raw category means are dangerously high variance for rare levels. A category observed twice, both times positive, yields an estimate of $1.0$ that the model will trust as strongly as a category observed ten thousand times. The standard remedy is empirical Bayes shrinkage toward the global mean $\mu$, blending the category estimate with the prior in proportion to how much evidence the category provides,
+Raw category means are dangerously high variance for rare levels. A category observed twice, both times positive, yields an estimate of $1.0$ that the model will trust as strongly as a category observed ten thousand times. To see this quantitatively, note that for a binary target with true rate $p_k$ the raw mean has variance $\operatorname{Var}(\hat{\mu}_k) = p_k(1-p_k)/n_k$, which blows up as $n_k \to 1$. The standard remedy is empirical Bayes shrinkage toward the global mean $\mu$, blending the category estimate with the prior in proportion to how much evidence the category provides,
 
 $$
 \tilde{\mu}_k = \frac{n_k \, \hat{\mu}_k + m \, \mu}{n_k + m},
 $$
 
-where $m$ is a smoothing strength expressed in pseudo counts. When $n_k$ is large the estimate is dominated by the category's own data, and when $n_k$ is small it is pulled toward the global mean. The hyperparameter $m$ controls the crossover point and is best chosen by cross validation. A common alternative parameterization uses a logistic weighting
+where $m$ is a smoothing strength expressed in pseudo counts. When $n_k$ is large the estimate is dominated by the category's own data, and when $n_k$ is small it is pulled toward the global mean. The hyperparameter $m$ controls the crossover point and is best chosen by cross validation.
+
+This formula is not an ad hoc convex combination. It is the posterior mean of a conjugate Bayesian model. Place a Beta$(\alpha, \beta)$ prior on the category rate $p_k$ and observe $s_k = n_k \hat{\mu}_k$ successes in $n_k$ Bernoulli trials. The posterior is Beta$(\alpha + s_k, \beta + n_k - s_k)$, whose mean is
+
+$$
+\mathbb{E}[p_k \mid \text{data}] = \frac{\alpha + s_k}{\alpha + \beta + n_k} = \frac{n_k \hat{\mu}_k + (\alpha + \beta)\,\tfrac{\alpha}{\alpha+\beta}}{n_k + (\alpha + \beta)}.
+$$
+
+Identifying $m = \alpha + \beta$ as the prior pseudo count and $\mu = \alpha/(\alpha+\beta)$ as the prior mean recovers the smoothing formula exactly. The prior strength $m$ thus has a clean interpretation: it is the number of phantom observations, drawn at the global rate, that we mix into every category before trusting its own data. Setting $m$ near the typical per category count makes the encoder skeptical of small samples and confident only when a level is well populated. A common alternative parameterization uses a logistic weighting
 
 $$
 \lambda(n_k) = \frac{1}{1 + e^{-(n_k - k_0)/f}},
 $$
 
 with $\tilde{\mu}_k = \lambda(n_k)\,\hat{\mu}_k + (1 - \lambda(n_k))\,\mu$, which gives a smooth sigmoid transition governed by an inflection point $k_0$ and a slope $f$. Either way, smoothing is not optional for high cardinality target encoding. It is what makes the estimator usable on the long tail.
+
+**Worked example.** Suppose a binary churn target has a global positive rate $\mu = 0.20$ and we use smoothing strength $m = 10$. Consider three merchant levels. Merchant A appears $n_A = 2$ times, both churned, so $\hat{\mu}_A = 1.0$. Merchant B appears $n_B = 50$ times with $30$ churns, so $\hat{\mu}_B = 0.60$. Merchant C appears $n_C = 5000$ times with $1500$ churns, so $\hat{\mu}_C = 0.30$. The smoothed codes are
+
+$$
+\tilde{\mu}_A = \frac{2(1.0) + 10(0.2)}{2 + 10} = 0.333, \quad
+\tilde{\mu}_B = \frac{50(0.6) + 10(0.2)}{50 + 10} = 0.533, \quad
+\tilde{\mu}_C = \frac{5000(0.3) + 10(0.2)}{5000 + 10} = 0.300.
+$$
+
+The rare merchant A, whose raw estimate of $1.0$ rested on a single decisive observation, is pulled most of the way back to the prior, while the well populated merchant C is essentially unchanged. This is exactly the behavior we want: the encoder expresses confidence in proportion to evidence.
 
 ### 4.3 The Leakage Problem
 
@@ -123,7 +157,13 @@ so that collisions tend to cancel in expectation rather than always adding. This
 
 ### 5.2 Properties and Trade-offs
 
-Hashing is stateless and streaming friendly. It requires no fitting pass, no stored vocabulary, and no special handling for categories unseen at training time, since any string simply hashes to some bucket. This makes it well suited to online learning, to extremely high cardinality features such as raw text n-grams, and to memory constrained or low latency production systems. The cost is collisions. When $K \gg d$, distinct categories share buckets and their signals superimpose, which injects noise and destroys interpretability, since you can no longer invert a bucket back to a category. The collision rate is governed by the load factor $K/d$, and the practical knob is to enlarge $d$ until collisions are tolerable for the task. Hashing pairs naturally with linear models and is a staple of large scale click through rate prediction, where billions of sparse categorical features must be handled within a fixed memory budget.
+Hashing is stateless and streaming friendly. It requires no fitting pass, no stored vocabulary, and no special handling for categories unseen at training time, since any string simply hashes to some bucket. This makes it well suited to online learning, to extremely high cardinality features such as raw text n-grams, and to memory constrained or low latency production systems. The cost is collisions. When $K \gg d$, distinct categories share buckets and their signals superimpose, which injects noise and destroys interpretability, since you can no longer invert a bucket back to a category. The collision rate is governed by the load factor $K/d$. Under the idealized assumption that a good hash distributes categories uniformly and independently over the $d$ buckets, the probability that a particular category collides with at least one of the other $K-1$ categories is
+
+$$
+P(\text{collision}) = 1 - \left(1 - \frac{1}{d}\right)^{K-1} \approx 1 - e^{-(K-1)/d},
+$$
+
+which is the same birthday paradox arithmetic that governs hash tables. The practical reading is that collisions become common once $K$ approaches $d$, so to keep the expected fraction of collided categories small one chooses $d$ several times larger than $K$. The practical knob is to enlarge $d$ until collisions are tolerable for the task. Hashing pairs naturally with linear models and is a staple of large scale click through rate prediction, where billions of sparse categorical features must be handled within a fixed memory budget.
 
 ## 6. Learned Entity Embeddings
 
@@ -158,6 +198,21 @@ The decision is driven primarily by cardinality and model family. For low cardin
 ### 7.2 Cross-Cutting Concerns
 
 Several issues span every encoder. Unseen categories must be handled explicitly, whether through an "other" bucket, a hashing fallback, or a dedicated out of vocabulary embedding, because production data will contain levels absent from training. Missing values should be treated as their own category rather than silently imputed, since missingness is frequently informative. All target based encoders must be fit strictly inside the cross validation loop or via out of fold estimation, never on the full data before splitting, or the validation estimate of generalization will be optimistic. Finally, encoding choices should be evaluated empirically. The interactions among cardinality, sample size, smoothing strength, and model family are difficult to predict in advance, so the reliable path is to treat the encoder as a tunable component of the pipeline and let leakage-safe cross validation decide.
+
+### 7.3 Encoders at a Glance
+
+The table consolidates the trade-offs developed above. The output dimension column gives the number of columns added per categorical variable, $K$ is the cardinality, $C$ the number of target classes, and $d$ a chosen output width.
+
+| Encoder | Output dim | Uses target | Leakage risk | Best when |
+|---|---|---|---|---|
+| One-hot or dummy | $K$ or $K-1$ | No | None | Low cardinality, any model |
+| Ordinal or contrast | $1$ | No | None | Genuine order in the levels |
+| Frequency or count | $1$ | No | None | Popularity is predictive |
+| Target or mean | $1$ (or $C-1$) | Yes | High if naive | High cardinality, batch training |
+| Feature hashing | $d$ | No | None | Streaming, huge or unbounded $K$ |
+| Entity embeddings | $d$ | Yes (jointly) | Low | Neural net, high $K$, ample data |
+
+The recurring pitfalls are worth restating as a checklist. Do not impose a fabricated order on a nominal variable with integer codes. Do not drop a reference level for a regularized linear model or a tree. Do not fit a target encoder on data the model will also train on. Do not forget to smooth high cardinality target codes, and do not forget an out of vocabulary path for categories that appear only in production. Each of these is a quiet failure that passes unit tests and surfaces only as a gap between offline and online performance.
 
 ## References
 

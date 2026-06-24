@@ -17,6 +17,25 @@ L  = t3 * t3    # square
 
 The nodes are $\{x, w, b, y, t_1, t_2, t_3, L\}$ and the edges encode the dependencies, for example $x \to t_1$ and $w \to t_1$. Each intermediate node stores both the operation it performs and, at execution time, the cached value it produced. This caching matters: the same intermediate can feed several downstream nodes, and storing it once avoids recomputation.
 
+The graph for this expression is small enough to draw in full. Inputs and parameters sit at the top, primitives in the middle, and the scalar loss at the bottom.
+
+```{mermaid}
+graph TD
+    x["x"] --> t1["t1 = x * w"]
+    w["w"] --> t1
+    t1 --> t2["t2 = t1 + b"]
+    b["b"] --> t2
+    t2 --> t3["t3 = t2 - y"]
+    y["y"] --> t3
+    t3 --> L["L = t3 * t3"]
+```
+
+We can fix the structure once and for all with a precise definition.
+
+::: {.callout-note title="Definition: computational graph"}
+A computational graph is a directed acyclic graph $G = (V, E)$ together with, for each non input node $v$, a primitive function $f_v$ and an ordered list of parent nodes $\mathrm{pa}(v) = (u_1, \ldots, u_k)$ such that $(u_i, v) \in E$. The value at $v$ is $a_v = f_v(a_{u_1}, \ldots, a_{u_k})$. Input, constant, and parameter nodes have no parents and carry a value directly. Acyclicity guarantees that the values $a_v$ are well defined and computable in a single pass.
+:::
+
 The granularity of a node is a design choice. A graph may be coarse, with a whole layer such as $\text{LayerNorm}$ as one node, or fine, with elementwise multiply and reduce-sum as separate nodes. Coarse graphs are easier to reason about and map cleanly to optimized library kernels. Fine graphs expose more structure to a compiler and allow operation fusion. Frameworks usually expose a coarse user level graph that is lowered into a finer internal representation before optimization.
 
 Two structural properties are worth naming. First, a topological order is any ordering of $V$ such that every edge points from an earlier node to a later node. Forward evaluation visits nodes in topological order. Second, the reverse topological order is what gradient computation uses, because a gradient at a node depends on gradients at all of its consumers.
@@ -68,13 +87,57 @@ $$
 
 The factor $\partial a_c / \partial a_v$ is the local Jacobian of the operation at node $c$ with respect to its input $v$, and it is exactly what the per primitive backward rule computes. Evaluating this recurrence in reverse topological order guarantees that every consumer's adjoint $\bar{a}_c$ is already available when $\bar{a}_v$ is needed.
 
+The sum over consumers is the part most often misremembered. When a node $v$ feeds more than one downstream node, its adjoint is the sum of the contributions routed back through each consumer, not just the contribution along one path. This is the multivariable chain rule, and it is why a tensor that is reused several times in a forward pass accumulates gradient from every use during the backward pass.
+
+### 4.2 A Worked Example
+
+Return to $L = (xw + b - y)^2$ and pick concrete numbers $x = 2$, $w = 3$, $b = 1$, $y = 4$. The forward pass fills in the cached values:
+
+$$
+t_1 = xw = 6, \quad t_2 = t_1 + b = 7, \quad t_3 = t_2 - y = 3, \quad L = t_3^2 = 9.
+$$
+
+The backward pass seeds $\bar{a}_L = \partial L / \partial L = 1$ and walks the graph in reverse, applying one local rule per node:
+
+$$
+\bar{a}_{t_3} = \bar{a}_L \cdot \frac{\partial L}{\partial t_3} = 1 \cdot 2 t_3 = 6,
+$$
+$$
+\bar{a}_{t_2} = \bar{a}_{t_3} \cdot \frac{\partial t_3}{\partial t_2} = 6 \cdot 1 = 6,
+$$
+$$
+\bar{a}_{t_1} = \bar{a}_{t_2} \cdot \frac{\partial t_2}{\partial t_1} = 6 \cdot 1 = 6.
+$$
+
+The parameter gradients then read off directly from the multiply and add nodes:
+
+$$
+\bar{a}_{w} = \bar{a}_{t_1} \cdot \frac{\partial t_1}{\partial w} = 6 \cdot x = 12, \qquad
+\bar{a}_{b} = \bar{a}_{t_2} \cdot \frac{\partial t_2}{\partial b} = 6 \cdot 1 = 6.
+$$
+
+We can verify $\bar{a}_w$ against the closed form. Since $L = (xw + b - y)^2$, we have $\partial L / \partial w = 2(xw + b - y) \cdot x = 2 \cdot 3 \cdot 2 = 12$, which matches. The point is that the graph reached the same exact answer mechanically, by composing simple local rules, never differentiating the full expression symbolically and never perturbing inputs numerically.
+
+### 4.3 Reverse Mode and Backpropagation
+
 ### 4.2 Reverse Mode and Backpropagation
 
 Reverse mode AD computes the full gradient $\nabla_\theta L$ with a single backward sweep whose cost is a small constant multiple of one forward evaluation, independent of the number of parameters. This property is the reason deep networks are trainable: a model may have billions of parameters $\theta$ but a single scalar loss $L$, so a method whose cost is independent of the parameter count and proportional to the function evaluation is essential. Backpropagation is exactly reverse mode AD specialized to neural network graphs.
 
-Forward mode AD, by contrast, propagates derivatives from inputs to outputs and costs a constant multiple per input direction. It is efficient when there are few inputs and many outputs, the opposite regime. For a function $f : \mathbb{R}^n \to \mathbb{R}^m$, reverse mode is preferred when $m \ll n$ and forward mode when $n \ll m$. Training, with $m = 1$ and $n$ enormous, sits firmly in the reverse mode regime.
+Forward mode AD, by contrast, propagates derivatives from inputs to outputs and costs a constant multiple per input direction. It is efficient when there are few inputs and many outputs, the opposite regime. For a function $f : \mathbb{R}^n \to \mathbb{R}^m$, reverse mode is preferred when $m \ll n$ and forward mode when $n \ll m$. Training, with $m = 1$ and $n$ enormous, sits firmly in the reverse mode regime. The table below summarizes the trade off.
 
-### 4.3 Vector Jacobian Products
+| Property | Forward mode | Reverse mode |
+|---|---|---|
+| Direction of sweep | inputs to outputs | outputs to inputs |
+| Quantity computed per sweep | one column of the Jacobian (one input direction) | one row of the Jacobian (one output direction) |
+| Cost relative to one forward pass | proportional to number of inputs $n$ | proportional to number of outputs $m$ |
+| Extra memory for the tape | none beyond the dual numbers | stores forward activations until consumed |
+| Best regime | $n \ll m$ (few inputs) | $m \ll n$ (few outputs) |
+| Typical use | Jacobian vector products, sensitivity in a direction | training a scalar loss, backpropagation |
+
+A useful intuition is that one reverse sweep yields the gradient of a single scalar with respect to everything, whereas one forward sweep yields the derivative of everything with respect to a single input. Training optimizes one scalar loss against many parameters, so reverse mode wins decisively.
+
+### 4.4 Vector Jacobian Products
 
 In practice AD frameworks never materialize a full Jacobian matrix. Reverse mode is implemented as a sequence of vector Jacobian products (VJPs): given an upstream adjoint vector $\bar{a}_c$, each backward rule returns $\bar{a}_c^\top J$ where $J = \partial a_c / \partial a_v$, without ever forming $J$ explicitly. For a linear node $y = W x$, the VJP with respect to $x$ is simply $W^\top \bar{a}_y$, a matrix vector product. Composing VJPs along the graph yields the gradient at the cost of ordinary forward style operations.
 
@@ -104,7 +167,21 @@ To optimize dynamic code, frameworks first capture a graph. Tracing runs the fun
 
 Every graph transformation must preserve semantics. Two constraints dominate. First, floating point arithmetic is not associative, so reorderings and fusions can change results at the level of rounding error; reputable compilers keep these changes within documented tolerances or behind explicit flags. Second, operations with side effects, such as in place mutation, random number generation, and reads of external state, impose ordering edges that pure dataflow does not capture. Compilers add explicit dependency edges to preserve such ordering, which is why a graph intended for aggressive optimization is easiest to reason about when its operations are pure functions of their inputs.
 
-## 6. Summary
+## 6. Practical Guidance and Pitfalls
+
+The graph view of computation is a mental model that pays off well beyond framework internals. A few practical points recur often enough to state plainly.
+
+**Choosing static versus dynamic.** Reach for dynamic define-by-run code by default. It is the easiest to write, debug, and reason about, and modern just-in-time compilers recover most of the performance through tracing. Move toward an explicitly captured or compiled graph when a model is stable in structure and dominated by a hot loop, when you need to deploy to an environment without a Python interpreter, or when a global optimization such as cross operation fusion materially changes throughput. The two are not exclusive: write in eager mode, then compile the steady state.
+
+**Mind the activation memory.** The single most common training pitfall traced to the graph is running out of memory because every forward activation needed by a backward rule is held alive until the backward pass consumes it. Training memory therefore scales with graph depth and batch size, not just parameter count. Gradient checkpointing trades compute for memory by discarding selected activations and recomputing them, and is the standard remedy for deep graphs.
+
+**Watch for accidental graph retention.** In eager frameworks the tape is normally freed after one backward pass. Keeping a reference to a loss tensor, or appending a tensor that still carries its graph to a running total, can pin the entire graph in memory across iterations. Detaching a tensor from the graph, or accumulating only its plain numeric value, avoids a slow memory leak that grows with the number of steps.
+
+**Purity helps the compiler.** Operations that are pure functions of their inputs can be freely reordered, fused, and deduplicated. Side effects such as in place mutation, random number draws, and reads of external state impose ordering constraints that a pure dataflow graph cannot express, so compilers must add explicit dependency edges and forgo some optimizations. Code written as pure transformations is both easier to differentiate and easier to optimize.
+
+**Non differentiable points are real.** AD differentiates the specific computation path taken, not the mathematical function in the abstract. At a kink such as $\mathrm{ReLU}$ at zero, the framework returns a chosen subgradient, and operations like rounding or argmax have zero gradient almost everywhere. A model that trains poorly can be a sign that gradient is not flowing through a discrete or piecewise constant operation.
+
+## 7. Summary
 
 A computational graph reduces a model to nodes that compute primitives and edges that carry values. The timing of graph construction separates static define-and-run frameworks, which optimize globally at the cost of flexibility, from dynamic define-by-run frameworks, which build the graph as code runs and recover performance through tracing. The graph structure is what makes reverse mode automatic differentiation possible: a single backward sweep in reverse topological order composes local vector Jacobian products into an exact gradient at a cost independent of the parameter count. The same structure is a compilation target, where fusion, constant folding, memory planning, and layout assignment turn a hardware agnostic model into efficient executable code. These ideas, graph, gradient, and compiler, are the foundation on which every modern training and inference system is built.
 
@@ -117,3 +194,5 @@ A computational graph reduces a model to nodes that compute primitives and edges
 5. Chen, T., et al. "TVM: An Automated End-to-End Optimizing Compiler for Deep Learning." OSDI, 2018. https://www.usenix.org/system/files/osdi18-chen.pdf
 6. The XLA Authors. "XLA: Optimizing Compiler for Machine Learning." TensorFlow Documentation. https://www.tensorflow.org/xla
 7. Ansel, J., et al. "PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation." ASPLOS, 2024. https://pytorch.org/assets/pytorch2-2.pdf
+8. Wengert, R. E. "A Simple Automatic Derivative Evaluation Program." Communications of the ACM, 1964. https://doi.org/10.1145/355586.364791
+9. Chen, T., Xu, B., Zhang, C., and Guestrin, C. "Training Deep Nets with Sublinear Memory Cost." arXiv, 2016. https://doi.org/10.48550/arXiv.1604.06174

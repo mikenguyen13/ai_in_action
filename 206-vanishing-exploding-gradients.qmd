@@ -2,6 +2,18 @@
 
 Training deep and recurrent neural networks by gradient descent depends on the assumption that a useful learning signal can travel from the loss at the output back to parameters in the earliest layers. When that signal shrinks toward zero or grows without bound as it propagates, optimization stalls or diverges. These two failure modes, known as the vanishing gradient problem and the exploding gradient problem, were the central obstacle to training very deep architectures for much of the field's history. This chapter develops the mathematics of why they arise, explains the roles of activation functions and weight initialization, and surveys the practical and architectural remedies that make modern deep learning feasible.
 
+The unifying object behind both failure modes is a single quantity: the product of layerwise Jacobians that the chain rule assembles as it carries the error signal backward. Everything in this chapter, the choice of activation, the scale of the initial weights, normalization, residual paths, and gating, can be read as an attempt to keep the multiplicative factors of that product near one so the signal neither collapses nor diverges. We make that reading explicit by stating a precise condition for vanishing and explosion, working a small numerical example, and then organizing the remedies by which factor of the product each one controls.
+
+::: {.callout-note}
+## Definitions
+
+**Vanishing gradients.** The backpropagated error signal $\delta^{(\ell)}$ at an early layer $\ell$ decays toward zero as the depth $L - \ell$ grows, so the gradient with respect to early parameters is negligible and those parameters effectively stop learning.
+
+**Exploding gradients.** The signal $\delta^{(\ell)}$ grows without bound as $L - \ell$ grows, producing huge or numerically overflowing updates that destabilize or diverge the optimization.
+
+Both are properties of the same product of Jacobians; they are the two ways a long matrix product can fail to be approximately norm preserving.
+:::
+
 ## 1. The Mechanics of Backpropagation Through Depth
 
 Consider a feedforward network with $L$ layers. Layer $\ell$ computes a preactivation $z^{(\ell)} = W^{(\ell)} a^{(\ell-1)} + b^{(\ell)}$ followed by an elementwise nonlinearity $a^{(\ell)} = \phi(z^{(\ell)})$, with $a^{(0)} = x$ the input. Let $\mathcal{L}$ be a scalar loss. Backpropagation computes the error signal $\delta^{(\ell)} = \partial \mathcal{L} / \partial z^{(\ell)}$ by the recursion
@@ -19,6 +31,16 @@ $$
 $$
 
 The magnitude of $\delta^{(\ell)}$ is therefore governed by the product of $L - \ell$ matrices. Products of many matrices tend to behave either like a contraction, collapsing toward zero, or like an expansion, blowing up, unless their multiplicative factors are carefully balanced near one. This is the structural origin of both problems.
+
+The following diagram traces a single error signal as it flows backward through the stack. Each arrow multiplies the signal by one Jacobian factor, and the cumulative product is what determines the regime.
+
+```{mermaid}
+flowchart RL
+  L["Loss gradient at output"] -->|"times J_L"| dL["delta at layer L"]
+  dL -->|"times J_L minus 1"| dmid["delta at middle layers"]
+  dmid -->|"times J ell plus 1"| de["delta at layer ell"]
+  de --> note["Product of L minus ell Jacobians sets the magnitude"]
+```
 
 ## 2. A Quantitative Account of the Two Regimes
 
@@ -44,7 +66,37 @@ $$
 \frac{\partial h_T}{\partial h_t} = \prod_{k=t+1}^{T} D_k W .
 $$
 
-Because $W$ is shared, the relevant quantity is its spectral radius $\rho(W)$. Bengio and colleagues showed that $\rho(W) < 1$ (combined with bounded activation slopes) is a sufficient condition for gradients to vanish, while $\rho(W) > 1$ is a necessary condition for them to explode [1]. Sequences thousands of steps long amplify even tiny deviations from one into enormous or negligible factors, which is why vanilla recurrent networks struggle to learn long range dependencies.
+Because $W$ is shared, the relevant quantity is its spectral radius $\rho(W)$, the largest absolute value among its eigenvalues. The following statement makes the threshold precise.
+
+::: {.callout-important}
+## Spectral condition for vanishing and explosion (Bengio et al., 1994)
+
+Let $h_t = \phi(W h_{t-1} + U x_t)$ with $\beta = \sup_z |\phi'(z)|$ the maximal slope of the activation. Then:
+
+- If $\rho(W) < 1/\beta$, the factor $\big\| \prod_{k} D_k W \big\|$ contracts to zero as the horizon grows, so gradients **vanish**. This is a sufficient condition.
+- Gradients can **explode** only if $\rho(W) > 1/\beta$. This is a necessary condition for explosion, not a guarantee of it.
+
+For bounded saturating activations $\beta$ is a constant ($\beta = 1$ for $\tanh$, $\beta = 1/4$ for the logistic sigmoid), so the boundary collapses to the familiar $\rho(W) = 1$ for $\tanh$ recurrence [1].
+:::
+
+*Proof sketch.* Each backward factor is $D_k W$ with $\|D_k\| \le \beta$. By submultiplicativity the norm of the product is bounded by $(\beta \, \|W\|)^{T}$, and for a diagonalizable $W$ the operator norm is controlled by $\rho(W)$ up to the conditioning of its eigenbasis. When $\beta \, \rho(W) < 1$ this bound tends to zero geometrically, forcing vanishing. For explosion, align the signal with the leading eigenvector of $W$; the product then grows like $\rho(W)^{T}$ only if $\rho(W)$ exceeds $1/\beta$, so a larger spectral radius is necessary, while saturation of the $D_k$ factors can still suppress growth, which is why it is not sufficient. $\square$
+
+Sequences thousands of steps long amplify even tiny deviations from one into enormous or negligible factors, which is why vanilla recurrent networks struggle to learn long range dependencies.
+
+::: {.callout-tip}
+## Worked example: how fast the signal moves
+
+Take a $\tanh$ recurrence ($\beta = 1$) whose backward factors each contribute an effective scalar gain $r$ per step. After $T$ steps the signal scales by $r^{T}$. The numbers are stark.
+
+| Per-step gain $r$ | After $T = 10$ | After $T = 100$ |
+|---|---|---|
+| $0.9$ (mild contraction) | $0.35$ | $2.7 \times 10^{-5}$ |
+| $0.99$ (near critical) | $0.90$ | $0.37$ |
+| $1.01$ (near critical) | $1.10$ | $2.7$ |
+| $1.1$ (mild expansion) | $2.6$ | $1.4 \times 10^{4}$ |
+
+A gain of $0.9$, which looks harmless over a few steps, has already destroyed five orders of magnitude of signal over a hundred steps, while a gain of $1.1$ inflates it by four. Only the near critical gains of $0.99$ and $1.01$ keep the signal usable across a long horizon, and they sit on a knife edge that drifting weights rarely hold. This single table is the whole problem in miniature: the regime is set by whether the per-step gain sits just below, at, or just above one, and the effect compounds exponentially in the horizon.
+:::
 
 ## 3. The Role of Activation Functions
 
@@ -80,7 +132,7 @@ $$
 \operatorname{Var}(W) = \frac{2}{n_{\text{in}}},
 $$
 
-which restores signal scale for ReLU networks and enabled the training of very deep convolutional models [3]. A useful refinement for deep linear and ReLU stacks is orthogonal initialization, which sets the singular values of each weight matrix to one so the Jacobian product is an isometry at the start of training, a condition associated with the dynamical regime of stable signal propagation [4].
+which restores signal scale for ReLU networks and enabled the training of very deep convolutional models [3]. A useful refinement for deep linear and ReLU stacks is orthogonal initialization, which sets the singular values of each weight matrix to one so the Jacobian product is an isometry at the start of training, a condition associated with the dynamical regime of stable signal propagation [4]. The stronger goal of making the entire input-output Jacobian close to an isometry, with all of its singular values concentrated near one rather than only its norm controlled, is called dynamical isometry, and mean field analysis shows it can be achieved for very deep networks by combining orthogonal weights with carefully chosen nonlinearities, which empirically permits training networks tens of thousands of layers deep without normalization or skip connections [11].
 
 ```text
 # Initialization scale (illustration, not executable)
@@ -141,7 +193,7 @@ $$
 c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t,
 $$
 
-where the forget gate $f_t$, input gate $i_t$, and a candidate $\tilde{c}_t$ are functions of the input and previous hidden state [9]. The recurrence in $c_t$ is additive rather than a repeated matrix multiplication, so when the forget gate stays near one the cell state forms a near identity path through time, an analogue of the residual connection that lets gradients persist over long horizons. This mechanism, the constant error carousel, is what allows the long short term memory network and the simpler gated recurrent unit to learn dependencies across hundreds of time steps that defeat vanilla recurrence.
+where the forget gate $f_t$, input gate $i_t$, and a candidate $\tilde{c}_t$ are functions of the input and previous hidden state [9]. The recurrence in $c_t$ is additive rather than a repeated matrix multiplication, so when the forget gate stays near one the cell state forms a near identity path through time, an analogue of the residual connection that lets gradients persist over long horizons. This mechanism, the constant error carousel, is what allows the long short term memory network and the simpler gated recurrent unit, which merges the cell and hidden state and uses two gates instead of three, to learn dependencies across hundreds of time steps that defeat vanilla recurrence [12].
 
 ### 7.3 Attention and the elimination of depth in time
 
@@ -149,7 +201,27 @@ Self attention sidesteps the temporal product entirely by connecting every posit
 
 ## 8. Practical Diagnosis and Synthesis
 
-In practice the regime of a network is diagnosed by monitoring gradient norms per layer. Norms that shrink by orders of magnitude from output to input signal vanishing, while norms that spike or produce numerical overflow signal explosion. The remedies compose rather than compete. A modern recipe combines a nonparametric activation with derivative near one, variance preserving initialization, a normalization layer, residual or gated paths for signal flow, and gradient clipping as a safety net against rare spikes. Each addresses a different factor in the product of Jacobians: the activation controls $\phi'$, initialization sets the initial $\|W\|$, normalization holds activation scale steady through training, architecture inserts an identity path that bypasses the product, and clipping caps the worst case step. Together they convert the once formidable barrier of training deep and recurrent networks into routine engineering, and understanding which factor each one controls is what allows a practitioner to diagnose and repair a network that fails to learn.
+In practice the regime of a network is diagnosed by monitoring gradient norms per layer. Norms that shrink by orders of magnitude from output to input signal vanishing, while norms that spike or produce numerical overflow signal explosion. The remedies compose rather than compete. A modern recipe combines a nonparametric activation with derivative near one, variance preserving initialization, a normalization layer, residual or gated paths for signal flow, and gradient clipping as a safety net against rare spikes. Each addresses a different factor in the product of Jacobians: the activation controls $\phi'$, initialization sets the initial $\|W\|$, normalization holds activation scale steady through training, architecture inserts an identity path that bypasses the product, and clipping caps the worst case step.
+
+### 8.1 Which factor does each remedy control?
+
+The table below makes the division of labor explicit. Reading it is the fastest way to map an observed symptom to the right intervention.
+
+| Remedy | Factor of the product it controls | Helps vanishing | Helps explosion |
+|---|---|---|---|
+| Non-saturating activation (ReLU family) | activation slope $\phi'$ | yes | no |
+| Variance preserving init (He, Xavier, orthogonal) | initial weight scale $\|W\|$ | yes | yes (at start) |
+| Normalization (batch, layer) | activation scale during training | yes | yes |
+| Residual or gated path | inserts an identity term in the Jacobian | yes | no |
+| Gradient clipping | caps the realized step norm | no | yes |
+
+### 8.2 When to use what, and pitfalls
+
+Reach for residual connections and normalization first in feedforward and convolutional stacks; they are the highest leverage changes and are nearly always worth their modest cost. For recurrence, prefer gated cells or, where the task allows, replace recurrence with attention to remove the temporal product entirely. Add gradient clipping whenever you train recurrent models or see occasional loss spikes, since it is cheap insurance against the rare steep wall.
+
+Several pitfalls recur. Gradient clipping fixes only explosion; a network that clips constantly is signaling a deeper conditioning problem, not solving one, and clipping does nothing for vanishing. Batch normalization couples examples within a minibatch, which degrades with very small batches and interacts subtly with recurrence, which is why layer normalization dominates in sequence and transformer models. He initialization assumes a ReLU style nonlinearity; pairing it with a saturating activation, or pairing Xavier with ReLU, leaves the variance miscalibrated by a factor of two per layer. Residual blocks help only if the residual branch is initialized small enough that the identity term dominates early; a residual branch initialized at full scale can still place the network in an unstable regime. Finally, monitoring a single global gradient norm hides the diagnosis: vanishing and explosion are spatial phenomena across depth, so log per-layer norms to see where in the stack the signal degrades. Mature open-source frameworks such as PyTorch, JAX with Flax, and TensorFlow expose all of these tools, He and Xavier initializers, batch and layer normalization, norm based gradient clipping, and residual building blocks, as standard components, so the practitioner's task is diagnosis and composition rather than implementation.
+
+Together these methods convert the once formidable barrier of training deep and recurrent networks into routine engineering, and understanding which factor each one controls is what allows a practitioner to diagnose and repair a network that fails to learn.
 
 ## References
 
@@ -163,3 +235,5 @@ In practice the regime of a network is diagnosed by monitoring gradient norms pe
 8. K. He, X. Zhang, S. Ren, and J. Sun, "Deep residual learning for image recognition," CVPR, 2016. https://arxiv.org/abs/1512.03385
 9. S. Hochreiter and J. Schmidhuber, "Long short-term memory," Neural Computation, 1997. https://doi.org/10.1162/neco.1997.9.8.1735
 10. A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, L. Kaiser, and I. Polosukhin, "Attention is all you need," NeurIPS, 2017. https://arxiv.org/abs/1706.03762
+11. L. Xiao, Y. Bahri, J. Sohl-Dickstein, S. S. Schoenholz, and J. Pennington, "Dynamical isometry and a mean field theory of CNNs: How to train 10,000-layer vanilla convolutional neural networks," ICML, 2018. https://arxiv.org/abs/1806.05393
+12. K. Cho, B. van Merrienboer, C. Gulcehre, D. Bahdanau, F. Bougares, H. Schwenk, and Y. Bengio, "Learning phrase representations using RNN encoder-decoder for statistical machine translation," EMNLP, 2014. https://doi.org/10.3115/v1/D14-1179

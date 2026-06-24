@@ -16,6 +16,16 @@ $$
 
 Here $\mathcal{L}$ is a loss such as one minus accuracy or root mean squared error, and $A^{(j)}_\lambda$ is the model produced by training algorithm $A^{(j)}$ with hyperparameters $\lambda$.
 
+It helps to name the structure of the search space precisely. Define the combined configuration space as the disjoint union
+
+$$
+\Theta = \bigcup_{j=1}^{k} \{A^{(j)}\} \times \Lambda^{(j)},
+$$
+
+where a point $\theta = (A^{(j)}, \lambda)$ first selects an algorithm and then its hyperparameters. The single categorical root variable that ranges over $\{A^{(1)}, \dots, A^{(k)}\}$ is the device that folds algorithm selection and hyperparameter tuning into one optimization over $\Theta$. The hyperparameter coordinates of $\Lambda^{(j)}$ are conditional: they are defined only on the slice where the root variable equals $A^{(j)}$. CASH is then simply the minimization of the cross validated loss $f(\theta)$ over $\Theta$, where $f$ is a black box. We can evaluate $f(\theta)$ by training and validating, but we have no gradient, no convexity, and only a noisy estimate at each query.
+
+It is worth being explicit about the bias of the inner estimator. The $K$ fold mean is an almost unbiased estimate of the expected loss of the retrained model, but because we select $A^\star, \lambda^\star$ to minimize this estimate over many candidates, the minimized value is optimistically biased: the winner is partly lucky. This is the optimization analogue of multiple comparisons, and it is the reason a genuinely held out test set, untouched by the search, is mandatory for reporting performance. The search loss is a selection criterion, not an unbiased performance estimate.
+
 ### 1.2 Why CASH is hard
 
 The trick that makes CASH a single optimization problem is to introduce a top level categorical variable that selects the algorithm. The combined search space becomes a hierarchical, conditional space: the hyperparameters of a random forest are only active when the algorithm choice is random forest, and the choice of a kernel in a support vector machine activates a further set of kernel specific parameters. This structure has three properties that defeat naive optimizers.
@@ -27,6 +37,14 @@ It is mixed. Variables can be continuous (a learning rate), integer valued (tree
 It is expensive and noisy. Each evaluation requires training and validating a model, which can take seconds to hours, and the cross validation estimate is itself a noisy sample of generalization error.
 
 Grid search and random search ignore this structure. Grid search scales exponentially with dimension and wastes effort on unimportant axes. Random search is a stronger baseline than its reputation suggests, because it concentrates samples along whichever dimensions matter, but it cannot exploit information gathered during the run. The methods that follow do exploit that information.
+
+The advantage of random search over grid search admits a clean argument. Suppose only one of $d$ hyperparameters actually influences the loss, and a configuration is good if that effective parameter lands in the best fraction $\rho$ of its range. Grid search with $m$ points per axis spends $m^d$ evaluations yet tries only $m$ distinct values of the effective parameter, so it samples the important axis sparsely. Random search with $N$ samples draws $N$ independent values of the effective parameter, and the probability that at least one lands in the good region is $1 - (1-\rho)^N$. To reach probability $1 - \delta$ it suffices to take
+
+$$
+N \ge \frac{\ln(1/\delta)}{\ln\!\big(1/(1-\rho)\big)} \approx \frac{\ln(1/\delta)}{\rho},
+$$
+
+which is independent of the ambient dimension $d$. This is the formal content of the Bergstra and Bengio result: when the effective dimensionality is low, random search beats grid search because it does not waste its budget tiling irrelevant axes. The model based methods below improve further by allocating samples adaptively rather than uniformly.
 
 ## 2. Pipeline Search
 
@@ -58,9 +76,27 @@ $$
 \mathrm{EI}(\lambda) = \mathbb{E}\left[\max\left(0,\ \mathcal{L}_{\text{best}} - \mathcal{L}(\lambda)\right)\right],
 $$
 
-which balances exploitation of regions the surrogate predicts to be good against exploration of regions where the surrogate is uncertain. The loop is: fit the surrogate to all evaluations so far, maximize the acquisition function to propose a configuration, evaluate it, and repeat.
+which balances exploitation of regions the surrogate predicts to be good against exploration of regions where the surrogate is uncertain. Here $\mathcal{L}_{\text{best}}$ is the smallest loss observed so far and the expectation is taken over the surrogate's predictive distribution at $\lambda$.
 
-Gaussian processes are the textbook surrogate, but they assume smooth, continuous spaces and scale poorly with the number of evaluations. CASH spaces are neither smooth nor purely continuous. For this reason Auto-WEKA and Auto-sklearn use random forest surrogates through the SMAC algorithm. Random forests handle conditional and categorical variables natively, give a usable uncertainty estimate from the variance across trees, and remain cheap to update as evaluations accumulate.
+When the surrogate is a Gaussian process, so the predictive distribution at $\lambda$ is normal with mean $\mu(\lambda)$ and standard deviation $\sigma(\lambda)$, Expected Improvement has a closed form. Writing $z = (\mathcal{L}_{\text{best}} - \mu(\lambda))/\sigma(\lambda)$,
+
+$$
+\mathrm{EI}(\lambda) = \sigma(\lambda)\,\big[\,z\,\Phi(z) + \phi(z)\,\big],
+$$
+
+where $\phi$ and $\Phi$ are the standard normal density and cumulative distribution. The two terms make the exploration and exploitation balance explicit. The $z\,\Phi(z)$ term rewards a low predicted mean (exploitation), and the $\phi(z)$ term, scaled by $\sigma(\lambda)$, rewards predictive uncertainty (exploration). A configuration is attractive either because the surrogate expects it to be good or because the surrogate is unsure about it. The loop is: fit the surrogate to all evaluations so far, maximize the acquisition function to propose a configuration, evaluate it, and repeat.
+
+```{mermaid}
+flowchart LR
+  A["Observed evaluations"] --> B["Fit surrogate model"]
+  B --> C["Maximize acquisition function"]
+  C --> D["Evaluate proposed config"]
+  D --> A
+```
+
+Gaussian processes are the textbook surrogate, but they assume smooth, continuous spaces and scale poorly with the number of evaluations, with naive inference cost growing cubically in the number of observations. CASH spaces are neither smooth nor purely continuous. For this reason Auto-WEKA and Auto-sklearn use random forest surrogates through the SMAC algorithm. Random forests handle conditional and categorical variables natively, give a usable uncertainty estimate from the variance across trees, and remain cheap to update as evaluations accumulate.
+
+A second model based surrogate, used by BOHB and by the Hyperopt library, is the Tree Parzen Estimator. Rather than modeling $p(\mathcal{L} \mid \lambda)$ directly, the TPE models the configuration space conditioned on outcome. It splits past evaluations at a quantile $\gamma$ of the loss into a good group and a rest group, fits a density $\ell(\lambda)$ to the configurations in the good group and a density $g(\lambda)$ to the rest, and proposes configurations that maximize the ratio $\ell(\lambda)/g(\lambda)$. One can show that under this construction maximizing Expected Improvement is equivalent to maximizing $\ell(\lambda)/g(\lambda)$, so the TPE is a valid acquisition strategy that, like the random forest, handles mixed and conditional spaces gracefully because the densities respect the tree structured conditionality of the search space.
 
 ### 3.2 The Auto-sklearn system
 
@@ -107,6 +143,19 @@ while len(configs) > 1:
     budget = budget * eta
 ```
 
+The resource accounting is what makes the method efficient. Starting from $n$ configurations at budget $r$ with elimination factor $\eta$, after round $i$ there are $n/\eta^i$ survivors each running at budget $r\eta^i$. The resource spent in round $i$ is therefore $(n/\eta^i)(r\eta^i) = nr$, a constant. With $S$ rounds the total resource is about $S \cdot nr$, so successive halving evaluates an exponentially growing per configuration budget while spending only linearly in the number of rounds. The quality of the surviving population concentrates as the budget per survivor rises.
+
+A concrete worked example fixes intuition. Take $n = 27$ configurations, initial budget $r = 1$ epoch, and $\eta = 3$.
+
+| Round | Configs evaluated | Budget per config (epochs) | Resource this round |
+|-------|-------------------|----------------------------|---------------------|
+| 0 | 27 | 1 | 27 |
+| 1 | 9 | 3 | 27 |
+| 2 | 3 | 9 | 27 |
+| 3 | 1 | 27 | 27 |
+
+Each round spends 27 epoch units, four rounds cost 108 epoch units in total, and the single survivor is trained for 27 full epochs. Training all 27 configurations to 27 epochs naively would cost 729 epoch units, so successive halving reaches a comparably trained finalist for roughly one seventh of the resource, provided that the low fidelity rankings are informative enough to retain the eventual winner.
+
 The weakness is the choice of $n$. For a fixed total budget $B$, a large $n$ gives each configuration little time before the first cut, which risks discarding a slow starter that would have won at full fidelity. A small $n$ gives generous early budgets but explores few configurations. This is the $n$ versus $B/n$ tradeoff, and there is no single right answer because it depends on how informative low fidelity scores are for the problem at hand.
 
 ### 4.3 Hyperband
@@ -114,6 +163,8 @@ The weakness is the choice of $n$. For a fixed total budget $B$, a large $n$ giv
 Hyperband resolves the tradeoff by refusing to commit to one value of $n$. It runs successive halving as a subroutine across several brackets, each with a different starting $n$ and initial budget $r$, hedging across the full spectrum from aggressive early stopping to conservative full training. The most aggressive bracket starts many configurations with tiny budgets, the most conservative starts few configurations near full budget, and intermediate brackets interpolate. Because Hyperband only needs the ability to evaluate at reduced fidelity and a single parameter $\eta$, it is simple to deploy and provides strong anytime performance, meaning it returns a good answer whenever it is stopped.
 
 The complementary strengths of Bayesian optimization and Hyperband led to their combination. BOHB replaces Hyperband's random sampling of configurations with a model based proposal using a Tree Parzen Estimator, while keeping Hyperband's bracket structure. The result samples promising configurations rather than random ones, yet still cuts losers early, and it converges faster than either method alone.
+
+The load bearing assumption of every multi fidelity method is that the low fidelity score is rank correlated with the full fidelity score. When that correlation is weak, aggressive early stopping discards configurations that would have won, and the method can perform worse than plain random search at full fidelity. Two failure modes are common in practice. Configurations that train slowly but converge to a better optimum, such as a small learning rate, are cut before they catch up. And subsampling the data too aggressively changes which inductive bias is favored, so the low fidelity ranking measures a different problem. The practical mitigation is to set the minimum budget $r$ large enough that rankings have stabilized, and to prefer fidelities such as epochs or ensemble size, where the proxy is monotone in the resource, over fidelities such as a tiny data subsample, where it may not be.
 
 ## 5. Neural Architecture Search
 
@@ -179,4 +230,6 @@ Use AutoML as a strong baseline generator and an accelerator, not as an oracle. 
 12. Elsken, T., Metzen, J. H., and Hutter, F. Neural Architecture Search: A Survey. JMLR 2019. https://arxiv.org/abs/1808.05377
 13. Ying, C., Klein, A., Christiansen, E., Real, E., Murphy, K., and Hutter, F. NAS-Bench-101: Towards Reproducible Neural Architecture Search. ICML 2019. https://arxiv.org/abs/1902.09635
 14. Bergstra, J. and Bengio, Y. Random Search for Hyper-Parameter Optimization. JMLR 2012. https://www.jmlr.org/papers/v13/bergstra12a.html
-15. Hutter, F., Kotthoff, L., and Vanschoren, J. (eds). Automated Machine Learning: Methods, Systems, Challenges. Springer, 2019. https://www.automl.org/book/
+15. Bergstra, J., Bardenet, R., Bengio, Y., and Kegl, B. Algorithms for Hyper-Parameter Optimization (Tree-structured Parzen Estimator). NeurIPS 2011. https://papers.nips.cc/paper/4443-algorithms-for-hyper-parameter-optimization
+16. Dong, X. and Yang, Y. NAS-Bench-201: Extending the Scope of Reproducible Neural Architecture Search. ICLR 2020. https://arxiv.org/abs/2001.00326
+17. Hutter, F., Kotthoff, L., and Vanschoren, J. (eds). Automated Machine Learning: Methods, Systems, Challenges. Springer, 2019. https://www.automl.org/book/

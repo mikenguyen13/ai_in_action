@@ -1,12 +1,166 @@
-Inspired by Lakkaraju et al. (2017) on solving the evaluation problem when assessing algorithmic predictions in the presence of unobservables, commonly referred to as the selective labels problem, this paper examines the methodological challenges that arise when outcome data are only partially observed. The selective labels problem occurs when we only observe certain outcomes conditional on prior human decisions, creating a non-random sample that complicates model evaluation.
-Consider the judicial system as an illustrative example. We observe whether a defendant fails to appear for their court date only if a human judge decides to release the defendant on bail. For defendants who are detained, we never observe what their behavior would have been had they been released. This selective labeling makes it considerably more difficult to evaluate predictive models, as the instances for which outcomes are observed do not represent a random sample of the population.
-The selective labels problem extends naturally to the credit scoring domain. Financial institutions do not extend credit to a random sample of applicants and then passively observe repayment behavior. Rather, banks make deliberate decisions about whom to approve based on their assessment of creditworthiness. Banks want to lend to those who are likely to repay their loans. Consequently, observed default rates are conditional on the bank's approval decision, not representative of the underlying population of potential borrowers. This selection mechanism introduces systematic bias into any evaluation of predictive credit scoring models trained on historical lending data.
+# The Selective Labels Problem
 
+A predictive model is only as trustworthy as the evaluation that vouches for it. Yet in many of the highest stakes settings where machine learning is deployed, including pretrial release, lending, hiring, medical triage, and content moderation, the outcomes we need in order to evaluate a model are systematically missing. They are missing not at random but as a direct consequence of an earlier human or algorithmic decision. We learn whether a released defendant reappears in court only because a judge chose to release them. We learn whether an approved borrower repays only because a loan officer chose to approve them. The decision that gates the outcome is exactly the decision the model is trying to improve, and so the data available for evaluation are filtered through the very behavior we wish to assess.
 
-@inproceedings{lakkaraju2017selective,
-  title={The selective labels problem: Evaluating algorithmic predictions in the presence of unobservables},
-  author={Lakkaraju, Himabindu and Kleinberg, Jon and Leskovec, Jure and Ludwig, Jens and Mullainathan, Sendhil},
-  booktitle={Proceedings of the 23rd ACM SIGKDD international conference on knowledge discovery and data mining},
-  pages={275--284},
-  year={2017}
-}
+This is the selective labels problem, named and formalized by @lakkaraju2017selective. It is one of the most consequential and least appreciated pitfalls in applied machine learning, because it can make a dangerous model look excellent and a useful model look poor, all without any error in the modeling code itself. This chapter states the problem precisely, locates it within the broader theory of missing data and sample selection, derives why naive evaluation is biased, and lays out the conditions and methods under which valid evaluation can be recovered.
+
+## 1. The Setting and a Motivating Example
+
+### 1.1 The judicial bail example
+
+Consider a judge deciding whether to release a defendant before trial. For each defendant the judge observes features $x$ (charge, prior record, demographics, case details) and renders a binary decision $D \in \{0, 1\}$, where $D = 1$ denotes release and $D = 0$ denotes detention. The outcome of interest $Y \in \{0, 1\}$ records whether the defendant would fail to appear at trial, with $Y = 1$ denoting failure to appear.
+
+The defining feature of the setting is that $Y$ is observed only when $D = 1$. A detained defendant cannot fail to appear, so for every defendant with $D = 0$ the label is structurally absent. We never see the counterfactual outcome the detained defendant would have produced had they been released. The labels we possess form a sample that is selected by the judge, not drawn at random from the population of defendants.
+
+### 1.2 The credit scoring example
+
+The same structure governs lending. A bank observes applicant features $x$, decides whether to approve credit ($D = 1$) or reject ($D = 0$), and observes repayment behavior $Y$ only for approved applicants. Rejected applicants generate no repayment record, so default rates are computed only over the approved population. Because banks deliberately approve applicants they judge creditworthy, the approved pool is healthier than the applicant pool as a whole, and the observed default rate understates the default rate that a random lending policy would have produced. Any model trained or evaluated on historical lending data inherits this distortion. In the credit literature the same idea travels under the name reject inference.
+
+### 1.3 The common structure
+
+In both examples three random variables interact: features $x$, a gating decision $D$, and an outcome $Y$ that is recorded only when $D = 1$. The selective labels problem is the study of what can and cannot be learned about the relationship between $x$ and $Y$ when the analyst sees $Y$ only on the decision-selected subset.
+
+```{mermaid}
+flowchart LR
+  X["Features x"] --> DEC["Decision D"]
+  DEC -->|"D = 1 release or approve"| OBS["Outcome Y observed"]
+  DEC -->|"D = 0 detain or reject"| MISS["Outcome Y missing"]
+  X --> Y["True outcome Y"]
+  Y -.->|"recorded only if D = 1"| OBS
+```
+
+The dashed edge carries the entire difficulty. The true outcome $Y$ exists for every individual as a potential outcome, but it is written into the dataset only along the $D = 1$ branch.
+
+## 2. Formalizing the Problem
+
+### 2.1 Variables and the observation rule
+
+Let each individual be described by a tuple $(x, Z, Y)$, where $x$ are the features visible to both the decision maker and the analyst, $Z$ are features visible to the decision maker but not recorded in the data (the unobservables), and $Y$ is the binary outcome. A decision maker applies a policy that yields $D \in \{0, 1\}$. The recorded label is
+
+$$
+Y^{\text{obs}} = \begin{cases} Y & \text{if } D = 1, \\ \text{missing} & \text{if } D = 0. \end{cases}
+$$
+
+Equivalently, define an observation indicator $R = D$, so $R = 1$ exactly when the label is observed. The analyst's dataset consists of triples $(x_i, D_i, Y_i)$ with $Y_i$ present only where $D_i = 1$.
+
+::: {.callout-note}
+## Definition: selective labels
+
+A learning problem exhibits **selective labels** when the outcome $Y$ is observed only on the subset of instances selected by a prior decision $D$, and that decision depends on information $Z$ that is not available to the analyst. The dependence on unrecorded information $Z$ is what separates selective labels from ordinary covariate shift: conditioning on the observed features $x$ alone does not restore a representative sample.
+:::
+
+### 2.2 The missingness mechanism
+
+The selective labels problem is a special case of the missing data taxonomy of @rubin1976inference. That framework classifies the mechanism that produces missing values by what the missingness depends on.
+
+- **Missing completely at random (MCAR):** the label is missing independently of everything, $P(R = 1 \mid x, Z, Y) = P(R = 1)$. Evaluation on observed labels is unbiased.
+- **Missing at random (MAR):** missingness depends only on observed quantities, $P(R = 1 \mid x, Z, Y) = P(R = 1 \mid x)$. Reweighting by the observation propensity recovers unbiased estimates.
+- **Missing not at random (MNAR):** missingness depends on unobserved quantities, including possibly $Y$ itself, even after conditioning on $x$.
+
+Selective labels are dangerous precisely because the decision maker uses private information $Z$ that is correlated with $Y$. If $Z$ carries signal about $Y$ beyond what $x$ contains, then conditioning on $x$ does not make missingness ignorable, and the mechanism is MNAR. This is the formal heart of the problem: the judge's hunch, the loan officer's read of an applicant, the clinician's gestalt, all push the data into the MNAR regime where naive correction fails.
+
+### 2.3 Connection to sample selection and censoring
+
+The econometric tradition reached the same structure from a different direction. @heckman1979sample showed that estimating a relationship on a sample selected by an outcome-correlated rule produces biased coefficients unless the selection is modeled explicitly. Selective labels are a sample selection problem in which the selection equation is the decision policy $D$. The connection clarifies both the danger and the available remedies: methods that work for sample selection, such as modeling the selection process or finding an instrument, port directly to selective labels.
+
+## 3. Why Naive Evaluation Is Biased
+
+### 3.1 The estimand and the available estimator
+
+Suppose we have built a risk model $s(x)$ and want to estimate its performance, for concreteness the true positive rate or, more simply, the average outcome the model would face if applied to everyone. The target estimand is the population mean
+
+$$
+\mu = \mathbb{E}[Y],
+$$
+
+the rate of the adverse outcome across the entire population of defendants or applicants, not just those who were selected. The quantity we can actually compute from data is the mean over the observed (selected) subset,
+
+$$
+\hat{\mu}_{\text{obs}} = \mathbb{E}[Y \mid D = 1].
+$$
+
+### 3.2 The selection bias identity
+
+By the law of total expectation,
+
+$$
+\mathbb{E}[Y] = \mathbb{E}[Y \mid D = 1]\,P(D = 1) + \mathbb{E}[Y \mid D = 0]\,P(D = 0).
+$$
+
+Rearranging to expose the gap between what we want and what we measure,
+
+$$
+\underbrace{\mathbb{E}[Y]}_{\text{target}} - \underbrace{\mathbb{E}[Y \mid D = 1]}_{\text{observed}} = P(D = 0)\,\Big(\underbrace{\mathbb{E}[Y \mid D = 0] - \mathbb{E}[Y \mid D = 1]}_{\text{selection gap}}\Big).
+$$
+
+The bias of the naive estimator is the product of two factors: the fraction of the population that was screened out, $P(D = 0)$, and the difference in outcome rates between the screened-out group and the selected group. A competent decision maker pushes the high-risk individuals into $D = 0$, which makes $\mathbb{E}[Y \mid D = 0] > \mathbb{E}[Y \mid D = 1]$, so the selection gap is positive and the observed rate understates the true rate. The crucial obstacle is that $\mathbb{E}[Y \mid D = 0]$ is unobservable by construction. We can bound or model it, but we cannot read it off the data, which is why the bias cannot be eliminated by clever bookkeeping alone.
+
+### 3.3 The problem with comparing to human decisions
+
+A tempting shortcut is to declare the model better than the judge whenever it would release the same number of people with a lower observed failure rate. @lakkaraju2017selective show this comparison is invalid. A model can appear to beat the judge simply by releasing the defendants the judge already released, which are the easy cases, while the judge's apparent failures concentrate among the borderline defendants the model never has to take responsibility for. Because the detained defendants' outcomes are missing, the model is graded only on a curriculum the human already pre-screened. The literature calls the resulting trap the **selective labels trap**: evaluation that looks rigorous but silently conditions on the incumbent policy.
+
+## 4. A Worked Numerical Example
+
+Consider a population of 1000 defendants. The true (counterfactual) failure-to-appear rate, if everyone were released, is 30 percent, so 300 would fail. A judge releases 700 and detains 300, and the judge is skilled, concentrating detentions among genuinely high-risk defendants.
+
+| Group | Count | True failure rate | Failures |
+|-------|------:|------------------:|---------:|
+| Released ($D = 1$) | 700 | 0.157 | 110 |
+| Detained ($D = 0$) | 300 | 0.633 | 190 |
+| Population | 1000 | 0.300 | 300 |
+
+The analyst sees only the released row. The naive observed failure rate is $110 / 700 = 0.157$. Plugging into the selection bias identity,
+
+$$
+\mathbb{E}[Y] - \mathbb{E}[Y \mid D = 1] = P(D = 0)\big(\mathbb{E}[Y \mid D=0] - \mathbb{E}[Y \mid D=1]\big) = 0.30 \times (0.633 - 0.157) \approx 0.143,
+$$
+
+which recovers the true rate $0.157 + 0.143 = 0.30$. The naive estimate of $0.157$ is wrong by almost a factor of two, and nothing in the released-only data reveals the error. A model trained and validated solely on the released population would internalize $0.157$ as the base rate and would be systematically overconfident about the safety of release.
+
+## 5. Paths to Valid Evaluation
+
+No method conjures the missing labels from nothing. Every approach either imports an additional assumption, exploits a source of exogenous variation, or accepts a partial answer in the form of bounds. The four families below are the workhorses.
+
+### 5.1 Exogenous variation: contraction and instruments
+
+@lakkaraju2017selective propose the **contraction** technique, which exploits heterogeneity among decision makers. Suppose defendants are assigned quasi-randomly to judges who differ in leniency. A lenient judge releases a larger fraction, which means the marginal defendants released by the lenient judge but detained by a strict judge have observed outcomes that the strict judge's data lack. By comparing a model against the most lenient decision maker, who supplies the most complete set of labels, one can evaluate the model at release rates up to that leniency without imputing any missing label. The leniency of the assigned judge functions as an instrument for the decision, an idea developed at scale by @kleinberg2018human, who used quasi-random judge assignment to evaluate machine predictions against human bail decisions.
+
+### 5.2 Reweighting under ignorability
+
+If one is willing to assume the decision is **unconfounded given the observed features**, meaning $Y \perp D \mid x$ so that the mechanism is MAR rather than MNAR, then inverse propensity weighting recovers the target. Let $\pi(x) = P(D = 1 \mid x)$ be the propensity that the label is observed, in the sense of @rosenbaum1983central. The estimator
+
+$$
+\hat{\mu}_{\text{IPW}} = \frac{1}{n} \sum_{i : D_i = 1} \frac{Y_i}{\pi(x_i)}
+$$
+
+is unbiased for $\mathbb{E}[Y]$ under ignorability and positivity ($\pi(x) > 0$ for all $x$ in the population). Doubly robust estimators combine this weighting with an outcome model and remain consistent if either the propensity model or the outcome model is correct, which is the basis of the counterfactual evaluation framework of @coston2020counterfactual. The decisive caveat is that ignorability is exactly the assumption selective labels tends to violate: if the decision maker used private information $Z$, then $Y \not\perp D \mid x$ and the weights correct for the wrong thing.
+
+### 5.3 Partial identification: bounds
+
+When no credible instrument exists and ignorability is untenable, one can still bound the target without point-identifying it. The worst case and best case for the missing group are $\mathbb{E}[Y \mid D = 0] \in [0, 1]$ for a binary outcome, which yields
+
+$$
+\mathbb{E}[Y \mid D = 1]\,P(D=1) \;\le\; \mathbb{E}[Y] \;\le\; \mathbb{E}[Y \mid D = 1]\,P(D=1) + P(D=0).
+$$
+
+These Manski-style bounds are often too wide to settle a decision, but they are assumption-light and honest, and tightening them with defensible monotonicity assumptions (for example, that the detained group is at least as risky as the released group) is frequently more credible than asserting full ignorability.
+
+### 5.4 Imputation and its hazards
+
+A final option is to model $P(Y \mid x)$ on the observed data and impute the missing labels. This is the most common and most dangerous approach, because the imputation model is itself trained on the selected sample and therefore inherits the same MNAR distortion. Imputation can be defensible when combined with a credible selection model, as in Heckman-style correction, but a plain supervised imputer fit to released defendants and applied to detained ones simply launders the selection bias into a confident number. Treat it as a sensitivity tool, not a solution.
+
+## 6. When To Worry and Common Pitfalls
+
+The selective labels problem is relevant whenever labels are gated by a decision and that decision plausibly used information you do not record. Use the following as a checklist.
+
+- **Is the outcome gated by a prior decision?** If every label in your training set required someone to say yes first, you are in selective labels territory. Pure observational data with no gating decision is exempt.
+- **Did the gatekeeper see more than you record?** If the decision maker had access to private signal $Z$ correlated with the outcome, the mechanism is MNAR and naive reweighting on $x$ will not save you.
+- **Is the selection rate far from one?** The bias scales with $P(D = 0)$. A policy that approves 95 percent of applicants leaves little room for bias; a policy that approves 30 percent can hide enormous distortion.
+
+The recurring pitfalls are worth naming explicitly. **Conditioning on the incumbent policy** by evaluating only on its accepted cases makes a new model look good for the wrong reason. **Treating MNAR as MAR** by applying propensity weights on observed features alone produces a falsely reassuring number. **Imputing the missing labels with a model trained on the selected sample** recycles the bias into apparent precision. **Reporting a point estimate when only bounds are identified** overstates what the data can support. The disciplined response is to state the missingness mechanism you are assuming, justify it, and prefer designs with exogenous variation (multiple decision makers, randomized holdouts, or staged rollouts) that supply genuinely missing labels rather than imputed ones.
+
+Open-source tooling supports several of these strategies directly. Inverse propensity and doubly robust estimators are available in `scikit-learn` pipelines and in dedicated causal inference libraries such as `DoWhy` and `EconML`, and partial identification bounds can be computed with a few lines of `numpy`. None of these tools removes the need to reason carefully about the mechanism, but they lower the cost of doing the analysis honestly.
+
+## 7. Summary
+
+Selective labels arise when an outcome is observed only for the instances a prior decision selected, and when that decision relied on information the analyst cannot see. The resulting missingness is missing not at random, so the observed sample misrepresents the population, and the bias of naive evaluation equals the screened-out fraction times the unobservable outcome gap between the screened-out and selected groups. Valid evaluation requires either exogenous variation in the decision (the contraction and leniency-instrument approach of @lakkaraju2017selective and @kleinberg2018human), a defensible ignorability assumption that licenses reweighting (@rosenbaum1983central, @coston2020counterfactual), partial identification through bounds, or carefully modeled selection in the tradition of @heckman1979sample. The unifying lesson is that the data you can see were shaped by the decisions you want to improve, and any evaluation that forgets this will grade the model on a curriculum the incumbent policy already curated.

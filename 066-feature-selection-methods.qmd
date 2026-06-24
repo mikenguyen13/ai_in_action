@@ -22,6 +22,27 @@ Feature selection keeps a subset of the original variables intact, which preserv
 
 The literature organizes methods by how tightly they couple to the downstream model. Filter methods rank features using statistics computed from the data alone, independent of any learner. Wrapper methods treat a specific model as a black box and search over feature subsets by repeated training and evaluation. Embedded methods perform selection as a side effect of model fitting, folding it into the optimization. Permutation importance, discussed last, is a post hoc model agnostic technique that estimates how much each feature contributes to a trained model's accuracy.
 
+```{mermaid}
+flowchart TD
+    A["Candidate features"] --> B["Filter: rank by data statistic, no model"]
+    A --> C["Wrapper: search subsets, train model per subset"]
+    A --> D["Embedded: select during model fitting"]
+    B --> E["Selected subset"]
+    C --> E
+    D --> E
+    E --> F["Permutation importance: audit the trained model"]
+```
+
+A useful mental model places the three families on a spectrum of how much they know about the eventual learner. Filters know nothing about it and pay the least compute. Wrappers know everything about it, calling it as an oracle, and pay the most. Embedded methods sit between the two, exploiting the structure of one particular learner without an external search. Permutation importance is orthogonal to this spectrum: it runs after a model is fit and reports the consequence of removing each feature's information.
+
+The table below summarizes the tradeoffs that the rest of the chapter develops.
+
+| Family | Sees the model | Captures interactions | Relative cost | Overfitting risk |
+|--------|----------------|-----------------------|---------------|------------------|
+| Filter | No | No (univariate) | Low | Low |
+| Wrapper | Yes (as oracle) | Yes | High | High without nesting |
+| Embedded | Yes (one family) | Partially | Low to moderate | Controlled by penalty |
+
 ## 2. Filter Methods
 
 Filter methods score each feature, or each feature relative to the target, using a fast statistical criterion and then keep the top ranked features. They are cheap, scale to very wide data, and act as a sensible preprocessing step even when a more expensive method follows.
@@ -55,6 +76,8 @@ $$
 where $H$ denotes Shannon entropy. Mutual information is zero if and only if $X_j$ and $Y$ are statistically independent, and it grows as knowing $X_j$ reduces uncertainty about $Y$. For continuous variables the sums become integrals, and practical estimators rely on $k$ nearest neighbor distances, as in the Kozachenko Leonenko and Kraskov estimators, to avoid binning artifacts.
 
 Mutual information is attractive because it is model free and detects any kind of dependence. Its drawbacks are that estimation in continuous high dimensional spaces is noisy, and that the univariate form $I(X_j; Y)$ ignores feature interactions. A feature useless on its own but informative in combination with another, the canonical XOR pattern, scores zero under univariate mutual information.
+
+**Worked example: the XOR trap.** Let $X_1$ and $X_2$ be independent fair coins taking values in $\{0, 1\}$, and let the target be their exclusive or, $Y = X_1 \oplus X_2$. Each input is marginally uninformative about the target. Conditioning on $X_1 = 0$ leaves $Y$ equally likely to be $0$ or $1$, so $H(Y \mid X_1) = H(Y) = 1$ bit and therefore $I(X_1; Y) = 0$. The same holds for $X_2$. A univariate filter, whether correlation, chi-squared, or mutual information, scores both features at zero and discards them, yet together they determine $Y$ exactly, since $I(X_1, X_2; Y) = 1$ bit. This is the precise reason filters are a first pass and not a final word: any selector that scores features one at a time is blind to information that lives only in their joint behavior. Wrapper and embedded methods, which evaluate features in the presence of others, can recover the pair.
 
 ### 2.3 The chi-squared test
 
@@ -129,6 +152,14 @@ $$
 
 The geometry of the $\ell_1$ ball, with its corners on the coordinate axes, drives many coefficients to be exactly zero at the optimum. Features with zero coefficients are effectively deselected, so the lasso performs continuous feature selection through a single convex optimization. The penalty strength $\lambda$ controls sparsity: larger values zero out more coefficients. Contrast this with the $\ell_2$ penalty of ridge regression, $\lambda \sum_j \beta_j^2$, which shrinks coefficients toward zero but never sets them exactly to zero and therefore selects nothing.
 
+The mechanism is made precise by the soft thresholding rule, the closed form solution for a single coordinate when the features are orthonormal. Let $\hat\beta_j^{\text{OLS}}$ be the ordinary least squares estimate for coefficient $j$. The lasso solution is
+
+$$
+\hat\beta_j = \operatorname{sign}\!\big(\hat\beta_j^{\text{OLS}}\big)\,\big(\,|\hat\beta_j^{\text{OLS}}| - \lambda\,\big)_{+},
+$$
+
+where $(z)_+ = \max(z, 0)$. Any coefficient whose unpenalized magnitude falls below $\lambda$ is set exactly to zero, and the rest are shrunk toward zero by the constant $\lambda$. Ridge regression, by comparison, applies the multiplicative shrinkage $\hat\beta_j = \hat\beta_j^{\text{OLS}} / (1 + \lambda)$, which scales every coefficient down but leaves all of them nonzero. The thresholding-versus-scaling contrast is the algebraic reason the lasso selects and ridge does not. Equivalently, the nondifferentiable kink of $|\beta_j|$ at the origin makes zero a stable optimum: a range of subgradients satisfies the stationarity condition there, so the optimizer can rest exactly on the axis.
+
 The lasso has known limitations. Among a group of highly correlated features it tends to pick one arbitrarily and zero the rest, which can be unstable. When $p > n$ it selects at most $n$ features. The elastic net addresses both issues by combining $\ell_1$ and $\ell_2$ penalties,
 
 $$
@@ -195,9 +226,28 @@ Method choice follows from dimensionality, compute budget, and the importance of
 
 The single most important discipline is to perform feature selection inside the cross validation loop, never on the full dataset before splitting. Selecting features using the entire dataset, including the eventual test rows, leaks target information and produces optimistic, irreproducible results. All of the methods here must see only training data within each fold. Standardization, encoding, and selection should be fitted on training folds and applied to validation folds, ideally inside a single pipeline object so the dependency is explicit and impossible to bypass.
 
+The danger is starkest when $p \gg n$. Suppose all features are pure noise, independent of a binary target. With thousands of columns and a few hundred rows, some columns will correlate with the target by chance alone. If a filter ranks all $p$ columns on the full dataset and keeps the top few before any split, those few are precisely the ones that happened to align with the labels everywhere, including the held out rows. A cross validated classifier then reports accuracy far above the chance level of a random target, a result that evaporates on genuinely fresh data. This failure mode was documented by Ambroise and McLachlan (2002) in microarray studies and is the textbook illustration of selection bias. The fix is to redo the ranking inside every training fold, which is exactly what nested cross validation enforces.
+
+```{mermaid}
+flowchart TD
+    A["Full dataset"] --> B["Outer fold split"]
+    B --> C["Outer train"]
+    B --> D["Outer test, untouched"]
+    C --> E["Select features on outer train only"]
+    E --> F["Fit model on selected features"]
+    F --> G["Evaluate once on outer test"]
+    G --> H["Average over outer folds for honest estimate"]
+```
+
 ### 6.3 Stability
 
-A robust feature set should be stable under resampling. Running the selection procedure on multiple bootstrap samples and retaining features chosen frequently, an approach known as stability selection, guards against the instability that lasso and greedy wrappers exhibit on correlated data. Reporting selection frequency alongside the chosen subset gives a far more honest picture than a single run.
+A robust feature set should be stable under resampling. The idea, formalized as stability selection, is to run a base selector (typically a lasso path) on many random subsamples of the data and retain features whose selection frequency exceeds a threshold. Let $\hat\Pi_j$ denote the empirical probability that feature $j$ is selected across $B$ subsamples,
+
+$$
+\hat\Pi_j = \frac{1}{B}\sum_{b=1}^{B} \mathbf{1}\{\,j \in \hat{S}_b\,\},
+$$
+
+where $\hat{S}_b$ is the set selected on subsample $b$. The stable set is $\{\,j : \hat\Pi_j \geq \pi_{\text{thr}}\,\}$ for a threshold such as $0.6$. This procedure guards against the instability that lasso and greedy wrappers exhibit on correlated data, where the particular feature chosen from a correlated group can flip from one sample to the next. Meinshausen and Buehlmann (2010) showed it also yields finite sample control on the expected number of falsely selected features. Reporting the selection frequencies $\hat\Pi_j$ alongside the chosen subset gives a far more honest picture than a single run.
 
 ## References
 
@@ -212,3 +262,4 @@ A robust feature set should be stable under resampling. Running the selection pr
 9. Hastie, T., Tibshirani, R. and Friedman, J. (2009). The Elements of Statistical Learning, 2nd edition. Springer. https://hastie.su.domains/ElemStatLearn/
 10. Pedregosa, F. et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research. https://www.jmlr.org/papers/v12/pedregosa11a.html
 11. Molnar, C. (2022). Interpretable Machine Learning, 2nd edition. https://christophm.github.io/interpretable-ml-book/
+12. Ambroise, C. and McLachlan, G. J. (2002). Selection Bias in Gene Extraction on the Basis of Microarray Gene-Expression Data. Proceedings of the National Academy of Sciences. https://doi.org/10.1073/pnas.102102699

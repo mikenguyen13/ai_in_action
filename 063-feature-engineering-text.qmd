@@ -4,6 +4,25 @@ Text is the most abundant and least structured data modality in modern machine l
 
 This chapter develops the classical text feature pipeline from first principles: tokenization, bag of words, n-grams, term weighting with TF-IDF, and the hashing trick for scale. It then builds a bridge to distributed representations, word and sentence embeddings, and closes with a sober account of when sparse classical features still outperform dense neural ones.
 
+The pipeline is best understood as a sequence of maps from one representation to the next, each adding structure or shedding cost.
+
+```{mermaid}
+flowchart LR
+    A["Raw text string"] --> B["Tokens"]
+    B --> C["Normalized tokens"]
+    C --> D["Document term matrix"]
+    D --> E["TF-IDF weighted matrix"]
+    C --> F["Hashed feature vector"]
+    C --> G["Averaged word embedding"]
+    A --> H["Sentence embedding"]
+    E --> I["Linear classifier"]
+    F --> I
+    G --> I
+    H --> I
+```
+
+The top path is the sparse symbolic pipeline that dominates Sections 1 through 5. The lower paths are the dense semantic routes of Section 6. Section 7 explains when each is the right choice.
+
 ## 1. From Characters to Tokens
 
 ### 1.1 The tokenization problem
@@ -18,7 +37,9 @@ def tokenize(text):
     return re.findall(r"[A-Za-z0-9']+", text.lower())
 ```
 
-This lowercases, splits on non alphanumeric characters, and keeps apostrophes. It is crude but reproducible, and reproducibility matters more than linguistic elegance because the same function must run at training and inference time.
+This lowercases, splits on non alphanumeric characters, and keeps apostrophes. It is crude but reproducible, and reproducibility matters more than linguistic elegance because the same function must run at training and inference time. A subtle but consequential rule follows from this: the tokenizer and every normalization step are part of the model, not preprocessing performed once and discarded. Any divergence between the function applied to training data and the function applied at serving time is a silent source of degradation often called training serving skew, and the most reliable defense is to encapsulate the entire transform (in scikit-learn, a `Pipeline`) so that it is fit once and applied identically thereafter.
+
+To fix vocabulary, define the **type token distinction**. A token is a single occurrence of a unit in a specific document, while a type is a distinct unit in the abstract vocabulary. The sentence `the cat sat on the mat` has six tokens but five types, since `the` occurs twice. The vocabulary is the set of types, and the dimension of the feature space is the number of types retained after pruning.
 
 ### 1.2 Normalization choices
 
@@ -30,7 +51,13 @@ Each normalization trades precision for recall in the feature space. Aggressive 
 
 Function words such as `the`, `of`, and `is` occur in nearly every document and carry little discriminative signal for many tasks. Removing a stop word list reduces dimensionality and noise. However, stop word removal is not universally beneficial. For sentiment, the word `not` is decisive, and for authorship attribution function word frequencies are among the strongest signals. Modern practice often retains stop words and lets the weighting scheme downweight them, which is more robust than a hard list.
 
-A related lever is frequency pruning. Tokens appearing in fewer than `min_df` documents are likely typos or noise, and tokens in more than `max_df` fraction of documents behave like stop words. Pruning both tails keeps the vocabulary compact and the model well conditioned.
+A related lever is frequency pruning. Tokens appearing in fewer than `min_df` documents are likely typos or noise, and tokens in more than `max_df` fraction of documents behave like stop words. Pruning both tails keeps the vocabulary compact and the model well conditioned. The shape of the count distribution makes this pruning especially effective. Word frequencies in natural language follow Zipf's law: ranking types by frequency, the frequency of the type at rank $r$ is approximately
+
+$$
+f(r) \approx \frac{C}{r^{s}}, \qquad s \approx 1,
+$$
+
+so a small number of types account for most tokens while a long tail of types each occur once or twice. The long tail inflates dimensionality without adding usable signal, which is exactly why a modest `min_df` (say 5) can discard the majority of types while removing only a small fraction of total token mass.
 
 ## 2. The Bag of Words Model
 
@@ -47,6 +74,14 @@ Stacking all document vectors row wise yields the document term matrix $X \in \m
 ### 2.2 Why discarding order can work
 
 Throwing away word order seems reckless, yet BoW is a strong baseline for topic level tasks such as spam detection, document categorization, and many sentiment problems. The reason is that for these tasks the presence of certain words is nearly sufficient: an email containing `viagra`, `wire transfer`, and `urgent` is probably spam regardless of arrangement. The signal lives in the marginal token statistics, which BoW captures exactly. Tasks that hinge on syntax or compositional meaning, such as `the food was good but the service was not`, are where BoW begins to fail, and the next section partially repairs this.
+
+The bag of words assumption has a precise probabilistic reading. The multinomial naive Bayes classifier models a document of class $c$ as a sequence of independent draws from a class conditional word distribution, giving
+
+$$
+P(d \mid c) = \frac{(\sum_j x_{d,j})!}{\prod_j x_{d,j}!} \prod_{j} P(w_j \mid c)^{x_{d,j}}.
+$$
+
+The independence of draws is exactly the discarding of order, and the log likelihood is linear in the count vector $\mathbf{x}_d$. This is why a linear classifier over BoW features is not an arbitrary choice but the natural decision rule under the bag assumption: maximizing the posterior reduces to a weighted sum of token counts plus a bias, which is precisely what logistic regression and the linear SVM also compute, learned discriminatively rather than generatively.
 
 ### 2.3 Geometry and similarity
 
@@ -100,9 +135,30 @@ $$
 \text{tfidf}(t, d) = \text{tf}(t, d) \cdot \text{idf}(t), \qquad \hat{\mathbf{x}}_d = \frac{\mathbf{x}_d}{\lVert \mathbf{x}_d \rVert_2}.
 $$
 
-The smoothing constants prevent division by zero and bound the IDF of terms absent from training. The logarithm in IDF reflects a diminishing returns view of rarity, consistent with an information theoretic reading where $\text{idf}(t)$ approximates the self information of observing term $t$ in a randomly drawn document.
+The smoothing constants prevent division by zero and bound the IDF of terms absent from training. The logarithm in IDF reflects a diminishing returns view of rarity, consistent with an information theoretic reading where $\text{idf}(t)$ approximates the self information of observing term $t$ in a randomly drawn document. If $P(t)$ is the probability that a random document contains $t$, estimated by $\text{df}(t)/n$, then the unsmoothed IDF $\log\frac{n}{\text{df}(t)} = -\log P(t)$ is exactly the Shannon surprisal of the event that $t$ appears. A term that occurs everywhere carries near zero surprisal and is heavily downweighted, while a term confined to a few documents carries high surprisal and is amplified. This is the formal sense in which TF-IDF measures specificity, as Sparck Jones argued in the founding paper on the idea (reference 3).
 
-### 4.3 Why it remains a strong baseline
+### 4.3 A worked example
+
+Take a toy corpus of four documents over the terms `cat`, `dog`, and `the`.
+
+| Document | cat | dog | the |
+|----------|-----|-----|-----|
+| $d_1$    | 2   | 0   | 3   |
+| $d_2$    | 0   | 1   | 2   |
+| $d_3$    | 1   | 1   | 1   |
+| $d_4$    | 0   | 0   | 4   |
+
+Here $n = 4$. The document frequencies are $\text{df}(\text{cat}) = 2$, $\text{df}(\text{dog}) = 2$, and $\text{df}(\text{the}) = 4$. Using the smoothed form $\text{idf}(t) = \log\frac{1+n}{1+\text{df}(t)} + 1$ with natural logarithm,
+
+$$
+\text{idf}(\text{cat}) = \log\tfrac{5}{3} + 1 \approx 1.51, \quad
+\text{idf}(\text{dog}) = \log\tfrac{5}{3} + 1 \approx 1.51, \quad
+\text{idf}(\text{the}) = \log\tfrac{5}{5} + 1 = 1.00.
+$$
+
+The term `the`, present in every document, receives the floor weight of 1, while the rarer `cat` and `dog` are boosted. For document $d_3$ with raw counts $(1, 1, 1)$ and sublinear term frequency $1 + \log(1) = 1$ for each, the unnormalized TF-IDF vector is $(1.51,\ 1.51,\ 1.00)$. L2 normalization divides by $\sqrt{1.51^2 + 1.51^2 + 1.00^2} \approx 2.34$, giving the final vector $(0.645,\ 0.645,\ 0.427)$. The common word `the` survives but is muted, and the two content words dominate the document's direction in the vector space, which is exactly the behavior cosine similarity then exploits.
+
+### 4.4 Why it remains a strong baseline
 
 TF-IDF weighted vectors fed to a linear classifier such as logistic regression or a linear support vector machine form one of the most reliable baselines in applied natural language processing. The weighting is parameter free, the model is convex and trains in seconds on millions of documents, and the learned coefficients are directly inspectable. Before reaching for a transformer, a practitioner should establish this baseline, because surprisingly often it is within a point or two of far more expensive models, and it is the number every fancier method must beat.
 
@@ -134,7 +190,7 @@ $$
 \phi_j(d) = \sum_{t \in d \,:\, h(t) \bmod m = j} \xi(t)\,\text{count}(t, d).
 $$
 
-The signed hashing yields an unbiased estimate of the original dot product, and the variance introduced by collisions is small when $m$ is chosen generously, for example $2^{20}$ or $2^{22}$.
+The sign hash is what makes this work. Without it, two colliding terms would always add constructively, systematically inflating the inner product between documents that happen to share a collision. With independent random signs, a collision contributes a zero mean perturbation, so the estimate stays unbiased: for any two documents $\mathbf{x}$ and $\mathbf{y}$, the hashed dot product satisfies $\mathbb{E}[\langle \phi(\mathbf{x}), \phi(\mathbf{y}) \rangle] = \langle \mathbf{x}, \mathbf{y} \rangle$, where the expectation is over the random choice of hash functions (reference 4). The price of an unbiased estimate is variance. The error variance from collisions scales as roughly $\lVert \mathbf{x} \rVert^2 \lVert \mathbf{y} \rVert^2 / m$, so it falls linearly in the table size $m$. Choosing $m$ generously, for example $2^{20}$ or $2^{22}$, drives the collision noise far below the signal for typical sparse text vectors, since each document touches only a tiny fraction of the $m$ buckets.
 
 ### 5.3 Trade-offs
 
@@ -189,6 +245,17 @@ Embeddings shine when labeled data is scarce, because pretrained representations
 ### 7.4 A practical decision rule
 
 The mature workflow is not to choose ideologically but to layer. Always build the TF-IDF linear baseline first, because it is cheap and sets the bar. Reach for embeddings when the task requires semantic generalization beyond surface tokens, when synonymy and paraphrase matter, when labeled data is limited, or when the baseline plateaus below the required accuracy. Often the best production system concatenates both, sparse lexical features for precise keyword signal and dense embeddings for semantic coverage, giving the downstream model the strengths of each. Feature engineering for text did not end with the rise of embeddings; it absorbed them into a richer toolbox.
+
+### 7.5 Common pitfalls
+
+A handful of mistakes recur often enough to enumerate explicitly.
+
+- **Fitting the vectorizer on the full dataset before splitting.** The vocabulary and the IDF weights are learned parameters. Computing them over the test set leaks information and inflates reported accuracy. Fit the vectorizer on the training fold only, then transform the validation and test folds with the fitted state.
+- **Treating tokenization as throwaway preprocessing.** As noted in Section 1.1, any mismatch between training time and serving time normalization silently degrades quality. Serialize the whole pipeline, not just the model weights.
+- **Over normalizing.** Aggressive stemming, stop word removal, and case folding can erase the exact signal a task depends on, such as the negation in sentiment or function word frequencies in authorship attribution. Tune normalization with cross validation rather than applying it reflexively.
+- **Unbounded n-gram ranges.** Setting a wide `ngram_range` without `min_df` pruning produces a feature matrix with millions of columns, most occurring once, which invites overfitting and exhausts memory. Pair n-grams with frequency pruning.
+- **Forgetting L2 normalization.** Without it, long documents have larger vector norms and dominate distance and similarity computations purely because of length. Normalize unless you have a specific reason not to.
+- **Expecting averaged embeddings to capture order.** Mean pooling word vectors discards word order just as BoW does, so it cannot distinguish `dog bites man` from `man bites dog`. When order or compositional meaning is essential, use a contextual sentence encoder rather than an average.
 
 ## References
 

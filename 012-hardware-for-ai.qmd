@@ -2,6 +2,8 @@
 
 Modern machine learning is, at its core, a story about hardware. The algorithms that define deep learning (backpropagation, attention, convolution) were known long before they became practical. What changed was the arrival of processors capable of executing the dense linear algebra these algorithms demand at enormous scale. Understanding the hardware substrate is therefore not an optional luxury for the machine learning practitioner. It governs which models are feasible to train, how much they cost to serve, and which research directions are even worth pursuing. This chapter develops a conceptual but accurate picture of why graphics processing units (GPUs) came to dominate, how they are built, what alternatives exist, and the physical constraints (chiefly memory bandwidth) that shape the entire field.
 
+A single quantitative thread runs through everything below. Arithmetic has become cheap and abundant while data movement has become the scarce, expensive resource. Almost every hardware feature (tensor cores, high bandwidth memory, low-precision number formats, fast interconnects) and almost every software technique (tiling, kernel fusion, FlashAttention, batching) is an answer to one question: how do we perform more useful arithmetic for each byte that crosses a memory or network boundary? We will make that question precise with the notion of arithmetic intensity and the roofline model, then use it as a lens on training and inference cost.
+
 ## 1. Why GPUs Dominate
 
 ### 1.1 Throughput Versus Latency
@@ -14,6 +16,16 @@ Deep learning workloads are dominated by matrix multiplication and related tenso
 
 GPUs execute under a model NVIDIA calls SIMT (single instruction, multiple threads). Threads are grouped into bundles (a "warp" of 32 threads on NVIDIA hardware) that execute the same instruction in lockstep on different data. This amortizes the cost of instruction fetch and decode across many lanes of arithmetic. The model also hides memory latency through massive oversubscription: when one warp stalls waiting on memory, the scheduler swaps in another warp that is ready to compute. With enough warps resident, the arithmetic units stay busy even though any individual memory access is slow. This is fundamentally different from a CPU, which fights latency with caches and prefetchers rather than by hiding it behind a sea of concurrent work.
 
+The amount of concurrency required to hide latency follows from Little's law, a result from queueing theory. To keep a pipeline of throughput $T$ (operations per second) fully utilized when each operation has latency $L$ (seconds), the number of operations that must be in flight at once is
+
+$$
+N_{\text{in flight}} \;=\; T \times L .
+$$
+
+A memory subsystem that delivers, say, $2 \times 10^{12}$ bytes per second at a latency of a few hundred nanoseconds must therefore keep hundreds of kilobytes of requests outstanding to run at full bandwidth. The GPU supplies this concurrency by having tens of thousands of threads resident simultaneously. The corollary is a real pitfall: a kernel that launches too few threads, or whose threads each request too little data, cannot generate enough in-flight memory traffic to saturate the bus, and it will run far below peak no matter how fast the hardware nominally is. This is called latency exposure, and it is why occupancy (the fraction of the maximum resident warps actually used) is a first-order tuning knob.
+
+A warp also pays a penalty when its threads disagree on a branch. Because all 32 lanes share one instruction stream, an `if`/`else` that sends some threads down each path is executed by serializing the two paths, masking off the inactive lanes in turn. This is warp divergence, and it is the main reason data-dependent control flow is discouraged in GPU kernels. The ideal GPU workload is wide, regular, and branch-free, which is exactly the shape of dense linear algebra.
+
 The practical consequence is a large gap in peak arithmetic throughput. A high-end data-center GPU delivers on the order of a thousand teraFLOP/s (floating-point operations per second) in reduced precision, while a server CPU delivers a couple of orders of magnitude less for the same dense linear algebra. For workloads that fit the throughput model, the GPU wins decisively.
 
 ## 2. Anatomy of a Modern GPU
@@ -22,11 +34,32 @@ The practical consequence is a large gap in peak arithmetic throughput. A high-e
 
 The fundamental compute building block of an NVIDIA GPU is the streaming multiprocessor (SM). A modern data-center GPU contains roughly one hundred or more SMs. Each SM contains its own set of arithmetic units (often called CUDA cores for general floating-point and integer work), a register file, a shared memory and L1 cache region, warp schedulers, and specialized units. The SMs operate independently and in parallel, and the chip's total throughput is essentially the per-SM throughput multiplied by the SM count. AMD's equivalent building block is the compute unit (CU), and the architectural ideas carry over closely.
 
+The block diagram below shows how these levels nest. Threads form warps, warps are scheduled on an SM that owns a register file and a shared-memory scratchpad, and many SMs share an L2 cache backed by off-die HBM.
+
+```{mermaid}
+flowchart TD
+  HBM["HBM device memory (tens to hundreds of GB)"]
+  L2["L2 cache (shared, tens of MB)"]
+  SM1["SM 1: warp schedulers, CUDA cores, tensor cores"]
+  SM2["SM 2"]
+  SMn["SM N (one hundred plus)"]
+  SMEM["Shared memory and L1 (per SM, hundreds of KB)"]
+  REG["Register file (per SM, tens of KB)"]
+  HBM --> L2
+  L2 --> SM1
+  L2 --> SM2
+  L2 --> SMn
+  SM1 --> SMEM
+  SMEM --> REG
+```
+
 ### 2.2 Tensor Cores
 
 The single most important innovation for deep learning was the tensor core, introduced with NVIDIA's Volta architecture in 2017 and refined in every generation since. A tensor core is a hardware unit that performs a small matrix multiply-accumulate operation, for example computing D = A times B plus C over small tiles (such as 4 by 4 or 16 by 16 blocks), in a single fused instruction. Rather than issuing many scalar multiply and add instructions, the SM issues one tensor-core instruction that consumes an entire tile per clock.
 
 This matters because matrix multiplication has a fixed, regular structure. By baking that structure into silicon, the tensor core achieves far higher arithmetic density than general-purpose lanes. The result is that the reduced-precision matrix throughput of a GPU is often five to ten times its general FP32 throughput. Tensor cores are the reason that BF16 and FP8 training, discussed below, deliver such dramatic speedups: those formats exist largely to feed the tensor cores efficiently.
+
+The density advantage is easy to see by counting operations. A tile multiply-accumulate $D = AB + C$ on $m \times k$ and $k \times n$ tiles performs $2mnk$ floating-point operations (one multiply and one add per inner-product term). A scalar pipeline that issues one fused multiply-add per lane per cycle would need $2mnk$ lane-cycles to do the same work. The tensor core instead consumes the whole tile across a handful of cycles, so it delivers a large multiple of the per-cycle arithmetic of the scalar lanes while reading each input element once into registers and reusing it across the tile. The reuse is the crucial part. Reading an element once but using it in $n$ inner products amortizes the expensive memory fetch over many cheap arithmetic operations, which is precisely the high-arithmetic-intensity regime that the rest of this chapter shows the hardware is built to reward.
 
 ### 2.3 The Memory Hierarchy
 
@@ -79,15 +112,27 @@ For several decades, the rate at which processors can compute has grown faster t
 
 The concept that makes this precise is arithmetic intensity, defined as the ratio of arithmetic operations performed to bytes of memory traffic required:
 
-```
-                    floating-point operations (FLOPs)
-  arithmetic        ---------------------------------
-  intensity   =        bytes moved to / from memory
-```
+$$
+I \;=\; \frac{\text{floating-point operations}}{\text{bytes moved to and from memory}} \quad \left[\frac{\text{FLOP}}{\text{byte}}\right].
+$$
 
-An operation with high arithmetic intensity does a lot of math per byte read, so it can keep the arithmetic units busy. An operation with low arithmetic intensity reads many bytes per unit of math, so the memory system becomes the bottleneck.
+An operation with high arithmetic intensity does a lot of math per byte read, so it can keep the arithmetic units busy. An operation with low arithmetic intensity reads many bytes per unit of math, so the memory system becomes the bottleneck. The threshold that separates the two regimes is a property of the hardware, not the kernel. Define the machine balance as the ratio of peak compute to peak bandwidth,
 
-Consider two contrasting cases. A large dense matrix multiplication of two N by N matrices performs on the order of N cubed operations while moving on the order of N squared bytes, giving an arithmetic intensity that grows with N. This is why large matrix multiplies are compute-bound and run near peak throughput. By contrast, an elementwise operation such as adding a bias or applying an activation function reads each element, does one or two operations, and writes it back. Its arithmetic intensity is roughly constant and very low, so it is firmly memory-bound. Attention over long sequences, and the autoregressive decoding step of a language model that processes one token at a time, also tend to be memory-bound, because they move large key-value tensors while performing relatively little arithmetic per byte. This is the central reason that techniques like FlashAttention (which restructures attention to avoid writing the large intermediate matrix to HBM) and operator fusion (which combines several memory-bound elementwise steps so data is read once) yield such large real-world speedups.
+$$
+I^{*} \;=\; \frac{\pi}{\beta},
+$$
+
+where $\pi$ is peak throughput in FLOP/s and $\beta$ is peak memory bandwidth in bytes/s. A kernel with $I < I^{*}$ is memory-bound; one with $I > I^{*}$ is compute-bound. We will meet $I^{*}$ again as the ridge point of the roofline.
+
+Consider two contrasting cases. A dense matrix multiplication of two $N \times N$ matrices in a format of $b$ bytes per element performs $2N^3$ operations while, in the best case of reading each matrix once and writing the result once, moving $3 N^2 b$ bytes. Its intensity is
+
+$$
+I_{\text{matmul}} \;=\; \frac{2N^3}{3 N^2 b} \;=\; \frac{2N}{3b},
+$$
+
+which grows linearly with $N$. This is why large matrix multiplies are compute-bound and run near peak throughput. By contrast, an elementwise operation such as adding a bias or applying an activation function reads each element and writes it back while doing a constant number $c$ of operations, giving $I_{\text{elementwise}} = c / (2b)$, independent of size and very small. It is firmly memory-bound. Attention over long sequences, and the autoregressive decoding step of a language model that processes one token at a time, also tend to be memory-bound, because they move large key-value tensors while performing relatively little arithmetic per byte. This is the central reason that techniques like FlashAttention (which restructures attention to avoid writing the large intermediate matrix to HBM) and operator fusion (which combines several memory-bound elementwise steps so data is read once) yield such large real-world speedups.
+
+A worked example makes the threshold concrete. Take an accelerator with $\pi = 1.0 \times 10^{15}$ FLOP/s of BF16 tensor-core throughput and $\beta = 2.0 \times 10^{12}$ bytes/s of HBM bandwidth, so the machine balance is $I^{*} = \pi / \beta = 500$ FLOP/byte. A BF16 matrix multiply ($b = 2$) reaches this intensity when $2N / (3 \times 2) \ge 500$, that is $N \gtrsim 1500$. Square multiplies larger than roughly fifteen hundred on a side are compute-bound on this machine and can approach peak; smaller ones, and all elementwise and decoding kernels, are stuck on the memory roof. The number $I^{*} = 500$ also warns that the headline FLOP/s figure is reachable only by a narrow class of high-intensity kernels, a point the roofline model in the next section makes visual.
 
 ## 5. Numerical Formats
 
@@ -157,6 +202,14 @@ The roofline model is a simple visual tool that ties together arithmetic intensi
 
 The sloped portion on the left is the memory-bound region: here performance is capped by memory bandwidth multiplied by arithmetic intensity, so the more math you do per byte, the faster you go. The flat portion on the right is the compute-bound region, where performance is capped by the peak arithmetic throughput regardless of intensity. The two lines meet at the ridge point, whose intensity equals peak FLOP/s divided by peak bandwidth.
 
+Formally, the attainable performance $P$ of a kernel with arithmetic intensity $I$ is the smaller of the two ceilings,
+
+$$
+P(I) \;=\; \min\bigl(\pi,\; \beta \, I\bigr),
+$$
+
+with $\pi$ the peak throughput and $\beta$ the peak bandwidth as above. The transition occurs exactly at the ridge-point intensity $I^{*} = \pi / \beta$, the same machine balance defined in Section 4. For the example machine of Section 4 ($\pi = 10^{15}$ FLOP/s, $\beta = 2 \times 10^{12}$ bytes/s, $I^{*} = 500$), a kernel at $I = 100$ FLOP/byte is memory-bound and can attain at most $\beta I = 2 \times 10^{14}$ FLOP/s, only one fifth of peak, no matter how good the kernel is. The roofline thus gives an immediate upper bound on achievable performance from two hardware numbers and one kernel number.
+
 ### 7.2 Using the Model
 
 To use the roofline, you compute a kernel's arithmetic intensity and locate it on the horizontal axis. If it falls left of the ridge point, the kernel is memory-bound, and no amount of faster arithmetic will help. The remedies are to move less data: fuse operations, cache and reuse tiles in shared memory, or use lower-precision formats that shrink every transfer. If it falls right of the ridge point, the kernel is compute-bound, and the remedies are to use faster arithmetic units such as tensor cores or lower-precision math. The roofline also exposes a sobering fact: because modern accelerators have ridge points at fairly high arithmetic intensity (often tens of FLOP/byte), many common operations land in the memory-bound region and run at a small fraction of the advertised peak. The headline FLOP/s number on a spec sheet is achievable only for high-intensity kernels like large matrix multiplies.
@@ -165,7 +218,21 @@ To use the roofline, you compute a kernel's arithmetic intensity and locate it o
 
 ### 8.1 Training Economics
 
-Training cost is driven by the total arithmetic required, the achievable hardware utilization, and the price and power of the accelerators. A useful planning heuristic, attributable to scaling-law analyses, is that training a dense transformer takes roughly six FLOPs per parameter per training token. Multiplying parameters by tokens by six gives the total compute, and dividing by the realistically achievable throughput of the cluster (not the peak, but the fraction actually attained, often called model FLOPs utilization) gives wall-clock device time. Because utilization is frequently in the range of a third to one half of peak, the gap between theoretical and real cost is large, and much engineering effort goes into closing it through better kernels, fusion, communication overlap, and precision reduction. Memory capacity also constrains training: the optimizer states for methods like Adam multiply the per-parameter memory footprint several-fold, which is why techniques such as sharded optimizers, activation checkpointing, and offloading exist.
+Training cost is driven by the total arithmetic required, the achievable hardware utilization, and the price and power of the accelerators. A useful planning heuristic, attributable to scaling-law analyses, is that training a dense transformer takes roughly six FLOPs per parameter per training token. Writing $N$ for the parameter count and $D$ for the number of training tokens, the total compute is
+
+$$
+C \;\approx\; 6 N D \quad [\text{FLOP}].
+$$
+
+The factor of six counts roughly two FLOPs per parameter for the forward pass and four for the backward pass (the backward pass computes gradients with respect to both activations and weights, doubling the forward work). Dividing this by the realistically achievable throughput of the cluster gives wall-clock device time,
+
+$$
+t_{\text{train}} \;\approx\; \frac{6 N D}{\, u \, \pi \, G \,},
+$$
+
+where $G$ is the number of accelerators, $\pi$ the per-device peak throughput, and $u \in (0,1)$ the model FLOPs utilization, the fraction of peak actually attained. Because $u$ is frequently in the range of a third to one half, the gap between theoretical and real cost is large, and much engineering effort goes into closing it through better kernels, fusion, communication overlap, and precision reduction.
+
+Memory capacity is the second hard constraint. For a model trained in mixed precision with the Adam optimizer, the per-parameter state includes a half-precision weight, a full-precision master weight, and two full-precision optimizer moments, so the optimizer and weight footprint alone is on the order of sixteen bytes per parameter before any activations are stored. A model with $N$ parameters therefore needs roughly $16N$ bytes just for this state, which for tens of billions of parameters already exceeds the HBM of a single device. This arithmetic is why sharded optimizers (which split the optimizer state across data-parallel ranks), activation checkpointing (which trades recomputation for activation memory), and offloading (which parks cold state in host DRAM) exist.
 
 ### 8.2 Inference Economics
 
@@ -174,6 +241,20 @@ Inference has a different cost structure, and for autoregressive language models
 ### 8.3 The Unifying Lesson
 
 Across training and inference, the recurring theme is that data movement, not arithmetic, is usually the limiting resource and the dominant cost. The processor designs (tensor cores, systolic arrays), the memory technology (HBM), the numerical formats (BF16, FP8, FP4), the interconnects (NVLink, InfiniBand), and the analytical tools (arithmetic intensity, the roofline) all converge on the same objective: do more useful computation for every byte moved. A practitioner who internalizes this single principle will correctly anticipate why a given model is slow, which optimization will help, and how much a workload will ultimately cost to run.
+
+## 9. When to Reach for This Lens, and Common Pitfalls
+
+The arithmetic-intensity-and-roofline lens is most valuable as a first diagnostic. Before optimizing a slow kernel, estimate its intensity, place it on the roofline, and decide whether it is memory-bound or compute-bound. That single classification rules out whole families of fixes. If a kernel is memory-bound, faster math (a bigger GPU, more tensor cores, a lower-precision format used only for the arithmetic) will not help; the only levers are moving less data through fusion, tiling, and reuse, or moving it in fewer bytes through quantization. If a kernel is compute-bound, the opposite is true. This back-of-envelope analysis routinely saves days of misdirected effort.
+
+Several pitfalls recur in practice.
+
+- Confusing peak FLOP/s with attainable FLOP/s. The spec-sheet number assumes a high-intensity kernel running at full occupancy. Most real workloads, especially inference decode and elementwise layers, live on the memory roof and attain a small fraction of it. Plan with measured throughput, not the headline figure.
+- Ignoring latency exposure at small batch sizes. By Little's law, too little in-flight work cannot saturate either the arithmetic units or the memory bus. A model that is memory-bound in theory can still underperform that bound if the batch is too small to fill the pipeline.
+- Counting only HBM traffic. Intensity computed against HBM bytes can look healthy while the true bottleneck is the interconnect (an all-reduce that does not overlap with compute) or the L2 cache. The roofline generalizes: each bandwidth tier (registers, shared memory, L2, HBM, NVLink, network) has its own ceiling, and the binding one is whichever the kernel actually stresses.
+- Reducing precision without controlling range. Narrow formats raise throughput and cut memory traffic, but FP16, FP8, and FP4 have limited dynamic range; without loss scaling or per-tensor scaling, gradients and activations can overflow or underflow and silently degrade the model.
+- Assuming the binding constraint is fixed. Capacity, bandwidth, and compute trade off against one another. Activation checkpointing buys memory by spending compute; quantization buys bandwidth by spending precision. The right choice depends on which resource is actually scarce for the workload at hand, which is exactly what the roofline tells you.
+
+The unifying advice is to measure intensity and identify the binding ceiling before changing anything, then apply the remedy that targets that specific ceiling.
 
 ## References
 
@@ -200,3 +281,7 @@ Across training and inference, the recurring theme is that data movement, not ar
 11. JEDEC Solid State Technology Association. "High Bandwidth Memory (HBM3) DRAM Standard, JESD238." 2022. https://www.jedec.org/standards-documents/docs/jesd238a
 
 12. NVIDIA. "NVLink and NVSwitch: The Building Blocks of Advanced Multi-GPU Communication." https://www.nvidia.com/en-us/data-center/nvlink/
+
+13. Little, J. D. C. "A Proof for the Queuing Formula: L = lambda W." Operations Research, 9(3), 1961, pp. 383-387. https://doi.org/10.1287/opre.9.3.383
+
+14. Hennessy, J. L., and Patterson, D. A. "Computer Architecture: A Quantitative Approach." 6th edition, Morgan Kaufmann, 2017. (Background on the memory wall, machine balance, and throughput-versus-latency design.)

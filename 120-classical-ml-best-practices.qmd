@@ -25,7 +25,47 @@ LogisticRegression(max_iter=1000)           # the honest reference
 
 Choose and write down your evaluation metric before training anything, because the metric defines what "better" means and quietly shapes every later decision. Match the metric to the decision the model supports. Accuracy is misleading under class imbalance, where a model that always predicts the majority class can look excellent while being useless. Prefer area under the precision recall curve when positives are rare, log loss or Brier score when you need calibrated probabilities, and a cost weighted metric when false positives and false negatives carry different business costs. For regression, decide deliberately between mean absolute error, which is robust to outliers, and root mean squared error, which punishes large misses. Define the metric once, and report it consistently from baseline through final model so that comparisons stay meaningful.
 
+It helps to keep the core definitions explicit. From the confusion matrix counts of true positives ($TP$), false positives ($FP$), true negatives ($TN$), and false negatives ($FN$), the standard classification quantities are
+
+$$
+\text{precision} = \frac{TP}{TP + FP}, \qquad
+\text{recall} = \frac{TP}{TP + FN}, \qquad
+F_1 = \frac{2 \cdot \text{precision} \cdot \text{recall}}{\text{precision} + \text{recall}}.
+$$
+
+Precision answers "when the model says positive, how often is it right," recall answers "of the true positives, how many did the model catch," and $F_1$ is their harmonic mean, which stays low unless both are high. When probabilities matter rather than hard labels, score the predicted probability $\hat{p}_i$ against the label $y_i \in \{0, 1\}$ with log loss or the Brier score,
+
+$$
+\text{LogLoss} = -\frac{1}{n} \sum_{i=1}^{n} \big[\, y_i \log \hat{p}_i + (1 - y_i) \log (1 - \hat{p}_i) \,\big], \qquad
+\text{Brier} = \frac{1}{n} \sum_{i=1}^{n} (\hat{p}_i - y_i)^2 .
+$$
+
+Both are minimized by reporting true probabilities, so both reward calibration, but log loss penalizes confident mistakes far more harshly because $-\log \hat{p}_i \to \infty$ as a confident prediction approaches certainty on the wrong class. For regression with residuals $r_i = y_i - \hat{y}_i$,
+
+$$
+\text{MAE} = \frac{1}{n} \sum_{i=1}^{n} |r_i|, \qquad
+\text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^{n} r_i^2}.
+$$
+
+Because RMSE squares the residuals before averaging, it is dominated by the largest misses and is the right choice when a few big errors are far more costly than many small ones. MAE weights every error equally and is the better summary when the target has heavy tailed noise or outliers you do not want to chase. The general rule is that the loss you optimize and the metric you report should encode the real cost of being wrong, and when those costs are asymmetric a cost weighted metric, $C = c_{FP} \cdot FP + c_{FN} \cdot FN$ with explicit per error costs, beats any symmetric default.
+
 ## 2. The Modeling Workflow
+
+The workflow is a loop with one strict rule: the final test set is touched exactly once, at the very end, and every other decision is made on training and validation data only. The diagram below shows the order and the protected boundary around the test set.
+
+```{mermaid}
+flowchart TD
+    A["Frame the problem and define the target"] --> B["Split data by time or group"]
+    B --> C["Hold out final test set untouched"]
+    B --> D["Build pipeline: impute, scale, encode, model"]
+    D --> E["Cross validate on training data"]
+    E --> F["Tune hyperparameters inside the loop"]
+    F --> G["Error analysis and slicing"]
+    G --> H{"Good enough"}
+    H -->|"No"| D
+    H -->|"Yes"| I["Evaluate once on test set"]
+    I --> J["Reproducibility: pin, log, ship"]
+```
 
 ### 2.1 Frame the Problem and Split the Data
 
@@ -66,6 +106,8 @@ Treat modeling as a sequence of small, reversible experiments. Change one thing,
 
 Leakage occurs when information that would not be available at prediction time, or information from the validation and test sets, influences training. Its signature is a model that performs beautifully in offline evaluation and then collapses in production. Leakage is dangerous precisely because it hides inside good looking numbers, so the team ships a model that was never as good as it appeared.
 
+A precise way to state the condition is in terms of the information set available at the prediction moment. Let $t_i$ be the timestamp at which a prediction for example $i$ must be made, and let $\mathcal{F}_{t_i}$ denote everything legitimately knowable at or before $t_i$. A feature vector $x_i = \phi(\mathcal{F}_{t_i})$ is leakage free when its construction function $\phi$ reads only from $\mathcal{F}_{t_i}$. Leakage is any dependence of $x_i$ on information outside $\mathcal{F}_{t_i}$, whether that is the future ($\mathcal{F}_{s}$ for some $s > t_i$), the label $y_i$ itself, or statistics estimated from validation and test rows. Kaufman and colleagues [@kaufman2012leakage] formalize this as the requirement that every feature be a legitimate function of the information available before the target is determined, and they catalog how violations slip past standard evaluation.
+
 ### 3.2 The Common Leakage Patterns
 
 Several patterns recur often enough to memorize. Preprocessing on the full dataset is the classic case: fitting a scaler, an imputer, or a feature selector on all rows before splitting lets statistics from the test set bleed into training. Target leakage happens when a feature is a proxy for the label or is computed using the label, such as a "number of late payments" field that is only populated after default is known. Temporal leakage uses future information to predict the past, for example aggregating a customer's full year of activity to predict an event in the middle of that year. Group leakage places correlated rows from the same entity on both sides of the split. Duplicate rows that straddle the split inflate scores for the same reason.
@@ -81,6 +123,10 @@ X_scaled = StandardScaler().fit_transform(X)   # do not do this
 # Correct: scaling lives in the pipeline, fit on train folds only
 cross_val_score(model, X_train, y_train, cv=5)
 ```
+
+### 3.4 A Worked Example of Preprocessing Leakage
+
+To see why fitting preprocessing before splitting inflates scores, consider feature selection by univariate correlation, a deceptively common mistake. Suppose the label $y$ is pure noise, independent of every one of $d$ candidate features, so the true accuracy of any model is the class prior. If you select the $k$ features most correlated with $y$ using the entire dataset, then split, then evaluate, the selection step has already peeked at the test labels. With $d$ large and $k$ small, some features will correlate with $y$ by chance across the full sample, and because the same rows drive both selection and test scoring, that spurious correlation survives into the held out set. The reported accuracy rises well above the prior even though no signal exists. The fix is structural rather than statistical: place the selector inside the pipeline so it is refit on the training folds alone, which the pattern in section 2.2 enforces automatically. The held out rows then have no influence on which features are chosen, and the score returns to the honest floor. The general lesson is that any step that estimates a parameter from data, including imputation means, scaling statistics, encoders, and feature selectors, must be fit inside the cross validation loop.
 
 ## 4. Error Analysis
 
@@ -98,11 +144,29 @@ Aggregate metrics can hide serious failures in subpopulations. Compute your metr
 
 Use the gap between training and validation performance to decide your next move. When training and validation scores are both poor and close together, the model is underfitting, and the cure is a more expressive model, richer features, or less regularization. When training performance is high but validation lags well behind, the model is overfitting, and the cure is more data, stronger regularization, fewer features, or a simpler model. Learning curves, which plot performance against training set size, make this diagnosis visual: a wide persistent gap signals variance, while two low flat curves signal bias. This single distinction redirects more wasted effort than almost any other habit.
 
+The distinction has a clean mathematical backbone. For squared error regression, the expected test error of a model trained on a random dataset $D$, at a fixed input $x$, decomposes into three nonnegative parts,
+
+$$
+\mathbb{E}_D\!\left[(y - \hat{f}_D(x))^2\right]
+= \underbrace{\big(\mathbb{E}_D[\hat{f}_D(x)] - f(x)\big)^2}_{\text{bias}^2}
++ \underbrace{\mathbb{E}_D\!\left[\big(\hat{f}_D(x) - \mathbb{E}_D[\hat{f}_D(x)]\big)^2\right]}_{\text{variance}}
++ \underbrace{\sigma^2}_{\text{irreducible}},
+$$
+
+where $f$ is the true function and $\sigma^2$ is the noise floor that no model can beat. Bias is the systematic error of the average model and falls as the model becomes more expressive. Variance is the sensitivity of the fit to the particular training sample and rises with expressiveness. Underfitting is the bias dominated regime, overfitting is the variance dominated regime, and the training to validation gap is the practical estimator of variance. Reading the gap this way tells you which term to attack: shrink bias with more capacity and richer features, or shrink variance with more data and stronger regularization. Adding data lowers variance but never lowers bias, which is exactly why two low flat learning curves mean more data will not help and only a more expressive model will.
+
 ## 5. Choosing the Model Family
 
 ### 5.1 Linear Models
 
-Reach for linear and logistic regression when you want a strong, transparent, fast baseline, when the signal is roughly additive, and when interpretability or calibrated probabilities matter. Regularized variants are workhorses: ridge for correlated features, lasso when you want sparsity and implicit feature selection, and elastic net as a balance of the two. Linear models shine in high dimensional sparse settings such as text with bag of words features, where they are hard to beat for the compute. Their weaknesses are real: they assume a linear decision boundary in the feature space, they need careful encoding and scaling, and they require you to engineer interactions and nonlinearities by hand.
+Reach for linear and logistic regression when you want a strong, transparent, fast baseline, when the signal is roughly additive, and when interpretability or calibrated probabilities matter. Regularized variants are workhorses: ridge for correlated features, lasso when you want sparsity and implicit feature selection, and elastic net as a balance of the two. The three differ only in the penalty added to the fitting objective,
+
+$$
+\hat{\beta} = \arg\min_{\beta} \; \frac{1}{n} \sum_{i=1}^{n} L(y_i, x_i^\top \beta)
+\; + \; \lambda \Big[\, \alpha \lVert \beta \rVert_1 + (1 - \alpha)\, \tfrac{1}{2}\lVert \beta \rVert_2^2 \,\Big],
+$$
+
+where $L$ is squared error for regression or logistic loss for classification, $\lambda \ge 0$ sets the overall penalty strength, and $\alpha \in [0, 1]$ mixes the two penalties. Ridge is the pure $\ell_2$ case ($\alpha = 0$), lasso the pure $\ell_1$ case ($\alpha = 1$), and elastic net any blend between. The geometry explains the behavior: the $\ell_1$ ball has corners on the axes, so its constraint surface meets the loss contours at points where some coefficients are exactly zero, which is why lasso performs selection, while the smooth $\ell_2$ ball merely shrinks correlated coefficients toward each other without zeroing them. Increasing $\lambda$ raises bias and lowers variance, so $\lambda$ is the single knob that walks the model along the bias variance tradeoff of section 4.3. Linear models shine in high dimensional sparse settings such as text with bag of words features, where they are hard to beat for the compute. Their weaknesses are real: they assume a linear decision boundary in the feature space, they need careful encoding and scaling, and they require you to engineer interactions and nonlinearities by hand.
 
 ### 5.2 Tree Ensembles
 

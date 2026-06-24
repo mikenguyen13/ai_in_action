@@ -2,79 +2,127 @@
 
 Architecture design is the practice of choosing the structure of a neural network before any weights are learned. It governs which functions the model can represent, how efficiently gradients flow, and how much compute and memory training will consume. A trained model can only ever be as good as the hypothesis class its architecture defines. This chapter treats architecture as a set of deliberate engineering decisions rather than a menu of named models, and it gives practical principles for making those decisions under real budgets.
 
+We will fix some vocabulary. A *layer* is a parameterized map from one tensor to another. A *block* is a small reusable group of layers, usually including a normalization, a main transformation, an activation, and a skip connection. An *architecture* is the rule that assembles blocks into a full network, together with the choices of width, depth, and connectivity. The *hypothesis class* $\mathcal{H}$ is the set of all functions the network can express as its weights range over their allowed values. Design is the act of choosing $\mathcal{H}$ before optimization ever begins.
+
 ## 1. The Design Problem
 
-Every architecture encodes an answer to one question: which functions are easy for this network to express and which are hard? Universal approximation theorems guarantee that even a single sufficiently wide hidden layer can approximate any continuous function on a compact domain to arbitrary precision. That result is almost useless for design, because it says nothing about how many parameters you need, whether gradient descent will find a good solution, or whether the model will generalize. Design is about shaping the loss landscape and the generalization behavior, not about raw representational possibility.
+Every architecture encodes an answer to one question: which functions are easy for this network to express and which are hard? Universal approximation theorems guarantee that even a single sufficiently wide hidden layer can approximate any continuous function on a compact domain to arbitrary precision [1, 2]. That result is almost useless for design, because it is existential rather than constructive. It says nothing about how many parameters you need, whether gradient descent will find a good solution, or whether the model will generalize. Design is about shaping the loss landscape and the generalization behavior, not about raw representational possibility.
 
-Three forces are always in tension. The first is capacity, the size of the function class. The second is optimization, whether stochastic gradient descent can actually navigate to a low-loss region. The third is generalization, whether the learned function behaves well on unseen data. A wider network increases capacity but can hurt optimization stability and inflate the parameter budget. A deeper network can compose features hierarchically but risks vanishing or exploding gradients. Good design balances these forces for a specific task, dataset size, and hardware target.
+To make the tradeoffs precise, decompose the expected risk of the learned predictor. Let $f^\star$ be the optimal predictor over all measurable functions, let $f^\star_{\mathcal{H}}$ be the best function in the chosen hypothesis class, and let $\hat{f}$ be the function actually returned by training on a finite dataset. The excess risk splits into three terms,
+
+$$
+\underbrace{R(\hat{f}) - R(f^\star)}_{\text{excess risk}}
+= \underbrace{\big(R(f^\star_{\mathcal{H}}) - R(f^\star)\big)}_{\text{approximation}}
++ \underbrace{\big(R(\hat{f}) - R(f^\star_{\mathcal{H}})\big)}_{\text{estimation and optimization}} .
+$$
+
+The approximation term shrinks as the architecture becomes more expressive. The estimation term grows with the size of $\mathcal{H}$ relative to the amount of data, and the optimization term measures how far stochastic gradient descent lands from the best achievable function in the class. Architecture design is the art of making all three small at once with a fixed budget, and the three terms are exactly the three forces described next.
+
+Three forces are always in tension. The first is **capacity**, the size of the function class, which controls the approximation term. The second is **optimization**, whether stochastic gradient descent can actually navigate to a low-loss region. The third is **generalization**, whether the learned function behaves well on unseen data, which controls the estimation term. A wider network increases capacity but can hurt optimization stability and inflate the parameter budget. A deeper network can compose features hierarchically but risks vanishing or exploding gradients. Good design balances these forces for a specific task, dataset size, and hardware target.
+
+```{mermaid}
+%%| label: fig-tradeoffs
+%%| fig-cap: "The three competing forces in architecture design."
+flowchart TD
+    A["Capacity (size of function class)"]
+    O["Optimization (can SGD reach low loss)"]
+    G["Generalization (behavior on unseen data)"]
+    D["Architecture design"]
+    A --> D
+    O --> D
+    G --> D
+    D --> R["Low excess risk under budget"]
+```
 
 ## 2. Depth and Width
 
 ### 2.1 Why Depth Helps
 
-Depth buys compositional expressivity. Functions that require exponentially many units to represent with a shallow network can sometimes be represented with linearly many units when depth is added, because each layer composes on the features of the previous one. With piecewise linear activations such as ReLU, a network with $L$ layers and width $w$ can carve the input space into a number of linear regions that grows roughly like $O(w^{d L})$ for input dimension $d$, far faster than the $O(w^d)$ of a single layer. This is the formal reason deep networks model hierarchical structure such as edges to textures to objects so efficiently.
+Depth buys compositional expressivity. Functions that require exponentially many units to represent with a shallow network can sometimes be represented with linearly many units when depth is added, because each layer composes on the features of the previous one [3]. With piecewise linear activations such as ReLU, a network partitions its input into regions on which it is affine. The number of such linear regions a deep ReLU network can realize grows polynomially in width but exponentially in depth: a network of depth $L$ and width $w$ over input dimension $d$ can carve out on the order of $\left(\tfrac{w}{d}\right)^{(L-1)d} w^d$ regions, far more than the $O(w^d)$ a single layer attains [4]. This separation is the formal reason deep networks model hierarchical structure such as edges to textures to objects so efficiently.
 
-Depth is not free. Each additional layer multiplies Jacobians during backpropagation, so without care the gradient norm can shrink or grow geometrically with $L$. The practical fixes are residual connections, normalization layers, and careful initialization, all discussed below. As a rule, prefer the depth your optimization tricks can support rather than the maximum depth that fits in memory.
+> **Worked example: a sawtooth.** Consider the triangle map $g(x) = 1 - |2x - 1|$ on $[0,1]$, which a single ReLU unit pair can represent. Composing it with itself $L$ times, $g^{(L)} = g \circ g \circ \cdots \circ g$, produces a sawtooth with $2^{L}$ linear pieces using only $O(L)$ units. A shallow ReLU network needs on the order of $2^{L}$ units to match the same number of oscillations. Depth converts addition of units into multiplication of pieces, which is the entire point.
+
+Depth is not free. Each additional layer multiplies Jacobians during backpropagation. If $J_\ell$ is the Jacobian of layer $\ell$, the gradient at the input carries the product $\prod_{\ell=1}^{L} J_\ell$, whose norm tends to shrink or grow geometrically with $L$ when the per-layer spectral radius differs from one. The practical fixes are residual connections, normalization layers, and careful initialization, all discussed below. As a rule, prefer the depth your optimization tricks can support rather than the maximum depth that fits in memory.
 
 ### 2.2 Why Width Helps
 
-Width controls how many features a layer can compute in parallel and strongly influences optimization. Very wide networks behave more like convex problems near initialization, which is part of why overparameterized models train reliably. Width also sets the dimensionality of the representation passed forward, which caps how much information a layer can preserve.
+Width controls how many features a layer can compute in parallel and strongly influences optimization. Very wide networks behave more like convex problems near initialization. In the infinite-width limit the network's training dynamics under gradient descent become those of a linear model in a fixed feature space, the neural tangent kernel, which is part of why heavily overparameterized models train reliably to near-zero training loss [5]. Width also sets the dimensionality of the representation passed forward, which caps how much information a layer can preserve.
 
 A useful heuristic is to keep the width roughly constant or gently tapering across a stack of blocks, rather than swinging wildly between layers. Sudden bottlenecks discard information that later layers cannot recover. When you must reduce dimensionality, do it gradually.
 
 ### 2.3 Trading Depth Against Width
 
-For a fixed parameter budget you can spend it on more layers or wider layers. Empirically, moderate depth with adequate width tends to outperform extreme choices in either direction. The compound scaling principle from EfficientNet formalizes this by scaling depth, width, and input resolution together according to a fixed ratio rather than scaling any single axis alone [1].
+For a fixed parameter budget you can spend it on more layers or wider layers. Empirically, moderate depth with adequate width tends to outperform extreme choices in either direction. The compound scaling principle from EfficientNet formalizes this by scaling depth, width, and input resolution together according to a fixed ratio rather than scaling any single axis alone [6].
 
-```text
-# Compound scaling sketch
-depth  = alpha ** phi
-width  = beta  ** phi
-resolution = gamma ** phi
-# subject to alpha * beta^2 * gamma^2 ~ 2, with phi the budget knob
-```
+Concretely, EfficientNet introduces a single budget knob $\phi$ and scales the three axes by constants raised to that power,
+
+$$
+\text{depth} = \alpha^{\phi}, \qquad
+\text{width} = \beta^{\phi}, \qquad
+\text{resolution} = \gamma^{\phi},
+$$
+
+subject to the constraint $\alpha \cdot \beta^{2} \cdot \gamma^{2} \approx 2$ with $\alpha, \beta, \gamma \ge 1$. The constraint reflects that doubling $\phi$ should roughly double the floating point operations: depth contributes linearly to compute, while width and resolution each contribute quadratically, so their exponents are squared. Choosing the constants by a small grid search and then scaling along $\phi$ gives a family of models that trace an efficient compute-accuracy frontier.
 
 ## 3. Inductive Biases
 
-An inductive bias is an assumption baked into the architecture that constrains which functions are preferred before any data is seen. Inductive bias is the single most important lever in architecture design because it determines how much data the model needs to generalize.
+An inductive bias is an assumption baked into the architecture that constrains which functions are preferred before any data is seen. Inductive bias is the single most important lever in architecture design because it determines how much data the model needs to generalize. Formally, a bias narrows $\mathcal{H}$ or reweights the functions inside it, which shrinks the estimation term of the risk decomposition at the cost of raising the approximation term if the bias is wrong.
 
 ### 3.1 Convolution
 
-Convolutional layers encode two strong priors: locality, the idea that nearby inputs interact more than distant ones, and translation equivariance, the idea that a pattern means the same thing wherever it appears. A convolution with a $k \times k$ kernel applied to $C$ channels uses $k^2 C$ weights regardless of image size, an enormous reduction from a dense layer. These priors match natural images so well that convolutional networks generalize from far less data than unstructured alternatives.
+Convolutional layers encode two strong priors: locality, the idea that nearby inputs interact more than distant ones, and translation equivariance, the idea that a pattern means the same thing wherever it appears. Equivariance is a precise statement: if $T_s$ denotes a spatial shift by $s$ and $C$ denotes the convolution operator, then $C(T_s x) = T_s(C x)$, so shifting the input shifts the output identically. A convolution with a $k \times k$ kernel applied between $C_{in}$ and $C_{out}$ channels uses $k^2 C_{in} C_{out}$ weights regardless of image size, an enormous reduction from a dense layer whose parameter count would scale with the number of pixels squared. These priors match natural images so well that convolutional networks generalize from far less data than unstructured alternatives.
 
 ### 3.2 Recurrence and Attention
 
-Recurrent layers assume sequential structure and parameter sharing across time steps. Self-attention makes a weaker assumption: it allows any token to interact with any other, with the interaction weights computed dynamically from the data. The attention operation
+Recurrent layers assume sequential structure and parameter sharing across time steps. Self-attention makes a weaker assumption: it allows any token to interact with any other, with the interaction weights computed dynamically from the data [7]. The scaled dot product attention operation is
 
-$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V$$
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V,$$
 
-has a softer inductive bias than convolution, which is why transformers need either large datasets or added structure to match convolutional sample efficiency on vision tasks. The general principle is a tradeoff: stronger biases mean better generalization on matching tasks and worse flexibility when the assumptions fail.
+where $Q$, $K$, and $V$ are the query, key, and value matrices and $d_k$ is the key dimension. The scaling by $\sqrt{d_k}$ keeps the dot products from growing with dimension and pushing the softmax into saturated regions where gradients vanish. Attention has a softer inductive bias than convolution, which is why transformers need either large datasets or added structure (for example the patch grid and locality of vision transformers, or hybrid convolutional stems) to match convolutional sample efficiency on vision tasks. The general principle is a tradeoff: stronger biases mean better generalization on matching tasks and worse flexibility when the assumptions fail.
 
 ### 3.3 Choosing the Right Bias
 
-Match the bias to the data geometry. Grid data such as images favors convolution. Set data with no natural order favors permutation invariant pooling. Graph data favors message passing layers. Sequence data with long range dependencies favors attention. When in doubt and data is abundant, weaker biases plus scale often win; when data is scarce, stronger biases are usually safer.
+Match the bias to the data geometry. The table below summarizes the common pairings.
+
+| Data geometry | Natural symmetry | Architectural bias |
+|---|---|---|
+| Grid (images, audio spectrograms) | translation | convolution |
+| Sequence (text, time series) | order, locality in time | recurrence or attention |
+| Set (point clouds, items) | permutation invariance | symmetric pooling |
+| Graph (molecules, networks) | permutation, local connectivity | message passing |
+| Unstructured, abundant data | none assumed | attention plus scale |
+
+When in doubt and data is abundant, weaker biases plus scale often win; when data is scarce, stronger biases are usually safer. The deeper lesson is the one formalized as geometric deep learning: most successful architectures are instances of building in the known symmetry group of the data so that the network is equivariant to transformations that leave the label unchanged [8].
 
 ## 4. Parameter Budgets and Compute
 
 ### 4.1 Counting Parameters and FLOPs
 
-Design under a budget requires knowing the cost of each layer. A dense layer mapping $n_{in}$ to $n_{out}$ has $n_{in} \cdot n_{out}$ weights. A convolution has $k^2 \cdot C_{in} \cdot C_{out}$ weights but its compute scales with spatial resolution as well, costing roughly $H \cdot W \cdot k^2 \cdot C_{in} \cdot C_{out}$ multiply accumulate operations. Self-attention costs $O(N^2 d)$ for sequence length $N$, which makes the quadratic term dominate for long sequences.
+Design under a budget requires knowing the cost of each layer. A dense layer mapping $n_{in}$ to $n_{out}$ has $n_{in} \cdot n_{out}$ weights plus $n_{out}$ biases. A convolution has $k^2 \cdot C_{in} \cdot C_{out}$ weights but its compute scales with spatial resolution as well, costing roughly $H \cdot W \cdot k^2 \cdot C_{in} \cdot C_{out}$ multiply accumulate operations for an $H \times W$ feature map. Self-attention costs $O(N^2 d)$ for sequence length $N$ and feature dimension $d$, because the score matrix $Q K^\top$ is $N \times N$; this quadratic term dominates for long sequences and is the central reason a large literature on efficient and linear attention exists.
 
-```text
-def dense_params(n_in, n_out):
-    return n_in * n_out + n_out  # weights plus bias
+The relationships are simple enough to keep as a reference rather than as runnable code.
 
-def conv_params(k, c_in, c_out):
-    return k * k * c_in * c_out + c_out
-```
+| Layer | Parameters | Compute (per forward pass) |
+|---|---|---|
+| Dense | $n_{in} n_{out} + n_{out}$ | $n_{in} n_{out}$ |
+| Convolution | $k^2 C_{in} C_{out} + C_{out}$ | $H W k^2 C_{in} C_{out}$ |
+| Self-attention | $\approx 4 d^2$ (the $Q,K,V,O$ projections) | $O(N^2 d + N d^2)$ |
+
+A useful sanity check is that the dense and convolution rows differ only by the spatial factor $HW$ and the weight-sharing of the kernel: a convolution is a dense layer whose weights are tied across spatial positions and reused at every location.
 
 ### 4.2 Parameters Are Not Memory
 
-Training memory is dominated not by parameters but by activations stored for the backward pass and by optimizer state. An Adam optimizer keeps two extra tensors per parameter, tripling the parameter memory footprint. Activation memory scales with batch size and sequence length and often exceeds parameter memory by a wide margin. When you hit an out of memory wall, the culprit is usually activations, addressable with gradient checkpointing, smaller batches, or activation recomputation rather than fewer parameters.
+Training memory is dominated not by parameters but by activations stored for the backward pass and by optimizer state. The Adam optimizer keeps two extra tensors per parameter, the first and second moment estimates, so with master weights in mixed precision the optimizer state alone can be three to four times the raw parameter memory [9]. Activation memory scales with batch size and sequence length and often exceeds parameter memory by a wide margin, because every intermediate tensor on the forward path must be retained until its gradient is computed. When you hit an out of memory wall, the culprit is usually activations, addressable with gradient checkpointing (recompute activations during the backward pass instead of storing them, trading compute for memory), smaller batches, or activation recomputation rather than fewer parameters.
 
 ### 4.3 Scaling Laws as a Budget Guide
 
-Empirical scaling laws relate loss to parameters, data, and compute through smooth power laws. The Chinchilla analysis showed that for a fixed compute budget, model size and training tokens should grow in roughly equal proportion, and that many large models were undertrained relative to their size [2]. The practical lesson for design is to size the model to the data and compute you actually have rather than to the largest model you can fit.
+Empirical scaling laws relate loss to parameters, data, and compute through smooth power laws [10]. A convenient parametric form fits the loss as
+
+$$
+L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}},
+$$
+
+where $N$ is the parameter count, $D$ is the number of training tokens, $E$ is the irreducible loss, and $A, B, \alpha, \beta$ are fitted constants. The Chinchilla analysis fit this surface under a fixed compute budget $C \approx 6 N D$ and showed that the optimum scales model size and training tokens in roughly equal proportion, $N \propto C^{0.5}$ and $D \propto C^{0.5}$, and that many large models of the era were badly undertrained relative to their size [11]. The practical lesson for design is to size the model to the data and compute you actually have rather than to the largest model you can fit.
 
 ## 5. Blocks and Modularity
 
@@ -82,17 +130,17 @@ Empirical scaling laws relate loss to parameters, data, and compute through smoo
 
 Modern architectures are rarely designed layer by layer. Instead a small block is designed once and repeated. A block typically bundles a normalization, a main transformation, an activation, and a residual connection. The residual block computes
 
-$$x_{out} = x + f(x)$$
+$$x_{out} = x + f(x),$$
 
-so that the layer learns a correction to the identity rather than a full transformation from scratch. This single idea lets networks reach hundreds of layers by keeping a clean gradient path from output to input [3]. Designing at the block level keeps the search space small and the implementation regular.
+so that the layer learns a correction to the identity rather than a full transformation from scratch [12]. The reason this helps is visible in the backward pass: differentiating gives $\frac{\partial x_{out}}{\partial x} = I + \frac{\partial f}{\partial x}$, so the identity term guarantees a gradient path of unit gain even when the learned branch $\frac{\partial f}{\partial x}$ is small. This single idea lets networks reach hundreds of layers by keeping a clean gradient path from output to input. Designing at the block level keeps the search space small and the implementation regular.
 
 ### 5.2 Normalization and Residuals
 
-Normalization layers stabilize the distribution of activations, which keeps gradients well scaled and lets you use higher learning rates. Batch normalization normalizes across the batch dimension and works well for vision with reasonable batch sizes. Layer normalization normalizes across features per example and is the default in transformers because it is independent of batch size. The placement of normalization relative to the residual addition, pre-norm versus post-norm, materially affects training stability; pre-norm is generally easier to train deep.
+Normalization layers stabilize the distribution of activations, which keeps gradients well scaled and lets you use higher learning rates. Batch normalization normalizes across the batch dimension and works well for vision with reasonable batch sizes, but it couples examples in a batch and degrades when batches are small [13]. Layer normalization normalizes across features per example and is the default in transformers because it is independent of batch size [14]. The placement of normalization relative to the residual addition, pre-norm versus post-norm, materially affects training stability. Pre-norm, $x + f(\text{norm}(x))$, keeps an unnormalized identity path and is generally easier to train deep without learning-rate warmup; post-norm, $\text{norm}(x + f(x))$, can reach slightly better final quality but is more delicate to optimize at depth [15].
 
 ### 5.3 Bottlenecks and Mixing
 
-Two recurring block motifs are worth internalizing. A bottleneck projects to a smaller dimension, does expensive work cheaply, then projects back, saving compute. A mixing pattern alternates a layer that mixes across positions or tokens with a layer that mixes across channels or features. Transformers follow exactly this pattern: attention mixes across tokens, the feedforward sublayer mixes across features. Recognizing these motifs lets you read and design architectures quickly.
+Two recurring block motifs are worth internalizing. A bottleneck projects to a smaller dimension, does expensive work cheaply, then projects back, saving compute; the ResNet bottleneck block uses a $1\times1$ reduction, a $3\times3$ convolution, and a $1\times1$ expansion for exactly this reason. A mixing pattern alternates a layer that mixes across positions or tokens with a layer that mixes across channels or features. Transformers follow exactly this pattern: attention mixes across tokens, the feedforward sublayer mixes across features. Recognizing these motifs lets you read and design architectures quickly. The pre-norm transformer block makes the mixing pattern explicit:
 
 ```text
 # A residual transformer block, pre-norm
@@ -102,35 +150,65 @@ def block(x):
     return x
 ```
 
+```{mermaid}
+%%| label: fig-block
+%%| fig-cap: "Pre-norm transformer block. Each sublayer is wrapped in a residual skip so the identity path stays clean."
+flowchart LR
+    X["Input x"] --> N1["LayerNorm"]
+    N1 --> A["Attention (mix tokens)"]
+    A --> S1["Add skip"]
+    X --> S1
+    S1 --> N2["LayerNorm"]
+    N2 --> M["MLP (mix features)"]
+    M --> S2["Add skip"]
+    S1 --> S2
+    S2 --> Y["Output"]
+```
+
 ## 6. Practical Design Principles
 
 The following principles distill the chapter into actionable guidance.
 
-Start from a known good baseline for your data type and modify incrementally. Architecture search from scratch is rarely worth it; the strong priors in established families encode hard won knowledge. Change one thing at a time so you can attribute any improvement.
+**Start from a known good baseline** for your data type and modify incrementally. Architecture search from scratch is rarely worth it; the strong priors in established families encode hard won knowledge. Change one thing at a time so you can attribute any improvement. Mature open-source reference implementations in PyTorch, the `timm` model zoo, Hugging Face `transformers`, and Flax give vetted baselines to fork rather than reinvent.
 
-Match inductive bias to data geometry and quantity. Use stronger structural priors when data is scarce and lean on scale with weaker priors when data is abundant. This single choice often matters more than depth or width tuning.
+**Match inductive bias to data geometry and quantity.** Use stronger structural priors when data is scarce and lean on scale with weaker priors when data is abundant. This single choice often matters more than depth or width tuning.
 
-Make the gradient path clean. Use residual connections, appropriate normalization, and principled initialization so that signal propagates through depth. Most failures to train deep networks are optimization failures, not capacity failures.
+**Make the gradient path clean.** Use residual connections, appropriate normalization, and principled initialization so that signal propagates through depth. Most failures to train deep networks are optimization failures, not capacity failures.
 
-Budget activations, not just parameters. Profile memory before assuming the parameter count is your constraint, and reach for checkpointing or smaller batches when activations dominate.
+**Budget activations, not just parameters.** Profile memory before assuming the parameter count is your constraint, and reach for checkpointing or smaller batches when activations dominate.
 
-Design blocks, then repeat them. A regular stack of identical blocks is easier to implement, scale, debug, and reason about than a bespoke layer sequence, and it makes compound scaling straightforward.
+**Design blocks, then repeat them.** A regular stack of identical blocks is easier to implement, scale, debug, and reason about than a bespoke layer sequence, and it makes compound scaling straightforward.
 
-Keep dimension changes gradual. Avoid sharp bottlenecks that throw away information; taper width and resolution smoothly so later layers retain what they need.
+**Keep dimension changes gradual.** Avoid sharp bottlenecks that throw away information; taper width and resolution smoothly so later layers retain what they need.
 
-Scale all axes together. When you have more compute, grow depth, width, resolution, and data in balance rather than pushing a single axis to an extreme.
+**Scale all axes together.** When you have more compute, grow depth, width, resolution, and data in balance rather than pushing a single axis to an extreme.
 
-Measure on the real objective. A larger or deeper network that improves a proxy metric but not the downstream task is wasted budget. Tie every architectural decision back to validation performance under the compute you can afford in production.
+**Measure on the real objective.** A larger or deeper network that improves a proxy metric but not the downstream task is wasted budget. Tie every architectural decision back to validation performance under the compute you can afford in production.
+
+### 6.1 When to Use Which, and Common Pitfalls
+
+A few rules of thumb resolve the most common decisions. Reach for **convolution** when inputs lie on a regular grid and you have limited labeled data. Reach for **attention** when interactions are long-range, the data has no fixed locality, or you have abundant data and compute to spend. Reach for **message passing** when relationships are explicitly relational, as in molecules or social graphs. Use **recurrence** mainly when strict streaming or constant memory per step is required, since attention has largely displaced it where parallel training is affordable.
+
+The recurring pitfalls are equally worth naming. Stacking depth without residual connections or normalization produces a network that simply will not train, and the failure looks like a capacity problem but is an optimization one. Aggressive bottlenecks early in a network destroy information irrecoverably. Counting only parameters while ignoring activation memory leads to surprise out-of-memory failures at the first large batch. Adopting a weak-bias architecture such as a plain transformer on a small dataset invites overfitting that a convolutional prior would have prevented. Finally, scaling a single axis to an extreme, very deep but thin, or very wide but shallow, almost always underperforms balanced compound scaling at the same budget.
 
 ## 7. Summary
 
-Architecture design shapes the hypothesis class, the optimization landscape, and the generalization behavior of a model all at once. Depth buys compositional expressivity and width buys parallel features and optimization stability, and the two should be balanced rather than maximized. Inductive biases determine sample efficiency and should be matched to the geometry and quantity of the data. Parameter budgets must account for activation and optimizer memory, not just weights, and scaling laws should guide how large a model the data justifies. Finally, modern design proceeds at the level of blocks that are designed once and repeated, with clean gradient paths and gradual dimension changes. Treat each of these as a deliberate lever and architecture design becomes a tractable engineering discipline rather than guesswork.
+Architecture design shapes the hypothesis class, the optimization landscape, and the generalization behavior of a model all at once, and these three correspond exactly to the approximation, optimization, and estimation terms of the excess risk. Depth buys compositional expressivity and width buys parallel features and optimization stability, and the two should be balanced rather than maximized. Inductive biases determine sample efficiency and should be matched to the geometry and quantity of the data, which is the lesson that geometric deep learning makes systematic. Parameter budgets must account for activation and optimizer memory, not just weights, and scaling laws should guide how large a model the data justifies. Finally, modern design proceeds at the level of blocks that are designed once and repeated, with clean gradient paths and gradual dimension changes. Treat each of these as a deliberate lever and architecture design becomes a tractable engineering discipline rather than guesswork.
 
 ## References
 
-1. Tan, M. and Le, Q. EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks. ICML 2019. https://arxiv.org/abs/1905.11946
-2. Hoffmann, J. et al. Training Compute-Optimal Large Language Models. 2022. https://arxiv.org/abs/2203.15556
-3. He, K., Zhang, X., Ren, S. and Sun, J. Deep Residual Learning for Image Recognition. CVPR 2016. https://arxiv.org/abs/1512.03385
-4. Vaswani, A. et al. Attention Is All You Need. NeurIPS 2017. https://arxiv.org/abs/1706.03762
-5. Ba, J., Kiros, J. and Hinton, G. Layer Normalization. 2016. https://arxiv.org/abs/1607.06450
-6. Kaplan, J. et al. Scaling Laws for Neural Language Models. 2020. https://arxiv.org/abs/2001.08361
+1. Cybenko, G. Approximation by Superpositions of a Sigmoidal Function. Mathematics of Control, Signals and Systems, 2(4):303-314, 1989. https://doi.org/10.1007/BF02551274
+2. Hornik, K., Stinchcombe, M. and White, H. Multilayer Feedforward Networks Are Universal Approximators. Neural Networks, 2(5):359-366, 1989. https://doi.org/10.1016/0893-6080(89)90020-8
+3. Telgarsky, M. Benefits of Depth in Neural Networks. COLT 2016. https://proceedings.mlr.press/v49/telgarsky16.html
+4. Montufar, G., Pascanu, R., Cho, K. and Bengio, Y. On the Number of Linear Regions of Deep Neural Networks. NeurIPS 2014. https://proceedings.neurips.cc/paper/2014/hash/109d2dd3608f669ca17920c511c2a41e-Abstract.html
+5. Jacot, A., Gabriel, F. and Hongler, C. Neural Tangent Kernel: Convergence and Generalization in Neural Networks. NeurIPS 2018. https://proceedings.neurips.cc/paper/2018/hash/5a4be1fa34e62bb8a6ec6b91d2462f5a-Abstract.html
+6. Tan, M. and Le, Q. EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks. ICML 2019. https://proceedings.mlr.press/v97/tan19a.html
+7. Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L. and Polosukhin, I. Attention Is All You Need. NeurIPS 2017. https://proceedings.neurips.cc/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html
+8. Bronstein, M. M., Bruna, J., Cohen, T. and Velickovic, P. Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges. 2021. https://arxiv.org/abs/2104.13478
+9. Kingma, D. P. and Ba, J. Adam: A Method for Stochastic Optimization. ICLR 2015. https://arxiv.org/abs/1412.6980
+10. Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J. and Amodei, D. Scaling Laws for Neural Language Models. 2020. https://arxiv.org/abs/2001.08361
+11. Hoffmann, J., Borgeaud, S., Mensch, A. et al. Training Compute-Optimal Large Language Models. NeurIPS 2022. https://arxiv.org/abs/2203.15556
+12. He, K., Zhang, X., Ren, S. and Sun, J. Deep Residual Learning for Image Recognition. CVPR 2016. https://doi.org/10.1109/CVPR.2016.90
+13. Ioffe, S. and Szegedy, C. Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift. ICML 2015. https://proceedings.mlr.press/v37/ioffe15.html
+14. Ba, J. L., Kiros, J. R. and Hinton, G. E. Layer Normalization. 2016. https://arxiv.org/abs/1607.06450
+15. Xiong, R., Yang, Y., He, D. et al. On Layer Normalization in the Transformer Architecture. ICML 2020. https://proceedings.mlr.press/v119/xiong20b.html

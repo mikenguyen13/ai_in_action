@@ -6,6 +6,13 @@ The two preceding chapters built the components: reading an identity document, a
 
 The defining distinction from in-person KYC is *unsupervised remote proofing*: the user self-captures evidence on their own device, and automated systems, not a trained agent, resolve, validate, and verify identity. This unlocks global, low-cost onboarding but introduces threat vectors absent in attended settings (injection attacks, synthetic identities, deepfakes) that the architecture must explicitly defend against. eKYC is therefore the canonical example of an AI system that is *only as good as its weakest link and its governance*: the machine learning is necessary but not sufficient; regulation, risk policy, human review, and fairness obligations are first-class parts of the design.
 
+It helps to fix vocabulary precisely, because the surrounding standards use these terms with care.
+
+- **Identity proofing** is the one-time process of establishing, with stated confidence, that a claimed identity corresponds to a real, unique person who is the one presenting it. eKYC is a proofing process.
+- **Authentication** is the recurring process of confirming, at each subsequent access, that the returning party is the same one that was proofed. Proofing happens once at onboarding; authentication happens on every login. The standards keep these on separate axes (see Section 3) because a strong login (hardware key) over a weak proofing (selfie of a stolen ID) still onboards the wrong person.
+- A **presentation attack** is an attempt to subvert biometric capture by presenting an artefact to the genuine sensor: a printed photo, a screen replay, a silicone mask. **Presentation-attack detection (PAD)**, often called liveness, is the countermeasure, standardized in ISO/IEC 30107.
+- An **injection attack** bypasses the camera entirely, feeding synthetic frames (a deepfake, a virtual camera stream) into the capture pipeline. PAD that only inspects pixels can be blind to injection, so modern systems bind capture to attested hardware and inspect the media for generation artefacts.
+
 ## 2. The End-to-End Pipeline
 
 A production eKYC system has six stages:
@@ -27,6 +34,22 @@ flowchart LR
 6. **Decision**, a policy engine routes to auto-approve, step-up (additional verification), or manual review by a human analyst.
 
 The architecture's recurring principle is **defense in depth**: no single check is trusted absolutely, and the decision aggregates redundant, partially independent signals.
+
+### 2.1 Why redundant signals help: a probabilistic view
+
+Defense in depth is not merely a slogan; it has a clean probabilistic justification. Suppose a fraudster must defeat $k$ checks, and let $p_i$ be the probability of defeating check $i$. If the checks were perfectly independent, the probability of passing all of them would be the product
+
+$$
+P(\text{all pass} \mid \text{fraud}) = \prod_{i=1}^{k} p_i ,
+$$
+
+which shrinks geometrically as checks are added. The same multiplicative structure is the reason an attacker concentrates effort: defeating a single weak check with $p_i$ near $1$ dominates the product, so the system is bounded by its weakest layer. Real checks are not independent (a sophisticated deepfake can fool document portrait extraction and face match together), so the honest bound is
+
+$$
+P(\text{all pass} \mid \text{fraud}) \ge \max_i p_i \cdot \rho ,
+$$
+
+where $\rho \in (0,1]$ captures positive correlation between layers. The engineering goal is therefore twofold: drive each $p_i$ down, and choose layers whose failure modes are as *uncorrelated* as possible. A chip-based passive authentication signal and a behavioral-biometrics signal fail for very different reasons, so combining them buys more than stacking two pixel-level liveness models that a single good deepfake defeats at once.
 
 ## 3. Identity Assurance Frameworks
 
@@ -59,7 +82,67 @@ Beyond document and biometric checks, modern eKYC layers passive, contextual sig
 
 **Synthetic identity fraud (SIF)** is the hardest case: fabricating a person from a *combination* of real and fake PII (the Federal Reserve's 2021 definition). It evades detection because there is no real victim to dispute the account, fabricated identities are aged before a "bust-out," and individual PII fragments may be valid. *(Widely cited loss figures are industry estimates, not official statistics.)*
 
-Machine learning drives three functions, applicant risk scoring, document-fraud/deepfake detection, and face-match/liveness, while **human-in-the-loop review** handles borderline scores, enhanced-due-diligence cases, and adverse-media hits. Governance constraints are not optional: model risk management (validation, drift and bias monitoring), explainability, and adverse-action law. Under the US Equal Credit Opportunity Act / Regulation B and the Fair Credit Reporting Act, a declined applicant must receive specific reasons, and CFPB Circular 2022-03 holds that **model opacity is no excuse** for failing to provide them, a direct constraint on using black-box models in the decision.
+### 5.1 The decision as a cost-sensitive two-threshold policy
+
+The final stage turns a continuous risk score into one of three actions. This is a *cost-sensitive decision problem*, and stating it formally clarifies why a single cutoff is rarely correct.
+
+Let $s \in [0,1]$ be the aggregated risk score, calibrated so that it approximates the posterior probability that the applicant is fraudulent given all signals,
+
+$$
+s \approx \Pr(\text{fraud} \mid \text{signals}) .
+$$
+
+There are two actions at the extremes, *approve* and *reject*, and a middle action, *manual review* (or step-up), which defers the decision to a human at a cost. Assign costs to outcomes: $C_{\text{FP}}$ is the cost of approving a fraudster (a false positive for fraud, a security loss), $C_{\text{FN}}$ is the cost of rejecting a legitimate customer (a false negative for fraud, lost revenue plus an inclusion harm), and $C_{\text{rev}}$ is the marginal cost of routing a case to a human analyst. The expected cost of auto-approving an applicant with score $s$ is $s \cdot C_{\text{FP}}$; the expected cost of auto-rejecting is $(1-s) \cdot C_{\text{FN}}$; and review costs a fixed $C_{\text{rev}}$ but resolves the case correctly (idealizing the analyst as accurate).
+
+Minimizing expected cost yields a **band policy** with two thresholds $\tau_{\text{low}} < \tau_{\text{high}}$:
+
+$$
+\text{decision}(s) =
+\begin{cases}
+\text{approve} & s \le \tau_{\text{low}} \\
+\text{manual review} & \tau_{\text{low}} < s < \tau_{\text{high}} \\
+\text{reject} & s \ge \tau_{\text{high}} .
+\end{cases}
+$$
+
+```{mermaid}
+flowchart LR
+    A["Risk score s in zero to one"] --> B{"s at most tau low"}
+    B -->|"yes"| C["Approve"]
+    B -->|"no"| D{"s at least tau high"}
+    D -->|"yes"| E["Reject"]
+    D -->|"no"| F["Manual review or step up"]
+```
+
+Setting the auto-approve cost equal to the review cost gives the lower threshold, and setting the auto-reject cost equal to the review cost gives the upper one:
+
+$$
+\tau_{\text{low}} = \frac{C_{\text{rev}}}{C_{\text{FP}}},
+\qquad
+\tau_{\text{high}} = 1 - \frac{C_{\text{rev}}}{C_{\text{FN}}} .
+$$
+
+Two consequences follow immediately. First, when human review is cheap relative to the error costs ($C_{\text{rev}}$ small), the review band widens and the system defers more, which is exactly the behavior a risk-averse regulated institution wants. Second, the thresholds depend on the *cost ratios*, not on accuracy alone, so a model improvement that does not change the relative costs of the two error types does not move the cutoffs. The pure single-cutoff Bayes rule (approve iff $s \le C_{\text{FN}}/(C_{\text{FP}}+C_{\text{FN}})$) is the degenerate case $C_{\text{rev}} \to \infty$, where review is so expensive it is never used.
+
+This framing also explains *why* the threshold is a policy lever and not a tuned hyperparameter (a theme of Section 7): $C_{\text{FN}}$ is not a number a data scientist can read off a validation set, because it bundles lost lifetime revenue with the social cost of wrongly denying someone a bank account. Whoever sets $C_{\text{FN}}$ is making a values judgment, and it should be owned accordingly.
+
+### 5.2 A worked example
+
+Suppose an institution estimates that approving a fraudster costs roughly 200 units of expected loss, that rejecting a genuine customer costs 20 units (forgone margin plus remediation), and that a manual review costs 2 units of analyst time. Then
+
+$$
+\tau_{\text{low}} = \frac{2}{200} = 0.01,
+\qquad
+\tau_{\text{high}} = 1 - \frac{2}{20} = 0.90 .
+$$
+
+An applicant scoring $s = 0.004$ is auto-approved; one scoring $s = 0.95$ is auto-rejected; and the wide band $[0.01, 0.90]$ goes to review. The asymmetry is stark and deliberate: because fraud is ten times costlier than a false rejection here, the bar for *auto*-approval is set very low, and most of the ambiguous middle is escalated to a human rather than auto-rejected. If the institution later concludes that wrongful rejection carries a larger inclusion cost and raises $C_{\text{FN}}$ to 40, then $\tau_{\text{high}}$ rises to $0.95$, shrinking the auto-reject region and pushing more borderline-high cases into review. No model was retrained; only a cost was repriced.
+
+### 5.3 Roles of learning and humans
+
+Machine learning drives three functions, applicant risk scoring, document-fraud/deepfake detection, and face-match/liveness, while **human-in-the-loop review** handles borderline scores (the band above), enhanced-due-diligence cases, and adverse-media hits. The decomposition matters: the learned components produce *calibrated scores and confidences*, and the policy layer, which is auditable and changeable without retraining, turns those into actions under explicit costs.
+
+Governance constraints are not optional: model risk management (validation, drift and bias monitoring), explainability, and adverse-action law. Under the US Equal Credit Opportunity Act / Regulation B and the Fair Credit Reporting Act, a declined applicant must receive specific reasons, and CFPB Circular 2022-03 holds that **model opacity is no excuse** for failing to provide them, a direct constraint on using black-box models in the decision. This is a strong argument for keeping the final policy layer simple and interpretable even when the upstream scorers are not: a reason code such as "liveness confidence below threshold" or "document number failed issuer validation" is contestable in a way that a raw gradient-boosted score is not.
 
 ## 6. National Digital-ID Systems as Case Studies
 
@@ -77,9 +160,40 @@ The obligations here are not add-ons; for a regulated, population-scale system t
 
 **Demographic bias.** As the face-verification chapter documented, NIST found false-positive rates 10 to 100× higher for some demographic groups in 1:1 verification (the eKYC mode), with women and the elderly also affected. The two error types have different consequences in eKYC: a **false match** is a security breach (wrong person onboarded), while an elevated **false non-match** is an *unfair rejection*, a real person locked out of a bank account. A system measured only in aggregate can hide a group for whom it effectively does not work, so error rates must be monitored *by demographic group*.
 
+To make "monitored by group" precise, let $G$ index demographic groups and let the per-group error rates be the **false non-match rate** (FNMR, a genuine user wrongly rejected) and the **false match rate** (FMR, an impostor wrongly accepted):
+
+$$
+\text{FNMR}_g = \Pr(\text{reject} \mid \text{genuine}, G=g),
+\qquad
+\text{FMR}_g = \Pr(\text{accept} \mid \text{impostor}, G=g).
+$$
+
+The relevant fairness criterion for the inclusion harm is approximate **equality of the false non-match rate across groups**, a form of equal opportunity:
+
+$$
+\max_{g}\, \text{FNMR}_g - \min_{g}\, \text{FNMR}_g \le \epsilon ,
+$$
+
+for a tolerance $\epsilon$ fixed in advance. This is the right target because the harm being equalized (a real person wrongly excluded) lands on the genuine population, conditioned on being genuine. Crucially, an aggregate FNMR can satisfy a target while a small group violates it badly: if group $A$ is $95\%$ of traffic with $\text{FNMR}_A = 1\%$ and group $B$ is $5\%$ with $\text{FNMR}_B = 12\%$, the blended rate is about $1.6\%$, which looks healthy while one in eight legitimate members of group $B$ is turned away. This is the formal reason aggregate metrics are not sufficient: averaging dilutes the signal from minorities by their population weight, exactly where the harm concentrates. The companion quantity, FMR, governs the security side, and a defensible monitoring dashboard tracks the full *detection error tradeoff* (FMR against FNMR) per group rather than a single accuracy number.
+
+One subtlety: because the operating threshold is shared but the score distributions differ by group, equalizing FNMR and equalizing FMR at the same time is generally impossible when group base rates or distributions differ, an instance of the well-known impossibility results in algorithmic fairness (ref. 12). The practical response is to pick the error type whose harm dominates in context (here FNMR, the exclusion harm), equalize that, and report the residual disparity in the other rather than pretending both can be zeroed at once.
+
 **Inclusion and exclusion.** The World Bank's ID4D program estimates that on the order of 800 to 850 million people lack official proof of identity, roughly half children, the majority in sub-Saharan Africa, and women systematically less likely to hold an ID. An eKYC flow requiring a government document or a successful biometric match risks excluding the undocumented, people whom biometrics misread for bias-related reasons, and those facing accessibility barriers (disability, age, low digital literacy, no smartphone). Financial inclusion and fraud control pull in opposite directions, and the threshold that resolves them is a *policy* choice with real human stakes, not a hyperparameter to be tuned on a validation set alone.
 
 **Privacy.** Under GDPR Article 9, biometric data used to uniquely identify a person is *special-category* data, prohibited absent an explicit exception (operationally, consent). Article 5's principles, data minimization, purpose limitation, storage limitation, translate into concrete engineering: store only the template the purpose requires, and delete raw images after extraction. In the US, Illinois' BIPA imposes consent and retention duties with a private right of action that has produced nine-figure settlements. The defensible posture is to treat biometric data as a liability to be minimized, not an asset to be accumulated.
+
+### 7.1 When to use eKYC, and common pitfalls
+
+Automated remote eKYC is the right tool when onboarding volume is high, the population mostly holds machine-readable documents (ideally with NFC chips), and the regulator accepts trustworthy digital ID for the assurance level required. It is a poor fit, and an *alternative or attended path must be offered*, when a meaningful share of the population is undocumented, when the customer segment is concentrated in groups for which biometric error rates are elevated, or when the required assurance level (IAL3) mandates an attended session regardless.
+
+Recurring pitfalls, each traceable to a section above:
+
+- **Aggregate-only metrics.** Reporting a single accuracy or FNMR hides per-group failure, as Section 7's worked disparity shows. Always slice by demographic group and by document type.
+- **Tuning the threshold as a hyperparameter.** The decision cutoffs encode a values judgment about the cost of wrongful exclusion (Section 5.1). Setting them by maximizing a validation-set objective quietly hard-codes whatever exclusion rate the data happened to produce.
+- **Stacking correlated checks.** Two pixel-level liveness models defeated by the same deepfake add little (Section 2.1). Prefer layers with uncorrelated failure modes, for example chip authentication plus behavioral signals.
+- **Pixel-only liveness against injection.** PAD that inspects only image content can miss injected synthetic frames; bind capture to attested hardware and inspect for generation artefacts, as SP 800-63-4 now requires.
+- **Hoarding raw biometrics.** Retaining selfies and document images beyond extraction is a standing liability under GDPR Article 9 and BIPA, not an asset. Delete raw media after templating.
+- **Opaque rejections.** A black-box score with no reason code is not contestable and may violate adverse-action law (Section 5.3). Keep the final policy layer interpretable.
 
 ## 8. The Vendor Landscape
 
@@ -102,3 +216,5 @@ An eKYC system is a defense-in-depth pipeline, document authentication, biometri
 9.  NIST. "FRVT Part 3: Demographic Effects" (NISTIR 8280). 2019. https://nvlpubs.nist.gov/nistpubs/ir/2019/nist.ir.8280.pdf
 10. Federal Reserve. "Synthetic Identity Fraud Defined." 2021. https://fedpaymentsimprovement.org/strategic-initiatives/payments-security/synthetic-identity-payments-fraud/
 11. EU. *Anti-Money Laundering Regulation (EU) 2024/1624 and AMLD6.* https://eur-lex.europa.eu/
+12. Kleinberg, J., Mullainathan, S., and Raghavan, M. "Inherent Trade-Offs in the Fair Determination of Risk Scores." *8th Innovations in Theoretical Computer Science Conference (ITCS 2017).* https://doi.org/10.4230/LIPIcs.ITCS.2017.43
+13. ISO/IEC 30107-1:2023. *Information technology, Biometric presentation attack detection, Part 1: Framework.* International Organization for Standardization. https://www.iso.org/standard/83828.html

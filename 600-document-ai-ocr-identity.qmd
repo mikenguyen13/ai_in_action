@@ -6,6 +6,8 @@ Reading a passport, national ID card, or driver's license automatically is the e
 
 This chapter develops the full pipeline: capture, localization, document-type classification, optical character recognition (OCR), key information extraction (KIE), and the structured machine-readable channels (MRZ, barcodes, NFC chips) that make ID documents uniquely verifiable. The central architectural insight to carry throughout is that **a genuine ID encodes the same data redundantly across multiple channels**, the printed visual zone, the machine-readable zone, a barcode, and on modern documents a cryptographically signed chip, and that *disagreement between channels is itself the most powerful fraud signal we have.*
 
+The reader should leave with three things: a clear mental model of the pipeline and where errors compound, the small amount of mathematics that actually governs the system (sequence-recognition loss, perspective rectification, the MRZ check-digit code, and probabilistic fusion of channel signals), and a calibrated sense of which checks are merely heuristic and which are cryptographically sound.
+
 ## 2. The ID-Document Pipeline
 
 A production system has six stages:
@@ -33,7 +35,17 @@ flowchart LR
 3. **Document-type classification.** The issuing country, document class (passport TD3 vs. ID card TD1/TD2 vs. driver's license), and the specific template/version are identified. Type is what unlocks the correct *template*, the expected layout of fields, fonts, and security features.
 4. **Field extraction.** Text lines are detected and recognized (OCR), then mapped to semantic fields (surname, document number, date of birth, expiry) via KIE. The MRZ and barcodes are parsed separately as structured, error-correcting encodings.
 5. **Validation and authentication.** Cross-checks run: MRZ check digits, MRZ-vs-visual-zone consistency, barcode-vs-print consistency, date logic, template/security-feature conformance, presentation-attack detection, and, where available, NFC chip cryptographic verification.
-6. **Decision.** Signals are aggregated into accept / step-up / manual-review.
+6. **Decision.** Signals are aggregated into accept, step-up, or manual-review.
+
+### 2.1 Why the pipeline is staged: error compounding
+
+The stages are not arbitrary. They form a chain in which each stage conditions the next, so end-to-end accuracy is bounded by the product of per-stage success rates. If localization succeeds with probability $p_L$, type classification with $p_T$, OCR with $p_O$, and validation with $p_V$, then under the simplifying assumption of independence the probability that a clean document flows through untouched is
+
+$$
+p_{\text{end-to-end}} \approx p_L \cdot p_T \cdot p_O \cdot p_V .
+$$
+
+The lesson is structural. A stage at 0.98 accuracy is "good" in isolation, but four such stages in series yield only $0.98^4 \approx 0.92$. This is why production systems (a) push easy rejections early (a blurry frame is discarded before any expensive model runs), (b) prefer video so that a failed stage can be retried on a different frame rather than failing the whole transaction, and (c) treat the MRZ and barcode as *parallel* redundant paths rather than purely sequential ones, so a single channel failure does not sink the decision.
 
 ## 3. OCR: From Tesseract to Transformers
 
@@ -52,15 +64,25 @@ flowchart TD
     B --> C
     C --> D["per-column character distributions"]
     D --> E["CTC decode"]
-    E -.->|"collapses repeats/blanks"| F["NGUYEN"]
+    E -.->|"collapses repeats and blanks"| F["NGUYEN"]
     E --> F
 ```
 
+**What CTC actually computes.** The recognizer turns an image into a sequence of $T$ columns, and at each column $t$ it emits a probability distribution over the alphabet augmented with a special *blank* symbol $\varnothing$. A length-$T$ path $\pi$ is one choice of symbol per column. CTC defines a many-to-one collapsing map $\mathcal{B}$ that first merges runs of identical adjacent symbols and then deletes blanks, so for example $\mathcal{B}(\texttt{N}\,\varnothing\,\texttt{G}\,\texttt{G}\,\texttt{U}) = \texttt{NGU}$. The probability of a target label $\mathbf{y}$ is the sum over all paths that collapse to it:
+
+$$
+p(\mathbf{y} \mid \mathbf{x}) = \sum_{\pi \in \mathcal{B}^{-1}(\mathbf{y})} \prod_{t=1}^{T} p_t(\pi_t \mid \mathbf{x}),
+$$
+
+and the network is trained to minimize $-\log p(\mathbf{y} \mid \mathbf{x})$. The blank symbol is the device that lets the model output repeated characters (the double L in `MULLER` is recovered by placing a blank between the two L columns) and lets it stay silent over the wide, featureless gaps between glyphs. The summation looks intractable, but it factorizes over time and is computed in $O(T \cdot |\mathbf{y}|)$ by a forward-backward dynamic program closely analogous to the one used for hidden Markov models. The key property for IDs is that CTC needs only the line transcription, not per-character boxes, which is exactly the supervision that is cheap to produce at scale.
+
 ### 3.3 Attention and Transformer OCR
 
-**Attention-based** sequence-to-sequence recognizers (ASTER, SAR) replace CTC's monotonic alignment with learned attention, improving curved and irregular text, at higher cost and with a risk of hallucination under domain shift.
+**Attention-based** sequence-to-sequence recognizers (ASTER, SAR) replace CTC's monotonic left-to-right alignment with learned attention, improving curved and irregular text, at higher cost and with a risk of hallucination under domain shift.
 
-**TrOCR** (Microsoft, 2021) is a pure transformer encoder, decoder: the image encoder is initialized from a vision transformer (BEiT) and the text decoder from a language model (RoBERTa), generating wordpiece tokens autoregressively. Variants span 62M to 558M parameters and reach state of the art on printed and handwritten benchmarks. The language-model prior helps recover degraded input, but it is double-edged: a model trained to produce *plausible* strings may "complete" a smudged document number into a valid-looking but wrong one, which is dangerous where exact characters carry legal weight. TrOCR has also been shown vulnerable to adversarial perturbation.
+**TrOCR** (Microsoft, 2021) is a pure transformer encoder, decoder: the image encoder is initialized from a vision transformer (BEiT) and the text decoder from a language model (RoBERTa), generating wordpiece tokens autoregressively. Variants span roughly 62M to 558M parameters and reach state of the art on printed and handwritten benchmarks. The language-model prior helps recover degraded input, but it is double-edged: a model trained to produce *plausible* strings may "complete" a smudged document number into a valid-looking but wrong one, which is dangerous where exact characters carry legal weight. TrOCR has also been shown vulnerable to adversarial perturbation.
+
+The CTC-versus-attention choice is, at heart, a choice about priors. CTC is conditionally independent across columns given the features and carries no learned language model, so it tends to fail *legibly*: a hard glyph comes back as a confusion or a blank, not a confident fabrication. Autoregressive decoders carry a language prior that improves accuracy on natural text but can mask errors behind fluent output. For ID fields that are essentially random strings (document numbers, MRZ lines) the language prior offers little upside and real downside, which is one reason CTC recognizers persist in this domain.
 
 ### 3.4 End-to-End Document Understanding
 
@@ -68,34 +90,49 @@ Three families move beyond line-level OCR:
 
 - **LayoutLM / LayoutLMv3** jointly model text, 2D layout position, and visual features; v3 uses unified text-and-image masked pre-training and patch embeddings, reducing dependence on an external OCR engine. For IDs, where layout is highly informative, this is a strong fit.
 - **Donut** ("OCR-free Document Understanding Transformer," 2021) skips OCR entirely: an image transformer encodes the document and a decoder emits structured JSON directly. This removes OCR-error propagation and generalizes across languages via synthetic pre-training, but is data-hungry and can hallucinate fields not present.
-- **PaddleOCR** (Baidu, 2020, Apache-2.0) is a modular DBNet-detector + CRNN-recognizer pipeline with strong multilingual coverage and mobile models, a common open-source ID backbone. **DocTR** pairs DBNet detection with a transformer recognizer.
+- **PaddleOCR** (Baidu, Apache-2.0) is a modular DBNet-detector plus CRNN-recognizer pipeline with strong multilingual coverage and mobile models, a common open-source ID backbone. **docTR** (Mindee, Apache-2.0) pairs DBNet-style detection with a transformer or CRNN recognizer and is a clean, well-maintained alternative.
 
-For identity documents specifically, detect-then-recognize pipelines (PaddleOCR, DocTR) give field-level control and auditable intermediate output; OCR-free models (Donut) are appealing for end-to-end extraction but harder to validate per character and riskier where exactness is legally significant. In a regulated pipeline, auditability often outweighs raw accuracy.
+For identity documents specifically, detect-then-recognize pipelines (PaddleOCR, docTR) give field-level control and auditable intermediate output; OCR-free models (Donut) are appealing for end-to-end extraction but harder to validate per character and riskier where exactness is legally significant. In a regulated pipeline, auditability often outweighs raw accuracy.
 
-## 4. Key Information Extraction and Multilingual Reality
+## 4. Localization and Rectification: The Homography
 
-**Key Information Extraction (KIE)** turns recognized text into typed fields. Three approaches dominate: layout-aware token classification (LayoutLM, BROS) tags each OCR token over field types using text plus spatial position; graph-and-transformer hybrids (PICK) model tokens as a graph to capture key, value geometry; and generative/QA approaches (Donut, or asking "what is the date of birth?"). The standard public benchmarks are FUNSD (199 noisy scanned forms) and SROIE (1,000 receipts, four key fields), semi-structured analogues to ID extraction.
+Before OCR can run, the document must be cut from its background and warped to a canonical frontal view. A flat card photographed by a pinhole camera is related to its rectified image by a **planar homography**, a $3 \times 3$ matrix $H$ acting on homogeneous coordinates:
 
-Multilingual, multi-script handling is a defining ID challenge. Government IDs routinely mix scripts (Latin with Arabic, Cyrillic, Devanagari, CJK, Thai, Greek). The practical lever is to use the **MRZ as a Latin-transliterated anchor**: ICAO 9303 specifies how each native-script name maps to a restricted Latin set, so the machine-readable zone provides a second, structured copy of the holder's data that cross-checks the visual zone in the native script.
+$$
+\begin{bmatrix} x' \\ y' \\ w' \end{bmatrix}
+= H \begin{bmatrix} x \\ y \\ 1 \end{bmatrix},
+\qquad
+(u, v) = \left( \frac{x'}{w'},\; \frac{y'}{w'} \right).
+$$
 
-## 5. The Structured Channels: MRZ, Barcodes, and Chips
+$H$ has eight degrees of freedom (it is defined up to scale), so four point correspondences suffice to solve for it. In practice the four detected document corners are mapped to the four corners of a fixed-size canvas, $H$ is recovered by a direct linear transform, and the image is resampled through $H^{-1}$. Rectification matters out of proportion to its simplicity: downstream OCR, template matching, and MRZ line-finding all assume a rectified, fixed-aspect image, so a corner-detection error of a few pixels propagates into every later stage. Video helps here too, since corners can be tracked and the most stable estimate selected across frames.
+
+## 5. Key Information Extraction and Multilingual Reality
+
+**Key Information Extraction (KIE)** turns recognized text into typed fields. Three approaches dominate: layout-aware token classification (LayoutLM, BROS) tags each OCR token over field types using text plus spatial position; graph-and-transformer hybrids (PICK) model tokens as a graph to capture key-value geometry; and generative or question-answering approaches (Donut, or asking "what is the date of birth?"). The standard public benchmarks are FUNSD (199 noisy scanned forms) and SROIE (1,000 receipts, four key fields), semi-structured analogues to ID extraction.
+
+A useful framing is that KIE on IDs is easier than on arbitrary forms in one respect and harder in another. It is easier because, once the template is known, field positions are nearly fixed, so a template-anchored crop plus a line recognizer often beats a general layout model. It is harder because the same logical field appears under dozens of localized labels and scripts, and because the ground truth must be exact: a transposed digit in a passport number is a hard failure, not a soft mismatch.
+
+Multilingual, multi-script handling is the defining ID challenge. Government IDs routinely mix scripts (Latin with Arabic, Cyrillic, Devanagari, CJK, Thai, Greek). The practical lever is to use the **MRZ as a Latin-transliterated anchor**: ICAO 9303 specifies how each native-script name maps to a restricted Latin set, so the machine-readable zone provides a second, structured copy of the holder's data that cross-checks the visual zone in the native script. When the visual-zone recognizer is uncertain on a non-Latin name, the MRZ transliteration is frequently the more reliable source.
+
+## 6. The Structured Channels: MRZ, Barcodes, and Chips
 
 This is where ID documents differ fundamentally from arbitrary documents: they carry redundant, error-correcting, sometimes cryptographically signed copies of the holder's data.
 
-### 5.1 The Machine-Readable Zone (ICAO 9303)
+### 6.1 The Machine-Readable Zone (ICAO 9303)
 
 The MRZ is the band of OCR-B text at the bottom of passports and IDs. Its formats:
 
 | Format | Used on | Layout |
 |--------|---------|--------|
-| TD1 | ID cards | 3 lines × 30 chars |
-| TD2 | ID cards | 2 lines × 36 chars |
-| TD3 | Passport booklets | 2 lines × 44 chars |
-| MRV-A / MRV-B | Visas | 2 × 44 / 2 × 36 |
+| TD1 | ID cards | 3 lines by 30 chars |
+| TD2 | ID cards | 2 lines by 36 chars |
+| TD3 | Passport booklets | 2 lines by 44 chars |
+| MRV-A / MRV-B | Visas | 2 by 44 / 2 by 36 |
 
 It encodes document type, issuing country, document number, name, nationality, date of birth, sex, expiry, and optional data, with `<` as filler. Crucially, the MRZ is **self-validating** through check digits.
 
-**The check-digit algorithm.** Map each character to a value (`0 to 9 → 0 to 9`, `A=10 … Z=35`, `< = 0`). Apply the repeating weight cycle **7, 3, 1** across positions, sum the products, and take the result **mod 10**:
+**The check-digit algorithm.** Map each character to a value (`0 to 9 -> 0 to 9`, `A=10 ... Z=35`, `< = 0`). Apply the repeating weight cycle **7, 3, 1** across positions, sum the products, and take the result **mod 10**:
 
 ``` python
 def mrz_check_digit(field: str) -> int:
@@ -114,64 +151,126 @@ def mrz_check_digit(field: str) -> int:
 
 Individual check digits cover the document number, date of birth, and expiry; a *composite* check digit covers the concatenated fields. A single mis-read or altered character invalidates the check digit, so the MRZ catches both OCR errors and tampering in one mechanism.
 
-### 5.2 Driver's-License Barcodes (AAMVA PDF417)
+**Worked example.** Take the date of birth field `740812` (12 August 1974) plus its check digit. Working through the algorithm:
 
-North American driver's licenses and IDs carry a **PDF417** 2D barcode defined by the AAMVA DL/ID Card Design Standard. Parsing is two steps: decode the PDF417 image to a raw string, then parse AAMVA element IDs (`DCS` family name, `DAC` first name, `DBB` date of birth, `DAQ` license number, `DCF` document discriminator). Because the barcode is a redundant machine copy of the printed front, **barcode-versus-print mismatch is a strong forgery indicator**, and the document discriminator helps detect duplicates.
+| position $i$ | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| digit | 7 | 4 | 0 | 8 | 1 | 2 |
+| weight $7,3,1$ | 7 | 3 | 1 | 7 | 3 | 1 |
+| product | 49 | 12 | 0 | 56 | 3 | 2 |
 
-### 5.3 NFC / eMRTD Chip Verification, the Gold Standard
+The sum is $49 + 12 + 0 + 56 + 3 + 2 = 122$, and $122 \bmod 10 = 2$, so the check digit is `2` and the field reads `7408122`. Now suppose a forger alters the year to make the holder appear older, changing `74` to `47`. The new sum is $4 \cdot 7 + 7 \cdot 3 + 0 + 56 + 3 + 2 = 28 + 21 + 61 = 110$, giving check digit `0`, which no longer matches the printed `2`. The tamper is caught arithmetically, with no model and no reference database.
 
-A modern ePassport or eID embeds a contactless **ISO 14443 / NFC** chip (an *eMRTD*) storing data groups defined by ICAO 9303, DG1 holds the MRZ data, DG2 the face image. Reading requires deriving an access key from the MRZ (the BAC, or stronger PACE protocol). Two authentication mechanisms matter:
+**What the code does and does not protect against.** The weighting `7, 3, 1` is a classic device for catching the two most common human and OCR errors: any single changed character changes the weighted sum, and because adjacent weights differ, most transpositions of adjacent characters are caught as well. It is a detection code, not a correction code, and it offers no cryptographic protection: a forger who rewrites the whole MRZ can recompute consistent check digits. Check digits prove internal arithmetic consistency, nothing more. The strong guarantees come from the chip in section 6.3.
 
-- **Passive Authentication (PA)**, the integrity check. The chip's Document Security Object is digitally signed by the issuing state's Document Signer, whose certificate chains to the country's Country Signing CA, with trust distributed via the ICAO Public Key Directory. PA proves the data was written by the legitimate authority and is unaltered. Critically, **PA alone does not prove the chip is genuine rather than cloned.**
-- **Active Authentication (AA) / Chip Authentication**, a challenge, response against a chip-resident private key, proving the chip is genuine and not cloned.
+### 6.2 Driver's-License Barcodes (AAMVA PDF417)
 
-Because signed chip data is cryptographically bound to the issuer, NFC verification is far stronger than any visual or OCR check and is the recommended ground truth wherever an NFC-capable phone and a chipped document are both present. Its limits: many IDs are not chipped, key derivation needs an accurate MRZ read first, and some older chips lack AA.
+North American driver's licenses and IDs carry a **PDF417** 2D barcode defined by the AAMVA DL/ID Card Design Standard. PDF417 is a stacked-bar symbology with built-in Reed-Solomon error correction, so it tolerates scuffs and partial occlusion and decodes reliably from a phone photo. Parsing is two steps: decode the PDF417 image to a raw string, then parse AAMVA element IDs (`DCS` family name, `DAC` first name, `DBB` date of birth, `DAQ` license number, `DCF` document discriminator). Because the barcode is a redundant machine copy of the printed front, **barcode-versus-print mismatch is a strong forgery indicator**, and the document discriminator (a unique value the issuer assigns to each physical card) helps detect duplicates and re-issued cards.
 
-## 6. Document Authenticity and Fraud Detection
+### 6.3 NFC / eMRTD Chip Verification, the Gold Standard
 
-Threats span a physical-to-digital spectrum: physical forgery (altered or counterfeit cards), copy-move edits, recapture/screen-replay (photographing a screen showing an ID), print attacks, and synthetic or morphed documents. Detection layers correspondingly:
+A modern ePassport or eID embeds a contactless **ISO 14443 / NFC** chip (an *eMRTD*) storing data groups defined by ICAO 9303, DG1 holds the MRZ data, DG2 the face image. Reading requires deriving an access key from the MRZ (the older BAC, or the stronger PACE protocol), which is also why an accurate MRZ read is a prerequisite for chip access. Two authentication mechanisms matter, and they answer different questions:
 
-- **Template and security-feature checks.** Given the identified type, verify layout geometry, fonts (kerning anomalies betray edited fields), microprint, guilloché patterns, and optically variable features such as holograms, best observed across video frames where reflectance changes.
-- **Signal-level forensics.** Copy-move detection, JPEG-artifact and noise-residual analysis, and frequency-domain analysis for screen recapture (moiré patterns, display sub-pixel structure).
-- **ML-based presentation-attack detection (PAD).** Classifiers trained under the **ISO/IEC 30107** framework; part 3 mandates reporting **APCER** (attack presentations wrongly accepted) and **BPCER** (genuine presentations wrongly rejected).
-- **Cross-channel consistency.** MRZ ↔ visual zone ↔ barcode ↔ NFC chip agreement, the redundancy that makes IDs verifiable.
+- **Passive Authentication (PA)**, the integrity check. The chip's Document Security Object is digitally signed by the issuing state's Document Signer, whose certificate chains to the country's Country Signing CA, with trust distributed via the ICAO Public Key Directory. PA proves the data was written by the legitimate authority and is unaltered. Critically, **PA alone does not prove the chip is genuine rather than cloned**, since a byte-for-byte copy of a signed object verifies just as well as the original.
+- **Active Authentication (AA) / Chip Authentication**, a challenge-response against a chip-resident private key that never leaves the secure element, proving the chip is genuine and not a clone.
 
-### 6.1 Datasets
+Together these answer the two distinct questions an authenticator cares about. PA answers "was this data issued and is it unaltered"; AA answers "is this the original physical chip". Because signed chip data is cryptographically bound to the issuer, NFC verification is far stronger than any visual or OCR check and is the recommended ground truth wherever an NFC-capable phone and a chipped document are both present. Its limits: many IDs are not chipped (most driver's licenses, many national IDs), key derivation needs an accurate MRZ read first, and some older chips lack AA, leaving them clone-detectable only by other means.
+
+## 7. Document Authenticity and Fraud Detection
+
+Threats span a physical-to-digital spectrum: physical forgery (altered or counterfeit cards), copy-move edits, recapture and screen-replay (photographing a screen showing an ID), print attacks, and synthetic or morphed documents. Detection layers correspondingly:
+
+- **Template and security-feature checks.** Given the identified type, verify layout geometry, fonts (kerning anomalies betray edited fields), microprint, guilloche patterns, and optically variable features such as holograms, best observed across video frames where reflectance changes.
+- **Signal-level forensics.** Copy-move detection, JPEG-artifact and noise-residual analysis, and frequency-domain analysis for screen recapture (moire patterns, display sub-pixel structure).
+- **ML-based presentation-attack detection (PAD).** Classifiers trained and evaluated under the **ISO/IEC 30107** framework; part 3 mandates reporting **APCER** (attack presentations wrongly accepted) and **BPCER** (genuine presentations wrongly rejected).
+- **Cross-channel consistency.** MRZ, visual zone, barcode, and NFC chip agreement, the redundancy that makes IDs verifiable.
+
+### 7.1 Quantifying detector performance
+
+PAD and forgery detectors are binary classifiers under heavy class imbalance and asymmetric costs, so headline accuracy is misleading. The ISO/IEC 30107-3 metrics are the standard:
+
+$$
+\text{APCER} = \frac{\#\,\text{attacks accepted as genuine}}{\#\,\text{attack presentations}},
+\qquad
+\text{BPCER} = \frac{\#\,\text{genuine rejected as attack}}{\#\,\text{genuine presentations}}.
+$$
+
+APCER is the security miss rate (a false negative, fraud let through) and BPCER is the user-friction rate (a false positive, a real customer turned away). They trade off along an operating curve set by the decision threshold, and the right operating point is a business and risk decision, not a modeling constant: an account opening for a high-value financial product tolerates more friction (higher BPCER) to drive APCER toward zero, while a low-risk flow may accept the reverse. A single number such as the equal-error rate (where APCER equals BPCER) is useful for comparing models but should never be the production target.
+
+### 7.2 Cross-channel fusion as a decision
+
+The most reliable signal is agreement across the redundant channels. The natural way to combine them is probabilistic. Let $G$ be the event "document is genuine" and let each channel produce a signal $s_i$ (MRZ check digits pass, MRZ matches the visual zone, barcode matches print, chip PA and AA verify). Treating the channels as conditionally independent given authenticity, the posterior odds update multiplicatively:
+
+$$
+\frac{p(G \mid s_1, \ldots, s_n)}{p(\lnot G \mid s_1, \ldots, s_n)}
+= \frac{p(G)}{p(\lnot G)} \prod_{i=1}^{n} \frac{p(s_i \mid G)}{p(s_i \mid \lnot G)} .
+$$
+
+Each factor is a likelihood ratio for that channel. The model makes explicit why the chip dominates: a valid Active Authentication is extremely improbable under a forgery, so its likelihood ratio is enormous and a single passing chip check can outweigh many soft visual signals. Conditional independence is only an approximation (a skilled forger may make the MRZ and visual zone agree precisely because they copied one from the other), so production systems do not accept on soft signals alone when a strong channel is available, and they reserve a "step-up" outcome for cases where channels are present but disagree.
+
+```{mermaid}
+flowchart TD
+    A["Extracted data per channel"] --> B["MRZ check digits"]
+    A --> C["MRZ vs visual zone"]
+    A --> D["Barcode vs print"]
+    A --> E["NFC PA and AA"]
+    B --> F["Combine likelihood ratios"]
+    C --> F
+    D --> F
+    E --> F
+    F --> G{"Posterior over threshold"}
+    G -->|"High confidence genuine"| H["Accept"]
+    G -->|"Channels disagree"| I["Step up or review"]
+    G -->|"Strong fraud signal"| J["Reject"]
+```
+
+### 7.3 Datasets
 
 Because real IDs are personally identifying and legally restricted, essentially all public ID benchmarks use *fictitious identities and generated faces*:
 
 | Dataset | Contents | Use |
 |---------|----------|-----|
 | MIDV-500 | 500 video clips, 50 ID types | Localization, recognition (mobile video) |
-| MIDV-2020 | 1,000 mock IDs: 1,000 clips + 2,000 scans + 1,000 photos | Largest public ID set at 2021 publication |
-| SIDTD | MIDV-2020 as bona fide + crop-and-move/inpainting forgeries | Presentation-attack / forgery detection |
+| MIDV-2020 | 1,000 mock IDs: 1,000 clips plus 2,000 scans plus 1,000 photos | Large public ID set at 2021 publication |
+| SIDTD | MIDV-2020 as bona fide plus crop-and-move/inpainting forgeries | Presentation-attack and forgery detection |
 | DocXPand-25k | 24,994 synthetic IDs, 9 fictitious designs | Localization, recognition, fraud |
 | IDNet, DocForge-Bench | Forgery-focused | Newer tamper benchmarks |
 
 The reliance on synthetic data is itself a lesson: the very techniques (generative faces, synthetic templates) that build these training sets are also what adversaries now use to *create* convincing forgeries, which is why the field increasingly treats NFC verification and cross-channel consistency, not any single visual model, as the trustworthy anchor.
 
-## 7. Practical Challenges
+## 8. Practical Challenges, When to Use What, and Pitfalls
 
-- **Image quality and environment**, glare over holograms, motion blur, low light, partial occlusion; mitigated by video capture and frame selection.
-- **Perspective and geometry**, robust corner detection and rectification before OCR.
-- **Low-end devices**, wide variance in camera and compute; on-device models must be quantized and small, trading accuracy for offline operation and latency.
-- **Template coverage**, the long tail of document types and versions worldwide requires a continually maintained template database.
-- **Edge versus cloud**, edge keeps PII on-device, lowers latency, and works offline but limits model size and template breadth; cloud allows larger models and centralized updates but raises privacy, latency, and regulatory concerns. Hybrid splits are common: capture, quality, and PAD on-device; heavy KIE and authenticity in the cloud.
+**Environment and capture.** Glare over holograms, motion blur, low light, and partial occlusion are the dominant real-world failure modes; mitigate by capturing video and selecting the sharpest, least-occluded frame rather than trusting a single shot. Robust corner detection and rectification must precede OCR, since geometric error propagates into every later stage.
 
-## 8. Conclusion
+**Deployment split.** Edge keeps personally identifiable information (PII) on-device, lowers latency, and works offline but limits model size and template breadth; cloud allows larger models and centralized template updates but raises privacy, latency, and regulatory concerns. The common hybrid runs capture quality, localization, and presentation-attack detection on-device, then sends a rectified crop to the cloud for heavy KIE and authenticity checks. On-device models must be quantized and small, trading some accuracy for offline operation and lower latency.
 
-Reading an identity document well is not primarily an OCR problem; it is a *verification* problem. Modern recognizers, CRNN+CTC, TrOCR, LayoutLMv3, Donut, extract the holder's data reliably, but the security of the system rests on the structured channels: the self-validating MRZ, the redundant barcode, and above all the cryptographically signed NFC chip, cross-checked against one another and against the printed visual zone. The next chapter takes the face image extracted here, from the document portrait or the NFC chip, and addresses the second half of identity verification: confirming that the person presenting the document is its genuine, living owner.
+**Template coverage.** The long tail of document types and versions worldwide requires a continually maintained template database; coverage, not raw model accuracy, is often what limits a real system.
+
+A short field guide:
+
+- **Reach for the chip first.** When an NFC-capable phone and a chipped document are both present, chip verification (PA plus AA) is the strongest signal and should anchor the decision. Treat visual and OCR checks as corroboration, not the primary basis of trust.
+- **Prefer detect-then-recognize over OCR-free for regulated flows.** Per-character auditability and field-level confidence matter more than a small accuracy gain when a decision must be explained to a regulator or contested by a user.
+- **Prefer CTC recognizers for random-string fields.** Document numbers and MRZ lines have no useful language prior, so an autoregressive decoder's fluency becomes a liability that can hide errors behind plausible output.
+- **Do not equate "MRZ check digits pass" with "genuine".** Check digits prove arithmetic self-consistency only; a forger who rewrote the MRZ also recomputed them. Cross-channel agreement and the chip carry the real weight.
+- **Set the threshold to the risk, not the dataset.** Report APCER and BPCER at the chosen operating point and pick that point from the cost of fraud versus the cost of friction, not from a single equal-error number.
+- **Assume synthetic forgeries.** The same generative tooling that builds public datasets builds attacks, so a system tuned only against historical physical forgeries will be blind to the current threat.
+
+## 9. Conclusion
+
+Reading an identity document well is not primarily an OCR problem; it is a *verification* problem. Modern recognizers, CRNN+CTC, TrOCR, LayoutLMv3, Donut, extract the holder's data reliably, but the security of the system rests on the structured channels: the self-validating MRZ, the redundant barcode, and above all the cryptographically signed NFC chip, cross-checked against one another and against the printed visual zone. The mathematics that governs the system is modest in volume but load-bearing: a sequence-alignment loss for recognition, a homography for rectification, a weighted modular code for the MRZ, and a likelihood-ratio fusion for the final decision. The next chapter takes the face image extracted here, from the document portrait or the NFC chip, and addresses the second half of identity verification: confirming that the person presenting the document is its genuine, living owner.
 
 ## References
 
 1.  ICAO. *Doc 9303: Machine Readable Travel Documents* (MRZ formats, check digits, eMRTD). https://www.icao.int/publications/pages/publication.aspx?docnum=9303
 2.  Shi, B., Bai, X., Yao, C. "An End-to-End Trainable Neural Network for Image-Based Sequence Recognition (CRNN)." 2016. https://arxiv.org/abs/1507.05717
-3.  Li, M. et al. "TrOCR: Transformer-based Optical Character Recognition with Pre-trained Models." 2021. https://arxiv.org/abs/2109.10282
-4.  Kim, G. et al. "OCR-free Document Understanding Transformer (Donut)." 2021. https://arxiv.org/abs/2111.15664
-5.  Huang, Y. et al. "LayoutLMv3: Pre-training for Document AI with Unified Text and Image Masking." 2022.
-6.  PaddleOCR. https://github.com/PaddlePaddle/PaddleOCR
-7.  Bulatov, K. et al. "MIDV-2020: A Comprehensive Benchmark Dataset for Identity Documents." 2021. https://arxiv.org/abs/2107.00396
-8.  "DocXPand-25k: a large and diverse benchmark dataset for identity documents analysis." 2024. https://arxiv.org/abs/2407.20662
-9.  AAMVA. *DL/ID Card Design Standard* (PDF417 encoding). https://www.aamva.org/
-10. ISO/IEC 30107-3. *Information technology, Biometric presentation attack detection, Part 3: Testing and reporting.* https://www.iso.org/standard/79520.html
-11. Systematic review of ID-card presentation-attack detection. 2025. https://arxiv.org/abs/2511.06056
+3.  Graves, A., Fernandez, S., Gomez, F., Schmidhuber, J. "Connectionist Temporal Classification: Labelling Unsegmented Sequence Data with Recurrent Neural Networks." ICML 2006. https://doi.org/10.1145/1143844.1143891
+4.  Li, M. et al. "TrOCR: Transformer-based Optical Character Recognition with Pre-trained Models." 2021. https://arxiv.org/abs/2109.10282
+5.  Kim, G. et al. "OCR-free Document Understanding Transformer (Donut)." 2021. https://arxiv.org/abs/2111.15664
+6.  Huang, Y. et al. "LayoutLMv3: Pre-training for Document AI with Unified Text and Image Masking." 2022. https://doi.org/10.1145/3503161.3548112
+7.  PaddleOCR. https://github.com/PaddlePaddle/PaddleOCR
+8.  Bulatov, K. et al. "MIDV-2020: A Comprehensive Benchmark Dataset for Identity Documents." 2021. https://arxiv.org/abs/2107.00396
+9.  "DocXPand-25k: a large and diverse benchmark dataset for identity documents analysis." 2024. https://arxiv.org/abs/2407.20662
+10. AAMVA. *DL/ID Card Design Standard* (PDF417 encoding). https://www.aamva.org/
+11. ISO/IEC 30107-3. *Information technology, Biometric presentation attack detection, Part 3: Testing and reporting.* https://www.iso.org/standard/79520.html
+12. Hartley, R., Zisserman, A. *Multiple View Geometry in Computer Vision*, 2nd ed. Cambridge University Press, 2004. https://doi.org/10.1017/CBO9780511811685
+13. Systematic review of ID-card presentation-attack detection. 2025. https://arxiv.org/abs/2511.06056

@@ -10,11 +10,13 @@ $$
 \mathcal{L}_{\mathrm{CE}} = -\sum_{k=1}^{K} y_k \log \hat{p}_k = -\log \hat{p}_{c},
 $$
 
-where $c$ is the true class. The objective is calibrated and well behaved, but it carries two implicit assumptions that fail in practice. First, it treats every example as equally important. Under heavy class imbalance, the aggregate loss is dominated by the majority class, and the gradient signal from rare classes is drowned out even when each rare example is individually well classified is not. Second, cross-entropy is fundamentally a per example classification objective tied to a fixed label vocabulary. It says nothing about the geometry of the representation space and cannot express a goal like "embed these two augmented views of the same image close together."
+where $c$ is the true class. The objective is calibrated and well behaved, but it carries two implicit assumptions that fail in practice. First, it treats every example as equally important. Under heavy class imbalance, the aggregate loss is dominated by the majority class, and the gradient signal from rare classes is drowned out even when each rare example is poorly classified. Second, cross-entropy is fundamentally a per example classification objective tied to a fixed label vocabulary. It says nothing about the geometry of the representation space and cannot express a goal like "embed these two augmented views of the same image close together."
+
+To see the first failure quantitatively, suppose a detector sees $10^4$ background anchors, each confidently correct at $\hat{p}_t = 0.99$, alongside $10$ foreground objects that the model finds hard at $\hat{p}_t = 0.3$. Each easy negative contributes $-\log 0.99 \approx 0.01$ to the loss, so the negatives together contribute about $100$. The ten hard positives contribute $10 \times (-\log 0.3) \approx 12$. The background, though individually trivial, supplies roughly eight times the total loss and dominates the gradient. No tuning of the learning rate fixes this; the problem is the shape of the objective, not its scale. This single observation motivates focal loss in @sec-focal.
 
 The losses below relax one or both assumptions. Focal loss keeps the classification framing but reweights examples by difficulty. Metric and contrastive losses abandon the fixed label set entirely and instead shape pairwise or higher order relationships in embedding space.
 
-## 2. Focal Loss for Imbalance
+## 2. Focal Loss for Imbalance {#sec-focal}
 
 ### 2.1 Motivation and definition
 
@@ -49,7 +51,21 @@ $$
 = \alpha_t (1 - p_t)^{\gamma}\Big( \gamma\, p_t \log p_t + p_t - 1 \Big),
 $$
 
-so the per example gradient magnitude is itself attenuated by $(1 - p_t)^{\gamma}$ for easy examples, ensuring they neither dominate the loss nor the update direction.
+so the per example gradient magnitude is itself attenuated by $(1 - p_t)^{\gamma}$ for easy examples, ensuring they neither dominate the loss nor the update direction. To make the derivation concrete, recall that for binary logistic output $p_t = \sigma(z)$ on a positive example we have $\partial p_t / \partial z = p_t (1 - p_t)$ and $\partial \log p_t / \partial z = 1 - p_t$. Differentiating $-(1-p_t)^{\gamma}\log p_t$ by the product rule gives a term from the modulating factor, $\gamma (1-p_t)^{\gamma-1} p_t (1-p_t) \log p_t = \gamma (1-p_t)^{\gamma} p_t \log p_t$, and a term from the log, $-(1-p_t)^{\gamma}(1-p_t)$. Collecting them yields the expression above. The two terms have opposite sign and the overall factor $(1-p_t)^{\gamma}$ guarantees that as $p_t \to 1$ the gradient vanishes faster than under cross-entropy, which is precisely the desired behavior.
+
+The pipeline that turns raw logits into a focal contribution is summarized below.
+
+```{mermaid}
+%%| label: fig-focal-flow
+%%| fig-cap: "How focal loss reshapes the per example contribution from logits to weighted loss."
+flowchart LR
+  A["logit z"] --> B["probability p_t"]
+  B --> C["cross-entropy term: minus log p_t"]
+  B --> D["modulating factor: one minus p_t, raised to gamma"]
+  D --> E["class weight alpha_t"]
+  C --> F["focal loss: alpha_t times factor times CE"]
+  E --> F
+```
 
 ```python
 # Binary focal loss (illustrative, not runnable)
@@ -122,11 +138,13 @@ $$
 I(\mathbf{q}; \mathbf{k}^{+}) \;\geq\; \log(N+1) - \mathcal{L}_{\mathrm{InfoNCE}} .
 $$
 
-The bound tightens as the number of negatives $N$ grows, which gives a principled reason to want many negatives. This insight drove architectures that decouple the negative pool size from the gradient batch size. SimCLR uses very large batches so that all other examples serve as in batch negatives. MoCo maintains a momentum updated encoder and a queue of past keys, providing a large and consistent dictionary of negatives without the memory cost of large batches.
+The bound tightens as the number of negatives $N$ grows, which gives a principled reason to want many negatives. The factor $\log(N+1)$ also caps how much information any single InfoNCE term can certify: with a batch of $256$ candidates the bound saturates near $\log 256 \approx 5.5$ nats, so contrastive pretraining that needs to capture high mutual information must either grow the candidate pool or accept that the bound is loose. This insight drove architectures that decouple the negative pool size from the gradient batch size. SimCLR uses very large batches so that all other examples serve as in batch negatives. MoCo maintains a momentum updated encoder and a queue of past keys, providing a large and consistent dictionary of negatives without the memory cost of large batches.
 
 ### 4.3 Temperature and its effect
 
 The temperature $\tau$ controls the sharpness of the distribution over candidates. A small $\tau$ sharpens the softmax, concentrating gradient on the hardest negatives, those most similar to the query, which improves discrimination but risks instability. A large $\tau$ softens the distribution and treats negatives more uniformly. Empirically $\tau$ in the range $0.05$ to $0.2$ is common, and the choice materially affects the learned uniformity and separability of the embedding space.
+
+A small worked example makes the role of $\tau$ tangible. Take an anchor with cosine similarity $0.8$ to its positive and $0.6$ and $0.1$ to two negatives. At $\tau = 0.1$ the scaled logits are $8.0$, $6.0$, and $1.0$; the softmax probability mass on the positive is about $0.88$, so the loss $-\log 0.88 \approx 0.13$ and the hard negative at $0.6$ absorbs almost all of the residual gradient. At $\tau = 0.5$ the logits become $1.6$, $1.2$, and $0.2$; the positive probability falls to about $0.52$, the loss rises to $\approx 0.65$, and the easy negative at $0.1$ now receives a non trivial share of the push. Lower temperature thus concentrates effort on the most confusable negatives, at the cost of larger gradients that can destabilize early training.
 
 ```python
 # InfoNCE for a batch of L2-normalized embeddings (illustrative)
@@ -185,6 +203,19 @@ $$
 The scale $s$ plays the role of an inverse temperature on the unit sphere. By demanding a geodesic margin between classes, ArcFace produces highly discriminative, well separated embeddings and became a standard for face recognition. It is a revealing synthesis: a softmax cross-entropy at heart, but reshaped by the margin and metric learning ideas of the preceding sections.
 
 ## 6. Choosing an Objective
+
+The following table maps problem structure to a default objective and its dominant practical lever.
+
+| Problem structure | Default loss | Key knob | Main pitfall |
+|---|---|---|---|
+| Balanced classification, fixed labels | Cross-entropy | label smoothing | overconfidence |
+| Severe imbalance, dense prediction | Focal loss | focusing $\gamma$, balance $\alpha$ | over down weighting hard positives |
+| Embedding geometry, scarce labels | Contrastive or triplet | margin $m$, negative mining | mining collapse, dead triplets |
+| Embedding geometry, many negatives | InfoNCE | temperature $\tau$, negatives $N$ | small $N$ loosens the MI bound |
+| Relative order matters | Ranking or LambdaRank | margin, metric weighting | pairwise objective ignores list position |
+| Open set verification | ArcFace | angular margin $m$, scale $s$ | overlarge margin stalls convergence |
+
+A few cross cutting pitfalls deserve emphasis. Margin based losses produce exactly zero gradient once the margin is satisfied, so a poorly chosen margin or a stale set of pairs can silently halt learning while the loss curve looks healthy; monitoring the fraction of active (nonzero loss) pairs is a cheap and reliable diagnostic. Contrastive objectives are acutely sensitive to false negatives, since two samples that share a latent class but no label are pushed apart by construction, which is one reason supervised positives help when labels exist. Finally, focal loss assumes the easy examples really are correct; under heavy label noise its down weighting can starve the model of signal, so it pairs best with reasonably clean annotations. Mature open source implementations of all of these losses ship with `torchvision`, `timm`, `pytorch-metric-learning`, and `sentence-transformers`, and reaching for a tested implementation is preferable to re deriving the numerically delicate stable forms by hand.
 
 The losses in this chapter are not competitors so much as tools matched to problem structure. If the task is classification with a fixed label set and roughly balanced classes, cross-entropy remains the right default. Under severe imbalance, especially dense prediction, focal loss restores a useful gradient from the rare, hard examples. When the goal is an embedding space whose geometry encodes similarity, and labels are scarce or open ended, contrastive, triplet, and InfoNCE losses shape that geometry directly, with the number and quality of negatives being the dominant practical lever. When relative order is what matters, margin and ranking losses optimize it explicitly, and listwise refinements align training with the metrics that actually govern retrieval quality. A recurring theme ties them together. Most of these objectives can be read as a softmax cross-entropy that has been reweighted by difficulty, restructured over a dynamic candidate set, or augmented with an explicit margin. Understanding that common skeleton is the surest guide to selecting and adapting a loss for a new problem.
 

@@ -19,6 +19,20 @@ $$
 
 The only thing that distinguishes the four methods is the definition of $\mathcal{S}_i$, the pooling set over which statistics are aggregated. This is the central insight that makes the spectrum legible: each method answers the question of which activations share a normalizer.
 
+Two formal properties hold for every choice of $\mathcal{S}_i$ and are worth stating precisely, because they explain why the family stabilizes training at all.
+
+::: {.callout-note title="Proposition (scale and shift invariance of the normalized statistic)"}
+Fix a pooling set $\mathcal{S}$ and let $\hat{x}$ denote the normalized output before the affine step, with $\epsilon = 0$. For any scalars $a \neq 0$ and $b$, replacing every activation $x_j \to a x_j + b$ for $j \in \mathcal{S}$ leaves $\hat{x}$ unchanged.
+:::
+
+The proof is a one line computation. Under $x_j \to a x_j + b$ the pooled mean becomes $a\mu + b$ and the pooled standard deviation becomes $|a|\sigma$, so
+
+$$
+\frac{(a x_i + b) - (a\mu + b)}{|a|\sigma} = \frac{a (x_i - \mu)}{|a|\sigma} = \operatorname{sign}(a)\,\frac{x_i - \mu}{\sigma},
+$$
+
+which equals $\hat{x}_i$ up to the sign that a nonzero $a$ cannot flip in practice, since deep networks place the normalizer after a linear map whose scale is absorbed harmlessly. The practical reading is that the layer feeding a normalization layer cannot change the loss by globally rescaling or offsetting its output inside the pooling set. This decouples the optimization of upstream weight magnitude from the optimization of direction, which is the mechanism behind the smoother loss surface reported by Santurkar et al. (reference 8).
+
 ### 1.1 The Four Pooling Sets
 
 Let $i = (n, c, h, w)$. The four schemes correspond to four choices.
@@ -38,7 +52,29 @@ InstanceNorm: reduce over (H, W)      per (sample, channel)
 GroupNorm   : reduce over (H, W, c/G) per (sample, group)
 ```
 
+The following diagram places the schemes on the axis that orders them, the size of the per example pooling set, with Batch Norm set apart as the only batch coupled member.
+
+```{mermaid}
+flowchart LR
+    B["LayerNorm: pool over C, H, W per sample, G equals 1"] --> C["GroupNorm: pool over H, W and channels in a group"]
+    C --> D["InstanceNorm: pool over H, W per channel, G equals C"]
+    A["BatchNorm: pool over N, H, W per channel, batch coupled"]
+```
+
 The crucial structural difference is that Batch Norm is the only one of the four whose statistics couple different examples in the batch. The other three are computed within a single example and are therefore independent of batch size. This single fact explains most of the practical behavior that follows.
+
+### 1.2 A Small Worked Example
+
+Concrete numbers make the pooling sets tangible. Take a tiny tensor with $N = 1$ example, $C = 2$ channels, and a $2 \times 2$ spatial grid, so $H = W = 2$. Let the two channel maps be
+
+$$
+x_{0,0} = \begin{pmatrix} 1 & 3 \\ 5 & 7 \end{pmatrix}, \qquad
+x_{0,1} = \begin{pmatrix} 0 & 4 \\ 8 & 12 \end{pmatrix}.
+$$
+
+Instance Norm normalizes each channel over its four spatial entries. Channel $0$ has mean $4$ and variance $5$, so its standard deviation is $\sqrt{5} \approx 2.236$. Channel $1$ has mean $6$ and variance $20$, so its standard deviation is $\sqrt{20} \approx 4.472$. The two channels are scaled by different amounts, $2.236$ and $4.472$, which is exactly the behavior that erases per channel contrast.
+
+Layer Norm, or equivalently Group Norm with $G = 1$, pools all eight entries together. Their mean is $5$ and their variance is $\tfrac{1}{8}\sum (x - 5)^2 = 13.5$, giving one standard deviation $\sqrt{13.5} \approx 3.674$ applied to both channels. Because a single normalizer is shared, the larger spread of channel $1$ relative to channel $0$ survives the normalization, preserving cross channel scale information that Instance Norm discards. Group Norm with $G = 2$ on this tensor coincides with Instance Norm, since each group then holds one channel. This four entry computation is the whole story scaled down: the only thing that changed between the methods was which entries entered the sums.
 
 ## 2. Why Batch Norm Breaks
 
@@ -134,6 +170,18 @@ Practical guidance follows directly from this structure.
 
 A useful diagnostic is to ask whether the task wants to preserve or discard global per channel intensity. Classification wants to preserve discriminative scale information, which argues against Instance Norm. Stylization wants to discard input contrast, which argues for it. Group Norm gives a tunable knob between these regimes.
 
+### 5.1 Pitfalls
+
+A few failure modes recur often enough to call out.
+
+- The number of groups must divide the channel count. Choosing $G = 32$ on a layer with $C = 48$ channels is a configuration error. When channel counts vary across a network, a common robust choice is to fix the channels per group, for example $C/G = 16$, rather than fixing $G$, so that every layer divides cleanly.
+- Group Norm degenerates on tiny spatial maps. With $G = C$ the pooling set is just the $H W$ spatial entries, so a $1 \times 1$ feature map leaves a single sample and the variance estimate becomes meaningless. Late stage feature maps in classifiers and the per token features in some architectures are exactly this regime, and Layer Norm or a small $G$ is safer there.
+- Do not mix the train and inference paths. The appeal of the single example methods is that the same computation runs at training and inference, with no running averages to maintain. Reintroducing a running statistic, or freezing a Batch Norm layer and a Group Norm layer inconsistently when fine tuning, silently recreates the train and test mismatch the switch was meant to avoid.
+- Instance Norm erases information by design. Using it in a classifier removes the per channel intensity that often carries class signal, which is why it underperforms there. Reach for it only when contrast removal is the goal.
+- The affine parameters still matter. Setting $\gamma$ and $\beta$ per channel restores representational capacity that the normalization removed. Omitting them, or sharing them too coarsely, can leave the normalized features unable to recover a needed scale.
+
+Mature open source frameworks ship all four layers directly, so none of this requires custom kernels. PyTorch provides `nn.BatchNorm2d`, `nn.GroupNorm`, `nn.InstanceNorm2d`, and `nn.LayerNorm`, and Flax and Haiku expose the same set, which makes swapping among them a one line change during ablation.
+
 ```python
 # pseudocode: one implementation, four behaviors
 def normalize(x, axes, gamma, beta, eps=1e-5):
@@ -150,7 +198,19 @@ def normalize(x, axes, gamma, beta, eps=1e-5):
 
 ## 6. Theoretical Notes
 
-Two properties unify the batch independent methods. First, they are invariant to per group affine transformations of the input within their pooling set, which makes them robust to shifts in input scale and offset. Second, their Jacobian has a benign structure: the centering and scaling operations bound the effective gradient scale, which is one reason normalization stabilizes training. The variance term introduces a coupling in the backward pass, since each $\hat{x}_i$ depends on all activations in $\mathcal{S}_i$ through $\mu$ and $\sigma$, and this coupling is what spreads gradient information across the pooling set.
+Two properties unify the batch independent methods. First, they are invariant to per group affine transformations of the input within their pooling set, which is the proposition proved in Section 1. Second, their Jacobian has a benign structure: the centering and scaling operations bound the effective gradient scale, which is one reason normalization stabilizes training.
+
+### 6.1 The Backward Pass
+
+The coupling that normalization introduces is easiest to see by differentiating through a single pooling set. Fix one set $\mathcal{S}$ of size $m = |\mathcal{S}|$, write the centered and scaled output as $\hat{x}_i = (x_i - \mu)/\sqrt{\sigma^2 + \epsilon}$, and let $g_i = \partial L / \partial \hat{x}_i$ be the incoming gradient. Standard differentiation through the shared $\mu$ and $\sigma^2$ gives
+
+$$
+\frac{\partial L}{\partial x_i} = \frac{1}{\sqrt{\sigma^2 + \epsilon}} \left( g_i - \frac{1}{m} \sum_{j \in \mathcal{S}} g_j - \hat{x}_i \cdot \frac{1}{m} \sum_{j \in \mathcal{S}} g_j \hat{x}_j \right).
+$$
+
+The structure is informative. The first inner term subtracts the mean of the incoming gradients, so a gradient component that is uniform across the pooling set is removed. The second inner term subtracts the projection of the gradient onto the current normalized output, so a component aligned with $\hat{x}$ is also removed. In words, the backward pass orthogonalizes the gradient against the two directions that scaling and shifting the activations cannot affect, namely the constant direction and the $\hat{x}$ direction. This is the exact backward image of the forward invariance proposition, and it is why a normalization layer cannot pass gradient signal that would only renormalize its own input. The factor $1/\sqrt{\sigma^2 + \epsilon}$ in front shows that the layer also rescales the gradient by the inverse activation scale, which is the bounding effect that keeps gradient magnitudes well behaved through depth.
+
+### 6.2 Bias Variance Tradeoff in the Pooling Set
 
 The choice of pooling set is ultimately a bias variance tradeoff in statistics estimation. Larger pooling sets give lower variance estimates of $\mu$ and $\sigma$ but impose a stronger assumption that the pooled activations are exchangeable. Batch Norm has a large pooling set but pays with batch dependence. Instance Norm has the smallest pooling set, $H W$ samples, which is fine for large feature maps but unstable for small ones. Group Norm tunes the pooling set size through $G$, trading estimation variance against the validity of the within group exchangeability assumption, which is why an intermediate $G$ tends to win.
 

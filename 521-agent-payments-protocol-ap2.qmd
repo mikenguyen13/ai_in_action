@@ -6,11 +6,22 @@ The previous two chapters built the foundation of the agent stack: MCP connects 
 
 When an agent transacts on a user's behalf, that assumption collapses, and a trust gap opens that Google's launch material frames as three questions:
 
-1. **Authorization**, How does a merchant know the user actually gave this agent authority to make *this particular* purchase?
-2. **Authenticity**, How does the merchant know the agent's request faithfully reflects the user's true intent, rather than a hallucination or a manipulated instruction?
-3. **Accountability**, When a fraudulent or incorrect transaction occurs, who is responsible, the user, the merchant, the issuer, or the agent?
+1. **Authorization.** How does a merchant know the user actually gave this agent authority to make *this particular* purchase?
+2. **Authenticity.** How does the merchant know the agent's request faithfully reflects the user's true intent, rather than a hallucination or a manipulated instruction?
+3. **Accountability.** When a fraudulent or incorrect transaction occurs, who is responsible: the user, the merchant, the issuer, or the agent?
 
-The **Agent Payments Protocol (AP2)** is an open protocol, announced by Google on September 16, 2025, that answers these questions with cryptographic, non-repudiable proof. It launched with more than sixty partners drawn heavily from the payments industry, Mastercard, American Express, PayPal, Adyen, Worldpay, Checkout.com, Coinbase, Intuit, and others, and is designed as an **extension layer that rides on top of A2A** (and is usable alongside MCP). This chapter develops AP2's trust model, its central abstraction of the **Mandate**, its actors and flows, and its payment-method-agnostic design.
+The **Agent Payments Protocol (AP2)** is an open protocol, announced by Google on September 16, 2025, that answers these questions with cryptographic, non-repudiable proof. It launched with more than sixty partners drawn heavily from the payments industry, Mastercard, American Express, PayPal, Adyen, Worldpay, Checkout.com, Coinbase, Intuit, and others, and is designed as an **extension layer that rides on top of A2A** (and is usable alongside MCP). This chapter develops AP2's trust model, its central abstraction of the **Mandate**, its actors and flows, its underlying cryptography, and its payment-method-agnostic design.
+
+### 1.1 What "trust" means here, precisely
+
+It helps to state the goal in security terms before introducing the machinery. AP2 aims to make every economically consequential action satisfy four properties simultaneously:
+
+- **Integrity.** The cart and its terms cannot be altered after approval without detection. A single changed byte invalidates the signature.
+- **Authenticity.** Each party's contribution is attributable to a key that party controls, so the merchant knows the approval came from the user's device and the user knows the offer came from the merchant.
+- **Non-repudiation.** Having signed, no party can later credibly deny what it signed. This is the property a plain shared-secret system (such as a password or a bearer token) cannot provide, since either side could have produced the message.
+- **Authorization scope.** When the human is not present, the action provably falls within bounds the human declared in advance. Authority is delegated, but it is bounded and auditable.
+
+The contribution of AP2 is not any one of these properties in isolation, each is standard cryptography, but the way it composes them into a chain that mirrors the legal structure of a purchase: an instruction, an agreement on terms, and an execution.
 
 ## 2. Position in the Agent Stack
 
@@ -18,43 +29,83 @@ AP2 occupies the commerce layer of the stack, above agent-to-agent coordination:
 
 ```{mermaid}
 flowchart TD
-    AP2["AP2: payments / commerce (Mandates, signed VCs)"]
+    AP2["AP2: payments and commerce (Mandates, signed VCs)"]
     A2A["A2A: agent to agent (Agent Cards, Tasks)"]
-    MCP["MCP: agent to tools/data (tools, resources)"]
+    MCP["MCP: agent to tools and data (tools, resources)"]
     AP2 --> A2A --> MCP
 ```
 
 Concretely, AP2 is implemented as an **A2A extension**. An agent advertises AP2 support through the A2A extension mechanism (an `X-A2A-Extensions` header), and AP2's mandates and credentials are carried as structured data payloads inside ordinary A2A messages. AP2 inherits A2A's transport, discovery, and security machinery and adds the one thing commerce requires that agent coordination does not: a verifiable, tamper-evident chain of authorization tying a payment back to a real human's instruction. The reference implementations use Google's Agent Development Kit and Gemini, but the protocol mandates neither, it is model- and framework-agnostic by design.
 
+It is worth being precise about the layering. A2A answers "which agent am I talking to, and how do we exchange tasks safely?" AP2 answers "what did the human authorize, and how do I prove it to a third party who trusts neither agent?" The second question is strictly harder, because its security must hold even against the agents themselves. An A2A channel can be perfectly authenticated and encrypted and still carry a fraudulent purchase if a compromised or hallucinating agent fabricates a cart. AP2 closes that gap by moving the proof of human intent out of the channel and into a signed artifact that the human's own device produced.
+
 ## 3. The Central Abstraction: Mandates
 
 The trust primitive in AP2 is the **Mandate**: a tamper-proof, cryptographically signed digital contract that serves as verifiable proof of a user's instructions. Mandates are expressed as **Verifiable Credentials** (the W3C standard; the specification also uses the term *Verifiable Digital Credentials*), tamper-evident, cryptographically signed digital objects, ideally signed with a hardware-backed device key so that each mandate is both non-repudiable and attributable to a specific party.
 
+### 3.1 A precise definition
+
+Strip away the framing and a mandate is a signed statement. Let a party hold an asymmetric key pair $(sk, pk)$, a secret signing key and a public verification key. A mandate is a triple
+
+$$
+M = \bigl(\, c,\ \sigma,\ pk \,\bigr), \qquad \sigma = \mathrm{Sign}_{sk}\bigl(H(c)\bigr),
+$$
+
+where $c$ is the canonical serialization of the mandate's claims (the cart, the constraints, the timestamps, and a reference to any parent mandate), $H$ is a collision-resistant hash, and $\sigma$ is a digital signature over that hash. A verifier accepts $M$ if and only if
+
+$$
+\mathrm{Verify}_{pk}\bigl(H(c),\, \sigma\bigr) = \texttt{true}.
+$$
+
+Three consequences follow directly from this definition and are the whole reason mandates work:
+
+1. **Tamper evidence.** Because $H$ is collision-resistant, changing any field of $c$ changes $H(c)$ with overwhelming probability, so the old $\sigma$ no longer verifies. There is no way to edit an approved cart and keep the signature valid.
+2. **Attribution.** Because only the holder of $sk$ can produce a $\sigma$ that verifies under $pk$, a valid signature binds the claims to that specific party. If $sk$ lives in a device's secure element and never leaves it, the binding is to that device.
+3. **Non-repudiation.** The same asymmetry means the signer cannot later claim someone else produced the signature, since no one else holds $sk$.
+
+The phrase "canonical serialization" carries real weight. Two byte sequences that a human would read as the same JSON object can hash differently if keys are reordered or whitespace differs, which would let a signature silently fail or, worse, let an attacker craft two readings of one signed blob. Production deployments therefore fix a canonicalization (for example a deterministic JSON encoding) so that $c$ has exactly one byte representation. This is the same class of concern that motivated canonicalization in older signed-document standards, and getting it wrong is a recurring source of interoperability bugs.
+
+### 3.2 The three mandate types
+
 AP2 defines three mandate types, which chain together to form a complete audit trail.
 
-### 3.1 The Intent Mandate
+#### The Intent Mandate
 
 The **Intent Mandate** captures the user's initial request and the constraints around it, the "rules of engagement." It encodes the natural-language instruction together with bounds such as a maximum price, acceptable merchants or SKUs, timing conditions, and an expiry. The Intent Mandate is the vehicle for **delegated, human-not-present authority**: by signing it up front, the user authorizes the agent to act *later*, autonomously, but only within the pre-declared bounds. "Buy two tickets the moment they go on sale, up to \$150 each" is an Intent Mandate.
 
-### 3.2 The Cart Mandate
+Formally, the constraints in an Intent Mandate define a **predicate** $\phi$ over candidate carts. A cart $x$ is authorized if and only if $\phi(x) = \texttt{true}$. For the ticket example, with $x = (\text{price},\ \text{quantity},\ \text{event},\ t)$,
+
+$$
+\phi(x) \;=\; \bigl[\text{price} \le 150\bigr] \,\wedge\, \bigl[\text{quantity} \le 2\bigr] \,\wedge\, \bigl[\text{event} = \text{target}\bigr] \,\wedge\, \bigl[t \le \text{expiry}\bigr].
+$$
+
+The agent's job in the delegated flow is to find an $x$ with $\phi(x) = \texttt{true}$ and nothing more. The signed predicate is what lets a third party later confirm that the autonomous purchase stayed inside the granted authority.
+
+#### The Cart Mandate
 
 The **Cart Mandate** is the user's explicit approval of an *exact* cart, precise items and a precise total, in a **human-present** flow. It is "a secure, unchangeable record of the exact items and price," delivering the guarantee that **what you see is what you pay for**. A defining feature is that the Cart Mandate is **signed by both parties**: the merchant signs the cart to guarantee it will honor those items at that price, and the user signs to approve the purchase. This dual signature is what closes the authenticity gap, neither side can later claim a different cart.
 
-### 3.3 The Payment Mandate
+The dual signature is a small but important piece of structure. Let $c$ be the cart contents. The merchant produces $\sigma_m = \mathrm{Sign}_{sk_m}(H(c))$, committing to honor those items at that price. The user then signs over the cart *together with* the merchant's commitment, $\sigma_u = \mathrm{Sign}_{sk_u}\bigl(H(c \,\|\, \sigma_m)\bigr)$, so the user's approval is meaningful only against the specific merchant offer it accepted. This ordering matters: it prevents a swap in which an honestly user-approved cart is re-paired with a different merchant offer.
+
+#### The Payment Mandate
 
 The **Payment Mandate** is a minimal credential *derived from* the Cart (or Intent) Mandate and appended to the payment authorization itself. Its purpose is narrow but critical: it signals **to the payment network and the issuing bank that an agent was involved**, and whether a human was present at the moment of purchase. It carries a tokenized payment reference and a cryptographic link back to the cart, giving the rail and the issuer the signals they need for risk decisioning on agent-initiated transactions, a category their existing fraud models were never built to see.
 
-### 3.4 The Audit Chain
+The Payment Mandate is deliberately thin. It is not where the money lives and it does not carry the card number. It is a *labeled pointer*: a small signed object that says "this authorization descends from cart $c$, an agent produced it, and a human was (or was not) present," with a tokenized reference standing in for the real instrument. The issuer reads that label and routes the transaction through whatever risk logic it chooses for agentic payments, which is precisely the new signal that legacy "card-present versus card-not-present" categories could not express.
 
-Chained together, the three mandates form a non-repudiable record of the full transaction:
+### 3.3 The audit chain
+
+Chained together, the three mandates form a non-repudiable record of the full transaction. The chaining is itself cryptographic: each mandate embeds the hash of its parent, so the three signatures form a **hash chain** in which tampering with any earlier link breaks every link after it.
 
 ```{mermaid}
 flowchart LR
     Intent["Intent Mandate"]
     Cart["Cart Mandate"]
     Payment["Payment Mandate"]
-    Intent -->|"cryptographically bound"| Cart -->|"cryptographically bound"| Payment
+    Intent -->|"hash embedded in"| Cart -->|"hash embedded in"| Payment
 ```
+
+Concretely, writing $h_I = H(c_I)$ for the Intent Mandate's content hash, the Cart Mandate's content includes $h_I$, so $c_C \supseteq \{h_I, \dots\}$ and $h_C = H(c_C)$; the Payment Mandate's content in turn includes $h_C$. A verifier who is handed all three can recompute every hash and confirm the links. If anyone edits the intent after the fact, $h_I$ changes, which changes $h_C$, which invalidates the cart signature and the payment link. The chain is therefore tamper-evident end to end, not merely link by link.
 
 | Mandate | Captures | Signed by | Contents |
 |---|---|---|---|
@@ -62,19 +113,19 @@ flowchart LR
 | Cart Mandate | what was approved | merchant and user | exact items and price |
 | Payment Mandate | what the network executed | derived | agent-presence signal to issuer and rail |
 
-Given a disputed transaction, any party can verify exactly what the user authorized (Intent), what they approved (Cart), and what was charged (Payment), with each step cryptographically bound to the last. Accountability is thereby tied to real-world entities, user, merchant, issuer, **and explicitly not to the agent**, which is the only way agentic commerce can integrate with existing liability frameworks.
+Given a disputed transaction, any party can verify exactly what the user authorized (Intent), what they approved (Cart), and what was charged (Payment), with each step cryptographically bound to the last. Accountability is thereby tied to real-world entities, user, merchant, issuer, **and explicitly not to the agent**, which is the only way agentic commerce can integrate with existing liability frameworks. The agent is a conduit that produces signed artifacts; it is never itself the signer of record, because a software agent has no standing in a chargeback dispute.
 
 ## 4. Actors
 
 An AP2 transaction involves roughly five roles:
 
-- **User / Payer**, originates intent and signs mandates, ideally with a hardware-backed key.
-- **Shopping Agent (User Agent)**, represents the user: gathers preferences, queries merchants, assembles and presents carts, orchestrates the flow.
-- **Merchant Agent**, represents the merchant: makes offers and builds and signs carts.
-- **Credentials Provider** (Payment Credential Provider), secures the user's payment methods and shipping data and issues *tokenized* payment credentials, so that agents never handle raw card numbers.
-- **Merchant Payment Processor / Issuer / Network**, authorizes and settles the transaction on the appropriate rail.
+- **User / Payer.** Originates intent and signs mandates, ideally with a hardware-backed key.
+- **Shopping Agent (User Agent).** Represents the user: gathers preferences, queries merchants, assembles and presents carts, orchestrates the flow.
+- **Merchant Agent.** Represents the merchant: makes offers and builds and signs carts.
+- **Credentials Provider (Payment Credential Provider).** Secures the user's payment methods and shipping data and issues *tokenized* payment credentials, so that agents never handle raw card numbers.
+- **Merchant Payment Processor / Issuer / Network.** Authorizes and settles the transaction on the appropriate rail.
 
-The separation of the Credentials Provider from the agents is a deliberate security boundary: sensitive instruments stay with a dedicated custodian and are exposed to the flow only as tokens.
+The separation of the Credentials Provider from the agents is a deliberate security boundary: sensitive instruments stay with a dedicated custodian and are exposed to the flow only as tokens. This follows the principle of least privilege. The Shopping Agent needs to *initiate* a payment, but it does not need to *see* the card number to do so, and an agent that never holds the raw instrument cannot leak it, whether through a prompt injection, a logging mistake, or a model that repeats its context. Tokenization confines the blast radius of an agent compromise to a single tokenized reference rather than a reusable credential.
 
 ## 5. Transaction Flows
 
@@ -90,6 +141,27 @@ The separation of the Credentials Provider from the agents is a deliberate secur
 6. A **Payment Mandate** is generated and signed, flagging agent involvement (human present).
 7. The agent initiates payment; the processor and network settle, with the Payment Mandate visible to the issuer for risk assessment.
 
+```{mermaid}
+sequenceDiagram
+    participant U as User
+    participant SA as Shopping Agent
+    participant MA as Merchant Agent
+    participant CP as Credentials Provider
+    participant NET as Processor and Network
+    U->>SA: "Find white running shoes"
+    SA->>SA: create Intent Mandate
+    SA->>MA: request offers
+    MA-->>SA: candidate carts
+    SA->>U: present options
+    U->>SA: select exact item
+    MA->>SA: merchant-signed cart
+    U->>SA: user-signed Cart Mandate
+    SA->>CP: request tokenized credential
+    CP-->>SA: payment token
+    SA->>NET: payment with Payment Mandate
+    NET-->>SA: authorize and settle
+```
+
 ### 5.2 Human-Not-Present (Delegated) Purchase
 
 "Buy concert tickets the moment they go on sale, up to \$150 each."
@@ -101,21 +173,50 @@ The separation of the Credentials Provider from the agents is a deliberate secur
 
 The structural difference between the two flows is precisely *where the user's signature enters*. In the human-present flow the user signs the Cart Mandate live; in the delegated flow the user's earlier Intent Mandate signature is what authorizes the agent to produce a Cart Mandate without the user present. The cryptographic chain is identical in both cases, which is what lets merchants and issuers treat delegated purchases with the same accountability guarantees as live ones.
 
+The two flows can be read as the two ways of satisfying the same verification obligation. A verifier always wants to confirm that the executed cart $x$ is authorized. In the human-present flow that confirmation is the user's fresh signature on $x$ itself. In the delegated flow the user never saw $x$, so the confirmation is instead a proof that $\phi(x) = \texttt{true}$ against the user's pre-signed predicate $\phi$. The signature moves earlier in time and becomes a signature over a *rule* rather than over a specific cart, but the obligation it discharges, "the human authorized this," is the same.
+
+### 5.3 A worked verification
+
+Suppose a dispute arises over the delegated ticket purchase. The issuer holds three mandates and the user's and merchant's public keys, and runs the following checks.
+
+1. **Intent integrity and authority.** Recompute $h_I = H(c_I)$ and check $\mathrm{Verify}_{pk_u}(h_I, \sigma_I)$. This confirms the user signed an intent with predicate $\phi$: price ceiling \$150, quantity at most two, the specific event, expiry not yet passed.
+2. **Cart legitimacy.** Recompute $h_C = H(c_C)$ and confirm both signatures: the merchant's $\sigma_{C,m}$ and the agent's cart assembly. Confirm that $c_C$ embeds $h_I$, linking this cart to that intent.
+3. **Scope.** Evaluate $\phi$ on the actual cart. If the tickets were \$140 each, quantity two, the right event, and within the time window, then $\phi(x) = \texttt{true}$ and the purchase was inside the granted authority. Had the price been \$160, the chain would be cryptographically valid yet $\phi(x) = \texttt{false}$, exposing an agent that exceeded its mandate.
+4. **Payment linkage.** Confirm the Payment Mandate embeds $h_C$ and carries the human-not-present flag, so the issuer's risk record correctly reflects that this was a delegated, agent-initiated charge.
+
+The outcome is decisive in a way a screenshot or a log line never is: either the signatures verify and the predicate holds, in which case the user's authority covered the charge, or one of those checks fails and the failing step names the responsible party. That determinacy is the practical payoff of building the flow on signatures rather than on trust in any single actor's records.
+
 ## 6. Payment-Method-Agnostic Design
 
 AP2 cleanly separates two questions that legacy systems conflate: **"did the user authorize this?"** (answered by the mandate chain) and **"is the payment valid?"** (answered by whatever rail moves the money). Because the authorization layer is independent of the settlement layer, AP2 supports a wide range of payment methods. The announcement spans "credit and debit cards to stablecoins and real-time bank transfers"; the initial specification targets common card ("pull") methods, with a roadmap adding e-wallets, "push" payments such as real-time bank transfers, and digital currencies.
 
+This separation is an instance of a familiar architectural move: decoupling *policy* from *mechanism*. The mandate chain is policy, the standing answer to who approved what and within which bounds. The rail is mechanism, the plumbing that actually moves value. Because the two are bound only by a hash reference (the Payment Mandate pointing at the cart), a new rail can be added without touching the authorization model, and a single authorization can in principle be settled over different rails. The same property is why the audit guarantees do not weaken when the money moves over an unfamiliar rail: the proof of human intent lives entirely on the policy side.
+
 For cryptocurrency, Google released the **A2A x402 extension** alongside AP2, developed with Coinbase, the Ethereum Foundation, and MetaMask. **x402** is Coinbase's open standard that repurposes the long-dormant **HTTP 402 ("Payment Required")** status code to let agents make instant on-chain stablecoin (e.g., USDC) payments. Within AP2, an x402 settlement is authorized by an AP2 mandate, so a stablecoin payment carries exactly the same audit trail as a card payment. Google has indicated that extensions like x402 will shape how cryptocurrency support is folded into the core protocol over time.
 
-## 7. Standardization, Status, and Open Questions
+## 7. When to Use AP2, and Pitfalls
+
+AP2 is the right tool when an agent must take an economically consequential action that a third party (a merchant, an issuer, a network) has to be able to verify and dispute *without trusting the agent*. The delegated, human-not-present case is where it earns its keep, because that is exactly the scenario in which "the user clicked buy" is no longer available as evidence. Conversely, AP2 is overkill for purely internal automation where one organization owns every actor and accepts the liability itself; there a simpler signed-receipt or audit-log scheme may suffice, and the full mandate chain adds ceremony without adding a counterparty that needs convincing.
+
+Several pitfalls deserve emphasis, because they are where a careless deployment loses the guarantees the protocol promises on paper.
+
+- **Key custody is the whole game.** Every property in Section 1.1 rests on the secrecy of the user's signing key. If $sk_u$ can be extracted, exported, or used without user presence, mandates become forgeable and non-repudiation collapses. Hardware-backed keys (a secure element or platform authenticator, in the spirit of the FIDO work AP2 is aligning with) are not a nicety here, they are the foundation. A mandate signed by a key the agent can silently reuse is no proof of human intent at all.
+- **Canonicalization bugs silently break verification.** As noted in Section 3.1, if signer and verifier disagree on the byte representation of $c$, valid mandates fail to verify and, in the worse case, two different carts hash the same. Pin one canonical encoding and test it across every implementation.
+- **Predicate ambiguity widens authority.** A loosely written Intent Mandate is a loosely bounded delegation. "Up to \$150" must specify per-item versus per-order, currency, and whether fees and taxes count, or the agent's authority is broader than the user believed. The predicate $\phi$ is a contract; vague predicates are vague contracts.
+- **Replay and expiry.** A signed mandate with no freshness binding can be replayed. Mandates must carry expiries and nonces (or a one-time reference), and verifiers must enforce them, or an old approval becomes a standing license to charge.
+- **Confused-deputy and scope creep across agents.** When several agents share an Intent Mandate, the protocol bounds *what* may be purchased but coordinating cumulative spend across agents is an open operational problem, flagged in Section 8. Two agents each honoring a \$150 ceiling can still spend \$300 together.
+
+The recurring theme is that AP2 gives you sound cryptographic guarantees *conditional on* sound key custody, canonical encoding, tight predicates, and freshness. The protocol cannot rescue a deployment that gets those wrong, and most real-world failures will live there rather than in the cryptography itself.
+
+## 8. Standardization, Status, and Open Questions
 
 At launch (September 2025) AP2 was an early-stage, v0.x specification accompanied by reference implementations (Python, Go, and Android), Pydantic data models, and canonical JSON schemas, rather than a frozen standard. Google committed to ongoing updates and additional reference implementations, and standardization work is being pursued in collaboration with **FIDO Alliance** working groups on agentic authentication and payments.
 
 Several aspects remain unsettled and should be read as a snapshot of a fast-moving protocol. AP2's governance home is the least consolidated of the three core protocols: it is an open Google-led repository that intersects both the FIDO Alliance and the A2A/Linux Foundation orbit, without a single declared steward as of early 2026. The mandate terminology is still evolving, the live specification shows naming and state refinements (for instance, a "Checkout Mandate" framing and explicit open/closed states) beyond the announcement-era Intent/Cart/Payment triad, which nonetheless remains the dominant and well-corroborated model. Adoption figures (sixty-plus partners at launch, reportedly surpassing one hundred by late October 2025 around the PayPal, Google Cloud conversational-commerce announcement) come largely from vendor communications and should be cited as such. The deeper open questions are economic and legal as much as technical: how dispute resolution and chargebacks adapt to delegated authority, how spending limits are enforced across agents, and how regulators will treat autonomous purchases.
 
-## 8. Conclusion
+## 9. Conclusion
 
-AP2 completes the agent stack's commerce layer. Where MCP gives an agent hands (tools) and A2A gives it colleagues (peer agents), AP2 gives it a wallet, governed by verifiable, signed mandates that preserve the chain of human authorization a payment system requires. Its central insight is to separate authorization from settlement: the Intent → Cart → Payment mandate chain answers "who authorized this and what did they approve?" in a tamper-evident way, while remaining agnostic to whether the money ultimately moves over a card rail, a bank transfer, or a stablecoin. That separation is what allows agentic commerce to plug into existing liability and fraud frameworks rather than asking them to be rebuilt. AP2 is young and its governance is still settling, but it defines the structure on which trustworthy autonomous purchasing is being built.
+AP2 completes the agent stack's commerce layer. Where MCP gives an agent hands (tools) and A2A gives it colleagues (peer agents), AP2 gives it a wallet, governed by verifiable, signed mandates that preserve the chain of human authorization a payment system requires. Its central insight is to separate authorization from settlement: the Intent, Cart, Payment mandate chain answers "who authorized this and what did they approve?" in a tamper-evident way, while remaining agnostic to whether the money ultimately moves over a card rail, a bank transfer, or a stablecoin. The cryptography underneath is deliberately conventional, hashes, signatures, and a hash chain, but its arrangement mirrors the legal anatomy of a purchase so closely that a verifier can settle a dispute by computation rather than by trust. That separation is what allows agentic commerce to plug into existing liability and fraud frameworks rather than asking them to be rebuilt. AP2 is young and its governance is still settling, but it defines the structure on which trustworthy autonomous purchasing is being built.
 
 ## References
 

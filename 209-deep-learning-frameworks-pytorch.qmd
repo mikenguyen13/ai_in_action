@@ -6,6 +6,10 @@ PyTorch has become the dominant framework for deep learning research and a major
 
 The tensor is the fundamental data structure in PyTorch. A tensor is a multidimensional array with a uniform element type, conceptually similar to a NumPy `ndarray` but with two crucial additions: it can live on a hardware accelerator such as a GPU, and it can participate in automatic differentiation. Everything in a PyTorch program, from input images to model parameters to gradients, is represented as a tensor.
 
+::: {.callout-note title="Definition: tensor"}
+A PyTorch tensor is a tuple of a one dimensional contiguous block of memory, called the storage, together with metadata that interprets it as a multidimensional array. The metadata is a shape $(d_1, \dots, d_n)$, a stride $(s_1, \dots, s_n)$, and an offset. The logical element at index $(i_1, \dots, i_n)$ is found in storage at position $\text{offset} + \sum_{k} i_k s_k$. Separating logical layout from physical storage is what lets views, slices, and transposes be created without copying. They simply install new shape, stride, and offset values over the same storage.
+:::
+
 A tensor has a shape, a data type, and a device. The shape is a tuple of dimension sizes. For a batch of $N$ color images of height $H$ and width $W$, the conventional shape is $(N, C, H, W)$ where $C$ is the number of channels. The data type, or `dtype`, is commonly `torch.float32` for model weights and activations, though lower precision types like `torch.bfloat16` are now standard for large model training. The device indicates where the tensor's memory resides, such as `cpu` or `cuda:0`.
 
 ```python
@@ -21,7 +25,13 @@ x = x.to("cuda")                 # move to the first GPU
 
 Tensors support a rich algebra of operations: elementwise arithmetic, reductions, matrix multiplication, broadcasting, and reshaping. Two ideas deserve emphasis because they govern performance and correctness.
 
-The first is broadcasting. When an operation involves tensors of different shapes, PyTorch attempts to align them by stretching dimensions of size one. Adding a bias vector of shape $(C,)$ to an activation of shape $(N, C)$ works because the bias is broadcast across the batch dimension. Broadcasting avoids materializing redundant copies and keeps code concise, but it can silently produce wrong shapes when an operation aligns dimensions you did not intend, so reading shapes carefully is a habit worth cultivating.
+The first is broadcasting. When an operation involves tensors of different shapes, PyTorch attempts to align them by stretching dimensions of size one. The rule is precise. Align the two shapes from the trailing dimension leftward, padding the shorter shape on the left with ones. Two dimensions are compatible if they are equal or if one of them is $1$, in which case the size $1$ dimension is virtually expanded to match the other. If any aligned pair is incompatible the operation raises an error.
+
+::: {.callout-note title="Broadcasting, worked"}
+Adding a bias of shape $(C,)$ to an activation of shape $(N, C)$ proceeds as follows. The bias is left padded to $(1, C)$, then its leading dimension is stretched from $1$ to $N$, producing an effective shape $(N, C)$ that matches the activation. No data is copied. The stretched dimension is read with a stride of zero, so the same $C$ values are reused across all $N$ rows. By contrast, a bias of shape $(N,)$ added to that same activation would left pad to $(1, N)$ and require $N$ to equal $C$, which is usually a bug.
+:::
+
+Broadcasting avoids materializing redundant copies and keeps code concise, but it can silently produce wrong shapes when an operation aligns dimensions you did not intend, so reading shapes carefully is a habit worth cultivating.
 
 The second is the distinction between operations that share memory and operations that copy. Slicing and `view` produce a new tensor that references the same underlying storage, so writing through one alias mutates the other. `reshape` may return a view or a copy depending on memory layout, while `clone` always copies. Understanding this storage model explains why certain in place operations are fast and why others raise errors during differentiation.
 
@@ -47,7 +57,18 @@ y = (w * x).sum()       # y is a scalar
 print(y.grad_fn)        # <SumBackward0 object>
 ```
 
-When you call `y.backward()`, autograd walks the graph from `y` back to every leaf with `requires_grad=True`, applying the chain rule at each node and accumulating the result into each leaf's `.grad` attribute. For a scalar loss $L$ and a parameter tensor $w$, the gradient is the vector of partial derivatives $\frac{\partial L}{\partial w_i}$.
+The graph for the expression above can be drawn explicitly. The leaf $w$ flows through an elementwise multiply with the constant $x$, then a sum reduction to the scalar $y$. Autograd records this structure as a chain of backward functions.
+
+```{mermaid}
+flowchart LR
+    w["w (leaf, requires_grad)"] --> mul["multiply by x"]
+    x["x (constant)"] --> mul
+    mul --> p["p = w * x"]
+    p --> sum["sum reduction"]
+    sum --> y["y (scalar)"]
+```
+
+When you call `y.backward()`, autograd walks the graph from `y` back to every leaf with `requires_grad=True`, applying the chain rule at each node and accumulating the result into each leaf's `.grad` attribute. For a scalar loss $L$ and a parameter tensor $w$, the gradient is the vector of partial derivatives $\frac{\partial L}{\partial w_i}$. In the example above $y = \sum_i w_i x_i$, so $\frac{\partial y}{\partial w_i} = x_i$ and `w.grad` equals `x` exactly.
 
 ```python
 y.backward()
@@ -56,7 +77,17 @@ print(w.grad)           # equals x, since dy/dw_i = x_i
 
 ### 2.2 What backward actually computes
 
-It helps to be precise about what `backward` does. PyTorch implements reverse mode automatic differentiation, which computes vector Jacobian products. If a function maps an input to a vector output, the full Jacobian $J$ can be large, but training only ever needs $v^\top J$ for a particular vector $v$. When the output is a scalar loss, $v$ is implicitly $1$, which is why `backward` on a scalar requires no argument. For nonscalar outputs you must supply the vector $v$ explicitly. This design is what makes backpropagation through networks with millions of parameters tractable: the cost of one backward pass is comparable to one forward pass, regardless of how many parameters there are.
+It helps to be precise about what `backward` does. PyTorch implements reverse mode automatic differentiation, which computes vector Jacobian products. Suppose the forward computation is a composition of functions $f = f_k \circ \cdots \circ f_2 \circ f_1$, where intermediate values are $z_0 = x$ and $z_i = f_i(z_{i-1})$. The Jacobian of the whole map factors by the chain rule as a product of per layer Jacobians,
+$$
+J = \frac{\partial z_k}{\partial z_0} = J_k\, J_{k-1} \cdots J_1, \qquad J_i = \frac{\partial z_i}{\partial z_{i-1}}.
+$$
+A vector Jacobian product $v^\top J$ can be evaluated right to left by repeatedly applying one layer Jacobian at a time,
+$$
+v^\top J = \big( \cdots \big( (v^\top J_k)\, J_{k-1} \big) \cdots \big) J_1,
+$$
+so each step is a vector times a single Jacobian rather than a dense matrix times matrix product. Each $J_i$ is never formed explicitly. Instead every operation supplies a backward rule that maps an incoming cotangent vector to an outgoing one, which is exactly a multiplication by $J_i^\top$ on the left.
+
+If a function maps an input to a vector output, the full Jacobian $J$ can be large, but training only ever needs $v^\top J$ for a particular vector $v$. When the output is a scalar loss $L$, the seed vector $v$ is implicitly the scalar $1$, and $v^\top J = \nabla_x L$ is precisely the gradient, which is why `backward` on a scalar requires no argument. For nonscalar outputs the gradient is not defined without choosing how to weight the outputs, so you must supply the vector $v$ explicitly as `y.backward(v)`. This design is what makes backpropagation through networks with millions of parameters tractable. Reverse mode computes the gradient of one scalar with respect to all inputs in a single pass whose cost is a small constant multiple of one forward pass, independent of the number of parameters. Forward mode automatic differentiation has the opposite profile, cheap for one input against many outputs, which is why training, with its single scalar loss and many parameters, always uses reverse mode.
 
 ### 2.3 Controlling gradient flow
 
@@ -134,7 +165,20 @@ The ordering matters. Gradients must be zeroed before `backward` accumulates fre
 
 ### 4.2 The optimizer
 
-An optimizer encapsulates an update rule. The simplest is stochastic gradient descent, which updates each parameter as $\theta \leftarrow \theta - \eta \nabla_\theta L$ where $\eta$ is the learning rate. Adaptive methods such as Adam maintain running estimates of the first and second moments of the gradient and scale updates per parameter, which often accelerates convergence on the loss surfaces typical of deep networks. The optimizer holds references to the parameter tensors passed at construction, so its `step` method can mutate them in place using the gradients autograd has stored.
+An optimizer encapsulates an update rule. The simplest is stochastic gradient descent, which updates each parameter as $\theta \leftarrow \theta - \eta \nabla_\theta L$ where $\eta$ is the learning rate. Adaptive methods such as Adam maintain running estimates of the first and second moments of the gradient and scale updates per parameter. Writing $g_t$ for the gradient at step $t$, Adam keeps exponential moving averages of the gradient and its square,
+$$
+m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t, \qquad
+v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2,
+$$
+corrects the initialization bias of these averages,
+$$
+\hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \qquad \hat{v}_t = \frac{v_t}{1 - \beta_2^t},
+$$
+and applies a per parameter step
+$$
+\theta_t = \theta_{t-1} - \eta\, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}.
+$$
+All operations are elementwise, so each coordinate receives an effective learning rate scaled by the inverse root of its own recent squared gradients. This adaptivity often accelerates convergence on the ill conditioned loss surfaces typical of deep networks, where a single global learning rate suits some directions but not others. The defaults $\beta_1 = 0.9$, $\beta_2 = 0.999$, and $\epsilon = 10^{-8}$ work across a wide range of problems. The optimizer holds references to the parameter tensors passed at construction, and the per parameter state $m_t$ and $v_t$ lives in the optimizer rather than the model, so its `step` method can mutate the parameters in place using the gradients autograd has stored. This is also why a checkpoint that must resume training has to save the optimizer state alongside the model weights.
 
 ### 4.3 Validation and the full picture
 
@@ -228,7 +272,21 @@ When the compiler encounters Python control flow that depends on tensor values, 
 
 The deeper reason define by run prevailed is that it aligns the framework with how people think. A neural network, written in PyTorch, is a Python function. Its parameters are objects you can inspect, its computation is code you can step through, and its behavior is determined by execution rather than by a separate compilation phase. This conceptual economy lowers the barrier between an idea and a working implementation, which is precisely what accelerated the pace of deep learning research over the past decade. The abstractions covered in this chapter, tensors, autograd, modules, the training loop, and the data pipeline, all serve that same goal of keeping the model close to ordinary code.
 
-## 7. Summary
+## 7. Practical Guidance and Common Pitfalls
+
+The abstractions above compose cleanly, but a handful of recurring mistakes account for most of the time lost by practitioners. Knowing them in advance is worth more than any single optimization.
+
+Forgetting to zero gradients is the most frequent error. Because `.grad` accumulates, omitting `optimizer.zero_grad()` sums gradients across batches and produces a model that trains erratically or diverges. The symptom is subtle precisely because the code still runs.
+
+Mixing up the two evaluation switches is a close second. `model.eval()` changes layer behavior such as dropout and batch normalization, while `torch.no_grad()` stops graph construction. They are independent. A validation loop needs both. Using only one leaves either stochastic layers active or a needless graph consuming memory.
+
+Holding tensor references in accumulators leaks memory. Writing `total_loss += loss` keeps the entire computation graph for every batch alive, since `loss` still points into it. Accumulate `loss.item()` or `loss.detach()` instead, which is why the worked validation loop above used `.item()`.
+
+Silent broadcasting bugs arise when shapes happen to align in an unintended way, for example combining a $(N, 1)$ tensor with a $(1, N)$ tensor to get an $(N, N)$ result where a length $N$ vector was meant. The operation succeeds and the error surfaces only later as a wrong loss. Printing shapes is the cheapest defense.
+
+On when to reach for the heavier machinery, a short rule of thumb helps. Write the plain eager training loop first, since it is transparent and easy to debug. Add `num_workers` and `pin_memory` to the dataloader once profiling shows the accelerator waiting on input. Apply `torch.compile` only after the model is correct, because compilation makes stepwise debugging harder and its speedups matter most for stable, repeatedly executed graphs. Mixed precision with `torch.bfloat16` and gradient accumulation become relevant when a model no longer fits comfortably in memory. Each of these is an optimization layered onto a working baseline, not a starting point.
+
+## 8. Summary
 
 PyTorch provides a small set of composable abstractions that together support the full lifecycle of a deep learning model. Tensors are multidimensional arrays that run on accelerators and track gradients. Autograd builds a dynamic computation graph and computes gradients by reverse mode differentiation. The module system organizes parameters and computation into reusable, recursively composable objects. The training loop is written explicitly and follows a fixed five step pattern of forward, loss, backward, step, and reset. Datasets and dataloaders separate per example retrieval from batching and parallel loading. Underlying all of it is the define by run philosophy, which treats a model as ordinary running code and which, with modern compilation, now delivers performance to match its flexibility.
 

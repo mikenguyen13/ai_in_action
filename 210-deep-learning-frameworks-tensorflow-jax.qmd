@@ -2,6 +2,16 @@
 
 Modern deep learning rests on a small number of numerical computing frameworks that handle automatic differentiation, hardware acceleration, and distributed execution. This chapter examines two systems that originated at Google: TensorFlow, the production-oriented platform built around the Keras API, and JAX, a research-oriented library built around composable functional transformations. Both compile to the same accelerator backend, XLA, yet they embody sharply different philosophies. Understanding their design choices, and how they compare to PyTorch, clarifies the tradeoffs that govern framework selection for any serious project.
 
+All three frameworks are mature, free, and open source under permissive licenses (Apache 2.0 for TensorFlow and JAX, BSD-style for PyTorch), which means the design questions below are about fit and engineering tradeoffs rather than cost or vendor lock-in.
+
+A useful way to organize the material is to recognize that every modern framework must answer three questions, and the answers are what distinguish them.
+
+1. How is a derivative obtained? This is the automatic differentiation strategy.
+2. How is fast machine code produced from a high-level program? This is the compilation strategy.
+3. Where does mutable state, such as parameters and random seeds, live? This is the state model.
+
+TensorFlow, JAX, and PyTorch give different but principled answers to each. The sections that follow build up the necessary definitions, then return to these three axes in the comparison.
+
 ## 1. The TensorFlow and Keras Ecosystem
 
 ### 1.1 What TensorFlow Provides
@@ -31,6 +41,8 @@ model.fit(x_train, y_train, epochs=10, batch_size=128)
 ```
 
 The `compile` and `fit` pattern hides the training loop, gradient computation, and device placement. For practitioners who want standard supervised training, this is the fastest path from data to a trained model. The cost is that the loop is opaque; custom training logic requires either callbacks or dropping to a lower level.
+
+The three styles form a strict generality ordering. Any Sequential model can be written as a Functional model, and any Functional model can be written as a subclass, but not the reverse. The practical rule is to use the least powerful style that expresses the architecture, because the more declarative styles give the framework a static graph it can validate (shape checking at construction time), plot, and serialize, whereas an imperative `call` method hides the structure until runtime.
 
 ## 2. Graph Mode and Eager Mode
 
@@ -85,6 +97,20 @@ g = grad_loss(w, x, y)
 
 Differentiation is itself a function transform, so `jax.grad(jax.grad(f))` yields a second derivative, and `jax.jacobian`, `jax.hessian`, `jax.jvp`, and `jax.vjp` expose forward-mode and reverse-mode primitives directly. For a function $f: \mathbb{R}^n \to \mathbb{R}$, reverse mode computes the full gradient $\nabla f$ in roughly the cost of one forward evaluation, which is why it underlies neural network training.
 
+::: {.callout-note}
+## Why reverse mode for training, forward mode otherwise
+
+Automatic differentiation is not numerical differentiation (finite differences) and not symbolic differentiation (expression-tree manipulation). It applies the chain rule to the actual sequence of elementary operations the program executes, producing exact derivatives up to floating-point rounding. For a composite map $f = f_L \circ \cdots \circ f_1$ acting on $x$, the chain rule gives the Jacobian as a product
+$$
+J_f(x) = J_{f_L} \, J_{f_{L-1}} \cdots J_{f_1}.
+$$
+This matrix product can be evaluated in two natural orders.
+
+Forward mode (the `jvp`, or Jacobian-vector product) pushes a tangent vector $v$ through left to right, computing $J_f v$ in one sweep at cost proportional to $\dim(v)$ inputs. Reverse mode (the `vjp`, or vector-Jacobian product) pulls a cotangent vector $u$ through right to left, computing $u^\top J_f$ in one sweep at cost proportional to the number of outputs, but it must store the intermediate values from the forward pass.
+
+For a scalar loss $f: \mathbb{R}^n \to \mathbb{R}$ with $n$ large (millions of parameters), reverse mode obtains the entire gradient $\nabla f = J_f^\top \cdot 1$ with a single cotangent seed $u = 1$, so one backward sweep yields all $n$ partial derivatives at a small constant multiple of the forward cost. Forward mode would need $n$ sweeps. The situation reverses for $f: \mathbb{R} \to \mathbb{R}^m$ with few inputs and many outputs, where forward mode wins. JAX exposes both because the right choice depends on the shape of the function, and it composes them: `jax.hessian` is implemented as `jax.jacfwd(jax.jacrev(f))`, forward over reverse, which is the efficient ordering for the second derivative of a scalar function.
+:::
+
 ### 3.3 jit: Compilation with XLA
 
 The `jax.jit` transform traces a function into an intermediate representation called a jaxpr, then hands it to XLA for compilation into a fused, optimized kernel.
@@ -107,7 +133,26 @@ batched_predict = jax.vmap(predict, in_axes=(None, 0))
 predictions = batched_predict(params, batch_of_inputs)
 ```
 
-Here `in_axes=(None, 0)` means parameters are shared across the batch while the second argument is mapped over its leading axis. Because `vmap` composes with `grad` and `jit`, one can write clean per-example logic and obtain a batched, differentiated, compiled function by stacking transforms, for example `jit(vmap(grad(f)))`. This per-example clarity also makes constructs such as per-sample gradients, needed for differential privacy, far simpler than in graph-first frameworks.
+Here `in_axes=(None, 0)` means parameters are shared across the batch while the second argument is mapped over its leading axis. Semantically, for a function $g$ of a single example, `vmap(g)` denotes the map
+$$
+\big[x_1, x_2, \ldots, x_B\big] \;\longmapsto\; \big[g(x_1), g(x_2), \ldots, g(x_B)\big],
+$$
+but it is not implemented as a Python loop. JAX rewrites $g$ at the level of primitive operations so that each primitive gains a batch axis, producing a single vectorized program with no per-example overhead. The result is the same code XLA would compile from hand-written batched array operations, obtained without writing them.
+
+Because `vmap` composes with `grad` and `jit`, one can write clean per-example logic and obtain a batched, differentiated, compiled function by stacking transforms, for example `jit(vmap(grad(f)))`. This per-example clarity also makes constructs such as per-sample gradients, needed for differential privacy, far simpler than in graph-first frameworks, where the batch dimension is baked into every operation and recovering individual gradients requires awkward workarounds.
+
+The four core transforms are designed to compose, and the order of composition is meaningful. The diagram below shows the canonical stack that turns a single-example loss into a batched, differentiated, hardware-compiled, multi-device training step.
+
+```{mermaid}
+flowchart TD
+    A["loss(params, example): scalar"] --> B["grad: per-example gradient"]
+    B --> C["vmap: gradient over a batch axis"]
+    C --> D["jit: fuse and compile with XLA"]
+    D --> E["pmap or shard_map: replicate across devices"]
+    E --> F["one compiled distributed training step"]
+```
+
+Reading the stack from inside out, `grad` differentiates, `vmap` vectorizes, `jit` compiles, and `pmap` parallelizes, each accepting and returning an ordinary function. This is the central payoff of the functional design: capabilities that are framework features elsewhere are here just functions that wrap other functions.
 
 ### 3.5 pmap and the Modern Sharding Model
 
@@ -129,6 +174,8 @@ XLA (Accelerated Linear Algebra) is the compilation backend shared by TensorFlow
 
 The most consequential optimization is operator fusion. Consider an elementwise chain such as $y = \text{relu}(\alpha x + b)$. Executed eagerly, each operation reads its inputs from device memory and writes its output back, so the data crosses the memory bus several times. Accelerators are typically memory-bandwidth bound on such kernels, meaning the bottleneck is data movement rather than arithmetic. XLA fuses the multiply, add, and activation into a single kernel that keeps intermediate values in registers, eliminating the round trips. Beyond fusion, XLA performs constant folding, buffer assignment to reuse memory, layout optimization, and algebraic simplification. The result is compiled, hardware-specific code for CPU, GPU, and TPU.
 
+The size of the fusion win can be made precise with the arithmetic intensity argument behind the roofline model [@williams2009roofline]. Arithmetic intensity $I$ is the ratio of floating-point operations performed to bytes moved to and from memory. A kernel is memory bound when $I$ is below the ratio $\pi / \beta$ of peak compute $\pi$ (FLOP/s) to peak bandwidth $\beta$ (bytes/s), and compute bound above it. For the chain $y = \text{relu}(\alpha x + b)$ over a vector of $n$ elements stored in 4-byte floats, an unfused execution materializes two intermediate vectors. Counting reads and writes, it moves on the order of $4 \times 4n$ bytes (input, two intermediates written then reread, output) while doing roughly $3n$ floating-point operations, giving $I \approx 3n / 16n \approx 0.19$ FLOP per byte. A fused kernel reads $x$ once and writes $y$ once, moving about $8n$ bytes for the same $3n$ operations, so $I \approx 0.38$, double the intensity. On hardware where these kernels sit well below the roofline ridge, runtime is proportional to bytes moved, so halving traffic roughly halves the time. Fusion does not change the arithmetic; it removes the memory traffic that dominates it.
+
 The tradeoff is compilation latency and a preference for static shapes. Each new input shape can trigger a recompilation, so workloads with highly variable shapes, such as variable-length sequences, often require bucketing or padding to a fixed set of shapes. This is the practical reason both JAX and `tf.function` reward static, regular computation and penalize dynamic Python that changes structure at runtime.
 
 ## 5. Comparison to PyTorch
@@ -141,7 +188,17 @@ PyTorch is eager by default and builds its autograd graph dynamically on each fo
 
 The frameworks differ most in how they treat state. PyTorch and Keras are object-oriented: a module holds its parameters as mutable attributes, and optimizers mutate those tensors in place. JAX is functional: parameters live in explicit data structures, usually nested dictionaries known as pytrees, and every update returns a new structure. Neural network libraries built on JAX, such as Flax and Equinox, formalize this pattern. The functional style makes transformations and reproducibility cleaner but shifts the burden of state management onto the programmer.
 
-Randomness illustrates the divide. PyTorch and TensorFlow rely on a global random seed and implicit state. JAX requires an explicit, splittable random key passed into each stochastic operation, so a function's output is fully determined by its arguments. This explicitness guarantees bit-for-bit reproducibility across devices and parallel replicas, at the cost of more verbose code.
+Randomness illustrates the divide. PyTorch and TensorFlow rely on a global random seed and implicit state. JAX requires an explicit, splittable random key passed into each stochastic operation, so a function's output is fully determined by its arguments. This explicitness guarantees bit-for-bit reproducibility across devices and parallel replicas, at the cost of more verbose code. The key discipline is to never reuse a key and to split it whenever more than one random draw is needed.
+
+```python
+key = jax.random.PRNGKey(0)
+key, subkey = jax.random.split(key)      # derive a fresh, independent key
+noise = jax.random.normal(subkey, shape=(256,))
+# `key` is now reserved for the next split; reusing `subkey` would
+# reproduce the exact same noise, a silent correlation bug.
+```
+
+The same draw with the same key always returns the same array, on any device, in any order of execution. This is what makes a sharded computation across a thousand chips reproducible without a coordinating global counter.
 
 ### 5.3 Ecosystem and Selection Criteria
 
@@ -156,6 +213,20 @@ The table below summarizes the practical contrasts.
 | Typical strength | Production, mobile, serving | Research, large-scale TPU | Research, broad community |
 
 A reasonable heuristic follows. Choose TensorFlow and Keras when deployment breadth matters, when targeting mobile or browser, or when a high-level fit-and-predict workflow suffices. Choose JAX when the work involves custom numerical methods, high-order derivatives, per-example gradients, or training at TPU scale where the functional model and XLA sharding pay off. Choose PyTorch when ecosystem momentum, the largest pool of pretrained models and tutorials, and frictionless debugging are the priorities, which describes most current research and a growing share of production. Keras 3, by running on all three backends, blurs these boundaries and lets a single high-level codebase migrate between them.
+
+### 5.4 Shared Pitfalls of Trace-and-Compile
+
+Because TensorFlow's `tf.function`, JAX's `jit`, and PyTorch's `torch.compile` all trace Python into a graph before compiling, they share a family of failure modes worth stating plainly.
+
+Silent retracing. A function that receives inputs of a new shape or dtype is retraced and recompiled. A loop that pads each batch to a different length, or a function called on a Python `int` that changes every iteration, can recompile on every step and run slower than eager mode. The remedy is to fix shapes (pad to a small set of buckets) and to mark genuinely static arguments as such, for example `jax.jit(f, static_argnums=...)` or stable input signatures for `tf.function`.
+
+Captured side effects. Python statements that are not array operations, such as `print`, appending to a list, or incrementing a counter, run only during tracing and are absent from the compiled graph. Debugging therefore requires the framework's own tools, `jax.debug.print` or printing inside an eager call, rather than ordinary Python prints inside a compiled function.
+
+Value-dependent control flow. A branch or loop bound whose condition depends on the value of a traced array cannot be expressed in the graph, because tracing sees an abstract placeholder, not a concrete value. Such control flow must be rewritten with structured primitives (`jax.lax.cond`, `jax.lax.scan`, or `tf.cond`, `tf.while_loop`). Control flow that depends only on shapes or Python constants is fine, since those are known at trace time.
+
+In-place surprises in JAX. JAX arrays are immutable, so `x[i] = v` is an error. The functional replacement is `x = x.at[i].set(v)`, which returns a new array and lets the compiler decide whether the update can be done in place. Programmers arriving from NumPy or PyTorch hit this first.
+
+The unifying lesson is that these compilers reward static, regular, side-effect-free computation and penalize dynamic Python that changes structure at runtime. Writing for them is closer to writing a small array language than to writing imperative Python.
 
 ## 6. Conclusion
 
@@ -174,3 +245,4 @@ TensorFlow and JAX express two philosophies that meet at XLA. TensorFlow wraps a
 9. Paszke, A., et al. "PyTorch: An Imperative Style, High-Performance Deep Learning Library." NeurIPS 2019. https://papers.nips.cc/paper/9015-pytorch-an-imperative-style-high-performance-deep-learning-library.pdf
 10. PyTorch documentation. "torch.compile." https://pytorch.org/docs/stable/torch.compiler.html
 11. Heek, J., et al. "Flax: A neural network library and ecosystem for JAX." https://github.com/google/flax
+12. Williams, S., Waterman, A., and Patterson, D. "Roofline: An Insightful Visual Performance Model for Multicore Architectures." Communications of the ACM 52(4), 2009. https://doi.org/10.1145/1498765.1498785

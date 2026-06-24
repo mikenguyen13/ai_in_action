@@ -14,7 +14,22 @@ where $P$ is the true data-generating distribution and $L$ is a loss. Because $P
 
 ### 1.2 The Optimism of the Minimum
 
-Suppose we evaluate $m$ configurations whose true risks are all roughly equal, and each estimate $\hat{R}(\theta_j)$ carries noise with standard deviation $\sigma$. The expected value of the smallest of $m$ such estimates falls below the common true risk by an amount that grows with both $\sigma$ and $m$. For Gaussian noise the gap scales like $\sigma\sqrt{2 \ln m}$. The practical lesson is immediate. The more configurations you try, and the noisier your validation estimate, the more optimistically biased your selected score becomes. This is why a large hyperparameter sweep evaluated on a small validation set produces a selected model whose validation score is almost guaranteed to flatter it.
+Suppose we evaluate $m$ configurations whose true risks are all roughly equal, and each estimate $\hat{R}(\theta_j)$ carries noise with standard deviation $\sigma$. The expected value of the smallest of $m$ such estimates falls below the common true risk by an amount that grows with both $\sigma$ and $m$. We can make this precise.
+
+::: {.callout-note title="Proposition (selection optimism for Gaussian noise)"}
+Let $\hat{R}_1, \dots, \hat{R}_m$ be the validation estimates of $m$ configurations whose true risks are all equal to a common value $R_0$. Model the estimation noise as independent and identically distributed Gaussian, $\hat{R}_j = R_0 + \sigma Z_j$ with $Z_j \sim \mathcal{N}(0,1)$. Then the selected (minimum) estimate is optimistically biased,
+$$
+\mathbb{E}\!\left[\min_j \hat{R}_j\right] = R_0 - \sigma\,\mathbb{E}\!\left[\max_j Z_j\right],
+$$
+and the size of the bias grows without bound in $m$, with the leading-order asymptotic
+$$
+\mathbb{E}\!\left[\max_j Z_j\right] \sim \sqrt{2 \ln m} \quad \text{as } m \to \infty .
+$$
+:::
+
+*Proof sketch.* The first equality is immediate from $\min_j(R_0 + \sigma Z_j) = R_0 - \sigma \max_j(-Z_j)$ and the symmetry of the Gaussian, which makes $-Z_j$ distributed as $Z_j$. For the asymptotic, the expected maximum of $m$ standard Gaussians is a classical extreme-value result. A short upper bound follows from Jensen applied to the moment generating function: for any $t > 0$, $\exp(t\,\mathbb{E}[\max_j Z_j]) \le \mathbb{E}[\exp(t \max_j Z_j)] \le \sum_j \mathbb{E}[e^{t Z_j}] = m\,e^{t^2/2}$, so $\mathbb{E}[\max_j Z_j] \le \frac{\ln m}{t} + \frac{t}{2}$; optimizing over $t$ at $t = \sqrt{2\ln m}$ gives $\mathbb{E}[\max_j Z_j] \le \sqrt{2\ln m}$. A matching lower bound of the same order completes the result. $\square$
+
+The practical lesson is immediate. The more configurations you try, and the noisier your validation estimate, the more optimistically biased your selected score becomes. The dependence is reassuringly slow in $m$ (the $\sqrt{\ln m}$ factor doubles only when $m$ is squared) but linear in $\sigma$, so the dominant lever is the variance of your validation estimate, not the size of the grid. This is why a large hyperparameter sweep evaluated on a small validation set produces a selected model whose validation score is almost guaranteed to flatter it: small validation sets inflate $\sigma$, and the reported winner sits roughly $\sigma\sqrt{2\ln m}$ below its true risk.
 
 ## 2. Train, Validation, and Test Revisited
 
@@ -61,6 +76,23 @@ for each outer fold (test block held out):
 report mean and spread of outer scores
 ```
 
+The two loops and their distinct purposes are easiest to see as a flow.
+
+```{mermaid}
+flowchart TD
+    A["Full training data"] --> B["Outer split into K folds"]
+    B --> C["Hold out outer fold k as test block"]
+    C --> D["Inner CV over m candidates on outer-train"]
+    D --> E["Pick best config by inner score"]
+    E --> F["Refit best config on full outer-train"]
+    F --> G["Score on held-out outer fold k"]
+    G --> H["Collect K honest outer scores"]
+    H --> I["Report mean and spread"]
+    I --> J["Run inner selection once on all data to ship"]
+```
+
+The outer scores in box H estimate the procedure, and box J produces the single deployable model.
+
 ### 3.2 What the Outer Score Means
 
 A crucial subtlety is that nested cross-validation does not evaluate a single fixed model. It evaluates a procedure. The inner loop may select different configurations on different outer folds, and that is acceptable and even informative. Disagreement across outer folds signals that the data does not strongly prefer one configuration, which is itself a result worth knowing. The reported number is the expected generalization of "run this selection procedure on a dataset of this size and deploy the winner." After estimating that number, you run the inner selection one final time on all the data to obtain the model you actually ship.
@@ -99,7 +131,7 @@ A feature can leak the target directly. Examples include a column populated only
 
 ### 4.4 Repeated Reuse of the Test Set
 
-Even a clean test set decays with use. Each time you peek at the test score and adjust your approach, you leak a bit of test information into your decisions, and across many iterations the test set quietly becomes a validation set. Treat the final test evaluation as a one-shot event, and resist the urge to iterate against it.
+Even a clean test set decays with use. Each time you peek at the test score and adjust your approach, you leak a bit of test information into your decisions, and across many iterations the test set quietly becomes a validation set. This is the problem of adaptive data analysis: once the choice of what to evaluate next depends on previous evaluations of the same held-out data, the classical guarantee that a held-out estimate is unbiased no longer holds, because the analyst's adaptive choices effectively search for configurations that fit the test sample's noise (Dwork et al., 2015). The optimism here grows with the number of adaptive queries in much the same way Section 1.2 describes for an explicit grid, except the "grid" is now the implicit sequence of decisions a practitioner makes while iterating. Treat the final test evaluation as a one-shot event, and resist the urge to iterate against it. When repeated checks against held-out data are genuinely unavoidable, a reusable-holdout mechanism that adds calibrated noise and answers only when a query meaningfully disagrees with the training estimate can extend a holdout's useful lifetime, at the cost of added machinery and looser per-query precision.
 
 ## 5. The One-Standard-Error Rule
 
@@ -125,7 +157,21 @@ thresh = mean_err[best] + se[best]
 choice = simplest(theta for theta if mean_err[theta] <= thresh)
 ```
 
-### 5.3 Caveats
+### 5.3 A Worked Example
+
+Suppose we tune the regularization strength of a ridge regression with five-fold cross-validation, ordering the candidates from strongest regularization (simplest) to weakest (most flexible). The mean cross-validated mean squared error and its per-configuration standard error across the five folds come out as follows.
+
+| Configuration | Complexity | Mean CV error | SE |
+|---|---|---|---|
+| $\theta_1$ (strong penalty) | lowest | 0.430 | 0.020 |
+| $\theta_2$ | low | 0.392 | 0.018 |
+| $\theta_3$ | medium | 0.381 | 0.017 |
+| $\theta_4$ | high | 0.378 | 0.016 |
+| $\theta_5$ (weak penalty) | highest | 0.376 | 0.019 |
+
+The naive argmin picks $\theta_5$ at 0.376, the most flexible model. The one-standard-error rule instead forms the band around the best mean: the threshold is $\widehat{CV}(\theta_5) + \mathrm{SE}(\theta_5) = 0.376 + 0.019 = 0.395$. Every configuration except $\theta_1$ (whose 0.430 exceeds 0.395) falls inside this band and is therefore statistically indistinguishable from the winner. Among the survivors $\theta_2, \theta_3, \theta_4, \theta_5$, the rule chooses the simplest, which is $\theta_2$ at 0.392. We have traded a 0.016 difference in point estimate, well inside one standard error, for a substantially more regularized model that is likelier to generalize and cheaper to reason about. The naive choice $\theta_5$ won by a margin smaller than the measurement noise, exactly the situation the rule is designed to defuse.
+
+### 5.4 Caveats
 
 The rule assumes a meaningful complexity ordering, such as a regularization strength or a tree depth, along which "simpler" is defined. When candidates are not naturally ordered, for example unrelated algorithm families, the band still helps you recognize ties but the parsimony tiebreak must be replaced by another secondary criterion such as inference latency or interpretability. The standard error across folds also understates true uncertainty, because cross-validation folds overlap in their training data and are therefore correlated, so the band is a heuristic rather than a calibrated confidence interval.
 
@@ -157,7 +203,21 @@ Refit the selected configuration on all the training data, then evaluate exactly
 
 Record the candidate space, the splitting strategy, the selection rule, the selected configuration, and both the cross-validation and test scores. This record makes the result reproducible and makes the optimism budget auditable, which is increasingly a requirement rather than a nicety.
 
-## 7. Synthesis
+## 7. When to Use What, and Common Pitfalls
+
+The techniques in this chapter are not interchangeable; each answers a specific question and carries a specific cost.
+
+| Situation | Recommended approach | Why |
+|---|---|---|
+| Abundant data | Single fixed train, validation, test split | Variance of one split is already negligible, so cross-validation buys little for its cost |
+| Scarce data, need a model | $k$-fold cross-validation with the one-standard-error rule | Averaging stabilizes the estimate, the band guards against chasing noise |
+| Scarce data, need an unbiased performance claim | Nested cross-validation | Only structure that reports the selection procedure honestly |
+| Records cluster by entity | Grouped splitting | Keeps near-duplicates off both sides of the partition |
+| Time-ordered data | Forward-chaining (prefix trains, next block validates) | The future must never inform a model judged on the past |
+
+The recurring pitfalls are worth stating plainly. Reporting the cross-validation score of the selected winner as a generalization estimate reintroduces selection optimism; the fix is nesting or a locked test set. Fitting any data-dependent transform outside the fold leaks held-out information into training; the fix is a single pipeline object refit per fold. Splitting randomly when rows cluster or when time matters leaks structure the random partition was blind to. Iterating against the test set turns it into a validation set one peek at a time. Selecting by raw argmin across a large grid on a small validation set maximizes exactly the $\sigma\sqrt{2\ln m}$ optimism of Section 1.2. Each failure has the same root: information spent on a decision was then double-counted as evidence about that decision.
+
+## 8. Synthesis
 
 The connective thread through this chapter is that data spent on a decision cannot also serve as an unbiased witness to that decision's quality. Training data fits, validation data selects, test data judges, and each role consumes a distinct slice of the data's informational capacity. Cross-validation stabilizes the validation estimate, nesting restores an honest report after selection has consumed the validation signal, leakage discipline keeps the partitions truly separate, and the one-standard-error rule stops the selection procedure from overfitting itself by chasing differences smaller than the noise. Mastery of model selection is less about any single trick and more about accounting honestly for where every bit of information went.
 
@@ -176,3 +236,5 @@ The connective thread through this chapter is that data spent on a decision cann
 6. Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research, 12, 2825-2830. https://jmlr.org/papers/v12/pedregosa11a.html
 
 7. Arlot, S., and Celisse, A. (2010). A Survey of Cross-validation Procedures for Model Selection. Statistics Surveys, 4, 40-79. https://projecteuclid.org/journals/statistics-surveys/volume-4/issue-none/A-survey-of-cross-validation-procedures-for-model-selection/10.1214/09-SS054.full
+
+8. Dwork, C., Feldman, V., Hardt, M., Pitassi, T., Reingold, O., and Roth, A. (2015). The Reusable Holdout: Preserving Validity in Adaptive Data Analysis. Science, 349(6248), 636-638. https://doi.org/10.1126/science.aaa9375

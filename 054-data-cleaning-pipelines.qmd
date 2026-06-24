@@ -2,6 +2,14 @@
 
 Most of the effort in any applied machine learning or analytics project is spent not on modeling but on preparing data. Raw data arrives messy. It carries duplicate records, inconsistent encodings, malformed dates, free text fields with a dozen spellings of the same category, and silent corruption introduced by upstream systems. A data cleaning pipeline is the disciplined machinery that turns this raw input into a trustworthy, analysis ready dataset. This chapter treats cleaning as software engineering rather than as a one off exploratory exercise. The goal is a pipeline that is reproducible, testable, idempotent, and free of subtle forms of leakage that would inflate model performance and mislead decision makers.
 
+The framing throughout is deliberately mathematical where precision pays off. We will define a pipeline as a composition of pure functions, state idempotency as a fixed point property, formalize leakage as a violation of an information boundary, and quantify the combinatorics that make deduplication and entity resolution hard at scale. These formalisms are not decoration. They tell you exactly which property a given test is checking, and they expose the precise point at which a tempting shortcut breaks one of the guarantees a downstream consumer is relying on.
+
+::: callout-note
+## What this chapter covers
+
+The hazards specific to cleaning: nondeterminism, non idempotent edits, contract violations, and the several distinct paths by which cleaning leaks information from the test set into the training set. The remedy in every case is a small discipline borrowed from ordinary software engineering, made precise enough to test.
+:::
+
 ## 1. Why Treat Cleaning as a Pipeline
 
 A common failure mode is to clean data interactively in a notebook, sprinkle in manual fixes, and then ship the resulting file downstream. The output looks fine, but nobody can reconstruct how it was produced. Six months later the upstream source changes, the numbers drift, and there is no way to tell whether the model degraded or the cleaning logic silently broke.
@@ -10,9 +18,39 @@ A common failure mode is to clean data interactively in a notebook, sprinkle in 
 
 A production grade cleaning pipeline should satisfy a small set of properties. It should be reproducible, meaning that running it on the same input always yields the same output, with no dependence on hidden state, wall clock time, or random seeds that were never recorded. It should be testable, meaning that each transformation can be exercised in isolation against known inputs and expected outputs. It should be idempotent, meaning that cleaning already clean data is a safe no op rather than a source of new corruption. It should be observable, meaning that the pipeline records what it changed and why, so that anomalies can be traced. Finally it should be leakage safe, meaning that no information from the target variable or from the test set bleeds into the features that a model will train on.
 
+It is worth stating these properties precisely, because the precise version is what a test actually checks. Let $C$ denote the cleaning pipeline, a function from a raw dataset to a clean one. Write $D$ for the space of datasets, and let $D_{\text{raw}}$ be a fixed input.
+
+- **Determinism.** $C$ is a function in the mathematical sense: $C(D_{\text{raw}})$ depends on $D_{\text{raw}}$ alone, and not on the wall clock, the host locale, hash seeds, or thread scheduling. Two evaluations on equal inputs return equal outputs.
+- **Idempotency.** $C \circ C = C$, that is, $C(C(D_{\text{raw}})) = C(D_{\text{raw}})$ for every input. Equivalently, every cleaned dataset is a fixed point of $C$.
+- **Leakage safety.** When the data is partitioned into a training part $D_{\text{tr}}$ and an evaluation part $D_{\text{te}}$, the cleaned training rows must not depend on $D_{\text{te}}$. Section 6 makes this an explicit information boundary.
+
+These three are not independent. Idempotency presupposes determinism, since a nondeterministic $C$ cannot satisfy $C \circ C = C$ except by accident. And both are properties of $C$ as a whole, which is why the most valuable tests in Section 4 run the entire pipeline rather than a single stage.
+
 ### 1.2 Declarative Stages Over Imperative Scripts
 
 The most maintainable pipelines express cleaning as a sequence of named, composable stages. Each stage takes a dataset and returns a dataset, plus a small report of what it did. Thinking of the pipeline as a list of functions has practical benefits. Stages can be reordered, skipped, or unit tested independently. The dependency between stages becomes explicit. And the whole pipeline can be serialized to a configuration file so that the same logic runs in development, in continuous integration, and in production.
+
+Formally, if the stages are $s_1, s_2, \ldots, s_n$, each a function $s_i : D \to D$, then the pipeline is their composition
+
+$$
+C = s_n \circ s_{n-1} \circ \cdots \circ s_1 .
+$$
+
+Two consequences follow immediately and guide the design. First, $C$ is deterministic exactly when every $s_i$ is deterministic, so determinism is checked stage by stage. Second, the composition $C$ is idempotent if each $s_i$ is idempotent and the stages do not undo one another, a sufficient condition being that each $s_i$ maps into the fixed point set of every stage that precedes it. In practice this is why ordering matters: standardization must precede the deduplication that relies on standardized keys, or the pair will fail to reach a joint fixed point. The diagram below shows the canonical ordering, with the split aware learned transformations deliberately pushed past the train and test boundary.
+
+```{mermaid}
+flowchart TD
+    A["Raw input"] --> B["Record level cleaning: trim, parse, sentinel to null"]
+    B --> C["Standardize to canonical forms"]
+    C --> D["Entity resolution and survivorship"]
+    D --> E["Data contract gate"]
+    E --> F["Train and test split by entity"]
+    F --> G["Learned transforms: impute, scale, encode"]
+    G --> H["Model ready features"]
+    E -. "violation" .-> Q["Quarantine and alert"]
+```
+
+The vertical line of the diagram is the cleaning pipeline proper. Everything above the split learns nothing from the distribution and is safe to apply in one pass. Everything below the split has a fit phase and must respect the boundary, which is the subject of Section 6.
 
 ```python
 # A pipeline is just an ordered list of stages.
@@ -35,7 +73,11 @@ Duplicates arrive in two flavors. Exact duplicates are byte identical rows, usua
 
 Exact deduplication is straightforward and should be done early, since it reduces the volume that later stages must process. Fuzzy deduplication, often called entity resolution or record linkage, is harder. It requires a similarity function over records, a blocking strategy to avoid comparing every pair, and a threshold or learned classifier to decide which pairs are matches.
 
-A crucial design decision is which record survives a merge. Picking the first row encountered makes the result depend on input ordering, which silently violates reproducibility. A better rule is deterministic survivorship, where you sort by an explicit key, prefer the most complete record, or prefer the most recent verified timestamp.
+The combinatorics explain why blocking is mandatory. A naive comparison of every pair of $N$ records examines $\binom{N}{2} = \tfrac{1}{2}N(N-1) = \Theta(N^2)$ pairs. For a million records that is roughly $5 \times 10^{11}$ comparisons, which is infeasible. Blocking partitions the records into groups that share a cheap key, for example the first three characters of a surname together with a postal code, and compares only pairs within the same block. If blocking yields $B$ blocks of roughly equal size $N/B$, the comparison count falls to about $B \cdot \binom{N/B}{2} \approx \tfrac{N^2}{2B}$, a factor of $B$ reduction. The cost of blocking is recall: any true duplicate whose two records land in different blocks can never be matched. Good blocking keys, and the use of several complementary keys, trade a small recall loss for an enormous speedup. The standard reference treatment of blocking, similarity, and survivorship is @christen2012data.
+
+Matching within a block needs a similarity function $\text{sim}(r_i, r_j) \in [0,1]$ and a threshold $\tau$, so that the pair is declared a match when $\text{sim}(r_i, r_j) \ge \tau$. For short strings a common choice is normalized edit distance, $\text{sim}(a,b) = 1 - \text{lev}(a,b) / \max(|a|, |b|)$, where $\text{lev}$ is the Levenshtein distance. For token sets such as words in an address, the Jaccard similarity $J(A,B) = |A \cap B| / |A \cup B|$ is natural and admits fast approximation by MinHash. Whatever the choice, record the threshold in version controlled configuration: $\tau$ is a parameter of the pipeline, and changing it silently changes the output.
+
+A crucial design decision is which record survives a merge. Picking the first row encountered makes the result depend on input ordering, which silently violates determinism. A better rule is deterministic survivorship, where you sort by an explicit key, prefer the most complete record, or prefer the most recent verified timestamp. Survivorship must be defined by a total order on records so that the surviving row is unique regardless of how the input happened to be sorted on arrival.
 
 ```python
 # Deterministic survivorship: sort, then keep the best per group.
@@ -82,7 +124,17 @@ Resolution is rarely automatic. Some inconsistencies can be fixed by a rule, suc
 
 ### 2.5 Missing Values
 
-Missing data deserves its own treatment because the choices made here interact strongly with leakage, a topic addressed later. At the cleaning stage the job is to detect missingness, distinguish its mechanisms where possible, and decide on a policy. Crucially, any imputation that learns from the data, such as filling with a column mean or a model prediction, is a modeling decision and should not be hard coded into the cleaning pipeline using statistics computed over the full dataset. Cleaning should standardize how missingness is represented, for example by converting sentinel values like 999 or empty strings into genuine nulls, and leave learned imputation to a later, leakage aware stage.
+Missing data deserves its own treatment because the choices made here interact strongly with leakage, a topic addressed later. At the cleaning stage the job is to detect missingness, distinguish its mechanisms where possible, and decide on a policy.
+
+It helps to recall Rubin's taxonomy of missingness mechanisms, since it governs which later imputation is even valid [@rubin1976inference; @little2019statistical]. Let $X$ be the complete data and let $M$ be the binary missingness indicator matrix, with $M_{ij}=1$ when entry $ij$ is missing. Partition the observed and missing entries as $X_{\text{obs}}$ and $X_{\text{mis}}$. The three mechanisms are distinguished by what the probability of being missing depends on:
+
+- **MCAR**, missing completely at random: $P(M \mid X) = P(M)$. Missingness is independent of the data, so dropping incomplete rows is unbiased, merely wasteful.
+- **MAR**, missing at random: $P(M \mid X) = P(M \mid X_{\text{obs}})$. Missingness depends only on observed values, so principled imputation conditioned on the observed columns can recover an unbiased analysis.
+- **MNAR**, missing not at random: $P(M \mid X)$ depends on $X_{\text{mis}}$ itself, for example incomes are missing precisely when they are high. No imputation from the observed data alone can fully correct this, and the mechanism must be modeled explicitly.
+
+The cleaning stage cannot determine which mechanism holds, but it should preserve the evidence needed to reason about it. That means representing missingness as a genuine null rather than overwriting it with a guess, and optionally emitting a missingness indicator column, which is both a useful feature and a guard against silently discarding an MNAR signal.
+
+Crucially, any imputation that learns from the data, such as filling with a column mean or a model prediction, is a modeling decision and should not be hard coded into the cleaning pipeline using statistics computed over the full dataset. Cleaning should standardize how missingness is represented, for example by converting sentinel values like 999 or empty strings into genuine nulls, and leave learned imputation to a later, leakage aware stage.
 
 ## 3. Building Reproducible Pipelines
 
@@ -143,6 +195,8 @@ It is worth distinguishing two failure policies. A hard gate halts the run when 
 
 Idempotency is the property that applying an operation twice has the same effect as applying it once. For cleaning pipelines this is both a correctness guarantee and an operational convenience.
 
+Precisely, a transformation $s : D \to D$ is idempotent when $s \circ s = s$, equivalently when its image is contained in its set of fixed points: $s(D) \subseteq \{x : s(x) = x\}$. A cleaned dataset is then a fixed point, and re running the cleaner moves it nowhere. The phone prefix example below is the canonical violation. The function $f(x) = \text{"+1"} \mathbin{\Vert} x$ that prepends a country code is not idempotent, since $f(f(x)) = \text{"+1+1"} \mathbin{\Vert} x \neq f(x)$. The repaired version maps every number to the single canonical E.164 form, $g = \text{to\_e164}$, which satisfies $g \circ g = g$ because applying canonicalization to an already canonical value is the identity. The general recipe is exactly this: write each transformation as a projection onto a canonical form rather than as an incremental edit, because a projection $\pi$ onto a set of canonical representatives automatically obeys $\pi \circ \pi = \pi$.
+
 ### 5.1 Why Idempotency Matters
 
 Pipelines fail partway through and get retried. Backfills reprocess historical data that may already have been cleaned. Streaming systems deliver the same record more than once. If a cleaning step is not idempotent, these ordinary events corrupt the data. Consider a step that appends a country code prefix to phone numbers. Run once, a number becomes correctly prefixed. Run twice on already cleaned data, it gains a second prefix and is now wrong. The bug is invisible until someone tries to dial the number.
@@ -176,7 +230,21 @@ Data leakage is the contamination of training data with information that would n
 
 ### 6.1 Fit on Train, Apply to All
 
-The central rule is that any cleaning step that learns parameters from the data must learn them from the training portion only, then apply those frozen parameters to validation and test data. Imputing missing values with a column mean is the canonical example. If the mean is computed over the entire dataset, the test rows have influenced a value used to clean the training rows, and the train rows have influenced the test cleaning. The fix is to compute the mean on the training split and reuse it everywhere else.
+It is worth stating the boundary as a property. Let a learned transform have a fit phase that estimates parameters $\theta$ from data and a transform phase $T_\theta$ that applies them. Leakage safety is the requirement that the parameters depend on the training split alone,
+
+$$
+\theta = \text{fit}(D_{\text{tr}}), \qquad \widetilde{D}_{\text{tr}} = T_\theta(D_{\text{tr}}), \quad \widetilde{D}_{\text{te}} = T_\theta(D_{\text{te}}) ,
+$$
+
+and the violation is any dependence of the form $\theta = \text{fit}(D_{\text{tr}} \cup D_{\text{te}})$. The latter lets test rows influence the cleaning of training rows, and the resulting offline score is optimistically biased: it measures performance on examples that have already touched the parameters, which is not the situation faced in production.
+
+The central rule, then, is that any cleaning step that learns parameters from the data must learn them from the training portion only, then apply those frozen parameters to validation and test data. Imputing missing values with a column mean is the canonical example. If the mean is computed over the entire dataset, the test rows have influenced a value used to clean the training rows, and the train rows have influenced the test cleaning. The fix is to compute the mean on the training split and reuse it everywhere else.
+
+::: callout-tip
+## Worked example: how mean imputation leaks
+
+Suppose the training income column is $\{40, 60\}$ with mean $50$, and the test column is $\{200, \text{missing}\}$. The leaky procedure pools all observed values, $\{40, 60, 200\}$, computes the mean $100$, and fills the test blank with $100$. The safe procedure computes the mean on training only, $50$, and fills the test blank with $50$. The two fills differ by a factor of two, and the gap is driven entirely by the test value $200$, a number the model would not have seen at fit time in production. The leaky fill is closer to the true held out distribution precisely because it cheated by looking at the test set, which is what makes the offline score misleading. The same arithmetic plays out for standardization scales, outlier clip bounds, and target encodings, each of which is a statistic that must be frozen on the training split.
+:::
 
 The same logic applies to scaling, to outlier clipping thresholds, to category vocabularies, to target encodings, and to any rare category grouping based on frequency counts. Each of these has a fit phase and a transform phase, and the fit phase must see only training data.
 
@@ -210,6 +278,12 @@ A subtle leakage path runs through deduplication itself. If duplicate or near du
 A mature cleaning pipeline reads as a short, declarative description. Record level cleaning runs first and applies uniformly. A data contract gates the boundary. Entity resolution and survivorship run before any split so that no entity straddles train and test. Learned transformations are deferred to a downstream, split aware stage that saves its fitted parameters as part of the model artifact. Every run records the hashes of its inputs, configuration, and outputs, along with counts of what changed, so that any anomaly can be traced to its cause. The whole thing is covered by unit tests, property tests, contract checks, and an idempotency test.
 
 None of these practices is exotic. Each is a modest discipline borrowed from ordinary software engineering and applied to the specific hazards of data. The payoff is large. A pipeline built this way produces data that downstream consumers can trust, that survives upstream change without silent corruption, and that does not flatter your models with leaked information. In applied work, where the majority of effort and the majority of catastrophic failures both live in data preparation, that reliability is worth far more than any individual modeling trick.
+
+### 7.1 When to Use This Machinery, and Common Pitfalls
+
+The full apparatus of contracts, provenance manifests, and property tests pays for itself when a dataset is reused, when it feeds a model whose predictions carry real consequences, or when the upstream source is outside your control and liable to change. A throwaway one off analysis that nobody will rerun does not need a content addressed manifest, and demanding one is its own kind of waste. The judgment is about reuse and blast radius, not about the size of the data.
+
+A handful of pitfalls recur often enough to name. The first is fitting a statistic during cleaning, where a global mean, scale, or vocabulary is computed before the split and quietly leaks the test set into training; the architectural fix in Section 6.3 exists precisely to make this mistake hard to commit. The second is the non idempotent edit, the incremental append or in place increment that corrupts data on the retries and backfills that production guarantees will happen; write projections to a canonical form instead. The third is order dependent survivorship, where the surviving row depends on how the input happened to arrive, which a total order on records removes. The fourth is the silent coercion failure, where unparseable values vanish into nulls without a count, hiding the schema drift that a failure counter would have surfaced on the first run. Each pitfall maps to a property defined earlier, and each property maps to a test, which is the whole point of stating them precisely.
 
 ## References
 

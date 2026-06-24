@@ -10,6 +10,14 @@ Suppose we have $M$ base models $f_1, \dots, f_M$, each producing a prediction $
 
 Fixed weighting is simple and surprisingly hard to beat, but it leaves value on the table. It assumes that a model's optimal contribution is constant across the input space. In reality a gradient boosted tree might dominate on tabular regions with sharp interactions while a linear model is more reliable in sparse regions, and a nearest neighbor model might shine only near dense clusters. A learned combiner can in principle discover these region-dependent weightings, and it can also discover that two models are nearly redundant and should not both receive full weight.
 
+There is a precise sense in which any fixed convex average is suboptimal whenever the base models are correlated. For squared-error regression, write each base prediction as $f_m(x) = y(x) + \varepsilon_m(x)$ with mean-zero error $\varepsilon_m$, and collect the error covariance into the matrix $\Sigma$ with entries $\Sigma_{mn} = \mathbb{E}[\varepsilon_m \varepsilon_n]$. The weighted ensemble $\sum_m w_m f_m$ has expected squared error $w^\top \Sigma\, w$ subject to $\mathbf{1}^\top w = 1$. Minimizing this quadratic form gives the optimal constant weights
+
+$$
+w^\star = \frac{\Sigma^{-1}\mathbf{1}}{\mathbf{1}^\top \Sigma^{-1}\mathbf{1}},
+$$
+
+which is exactly the minimum-variance portfolio of finance. When the errors are equicorrelated and equal in magnitude this reduces to the uniform average $w_m = 1/M$, so a plain mean is optimal only in that special symmetric case. Whenever the models differ in accuracy or share correlated errors, the optimum tilts away from uniform, and a stacking meta-learner is precisely a data-driven estimate of $w^\star$ (or, with a nonlinear combiner, of an input-dependent generalization of it).
+
 ### 1.2 Stacked generalization
 
 Stacking, introduced by Wolpert in 1992, replaces the fixed weighting rule with a trained model. The key idea is to construct a new dataset in which each original training example is represented by the vector of base-model predictions for that example, and the original label is retained as the target. Formally, define the meta-feature vector
@@ -21,6 +29,13 @@ $$
 and train a meta-learner $g$ to predict $y_i$ from $z_i$. At inference time, an unseen example $x$ is passed through every base model to form $z = (f_1(x), \dots, f_M(x))$, and the final prediction is $g(z)$.
 
 The meta-learner can be anything: linear or logistic regression, a regularized generalized linear model, a small gradient boosted ensemble, or even another neural network. The choice matters, and section 5 returns to it. The deeper subtlety, and the most common source of error in practice, is how the meta-features $z_i$ are generated for the training examples. Generating them naively destroys the entire method.
+
+::: {.callout-note title="Definitions"}
+- **Base model (level-0 learner)** $f_m$: a predictor trained on the original features $x$.
+- **Meta-feature vector** $z_i$: the vector of base-model predictions for example $i$. For classification with $C$ classes, each base model usually contributes $C$ predicted probabilities (or $C-1$ to avoid collinearity), so $z_i$ has $M(C-1)$ or $MC$ entries rather than $M$.
+- **Meta-learner (combiner, level-1 learner)** $g$: the model that maps $z_i$ to the target.
+- **Out-of-fold (OOF) prediction**: a prediction for example $i$ produced by a copy of a base model that was trained without example $i$. These are the entries of the meta-feature matrix $Z$ used to train $g$.
+:::
 
 ## 2. The Leakage Problem and Out-of-Fold Predictions
 
@@ -40,6 +55,25 @@ Partition the training set into $k$ disjoint folds $D_1, \dots, D_k$. For each b
 2. Use that copy to predict the held-out fold $D_j$.
 
 Because every example lands in exactly one held-out fold, every example receives a prediction from a model that never trained on it. Stacking these held-out predictions back together gives a complete column of out-of-fold predictions for model $m$ over the entire training set, with no leakage. Repeating across all $M$ models fills the meta-feature matrix $Z \in \mathbb{R}^{n \times M}$, where $n$ is the number of training examples.
+
+The data flow for a single base model with $k=4$ folds is shown below. Each fold is held out in turn while the other three train a fresh copy, and the four held-out prediction blocks are concatenated into one leakage-free column.
+
+```{mermaid}
+flowchart TD
+    D["Training set D"] --> S["Split into 4 folds"]
+    S --> F1["Hold out D1, train on D2 D3 D4"]
+    S --> F2["Hold out D2, train on D1 D3 D4"]
+    S --> F3["Hold out D3, train on D1 D2 D4"]
+    S --> F4["Hold out D4, train on D1 D2 D3"]
+    F1 --> P1["Predict D1"]
+    F2 --> P2["Predict D2"]
+    F3 --> P3["Predict D3"]
+    F4 --> P4["Predict D4"]
+    P1 --> Z["OOF column for model m"]
+    P2 --> Z
+    P3 --> Z
+    P4 --> Z
+```
 
 ```text
 for each base model m:
@@ -61,6 +95,25 @@ The second convention keeps all $k$ fold models and averages their predictions f
 ### 2.4 Practical cautions
 
 Several details determine whether the construction is truly leakage-free. The folds must respect the structure of the problem. For grouped data, where multiple rows share an entity such as a patient or a user, grouped folds must keep all rows of an entity together, or the base model will have seen a near-duplicate of the held-out example. For time series, the folds must be ordered so that training data precedes the held-out block, since a model that trains on the future to predict the past leaks information that will never exist at deployment. Any preprocessing fitted on data, such as target encoding of categorical variables, imputation statistics, or feature scaling, must be fitted inside each fold's training partition and applied to the held-out fold, never fitted on the full set before splitting. The entire stacking pipeline, base models and preprocessing together, must be cross-validated as a unit.
+
+### 2.5 A worked example: why correlation makes the combiner non-obvious
+
+A small numeric example makes the optimal-weight formula concrete and shows why stacking can beat the naive average even with only two models. Suppose two regressors have unbiased errors with standard deviations $\sigma_1 = 1$ and $\sigma_2 = 2$, and the errors are positively correlated with $\rho = 0.6$. The error covariance is
+
+$$
+\Sigma =
+\begin{pmatrix}
+\sigma_1^2 & \rho\,\sigma_1\sigma_2 \\
+\rho\,\sigma_1\sigma_2 & \sigma_2^2
+\end{pmatrix}
+=
+\begin{pmatrix}
+1 & 1.2 \\
+1.2 & 4
+\end{pmatrix}.
+$$
+
+Since $\det\Sigma = 4 - 1.44 = 2.56$, we have $\Sigma^{-1}\mathbf{1} = \tfrac{1}{2.56}(2.8,\, -0.2)$, and applying $w^\star = \Sigma^{-1}\mathbf{1} / (\mathbf{1}^\top \Sigma^{-1}\mathbf{1})$ gives $w^\star = (2.8,\, -0.2)/2.6 \approx (1.077,\, -0.077)$. The optimal weight on the weaker model is slightly negative: because its errors partly track those of the stronger model, subtracting a little of it cancels shared error, the same hedging logic that produces short positions in a minimum-variance portfolio. The resulting ensemble variance is $1/(\mathbf{1}^\top\Sigma^{-1}\mathbf{1}) = 2.56/2.6 \approx 0.985$, below the stronger model's own variance of $1$ and far below the naive average's variance of $\tfrac14(1 + 4 + 2\cdot1.2) = 1.85$. A meta-learner trained on out-of-fold predictions estimates weights like these directly from data, which is why even a two-model linear stack can outperform a uniform average. It also explains why a non-negativity constraint, discussed in section 5, is a deliberate choice rather than an oversight: it trades a little of this hedging power for robustness against overfitting the estimated covariance.
 
 ## 3. Blending versus Stacking
 
@@ -119,9 +172,23 @@ Stacking rewards base models that make different errors. If every base model is 
 
 Because stacking introduces a second fitting stage, its performance must be estimated with nested cross-validation or a completely untouched final test set. The out-of-fold predictions used to train the meta-learner are an internal device and do not by themselves give an unbiased estimate of ensemble performance, since the meta-learner was fitted on them. An outer loop that holds out data unseen by both base models and meta-learner is the only trustworthy measure. Skipping this step is the second most common stacking error after fold leakage, and it produces the same illusion of accuracy.
 
+The cross-validated form of stacking has a theoretical backing worth knowing. The Super Learner of Van der Laan, Polley, and Hubbard is exactly stacking with a cross-validated risk used to choose the meta-weights, and under mild conditions it is provably asymptotically as good as the best single base learner in the library, what the literature calls an oracle inequality. In plain terms, adding more base models to the library cannot hurt asymptotically, because the combiner can always learn to ignore the useless ones. This guarantee is asymptotic and assumes the cross-validation is done honestly, so it reinforces rather than replaces the need for an outer evaluation loop.
+
 ### 5.4 When stacking is not worth it
 
 Stacking is not free. It multiplies training and inference cost, complicates deployment because the full pipeline of base models plus combiner must be versioned and served together, and adds failure modes through its fold discipline. For many problems a well-tuned single gradient boosted model, or a plain average of a few diverse models, captures most of the available accuracy at a fraction of the operational cost. Stacking earns its place when the base models are genuinely diverse, when a small accuracy improvement carries real value, and when the team can sustain the validation rigor the method demands. Used with that discipline it remains one of the most effective ways to squeeze the last increment of performance out of a model portfolio.
+
+### 5.5 Summary: when to use and what to watch for
+
+| Situation | Recommendation |
+|---|---|
+| Base models are near-duplicates (highly correlated errors) | Skip stacking; a plain average captures almost all of the gain |
+| Few diverse model families, accuracy matters, data limited | Stacking with $k$-fold OOF and a regularized linear meta-learner |
+| Training is very expensive and data is abundant | Blending on a large holdout, or stacking with few folds |
+| Independent teams contributing predictions on a shared holdout | Blending, which needs no fold coordination |
+| Last-decimal accuracy in a competition, ample compute | Multi-level stack, stopping at level 2 in practice |
+
+The recurring pitfalls are worth restating as a checklist. Build meta-features only from out-of-fold predictions, never in-sample ones. Fit every data-dependent preprocessing step inside each fold, not on the full set. Respect grouped and temporal structure when assigning folds. Prefer a simple, regularized combiner and constrain weights when models are correlated. Finally, estimate the ensemble's accuracy with an outer loop that neither the base models nor the meta-learner has seen, since the out-of-fold predictions used for fitting cannot also serve as an honest performance estimate.
 
 ## References
 
