@@ -1,0 +1,398 @@
+# Preference Optimization: RLHF and DPO {#sec-preference-optimization-rlhf-dpo}
+
+A pre-trained language model is a good next-token predictor and a poor assistant. It will happily continue a prompt with something fluent, plausible, and useless, because the pre-training objective rewards imitation of the corpus, not helpfulness, harmlessness, or honesty. Supervised fine-tuning on demonstrations closes part of the gap by showing the model what good answers look like, but demonstrations are expensive to write and they only teach the model to match a single reference completion. They cannot express the far cheaper and more abundant signal that humans actually produce: *this answer is better than that one*.
+
+Preference optimization is the family of post-training methods that turn pairwise human (or AI) judgments into a training signal. It is the step that made instruction-tuned chat models usable, and every frontier assistant shipped since 2022 has gone through some version of it. This chapter develops the two dominant approaches. The first is **Reinforcement Learning from Human Feedback (RLHF)**, which fits a reward model to preferences and then optimizes the policy against that reward with reinforcement learning. The second is **Direct Preference Optimization (DPO)**, which shows that the same objective can be reached with a single supervised-style loss and no reward model, no sampling, and no reinforcement-learning loop. We derive both, then build the parts that run on a CPU from scratch and give the real library invocations for the parts that need a GPU.
+
+## 1. The Preference Data and the Bradley-Terry Model
+
+The raw material is a dataset of comparisons. For a prompt $x$ we sample two completions, present them to an annotator, and record which one was preferred. Write $y_w$ for the winning (chosen) completion and $y_l$ for the losing (rejected) one. The dataset is
+$$
+\mathcal{D} = \{(x^{(i)}, y_w^{(i)}, y_l^{(i)})\}_{i=1}^N .
+$$
+
+To learn from this we need a model of how preferences arise from some underlying notion of quality. The standard choice is the **Bradley-Terry model**, which posits a latent scalar reward $r(x, y)$ for each prompt-completion pair and assumes the probability that $y_w$ beats $y_l$ is a logistic function of the reward gap:
+$$
+P(y_w \succ y_l \mid x) = \sigma\!\big(r(x, y_w) - r(x, y_l)\big),
+\qquad
+\sigma(z) = \frac{1}{1 + e^{-z}} .
+$$
+
+Only reward *differences* are identifiable, the model is invariant to adding a constant to every reward for a fixed prompt, which is why an absolute reward scale never appears. Given the data, we fit a parametric reward $r_\phi$ by maximum likelihood, which is the same as minimizing the binary cross-entropy of the comparisons:
+$$
+\mathcal{L}_{\text{RM}}(\phi)
+= -\,\mathbb{E}_{(x, y_w, y_l)\sim\mathcal{D}}
+\Big[\log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big)\Big] .
+$$
+
+In RLHF the reward model is a copy of the language model with the final token-prediction head replaced by a single scalar head, trained with exactly this loss. We will fit a small Bradley-Terry reward model on a CPU below to make the objective concrete.
+
+## 2. RLHF: Optimizing a Policy Against a Learned Reward
+
+With a reward model $r_\phi$ in hand, RLHF optimizes the language-model policy $\pi_\theta$ to produce high-reward completions, while staying close to the supervised-fine-tuned reference policy $\pi_{\text{ref}}$ so it does not drift into degenerate text that fools the reward model. The objective is a KL-regularized expected reward:
+$$
+\max_{\theta}\;
+\mathbb{E}_{x\sim\mathcal{D},\, y\sim\pi_\theta(\cdot\mid x)}
+\Big[\, r_\phi(x, y) \,\Big]
+\;-\;
+\beta\, \mathbb{D}_{\mathrm{KL}}\!\big(\pi_\theta(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big) .
+$$
+
+The coefficient $\beta$ controls the strength of the leash to the reference. Set it too low and the policy exploits flaws in the reward model (reward hacking, producing text that scores high but reads badly). Set it too high and the policy barely moves. This single tradeoff is the central tuning problem of RLHF.
+
+Because we sample $y$ from the policy and the reward is computed on whole sequences, the objective is a reinforcement-learning problem, not a differentiable supervised loss. The classical solver is **Proximal Policy Optimization (PPO)**. PPO maximizes a clipped surrogate that prevents any single update from moving the policy too far:
+$$
+\mathcal{L}^{\text{PPO}}(\theta)
+= \mathbb{E}_t\Big[\min\big(\rho_t(\theta)\,\hat{A}_t,\;
+\operatorname{clip}(\rho_t(\theta),\,1-\epsilon,\,1+\epsilon)\,\hat{A}_t\big)\Big],
+\qquad
+\rho_t(\theta) = \frac{\pi_\theta(a_t\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t\mid s_t)},
+$$
+where $\hat{A}_t$ is an advantage estimate, usually from generalized advantage estimation against a separate value network. The per-token reward in RLHF is the reward-model score delivered at the final token, minus a per-token $\beta$-weighted KL penalty against $\pi_{\text{ref}}$.
+
+PPO works but is operationally heavy. It needs four models resident at once (policy, reference, reward, and value), online generation inside the training loop, and careful tuning of the clip range, the KL coefficient, and the advantage estimator. This cost is the motivation for the alternatives that follow.
+
+### 2.1 GRPO: Dropping the Value Network
+
+**Group Relative Policy Optimization (GRPO)**, introduced with the DeepSeekMath work and central to the DeepSeek-R1 reasoning models, removes the value network. For each prompt it samples a *group* of $G$ completions, scores them all, and uses the group's own statistics as the baseline. The advantage of the $i$-th completion is just its standardized reward within the group,
+$$
+\hat{A}_i = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}{\operatorname{std}(r_1, \dots, r_G)} ,
+$$
+which it then plugs into the same clipped surrogate as PPO, with an explicit KL term to the reference. Dropping the value model halves the memory footprint and removes a notoriously finicky component, which is why GRPO became the default for reinforcement learning with verifiable rewards (math and code, where $r_i$ can be a correctness check rather than a learned reward model).
+
+## 3. DPO: Preference Optimization Without Reinforcement Learning
+
+Direct Preference Optimization starts from a striking observation. The KL-regularized RLHF objective of Section 2 has a *closed-form* optimal policy. For a fixed reward $r$ and reference $\pi_{\text{ref}}$, the maximizer of expected reward minus $\beta$ times KL is the Gibbs distribution
+$$
+\pi^\star(y\mid x) = \frac{1}{Z(x)}\,\pi_{\text{ref}}(y\mid x)\,
+\exp\!\Big(\tfrac{1}{\beta}\, r(x, y)\Big),
+$$
+where $Z(x) = \sum_y \pi_{\text{ref}}(y\mid x)\exp(r(x,y)/\beta)$ is the partition function. This is a standard result: the optimal KL-regularized policy reweights the reference by the exponentiated reward.
+
+The trick is to *invert* this relation. Solving for the reward in terms of the optimal policy gives
+$$
+r(x, y) = \beta \log \frac{\pi^\star(y\mid x)}{\pi_{\text{ref}}(y\mid x)} + \beta \log Z(x) .
+$$
+
+Now substitute this expression for $r$ back into the Bradley-Terry preference probability from Section 1. The intractable partition function $Z(x)$ depends only on the prompt $x$, so it is *identical* for the chosen and rejected completions and cancels in the difference $r(x, y_w) - r(x, y_l)$. What remains is a preference probability written entirely in terms of the policy we want to train and the fixed reference:
+$$
+P(y_w \succ y_l \mid x)
+= \sigma\!\left(
+\beta \log \frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}
+- \beta \log \frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}
+\right).
+$$
+
+Maximizing the likelihood of the observed preferences under this model is the **DPO loss**:
+$$
+\boxed{\;
+\mathcal{L}_{\text{DPO}}(\theta)
+= -\,\mathbb{E}_{(x, y_w, y_l)\sim\mathcal{D}}
+\left[
+\log \sigma\!\left(
+\beta \log \frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}
+- \beta \log \frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}
+\right)
+\right]
+\;}
+$$
+
+This is the whole method. There is no reward model, no sampling from the policy, and no reinforcement-learning loop. It is an ordinary supervised loss over a frozen dataset, computed from four log-probabilities per example (chosen and rejected, each under the policy and the reference). The quantity $\hat{r}_\theta(x,y) = \beta \log \frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}$ is the *implicit reward*: DPO trains the policy to be its own reward model.
+
+### 3.1 The Gradient and Why It Behaves Well
+
+Differentiating the DPO loss gives an interpretable update. Writing the implicit reward gap as $\hat{\Delta} = \hat{r}_\theta(x, y_w) - \hat{r}_\theta(x, y_l)$,
+$$
+\nabla_\theta \mathcal{L}_{\text{DPO}}
+= -\,\beta\, \mathbb{E}
+\Big[\,
+\underbrace{\sigma(-\hat{\Delta})}_{\text{weight}}
+\big(
+\nabla_\theta \log \pi_\theta(y_w\mid x)
+- \nabla_\theta \log \pi_\theta(y_l\mid x)
+\big)
+\Big] .
+$$
+
+The update raises the log-probability of the chosen completion and lowers that of the rejected one, exactly as intended. The scalar weight $\sigma(-\hat{\Delta})$ is large precisely when the model currently has the preference *wrong* (the implicit reward gap is negative), and small when it already gets the pair right. This automatic hard-example weighting is what makes DPO stable without the clipping machinery PPO needs. The price is that DPO trains only on the fixed offline pairs; it cannot discover that some third, unsampled completion is better, which is the advantage online RLHF retains.
+
+## 4. Production Code
+
+We now make the math concrete. The two CPU-feasible pieces, a Bradley-Terry reward-model fit and the DPO loss with a real gradient step, run as executed cells below on a tiny deterministic model with no downloads. The GPU-scale pieces, full PPO, GRPO, and `trl` on a real language model, are shown as runnable code with an honest note that they require a GPU.
+
+### 4.1 Fitting a Bradley-Terry Reward Model (executed, CPU)
+
+We start with the reward-model stage of RLHF. Each prompt-completion pair is represented by a small feature vector, and a linear reward $r_\phi(z) = \phi^\top z$ is fit by minimizing the Bradley-Terry cross-entropy of Section 1. This is exactly logistic regression on the *difference* of features, which we exploit to check our hand-written training loop against scikit-learn.
+
+```{python}
+import numpy as np
+import torch
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+# Synthetic setup: each completion has a hidden "true quality" that is a known
+# linear function of its features. Preferences are generated by Bradley-Terry,
+# so a correctly fit reward model should recover the direction of true_w.
+d = 6
+N = 4000
+true_w = np.array([1.5, -1.0, 0.8, 0.0, 0.5, -0.3])
+
+feat_w = np.random.randn(N, d)          # features of the chosen completion
+feat_l = np.random.randn(N, d)          # features of the rejected completion
+reward_gap = (feat_w - feat_l) @ true_w
+p_w = 1.0 / (1.0 + np.exp(-reward_gap)) # Bradley-Terry probability w beats l
+
+# Flip a label whenever the "winner" actually lost the coin flip, so the data
+# contains realistic noise rather than perfectly separable preferences.
+coin = np.random.rand(N)
+keep = coin < p_w
+fw = np.where(keep[:, None], feat_w, feat_l)
+fl = np.where(keep[:, None], feat_l, feat_w)
+
+print(f"preference pairs: {N}, feature dim: {d}")
+print(f"mean Bradley-Terry P(chosen wins): {p_w.mean():.3f}")
+```
+
+```{python}
+# Fit the reward model by minimizing the Bradley-Terry loss with plain SGD.
+# This is the exact L_RM objective from Section 1.
+Xw = torch.tensor(fw, dtype=torch.float32)
+Xl = torch.tensor(fl, dtype=torch.float32)
+phi = torch.zeros(d, requires_grad=True)
+opt = torch.optim.Adam([phi], lr=0.05)
+
+for step in range(400):
+    opt.zero_grad()
+    r_w = Xw @ phi
+    r_l = Xl @ phi
+    loss = -torch.nn.functional.logsigmoid(r_w - r_l).mean()
+    loss.backward()
+    opt.step()
+
+phi_hat = phi.detach().numpy()
+# Reward is identifiable only up to scale, so compare directions via cosine.
+cos = (phi_hat @ true_w) / (np.linalg.norm(phi_hat) * np.linalg.norm(true_w))
+train_acc = ((Xw @ phi > Xl @ phi).float().mean()).item()
+
+print(f"final Bradley-Terry loss: {loss.item():.4f}")
+print(f"cosine(recovered reward, true reward): {cos:.3f}")
+print(f"pairwise ranking accuracy on training pairs: {train_acc:.3f}")
+```
+
+```{python}
+# Cross-check: the Bradley-Terry fit on paired data is logistic regression on
+# the feature difference (no intercept). Each comparison "chosen beats rejected"
+# is a label-1 row diff = Xw - Xl; its mirror -diff is the equivalent label-0
+# event "rejected beats chosen". Feeding both classes recovers the same fit.
+from sklearn.linear_model import LogisticRegression
+
+diff = (Xw - Xl).numpy()
+X_lr = np.vstack([diff, -diff])
+y_lr = np.concatenate([np.ones(N), np.zeros(N)])
+clf = LogisticRegression(fit_intercept=False, C=1e6, max_iter=2000)
+clf.fit(X_lr, y_lr)
+w_sklearn = clf.coef_.ravel()
+cos_sklearn = (w_sklearn @ true_w) / (
+    np.linalg.norm(w_sklearn) * np.linalg.norm(true_w))
+
+print(f"cosine(sklearn reward, true reward): {cos_sklearn:.3f}")
+print("both recover the same reward direction, confirming the loss is correct")
+```
+
+### 4.2 The DPO Loss From Scratch and One Gradient Step (executed, CPU)
+
+Now the DPO objective itself. To keep it fully deterministic and offline we use a *tiny* causal language model defined with `torch.nn`: a token embedding, one small transformer block, and a tied output head, on a vocabulary of 32 tokens. This is a real autoregressive model, small enough to train on a CPU in under a second, large enough to exhibit the DPO dynamics exactly as a full model would.
+
+```{python}
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+VOCAB, DMODEL, SEQ = 32, 32, 12
+
+class TinyLM(nn.Module):
+    """A minimal autoregressive language model: embed, one attention block, project."""
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(VOCAB, DMODEL)
+        self.pos = nn.Embedding(SEQ, DMODEL)
+        self.attn = nn.MultiheadAttention(DMODEL, num_heads=4, batch_first=True)
+        self.ln = nn.LayerNorm(DMODEL)
+        self.head = nn.Linear(DMODEL, VOCAB)
+
+    def forward(self, ids):
+        T = ids.shape[1]
+        h = self.emb(ids) + self.pos(torch.arange(T))
+        mask = torch.triu(torch.ones(T, T), diagonal=1).bool()  # causal mask
+        a, _ = self.attn(h, h, h, attn_mask=mask)
+        h = self.ln(h + a)
+        return self.head(h)  # logits over the vocabulary
+
+def seq_logprob(model, ids):
+    """Sum of per-token log-probs of a sequence under the model (teacher forcing)."""
+    logits = model(ids[:, :-1])
+    logp = F.log_softmax(logits, dim=-1)
+    tok_logp = logp.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    return tok_logp.sum(dim=-1)  # one scalar log-prob per sequence in the batch
+
+policy = TinyLM()
+reference = TinyLM()
+reference.load_state_dict(policy.state_dict())  # start policy == frozen reference
+for p in reference.parameters():
+    p.requires_grad_(False)
+
+print(f"policy parameters: {sum(p.numel() for p in policy.parameters())}")
+print(f"reference is frozen: {not any(p.requires_grad for p in reference.parameters())}")
+```
+
+```{python}
+# A tiny preference dataset of (chosen, rejected) token sequences. The chosen
+# sequences share a learnable "good" pattern (low token ids); the rejected ones
+# use "bad" tokens (high ids). DPO should push the policy toward the good pattern.
+torch.manual_seed(1)
+B = 16
+prompt = torch.randint(0, VOCAB, (B, 4))
+chosen_tail = torch.randint(0, 8, (B, SEQ - 4))    # "good" continuations
+rejected_tail = torch.randint(24, VOCAB, (B, SEQ - 4))  # "bad" continuations
+chosen = torch.cat([prompt, chosen_tail], dim=1)
+rejected = torch.cat([prompt, rejected_tail], dim=1)
+
+BETA = 0.1
+
+def dpo_loss(policy, reference, chosen, rejected, beta):
+    """The exact L_DPO from Section 3, plus diagnostics."""
+    pi_w = seq_logprob(policy, chosen)
+    pi_l = seq_logprob(policy, rejected)
+    with torch.no_grad():
+        ref_w = seq_logprob(reference, chosen)
+        ref_l = seq_logprob(reference, rejected)
+    # implicit rewards r_hat = beta * (logpi - logref)
+    r_w = beta * (pi_w - ref_w)
+    r_l = beta * (pi_l - ref_l)
+    loss = -F.logsigmoid(r_w - r_l).mean()
+    acc = (r_w > r_l).float().mean()          # fraction of pairs ranked correctly
+    margin = (r_w - r_l).mean()               # mean implicit-reward margin
+    return loss, acc.item(), margin.item()
+
+loss0, acc0, margin0 = dpo_loss(policy, reference, chosen, rejected, BETA)
+print(f"before training:  loss={loss0.item():.4f}  acc={acc0:.3f}  margin={margin0:+.4f}")
+print("(policy == reference, so every implicit reward gap is exactly 0)")
+```
+
+```{python}
+# Run a short DPO optimization. Each step is one evaluation of L_DPO and one
+# gradient update of the policy only; the reference stays frozen throughout.
+opt = torch.optim.Adam(policy.parameters(), lr=5e-3)
+
+for step in range(60):
+    opt.zero_grad()
+    loss, acc, margin = dpo_loss(policy, reference, chosen, rejected, BETA)
+    loss.backward()
+    opt.step()
+    if step % 20 == 0:
+        print(f"step {step:3d}:  loss={loss.item():.4f}  acc={acc:.3f}  margin={margin:+.4f}")
+
+lossF, accF, marginF = dpo_loss(policy, reference, chosen, rejected, BETA)
+print(f"after training:   loss={lossF.item():.4f}  acc={accF:.3f}  margin={marginF:+.4f}")
+print(f"implicit-reward margin moved from {margin0:+.4f} to {marginF:+.4f} "
+      f"(chosen now scores above rejected)")
+```
+
+The margin starting at exactly zero is the signature of a correct implementation: when the policy equals the reference, every implicit reward is zero and the loss is exactly $-\log\sigma(0) = \log 2 \approx 0.693$. Training drives the chosen-minus-rejected margin positive and the accuracy to one, which is precisely what the gradient in Section 3.1 prescribes.
+
+### 4.3 DPO at Scale With `trl` (show-only, requires GPU)
+
+For a real model the only thing that changes is the scale. The mature open-source `trl` library implements the identical loss on top of Hugging Face Transformers and PEFT, with LoRA adapters and 4-bit loading so a 7B-parameter model fits on a single GPU. The code below is the real invocation; it requires a GPU and downloads a multi-gigabyte model, so it is shown rather than executed.
+
+```python
+# requires GPU and a multi-gigabyte model download (not executed here).
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig
+from trl import DPOConfig, DPOTrainer
+import torch
+
+model_id = "mistralai/Mistral-7B-Instruct-v0.2"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+# 4-bit quantized base via bitsandbytes (GPU only) keeps the 7B model in memory.
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb,
+                                             device_map="auto")
+
+# A standard public preference dataset with prompt/chosen/rejected columns.
+dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
+
+peft_config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                         target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+
+config = DPOConfig(beta=0.1, learning_rate=5e-6, per_device_train_batch_size=2,
+                   gradient_accumulation_steps=8, max_length=1024,
+                   bf16=True, output_dir="dpo-mistral")
+
+# DPOTrainer manages the frozen reference internally (or via the LoRA base) and
+# computes exactly the L_DPO loss derived in Section 3.
+trainer = DPOTrainer(model=model, args=config, train_dataset=dataset,
+                     processing_class=tokenizer, peft_config=peft_config)
+trainer.train()
+```
+
+### 4.4 RLHF With PPO and GRPO via `trl` (show-only, requires GPU)
+
+The reinforcement-learning path is heavier because it generates from the policy online and scores those generations. `trl` provides `PPOTrainer` and `GRPOTrainer`. GRPO is shown here because it is the current default for reinforcement learning with verifiable rewards: it needs no value network and accepts a plain Python reward function.
+
+```python
+# requires GPU (online generation in the training loop). Not executed here.
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import GRPOConfig, GRPOTrainer
+
+model_id = "Qwen/Qwen2.5-3B-Instruct"
+model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+dataset = load_dataset("trl-lib/tldr", split="train")
+
+def reward_len(completions, **kwargs):
+    """A verifiable reward: prefer completions close to 50 tokens. Replace with
+    a math/code correctness check or a learned reward model in real use."""
+    return [-abs(50 - len(c.split())) for c in completions]
+
+# group_size G is the number of samples per prompt whose standardized rewards
+# form the GRPO advantage (Section 2.1). beta is the KL coefficient to the reference.
+config = GRPOConfig(output_dir="grpo-qwen", per_device_train_batch_size=4,
+                    num_generations=8, beta=0.04, max_completion_length=64, bf16=True)
+
+trainer = GRPOTrainer(model=model, reward_funcs=reward_len, args=config,
+                      train_dataset=dataset, processing_class=tokenizer)
+trainer.train()
+```
+
+The classical PPO path swaps `GRPOTrainer` for `PPOTrainer` and additionally requires a trained reward model and a value head, which is the extra operational weight discussed in Section 2.
+
+## 5. Pitfalls and When to Use
+
+**Choosing between DPO and online RLHF.** DPO is the right default when you have a fixed preference dataset and want a stable, cheap, reproducible run: it is a supervised loss with one extra forward pass for the reference, and it has no sampling loop to tune. Online RLHF (PPO or GRPO) earns its extra cost when the signal is a *verifiable* reward (math answers, unit tests, tool-use success) rather than a static comparison, because online sampling lets the policy discover high-reward behaviors that are not present in any offline pair. The DeepSeek-R1 reasoning results came from exactly this regime: GRPO against a correctness reward, not DPO on fixed pairs.
+
+**The $\beta$ tradeoff is real in both.** In RLHF, too small a $\beta$ invites reward hacking, the policy finds text that scores high under an imperfect reward model but is degenerate. In DPO, $\beta$ controls how far the implicit reward can pull the policy from the reference; too large freezes learning, too small lets the policy over-optimize the preference pairs and lose general fluency. There is no universal value; it must be tuned per dataset.
+
+**DPO can decrease the chosen log-probability.** A counterintuitive and frequently observed failure: the DPO gradient only cares about the *margin* between chosen and rejected, so it can satisfy the objective by pushing the rejected log-probability down faster than it pushes the chosen one up, lowering *both*. The chosen completion still wins the comparison, but its absolute likelihood has fallen. Watch the chosen and rejected log-probabilities separately, not just the loss; if the chosen log-prob is collapsing, lower the learning rate or raise $\beta$. Variants such as IPO and the addition of an explicit supervised-fine-tuning term (as in some implementations) were introduced partly to address this.
+
+**Reference-model and tokenization consistency.** Both methods assume $\pi_{\text{ref}}$ is the supervised-fine-tuned checkpoint the preferences were collected against, and that chosen and rejected are tokenized identically. A mismatched reference or an inconsistent chat template silently corrupts the implicit reward and is a common source of training that looks healthy but produces a worse model.
+
+**Preference data quality dominates.** Neither method can exceed the quality of its comparisons. Annotator disagreement, position bias (preferring the first answer shown), length bias (preferring longer answers regardless of quality), and distribution shift between the preferences and deployment all flow straight into the model. Length bias in particular is so pervasive that length-regularized variants exist specifically to counter it. The most important investment in preference optimization is usually in the data, not the algorithm.
+
+## References
+
+1. Christiano, P. et al. "Deep Reinforcement Learning from Human Preferences." NeurIPS 2017. https://arxiv.org/abs/1706.03741
+2. Ouyang, L. et al. "Training Language Models to Follow Instructions with Human Feedback" (InstructGPT). NeurIPS 2022. https://arxiv.org/abs/2203.02155
+3. Bradley, R. A. and Terry, M. E. "Rank Analysis of Incomplete Block Designs: I. The Method of Paired Comparisons." Biometrika, 1952. https://doi.org/10.2307/2334029
+4. Schulman, J. et al. "Proximal Policy Optimization Algorithms." 2017. https://arxiv.org/abs/1707.06347
+5. Rafailov, R. et al. "Direct Preference Optimization: Your Language Model is Secretly a Reward Model." NeurIPS 2023. https://arxiv.org/abs/2305.18290
+6. Shao, Z. et al. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models" (GRPO). 2024. https://arxiv.org/abs/2402.03300
+7. DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." Nature, September 2025. https://www.nature.com/articles/s41586-025-09422-z
+8. Azar, M. G. et al. "A General Theoretical Paradigm to Understand Learning from Human Preferences" (IPO). AISTATS 2024. https://arxiv.org/abs/2310.12036
+9. von Werra, L. et al. "TRL: Transformer Reinforcement Learning." Hugging Face, 2020 onward. https://github.com/huggingface/trl
+10. Hu, E. J. et al. "LoRA: Low-Rank Adaptation of Large Language Models." ICLR 2022. https://arxiv.org/abs/2106.09685

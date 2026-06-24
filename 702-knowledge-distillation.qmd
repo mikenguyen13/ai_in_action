@@ -1,0 +1,371 @@
+# Knowledge Distillation {#sec-knowledge-distillation}
+
+A frontier model can be enormously capable and almost unusably expensive to serve. A model with hundreds of billions of parameters answers well, but every query costs accelerator time, memory bandwidth, and latency that a real product cannot always afford. **Knowledge distillation** is the dominant technique for closing that gap: it trains a small, cheap **student** model to reproduce the behavior of a large, accurate **teacher**, transferring most of the teacher's capability into a fraction of the parameters. The student is what you deploy; the teacher is what you learn from.
+
+The central insight, due to Hinton, Vinyals, and Dean, is that a trained classifier's *full output distribution* carries far more information than its single hard label. When a good digit classifier sees an image of a 7, it does not merely assert "7." It assigns a small but nonzero probability to 1, a slightly larger one to 9, and almost nothing to 4. Those ratios encode the teacher's learned similarity structure over classes, the part of its knowledge that the one-hot training label throws away. Hinton called this the **dark knowledge** in the soft probabilities, and distillation is, at bottom, the act of training the student to match it.
+
+This chapter develops the technique in three layers. First the mathematics: temperature-scaled softmax, the distillation loss, and why the gradient recovers the right limit. Then runnable production code: we train a small teacher and distill it into a much smaller student on a CPU-feasible toy problem, reporting real accuracies, latencies, and compression. Finally the frontier case, distilling real language models such as DistilBERT, shown as the exact library invocation a reader would run on a GPU. The execution policy here is honest: the parts that fit on a CPU are executed and their printed numbers are real; the parts that need accelerators are shown, not run, and labeled as such.
+
+## Why Soft Targets Carry More Signal
+
+Consider a $K$-class classifier producing logits $z = (z_1, \dots, z_K)$. The usual training target for an example of class $c$ is the one-hot vector $e_c$, and standard cross-entropy pushes the predicted probability of class $c$ toward one and everything else toward zero. That objective is correct but informationally thin. It says nothing about *which* wrong classes are plausible, and that relative plausibility is exactly the generalization structure a large model has discovered.
+
+A teacher's softmax output $p^{\text{teacher}} = \operatorname{softmax}(z^{\text{teacher}})$ does encode it, but often too faintly to be useful. A confident teacher produces a distribution close to one-hot, with the informative inter-class ratios buried in probabilities like $10^{-6}$ versus $10^{-9}$. Distillation recovers that buried structure by **softening** the distribution with a temperature.
+
+## The Mathematics of Distillation
+
+### Temperature-Scaled Softmax
+
+Introduce a temperature $T > 0$ and define the softened distribution
+
+$$
+p_i(T) = \frac{\exp(z_i / T)}{\sum_{j=1}^{K} \exp(z_j / T)}.
+$$
+
+At $T = 1$ this is the ordinary softmax. As $T$ grows, the logits are compressed toward each other and the distribution flattens, lifting the small probabilities of the runner-up classes into a range where they meaningfully affect the loss. As $T \to \infty$ the distribution approaches uniform; as $T \to 0$ it approaches the one-hot argmax. The temperature is the dial that sets how much dark knowledge the student is asked to match: a moderate $T$ (typically between 2 and 8) exposes the inter-class structure without drowning it in noise.
+
+### The Distillation Objective
+
+The student is trained against two targets at once. The **soft** target is the teacher's softened distribution; the student matches it through a Kullback-Leibler divergence computed at the same temperature $T$. The **hard** target is the ground-truth label, matched through ordinary cross-entropy at $T = 1$. Writing $q(T)$ for the student's softened distribution and $p(T)$ for the teacher's, the loss for one example is
+
+$$
+\mathcal{L} = \alpha \, T^2 \, \mathrm{KL}\!\big(p(T) \,\|\, q(T)\big) \;+\; (1 - \alpha)\, \mathrm{CE}\!\big(e_c, q(1)\big),
+$$
+
+where $\alpha \in [0, 1]$ balances the two terms. The soft term teaches the student the teacher's similarity structure; the hard term anchors it to the verified truth so that the student does not merely inherit the teacher's mistakes.
+
+### Why the $T^2$ Factor
+
+The $T^2$ multiplier on the KL term is not cosmetic; it keeps the two losses on a comparable scale so a single learning rate works for both. The gradient of the softened cross-entropy with respect to a student logit $v_i$ is
+
+$$
+\frac{\partial}{\partial v_i} \, \mathrm{CE}\!\big(p(T), q(T)\big) = \frac{1}{T}\big(q_i(T) - p_i(T)\big).
+$$
+
+The explicit $1/T$ means the soft-target gradient shrinks like $1/T$, and a second factor of $1/T$ enters through how the softened probabilities themselves respond to the logits, so the raw soft gradient scales like $1/T^2$. Multiplying the soft loss by $T^2$ cancels this, leaving the soft and hard gradients of comparable magnitude across temperatures. Without it, raising $T$ would silently down-weight the distillation term, and the temperature would entangle two effects that should stay separate.
+
+### The High-Temperature Limit Recovers Logit Matching
+
+A clean way to see what distillation does is to expand the high-temperature gradient. For large $T$, $\exp(z_i/T) \approx 1 + z_i/T$, and if the logits are zero-meaned within each example, the softened cross-entropy gradient reduces to
+
+$$
+\frac{\partial \mathcal{L}_{\text{soft}}}{\partial v_i} \approx \frac{1}{K T^2}\big(v_i - z_i\big).
+$$
+
+In this regime, minimizing the (temperature-corrected) soft loss is equivalent to **matching the student's logits to the teacher's logits** in squared error. Distillation at high temperature is therefore a soft regression of student logits onto teacher logits, which is exactly the "match the full response, not just the argmax" intuition made precise. At low temperature it falls back toward ordinary label matching, ignoring the dark knowledge. The useful regime sits in between.
+
+## Three Flavors of Distillation
+
+The loss above is **response-based** distillation: the student matches the teacher's output distribution. Two other families matter in practice.
+
+- **Feature-based** distillation matches intermediate representations. The student is trained so that a chosen hidden layer's activations approximate the teacher's, usually through a small learned projection plus a mean-squared-error penalty. This transfers *how* the teacher represents inputs, not only *what* it outputs, and is central to distilling deep networks where the final layer alone underspecifies the target.
+- **Relation-based** distillation matches relationships between examples or between layers, for instance the Gram matrix of pairwise similarities, so the student preserves the geometry of the teacher's representation space rather than any single activation.
+
+Production language-model distillation, including DistilBERT, combines response-based and feature-based terms: a soft-label KL on the output logits, plus losses that align the student's hidden states and attention patterns with the teacher's. The toy example below uses the response-based loss because it is the core mechanism and the one that runs comfortably on a CPU; the show-only language-model section uses the full combination.
+
+## Production Code
+
+We now build the full pipeline on a problem small enough to execute on a CPU in seconds, yet rich enough to show distillation's real payoff. The setup is the regime where distillation earns its keep: a strong teacher trained on plenty of data, a much smaller student, and only a handful of hard labels available to the student. The teacher supplies soft targets across a large **transfer set** of inputs the student has no labels for, and the student recovers most of the teacher's accuracy at a fraction of the size.
+
+### Setup and Data
+
+We use the scikit-learn handwritten digits dataset (1797 images, 64 features, 10 classes). The teacher trains on the full labeled training split. The student is allowed only 150 hard labels, but the teacher provides soft targets over the entire training pool. Everything is seeded for determinism.
+
+```{python}
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+SEED = 0
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+digits = load_digits()
+X = digits.data.astype(np.float32)
+y = digits.target.astype(np.int64)
+
+X_tr_full, X_te, y_tr_full, y_te = train_test_split(
+    X, y, test_size=0.30, random_state=SEED, stratify=y
+)
+
+# The student is allowed only a small labeled subset of the training pool.
+sub_idx, _ = train_test_split(
+    np.arange(len(X_tr_full)), train_size=150,
+    random_state=SEED, stratify=y_tr_full
+)
+
+scaler = StandardScaler().fit(X_tr_full)
+X_tr_full = scaler.transform(X_tr_full).astype(np.float32)
+X_te = scaler.transform(X_te).astype(np.float32)
+
+to_t = torch.from_numpy
+X_full_t, y_full_t = to_t(X_tr_full), to_t(y_tr_full)
+X_te_t, y_te_t = to_t(X_te), to_t(y_te)
+
+# Mask marking which transfer-set points carry a usable hard label.
+labeled_mask = torch.zeros(len(X_tr_full), dtype=torch.bool)
+labeled_mask[sub_idx] = True
+
+print(f"teacher train: {X_tr_full.shape[0]} labeled")
+print(f"student hard labels: {int(labeled_mask.sum())}")
+print(f"transfer set (soft targets): {X_tr_full.shape[0]}")
+print(f"test: {X_te.shape[0]}  classes: {len(np.unique(y))}")
+```
+
+### Models and Training Utilities
+
+The teacher is a two-hidden-layer MLP with width 256; the student is a single-hidden-layer MLP with width 32, roughly 35 times smaller. The helper functions cover ordinary cross-entropy training, accuracy, and a simple forward-pass latency measurement.
+
+```{python}
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim, depth=1):
+        super().__init__()
+        layers, d = [], in_dim
+        for _ in range(depth):
+            layers += [nn.Linear(d, hidden), nn.ReLU()]
+            d = hidden
+        layers += [nn.Linear(d, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def count_params(m):
+    return sum(p.numel() for p in m.parameters())
+
+
+def train_ce(model, X, y, epochs, lr=5e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    for _ in range(epochs):
+        opt.zero_grad()
+        F.cross_entropy(model(X), y).backward()
+        opt.step()
+    return model
+
+
+@torch.no_grad()
+def accuracy(model, X, y):
+    model.eval()
+    return (model(X).argmax(1) == y).float().mean().item()
+
+
+@torch.no_grad()
+def latency_ms(model, X, repeats=50):
+    model.eval()
+    _ = model(X)  # warmup
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        _ = model(X)
+    return (time.perf_counter() - t0) / repeats * 1000.0
+```
+
+### Teacher and From-Scratch Student Baselines
+
+First we train the teacher on the full labeled set, then a from-scratch student of the same small architecture on only the 150 hard labels. The from-scratch student is the baseline distillation must beat.
+
+```{python}
+torch.manual_seed(SEED)
+teacher = train_ce(MLP(64, 256, 10, depth=2), X_full_t, y_full_t, epochs=120)
+acc_teacher = accuracy(teacher, X_te_t, y_te_t)
+print(f"teacher           params={count_params(teacher):>6}  test_acc={acc_teacher:.4f}")
+
+torch.manual_seed(SEED)
+X_sub_t = X_full_t[labeled_mask]
+y_sub_t = y_full_t[labeled_mask]
+student_scratch = train_ce(MLP(64, 32, 10, depth=1), X_sub_t, y_sub_t, epochs=200)
+acc_scratch = accuracy(student_scratch, X_te_t, y_te_t)
+print(f"student(scratch)  params={count_params(student_scratch):>6}  test_acc={acc_scratch:.4f}")
+```
+
+### The Distillation Loss
+
+This is the heart of the chapter, the temperature-scaled KL plus masked hard-label cross-entropy, exactly as derived above. The teacher's soft targets are computed once over the entire transfer set. The KL term applies to every transfer point; the cross-entropy term applies only where a hard label exists.
+
+```{python}
+def distill(student, teacher, X, y_hard, mask, T=4.0, alpha=0.7,
+            epochs=200, lr=5e-3):
+    with torch.no_grad():
+        teacher.eval()
+        soft_targets = F.softmax(teacher(X) / T, dim=1)   # dark knowledge
+    opt = torch.optim.Adam(student.parameters(), lr=lr)
+    student.train()
+    for _ in range(epochs):
+        opt.zero_grad()
+        s = student(X)
+        # Soft term: KL at temperature T, rescaled by T^2 (see derivation).
+        kd = F.kl_div(F.log_softmax(s / T, dim=1), soft_targets,
+                      reduction="batchmean") * (T * T)
+        # Hard term: ordinary cross-entropy, only on labeled points.
+        ce = F.cross_entropy(s[mask], y_hard[mask])
+        (alpha * kd + (1.0 - alpha) * ce).backward()
+        opt.step()
+    return student
+
+
+torch.manual_seed(SEED)
+student_kd = distill(MLP(64, 32, 10, depth=1), teacher, X_full_t, y_full_t,
+                     labeled_mask, T=4.0, alpha=0.7, epochs=200)
+acc_kd = accuracy(student_kd, X_te_t, y_te_t)
+print(f"student(distilled)params={count_params(student_kd):>6}  test_acc={acc_kd:.4f}")
+```
+
+### Results: Accuracy, Compression, and Latency
+
+The headline comparison is teacher versus from-scratch student versus distilled student, alongside the compression ratio and the latency advantage of the small model.
+
+```{python}
+print(f"teacher latency   {latency_ms(teacher, X_te_t):.3f} ms/batch")
+print(f"student latency   {latency_ms(student_kd, X_te_t):.3f} ms/batch")
+print(f"compression       {count_params(teacher)/count_params(student_kd):.1f}x fewer params")
+print()
+print(f"from-scratch student accuracy : {acc_scratch:.4f}")
+print(f"distilled student accuracy    : {acc_kd:.4f}")
+print(f"teacher accuracy              : {acc_teacher:.4f}")
+gap_total = acc_teacher - acc_scratch
+gap_closed = acc_kd - acc_scratch
+print(f"fraction of teacher gap recovered by distillation: "
+      f"{gap_closed/gap_total:.0%}")
+```
+
+The distilled student, with roughly 35 times fewer parameters and a fraction of the inference latency, recovers most of the accuracy gap between the from-scratch baseline and the teacher, using only 150 hard labels plus the teacher's soft targets over the unlabeled pool. That is the practical promise of distillation in one table.
+
+### The Role of Temperature
+
+Temperature is the most important distillation hyperparameter after the loss weight. The sweep below distills the same student at several temperatures, holding everything else fixed, so the effect is isolated.
+
+```{python}
+print("Temperature sweep (alpha=0.7, same seed and budget):")
+for T in [1.0, 2.0, 4.0, 8.0]:
+    torch.manual_seed(SEED)
+    s = distill(MLP(64, 32, 10, depth=1), teacher, X_full_t, y_full_t,
+                labeled_mask, T=T, alpha=0.7, epochs=200)
+    print(f"  T={T:>4}  test_acc={accuracy(s, X_te_t, y_te_t):.4f}")
+```
+
+The best temperature is dataset and model dependent, which is why it is tuned rather than fixed. On this easy problem a low to moderate temperature works well; on harder tasks with more confident teachers, a higher temperature is usually needed to surface the inter-class structure. The point the sweep makes is that temperature genuinely matters and must be searched, not assumed.
+
+## Distilling Real Language Models (Requires GPU)
+
+Everything above runs on a CPU because the models are tiny. Distilling a real language model is the same mathematics at a different scale, and it needs an accelerator. The blocks in this section are **shown, not executed**. They are the actual mature open-source invocations a reader would run on a GPU.
+
+The reference result is **DistilBERT**, which retains about 97 percent of BERT-base's language-understanding performance with roughly 40 percent fewer parameters and 60 percent faster inference. It is trained with a triple objective: a soft-label distillation loss on the teacher's output distribution, the original masked-language-modeling loss, and a cosine-embedding loss that aligns the student's hidden states with the teacher's (the feature-based term discussed earlier).
+
+The soft-label loss is exactly the temperature-scaled KL from this chapter, written here in plain PyTorch against teacher and student logits.
+
+```python
+# Requires GPU and a pretrained teacher. Shown, not executed.
+import torch
+import torch.nn.functional as F
+
+def distillation_loss(student_logits, teacher_logits, labels,
+                      T=2.0, alpha=0.5):
+    soft = F.kl_div(
+        F.log_softmax(student_logits / T, dim=-1),
+        F.softmax(teacher_logits / T, dim=-1),
+        reduction="batchmean",
+    ) * (T * T)
+    hard = F.cross_entropy(student_logits, labels)
+    return alpha * soft + (1.0 - alpha) * hard
+```
+
+The Hugging Face ecosystem provides mature, free, open-source tooling for the full pipeline. A response-based fine-tuning distillation can be expressed by subclassing the standard `Trainer` so its loss compares student logits to a frozen teacher's logits on the same batch.
+
+```python
+# Requires GPU. Shown, not executed. Open-source: transformers + datasets.
+from transformers import (AutoModelForSequenceClassification,
+                          AutoTokenizer, Trainer, TrainingArguments)
+from datasets import load_dataset
+import torch.nn.functional as F
+
+teacher = AutoModelForSequenceClassification.from_pretrained(
+    "bert-base-uncased", num_labels=2).cuda().eval()
+student = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased", num_labels=2).cuda()
+tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
+ds = load_dataset("glue", "sst2")
+def prep(b):
+    return tok(b["sentence"], truncation=True, padding="max_length",
+               max_length=128)
+ds = ds.map(prep, batched=True)
+
+class DistilTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kw):
+        labels = inputs["labels"]
+        with torch.no_grad():
+            t_logits = teacher(input_ids=inputs["input_ids"],
+                               attention_mask=inputs["attention_mask"]).logits
+        out = model(input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"])
+        T, alpha = 2.0, 0.5
+        soft = F.kl_div(F.log_softmax(out.logits / T, dim=-1),
+                        F.softmax(t_logits / T, dim=-1),
+                        reduction="batchmean") * (T * T)
+        hard = F.cross_entropy(out.logits, labels)
+        loss = alpha * soft + (1.0 - alpha) * hard
+        return (loss, out) if return_outputs else loss
+
+trainer = DistilTrainer(
+    model=student,
+    args=TrainingArguments(output_dir="distil-sst2", per_device_train_batch_size=32,
+                           num_train_epochs=3, fp16=True),
+    train_dataset=ds["train"], eval_dataset=ds["validation"],
+)
+trainer.train()
+```
+
+For instruction-style and generative distillation, the same idea takes a different surface. A modern recipe is **sequence-level distillation**, where a strong teacher generates outputs that become supervised training data for the student, the mechanism behind reasoning-trace distillation discussed in the reasoning-models chapter. The open-source TRL library provides a `GKDTrainer` (generalized knowledge distillation) for token-level distillation of generative models.
+
+```python
+# Requires GPU. Shown, not executed. Open-source: trl + peft.
+from trl import GKDTrainer, GKDConfig
+from peft import LoraConfig
+
+# 8-bit teacher loading shown for reference only. Do not run on CPU.
+# from transformers import BitsAndBytesConfig
+# bnb = BitsAndBytesConfig(load_in_8bit=True)
+
+trainer = GKDTrainer(
+    model="student-base",          # small generative student
+    teacher_model="teacher-large", # frozen strong teacher
+    args=GKDConfig(output_dir="gkd-out", temperature=2.0,
+                   lmbda=0.5, beta=0.5, num_train_epochs=1),
+    peft_config=LoraConfig(r=16, lora_alpha=32, task_type="CAUSAL_LM"),
+    train_dataset=None,            # your prompt set
+)
+trainer.train()
+```
+
+The arithmetic that justifies all of this is simple. If distillation cuts parameters by 40 percent and latency by 60 percent while keeping accuracy within a few points, then at serving scale it cuts the accelerator fleet and the per-query cost by a similar fraction. That recurring saving, paid once in training compute, is why distillation is standard practice for shipping large models.
+
+## Pitfalls and When to Use
+
+**The teacher caps the student.** Distillation transfers the teacher's knowledge, including its biases and errors. A student cannot reliably exceed a weak teacher on the distilled task, and a teacher that is systematically wrong will teach the student to be confidently wrong in the same way. Keep the hard-label term (a nonzero $1 - \alpha$) so the student stays anchored to ground truth where it exists.
+
+**Temperature and loss weight need tuning.** As the sweep showed, the temperature $T$ and the balance $\alpha$ materially change the result, and the best values depend on the dataset and on how confident the teacher is. Treat them as hyperparameters to search, not constants to copy. A too-low temperature wastes the dark knowledge; a too-high one drowns it in near-uniform noise.
+
+**The transfer set is doing the heavy lifting.** Distillation's largest gains in this chapter came not from the loss alone but from applying the teacher's soft targets across a large pool of unlabeled inputs. If your transfer set is tiny or unrepresentative of deployment inputs, the student has little to learn from. Distillation is most powerful when unlabeled data is plentiful and labels are scarce.
+
+**Capacity gaps can hurt.** A student that is too small relative to the teacher may be unable to fit the soft targets at all, and an extreme teacher-student gap can make distillation *worse* than training the student directly. Intermediate "teacher assistant" models or feature-based losses help bridge very large gaps.
+
+**Distillation is not free at training time.** You pay for teacher inference over the entire transfer set every epoch (or once, if you cache the soft targets, which is the standard optimization). For very large teachers this teacher-inference cost dominates, so caching soft targets and reusing them across epochs is usually essential.
+
+**When to reach for it.** Distillation is the right tool when you have a strong but expensive model and a hard latency, memory, or cost ceiling at serving time; when you have abundant unlabeled data in the deployment distribution; or when you want to compress a capability that is hard to learn directly from labels (reasoning traces, multi-step generation, calibrated probabilities). It composes naturally with the other compression techniques: quantization shrinks the weights' precision and pruning removes parameters, while distillation chooses a smaller architecture and trains it to behave like the large one. In production pipelines the three are routinely stacked.
+
+## References
+
+1. Hinton, G., Vinyals, O., and Dean, J. "Distilling the Knowledge in a Neural Network." 2015. https://arxiv.org/abs/1503.02531
+2. Sanh, V., Debut, L., Chaumond, J., and Wolf, T. "DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter." 2019. https://arxiv.org/abs/1910.01108
+3. Romero, A. et al. "FitNets: Hints for Thin Deep Nets" (feature-based distillation). 2015. https://arxiv.org/abs/1412.6550
+4. Park, W. et al. "Relational Knowledge Distillation." 2019. https://arxiv.org/abs/1904.05068
+5. Gou, J. et al. "Knowledge Distillation: A Survey." International Journal of Computer Vision, 2021. https://arxiv.org/abs/2006.05525
+6. Kim, Y. and Rush, A. M. "Sequence-Level Knowledge Distillation." 2016. https://arxiv.org/abs/1606.07947
+7. Agarwal, R. et al. "On-Policy Distillation of Language Models" (generalized KD). 2024. https://arxiv.org/abs/2306.13649
+8. Mirzadeh, S. et al. "Improved Knowledge Distillation via Teacher Assistant." 2020. https://arxiv.org/abs/1902.03393

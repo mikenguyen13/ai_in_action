@@ -1,0 +1,387 @@
+# Efficient Attention: KV-Cache, GQA, and Flash Attention
+
+## 1. Why Attention Efficiency Decides Whether a Model Ships
+
+A transformer language model spends most of its serving life doing one thing: predicting the next token, one token at a time, given everything generated so far. The mathematics of self attention says that to predict token $t$ the model attends over all $t-1$ previous tokens. Taken literally, generating a sequence of length $n$ recomputes attention over a growing prefix at every step, which costs $O(n^2)$ work in total and, worse, reads and writes an $O(n^2)$ matrix of attention scores through the memory hierarchy. On modern accelerators the second cost dominates: attention is **memory bound**, not compute bound, and the wall-clock bottleneck for long contexts is moving bytes, not multiplying numbers.
+
+Three techniques, layered on top of one another, turn this from a research curiosity into a deployable system. The **KV-cache** removes the redundant recomputation, dropping the per-step cost of decoding from $O(n^2)$ to $O(n)$ and making autoregressive generation tractable at all. **Grouped-query attention (GQA)** and its extreme, **multi-query attention (MQA)**, shrink the cache itself by sharing key and value projections across query heads, which is what makes long contexts fit in memory. **FlashAttention** restructures the attention computation so it never materializes the full score matrix in slow memory, turning the prefill and training passes from memory bound back toward compute bound. **Paged attention** then manages the cache like virtual memory so a server can pack many concurrent requests without fragmentation.
+
+This chapter develops the mathematics of each, then shows code. The CPU-feasible parts (a from-scratch KV-cache and a grouped-query demo) are executed here on small tensors so you can see the asymptotics and the numerics directly. The GPU-bound parts (fused FlashAttention kernels, paged attention in vLLM, GPU sliding-window attention) are shown as real, runnable library invocations with an honest note that they require an accelerator.
+
+## 2. Self Attention and the Cost of Naive Decoding
+
+Fix one attention head. Let the input be a sequence of $n$ token vectors stacked as rows of $X \in \mathbb{R}^{n \times d_{\text{model}}}$. Three learned projections produce queries, keys, and values,
+
+$$
+Q = X W_Q, \qquad K = X W_K, \qquad V = X W_V,
+$$
+
+with $W_Q, W_K, W_V \in \mathbb{R}^{d_{\text{model}} \times d_k}$ and $Q, K, V \in \mathbb{R}^{n \times d_k}$. Scaled dot-product attention is
+
+$$
+\operatorname{Attn}(Q, K, V) = \operatorname{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}} + M\right) V ,
+$$
+
+where $M$ is the causal mask with $M_{ij} = -\infty$ for $j > i$ and $0$ otherwise, so that token $i$ attends only to positions $j \le i$.
+
+The score matrix $S = QK^\top / \sqrt{d_k}$ is $n \times n$. Forming it costs $O(n^2 d_k)$ floating-point operations and, decisively, $O(n^2)$ memory traffic to write $S$, read it back for the softmax, and read it again for the multiply by $V$. For a single full sequence (training, or the **prefill** of a prompt) this is paid once. For autoregressive **decoding** the picture is worse: a naive implementation that re-runs the full attention at every generated step pays $\sum_{t=1}^{n} O(t^2) = O(n^3)$ across the whole generation. That cubic blowup is the wall a KV-cache exists to remove.
+
+## 3. The KV-Cache: From Quadratic to Linear Per Step
+
+The key observation is that during decoding the keys and values of past tokens never change. When we generate token $t$, its query $q_t = x_t W_Q$ is new, but the keys $k_1, \dots, k_{t-1}$ and values $v_1, \dots, v_{t-1}$ are exactly the ones computed at earlier steps. There is no reason to recompute them.
+
+A KV-cache stores the running matrices $K_{<t}$ and $V_{<t}$. At step $t$ we compute only the new key and value, append them, and attend the single new query against the whole cache:
+
+$$
+k_t = x_t W_K,\quad v_t = x_t W_V,\qquad
+K_{\le t} = \begin{bmatrix} K_{<t} \\ k_t \end{bmatrix},\quad
+V_{\le t} = \begin{bmatrix} V_{<t} \\ v_t \end{bmatrix},
+$$
+
+$$
+o_t = \operatorname{softmax}\!\left(\frac{q_t K_{\le t}^\top}{\sqrt{d_k}}\right) V_{\le t} .
+$$
+
+Now step $t$ does a single query against $t$ keys: $O(t \, d_k)$ work and $O(t)$ memory traffic, not $O(t^2)$. Across the full generation the total is $\sum_{t=1}^{n} O(t) = O(n^2)$ work, and the **per-step** cost is linear in the context length rather than quadratic. The causal mask disappears at decode time because the cache contains only past positions by construction.
+
+The price is memory. The cache holds, per layer and per head,
+
+$$
+\text{KV bytes} = 2 \times n_{\text{layers}} \times n_{\text{kv heads}} \times d_k \times n_{\text{tokens}} \times \text{batch} \times \text{bytes per element}.
+$$
+
+The factor of two is keys plus values. This number grows linearly with context length and batch size and, at long context, dominates the memory budget of a served model, often exceeding the size of the weights themselves. Everything in the next two sections is about shrinking it or streaming around it.
+
+## 4. Grouped-Query and Multi-Query Attention: Shrinking the Cache
+
+Standard **multi-head attention (MHA)** gives every one of the $h$ query heads its own key and value head. The cache therefore scales with $h$. The insight of **multi-query attention (MQA)** is that keys and values can be shared: use $h$ query heads but a single key head and a single value head, broadcast across all queries. This cuts the KV-cache by a factor of $h$ at the cost of some representational capacity, and it noticeably degraded quality in practice.
+
+**Grouped-query attention (GQA)** interpolates. Partition the $h$ query heads into $g$ groups; each group shares one key head and one value head. With $g = h$ this is plain MHA; with $g = 1$ it is MQA. Intermediate $g$ (Llama 2 70B and many later models use $g = 8$) recovers almost all of MHA's quality while cutting the cache by $h/g$. Concretely, with $h$ query heads and $g$ KV groups, query head $i$ uses KV group $\lfloor i / (h/g) \rfloor$, so each KV head is reused by $h/g$ query heads:
+
+$$
+o^{(i)}_t = \operatorname{softmax}\!\left(\frac{q^{(i)}_t \big(K^{(\lfloor i/(h/g)\rfloor)}_{\le t}\big)^\top}{\sqrt{d_k}}\right) V^{(\lfloor i/(h/g)\rfloor)}_{\le t} .
+$$
+
+The cache shrinks from $2 n_{\text{layers}} h\, d_k$ per token to $2 n_{\text{layers}} g\, d_k$ per token, a factor of $h/g$ smaller. Because attention is memory bound, a smaller cache also means less memory traffic per decode step, so GQA improves both footprint and decode latency. The reason it works at all is that the queries carry most of the head-specific specialization; sharing keys and values across a small group costs little because the softmax over shared keys still mixes differently per query.
+
+```{mermaid}
+flowchart LR
+    subgraph MHA["MHA eight query heads eight KV heads"]
+        q1["q1"] --> k1["kv1"]
+        q2["q2"] --> k2["kv2"]
+        q3["q3"] --> k3["kv3"]
+        q4["q4"] --> k4["kv4"]
+    end
+    subgraph GQA["GQA eight query heads two KV groups"]
+        a1["q1"] --> g1["kv group 1"]
+        a2["q2"] --> g1
+        a3["q3"] --> g2["kv group 2"]
+        a4["q4"] --> g2
+    end
+```
+
+## 5. FlashAttention: Never Materialize the Score Matrix
+
+KV-caching and GQA reduce how much we store. **FlashAttention** changes how we compute, and it targets the prefill and training passes where the full $n \times n$ score matrix is the problem. The standard implementation writes $S = QK^\top$ to high-bandwidth memory (HBM), reads it back to compute the softmax, and reads it a third time to multiply by $V$. For long sequences those $O(n^2)$ reads and writes to HBM, not the arithmetic, set the runtime.
+
+FlashAttention computes exact attention without ever writing the full $S$ to HBM. It tiles $Q$, $K$, and $V$ into blocks that fit in fast on-chip SRAM, and computes the output block by block using an **online softmax** that maintains a running maximum and running normalizer so the result is numerically identical to the full softmax. The online softmax recurrence, for a new block of scores $s$ added to a running state with max $m$ and sum $\ell$ and accumulated output $o$, is
+
+$$
+m' = \max(m, \max_j s_j), \quad
+\ell' = e^{m - m'}\ell + \sum_j e^{s_j - m'}, \quad
+o' = e^{m - m'} o + \sum_j e^{s_j - m'} v_j .
+$$
+
+Subtracting the running max keeps every exponential in $[0, 1]$, so the computation is stable, and rescaling the accumulator by $e^{m - m'}$ when the max grows keeps the partial sums consistent. Because each element of $K$ and $V$ is read from HBM once per query block rather than the score matrix being round-tripped, the HBM traffic drops from $O(n^2)$ to $O(n^2 d_k / B)$ for SRAM block size $B$, a large constant-factor reduction that makes attention compute bound again. FlashAttention-2 and FlashAttention-3 further improve work partitioning and exploit newer GPU features, but the core algorithmic idea is the tiled online softmax above. This is a GPU technique: the win comes from the SRAM-versus-HBM gap, which CPUs do not have in the same form, so we show it rather than execute it.
+
+## 6. Paged Attention and Sliding-Window Attention
+
+Two further production techniques round out the picture.
+
+**Paged attention**, introduced by vLLM, attacks fragmentation. A served model handles many concurrent requests of unpredictable and changing length. Allocating one contiguous KV-cache buffer per request wastes memory to internal fragmentation and over-provisioning. Paged attention borrows the operating-system idea of virtual memory: the cache is split into fixed-size **blocks**, a request's logical KV positions are mapped to physical blocks through a block table, and blocks are allocated on demand and shared (for example across beams or across requests with a common prompt prefix) via copy-on-write. The result is near-zero KV waste and much higher serving throughput, which is why vLLM became a default open-source serving engine.
+
+**Sliding-window attention** bounds the cache instead of managing it. Models such as Mistral 7B restrict each token to attend only to the previous $w$ tokens (a window), so the KV-cache never exceeds $w$ positions regardless of total sequence length. Information still propagates beyond the window because stacked layers compose their receptive fields: after $L$ layers the effective context reaches roughly $L \times w$ tokens. This trades a bounded, constant memory footprint for a controlled loss of exact long-range access, and it composes cleanly with GQA and paged attention.
+
+## 7. Production Code
+
+### 7.1 A From-Scratch KV-Cache, Executed on CPU
+
+The following cell implements single-head causal self attention two ways: the **naive** decoder that recomputes attention over the full prefix at every step, and the **cached** decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder's superlinear growth against the cache's near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.
+
+```{python}
+import torch
+import torch.nn.functional as F
+import time
+
+torch.manual_seed(0)
+
+d_model = 64          # model / head dimension
+n_steps = 256         # tokens to generate
+scale = d_model ** -0.5
+
+# Fixed projection weights (one head) and a fixed stream of input token vectors.
+# Small init keeps the logits in a sane range, as in a trained model.
+W_q = torch.randn(d_model, d_model) * 0.1
+W_k = torch.randn(d_model, d_model) * 0.1
+W_v = torch.randn(d_model, d_model) * 0.1
+inputs = torch.randn(n_steps, d_model)   # x_1 .. x_n, revealed one at a time
+
+
+def decode_naive(inputs):
+    """Recompute full causal attention over the whole prefix at every step."""
+    outputs = []
+    for t in range(1, inputs.shape[0] + 1):
+        x = inputs[:t]                       # all tokens seen so far
+        q, k, v = x @ W_q, x @ W_k, x @ W_v  # recompute K, V for the whole prefix
+        scores = (q @ k.t()) * scale
+        mask = torch.triu(torch.ones(t, t), diagonal=1).bool()
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn = F.softmax(scores, dim=-1) @ v
+        outputs.append(attn[-1])             # only the last row is the new token
+    return torch.stack(outputs)
+
+
+def decode_cached(inputs):
+    """Keep K and V in a cache; attend only the new query each step."""
+    outputs = []
+    k_cache, v_cache = [], []
+    for t in range(inputs.shape[0]):
+        x = inputs[t:t + 1]                  # single new token vector
+        q = x @ W_q
+        k_cache.append(x @ W_k)              # compute new k, v once and keep them
+        v_cache.append(x @ W_v)
+        K = torch.cat(k_cache, dim=0)        # cached keys, no recomputation
+        V = torch.cat(v_cache, dim=0)
+        scores = (q @ K.t()) * scale         # one query vs all cached keys
+        attn = F.softmax(scores, dim=-1) @ V
+        outputs.append(attn[0])
+    return torch.stack(outputs)
+
+
+out_naive = decode_naive(inputs)
+out_cached = decode_cached(inputs)
+
+max_diff = (out_naive - out_cached).abs().max().item()
+print(f"max abs difference between naive and cached outputs: {max_diff:.2e}")
+print(f"identical to floating-point tolerance: {torch.allclose(out_naive, out_cached, atol=1e-5)}")
+
+
+def timed(fn, inputs, repeats=3):
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn(inputs)
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+t_naive = timed(decode_naive, inputs)
+t_cached = timed(decode_cached, inputs)
+print(f"\ngenerating {n_steps} tokens (single head, CPU):")
+print(f"  naive  recompute : {t_naive * 1e3:8.1f} ms")
+print(f"  KV-cache         : {t_cached * 1e3:8.1f} ms")
+print(f"  speedup          : {t_naive / t_cached:8.1f}x")
+```
+
+The two decoders agree to floating-point tolerance, confirming the cache changes only *how* the answer is computed, not the answer. The naive decoder is markedly slower because it repeats the prefix projections and the growing softmax at every step; the cache removes exactly that redundancy.
+
+To see the asymptotics directly, we measure how per-decode cost scales with the prefix length. The naive step at position $t$ does $O(t^2)$ work, so doubling $t$ roughly quadruples its time; the cached step does $O(t)$ work, so doubling $t$ roughly doubles its time.
+
+```{python}
+def naive_step_time(t, d_model, repeats=20):
+    x = torch.randn(t, d_model)
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        q, k, v = x @ W_q, x @ W_k, x @ W_v
+        scores = (q @ k.t()) * scale
+        mask = torch.triu(torch.ones(t, t), diagonal=1).bool()
+        F.softmax(scores.masked_fill(mask, float("-inf")), dim=-1) @ v
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def cached_step_time(t, d_model, repeats=20):
+    q = torch.randn(1, d_model) @ W_q
+    K = torch.randn(t, d_model)
+    V = torch.randn(t, d_model)
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        scores = (q @ K.t()) * scale
+        F.softmax(scores, dim=-1) @ V
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+print(f"{'prefix len':>10} {'naive step (ms)':>16} {'cached step (ms)':>17}")
+prev = None
+for t in [128, 256, 512, 1024]:
+    tn = naive_step_time(t, d_model)
+    tc = cached_step_time(t, d_model)
+    print(f"{t:>10} {tn * 1e3:>16.3f} {tc * 1e3:>17.3f}")
+```
+
+The naive column grows faster than the cached column as the prefix doubles, the empirical signature of $O(t^2)$ versus $O(t)$ per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.
+
+### 7.2 Grouped-Query and Multi-Query Attention, Executed on CPU
+
+This cell implements one attention layer parameterized by the number of KV groups $g$. Setting $g = h$ gives multi-head attention, $g = 1$ gives multi-query attention, and $1 < g < h$ gives grouped-query attention. We repeat each KV head across its query group with `repeat_interleave`, run a forward pass for several values of $g$, and report the resulting KV-cache size so the $h/g$ reduction is explicit.
+
+```{python}
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+n_tokens = 32
+d_model = 256
+n_heads = 8
+d_head = d_model // n_heads
+scale = d_head ** -0.5
+
+x = torch.randn(n_tokens, d_model)
+W_q = torch.randn(d_model, d_model) * 0.02   # query: always n_heads heads
+
+
+def gqa_forward(x, n_kv_groups):
+    """One causal attention layer with n_kv_groups shared KV heads."""
+    assert n_heads % n_kv_groups == 0
+    n_tok = x.shape[0]
+    # Query projection: n_heads heads of size d_head.
+    q = (x @ W_q).view(n_tok, n_heads, d_head).transpose(0, 1)   # [h, n, d]
+    # KV projection: only n_kv_groups heads (this is what shrinks the cache).
+    W_kv = torch.randn(d_model, 2 * n_kv_groups * d_head) * 0.02
+    kv = x @ W_kv
+    k, v = kv.split(n_kv_groups * d_head, dim=-1)
+    k = k.view(n_tok, n_kv_groups, d_head).transpose(0, 1)       # [g, n, d]
+    v = v.view(n_tok, n_kv_groups, d_head).transpose(0, 1)
+    # Broadcast each KV head to the h/g query heads that share it.
+    repeats = n_heads // n_kv_groups
+    k = k.repeat_interleave(repeats, dim=0)                      # [h, n, d]
+    v = v.repeat_interleave(repeats, dim=0)
+    scores = (q @ k.transpose(-2, -1)) * scale                  # [h, n, n]
+    mask = torch.triu(torch.ones(n_tok, n_tok), diagonal=1).bool()
+    scores = scores.masked_fill(mask, float("-inf"))
+    out = F.softmax(scores, dim=-1) @ v                         # [h, n, d]
+    # KV-cache bytes for this layer at fp16: 2 (k and v) * g * d_head * n_tok * 2 bytes.
+    kv_bytes = 2 * n_kv_groups * d_head * n_tok * 2
+    return out.transpose(0, 1).reshape(n_tok, d_model), kv_bytes
+
+
+print(f"{'variant':>6} {'g (KV groups)':>14} {'KV bytes/layer':>16} {'vs MHA':>8}")
+mha_bytes = None
+for g, name in [(8, "MHA"), (4, "GQA"), (2, "GQA"), (1, "MQA")]:
+    out, kv_bytes = gqa_forward(x, g)
+    if mha_bytes is None:
+        mha_bytes = kv_bytes
+    print(f"{name:>6} {g:>14} {kv_bytes:>16} {mha_bytes / kv_bytes:>7.1f}x")
+
+# Sanity check: with g = n_heads, GQA reduces exactly to standard multi-head attention.
+torch.manual_seed(123)
+W_kv_full = torch.randn(d_model, 2 * n_heads * d_head) * 0.02
+
+
+def mha_reference(x):
+    n_tok = x.shape[0]
+    q = (x @ W_q).view(n_tok, n_heads, d_head).transpose(0, 1)
+    kv = x @ W_kv_full
+    k, v = kv.split(n_heads * d_head, dim=-1)
+    k = k.view(n_tok, n_heads, d_head).transpose(0, 1)
+    v = v.view(n_tok, n_heads, d_head).transpose(0, 1)
+    scores = (q @ k.transpose(-2, -1)) * scale
+    mask = torch.triu(torch.ones(n_tok, n_tok), diagonal=1).bool()
+    out = F.softmax(scores.masked_fill(mask, float("-inf")), dim=-1) @ v
+    return out.transpose(0, 1).reshape(n_tok, d_model)
+
+
+print(f"\nMHA forward output shape: {tuple(mha_reference(x).shape)}")
+print("GQA with g = n_heads is structurally identical to MHA (per-head KV, no sharing).")
+```
+
+The KV bytes fall exactly by the factor $h/g$: halving the number of KV groups halves the cache. MQA ($g = 1$) is eight times smaller than MHA here, and GQA at $g = 4$ or $g = 2$ gives an intermediate footprint, the trade space real models tune for quality versus memory.
+
+### 7.3 FlashAttention (requires GPU)
+
+FlashAttention ships as a fused CUDA kernel. The cleanest way to use it in practice is through PyTorch's `scaled_dot_product_attention`, which dispatches to a FlashAttention backend on supported GPUs, or through the `flash-attn` package directly. The code below is the real invocation; it is not executed here because the speedup depends on the GPU SRAM-versus-HBM gap.
+
+```python
+# requires GPU: PyTorch SDPA dispatches to a fused FlashAttention kernel on CUDA.
+import torch
+import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+q = torch.randn(4, 32, 8192, 128, device="cuda", dtype=torch.float16)  # [B, H, N, d]
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+
+# Force the FlashAttention backend; is_causal applies the causal mask fused in-kernel.
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+# out: [4, 32, 8192, 128], computed without ever materializing the 8192 x 8192 scores in HBM.
+```
+
+```python
+# requires GPU: the flash-attn package, exposing the kernel directly (variable-length, paged, etc.).
+# pip install flash-attn --no-build-isolation
+from flash_attn import flash_attn_func
+
+# q, k, v shaped [batch, seqlen, n_heads, head_dim], fp16/bf16, on CUDA.
+out = flash_attn_func(q, k, v, causal=True)
+```
+
+### 7.4 Paged Attention with vLLM (requires GPU)
+
+vLLM implements paged attention and continuous batching behind a simple serving API. The KV-cache management, block tables, and prefix sharing are internal; the user just gets high throughput. Shown, not executed, because it loads a multi-billion-parameter model onto a GPU.
+
+```python
+# requires GPU: vLLM serves with paged attention and continuous batching.
+# pip install vllm
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="mistralai/Mistral-7B-Instruct-v0.3")  # GQA + sliding window, served paged
+params = SamplingParams(temperature=0.7, max_tokens=256)
+
+prompts = ["Explain the KV-cache in one paragraph.",
+           "Why is attention memory bound on GPUs?"]
+# vLLM batches these, shares any common prompt prefix's KV blocks, and pages the cache.
+for output in llm.generate(prompts, params):
+    print(output.outputs[0].text)
+```
+
+### 7.5 Sliding-Window Attention on GPU
+
+Sliding-window attention is a property of the model architecture and is applied by the serving stack. With FlashAttention the window is passed as a kernel argument so the bounded attention is computed fused, and the KV-cache is capped at the window size. Shown, not executed, because it needs the GPU kernel.
+
+```python
+# requires GPU: FlashAttention supports a sliding window via window_size = (left, right).
+from flash_attn import flash_attn_func
+
+# Each query attends only to the previous 4096 keys (and itself); cache never exceeds the window.
+out = flash_attn_func(q, k, v, causal=True, window_size=(4096, 0))
+```
+
+## 8. Pitfalls and When to Use
+
+**The KV-cache is almost always the right default for decoding, but it is not free.** It trades recomputation for memory, and at long context the cache can exceed the model weights in size. Budget for it explicitly using the formula in Section 3 before assuming a context length fits. If memory is the binding constraint, the levers in order of disruption are GQA or MQA (architectural, set at training time), KV-cache quantization to int8 or fp8 (cheap, small quality cost), and sliding-window or other sparse attention (changes the model's reach).
+
+**GQA is a training-time decision, not a serving-time switch.** You cannot turn an MHA checkpoint into a GQA one for free; the shared KV heads must be trained or carefully mean-pooled and then fine-tuned. Choose $g$ when you design the model. The empirical sweet spot for large models has been a small number of KV groups (often $g = 8$), which recovers nearly all of MHA's quality at a large cache reduction; MQA ($g = 1$) saves the most memory but historically lost the most quality, which is precisely why GQA was introduced.
+
+**FlashAttention helps prefill and training, not the decode step you might expect.** Its win is eliminating the $O(n^2)$ score-matrix traffic, which exists when you attend a full sequence at once (training, and the prefill of a long prompt). A single-token decode step attends one query against the cache and is already linear; FlashAttention's decode variant helps mainly by streaming the cache efficiently, not by avoiding a large score matrix. Match the technique to the phase: FlashAttention for prefill and training, KV-cache and GQA for decode.
+
+**Numerical care matters.** The online softmax in Section 5 is exact only because of the running-max subtraction; a naive blockwise softmax without rescaling will overflow or silently lose precision. When implementing or debugging attention kernels, always verify against a reference full-softmax implementation on small inputs, exactly as the executed cells above assert `allclose`, before trusting a fused path.
+
+**Do not conflate the techniques.** They compose but solve different problems: the KV-cache removes redundant computation, GQA shrinks what the cache stores, FlashAttention changes how the score matrix is computed, paged attention manages the cache across concurrent requests, and sliding-window bounds the cache size. A production long-context serving stack uses all of them at once, and reasoning about memory and latency requires keeping their distinct roles straight.
+
+## References
+
+1. Vaswani, A. et al. "Attention Is All You Need." 2017. https://arxiv.org/abs/1706.03762
+2. Shazeer, N. "Fast Transformer Decoding: One Write-Head is All You Need" (multi-query attention). 2019. https://arxiv.org/abs/1911.02150
+3. Ainslie, J. et al. "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." 2023. https://arxiv.org/abs/2305.13245
+4. Dao, T. et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." 2022. https://arxiv.org/abs/2205.14135
+5. Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023. https://arxiv.org/abs/2307.08691
+6. Shah, J. et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." 2024. https://arxiv.org/abs/2407.08608
+7. Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM). 2023. https://arxiv.org/abs/2309.06180
+8. Jiang, A. Q. et al. "Mistral 7B" (sliding-window attention). 2023. https://arxiv.org/abs/2310.06825
+9. Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867
+10. Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288

@@ -1,0 +1,317 @@
+# Quantization {#sec-quantization}
+
+A modern large language model stores most of its capability in its weights, and those weights are expensive to keep around. A 7-billion-parameter model in 16-bit precision occupies roughly 14 GB of memory; the same model in 70-billion-parameter form needs about 140 GB, which already exceeds the memory of a single high-end accelerator. The cost is not only storage. Every token generated requires reading the relevant weights from memory into the compute units, and for the autoregressive decoding that dominates inference, the bottleneck is almost always memory bandwidth rather than arithmetic. Reading fewer bytes per weight makes generation faster as well as smaller.
+
+Quantization is the practice of representing weights (and sometimes activations) with fewer bits than the format the model was trained in. Trained in 16-bit or 32-bit floating point, a model can often be served in 8-bit integers, or even 4-bit, with a small and measurable loss of quality. This chapter develops the mathematics of quantization from first principles, derives the error introduced by reducing precision, then turns to production. The CPU-feasible techniques are executed here on small models so you can see real numbers for size, latency, and reconstruction error. The techniques that need a GPU or a large model (GPTQ, AWQ, 4-bit NF4 via bitsandbytes, and GGUF for llama.cpp) are shown with the exact library invocations a reader would run, clearly marked as requiring hardware this chapter does not assume.
+
+## The Core Idea
+
+A quantizer is a map from a continuous (or high-precision) range of values to a small finite set of levels, paired with a rule for recovering an approximate real value from each level. For a target of $b$ bits we have $2^b$ available integer levels. The art is choosing how to place those levels over the range of numbers we actually need to represent, so that the values that occur most often are represented most accurately.
+
+The dominant scheme in deep learning is **affine (asymmetric) uniform quantization**. Given a real value $x$ in some range $[\alpha, \beta]$, we pick a positive **scale** $s$ and an integer **zero point** $z$, and define
+
+$$
+q = \operatorname{clip}\!\left( \operatorname{round}\!\left( \frac{x}{s} \right) + z,\; q_{\min},\; q_{\max} \right),
+\qquad
+\hat{x} = s\,(q - z).
+$$
+
+Here $q$ is the stored integer code and $\hat{x}$ is the dequantized approximation of $x$. For signed 8-bit integers $q_{\min} = -128$ and $q_{\max} = 127$. The scale $s$ sets the spacing between representable values, and the zero point $z$ is the integer code that maps exactly to real zero, which matters because exact zero appears constantly (in padding, in ReLU outputs, in sparse activations) and we do not want to introduce error there.
+
+To cover an observed range $[\alpha, \beta]$ with the $2^b$ levels, the natural choice is
+
+$$
+s = \frac{\beta - \alpha}{q_{\max} - q_{\min}},
+\qquad
+z = \operatorname{round}\!\left( q_{\min} - \frac{\alpha}{s} \right).
+$$
+
+A common special case is **symmetric quantization**, where the range is forced to be centered at zero, $\alpha = -\beta$, so that $z = 0$ and dequantization is the single multiply $\hat{x} = s\,q$. Symmetric quantization is cheaper (no zero-point bookkeeping in the inner loop) and is the usual choice for weights, which tend to be roughly zero-centered. Asymmetric quantization is preferred for activations that are one-sided, such as the non-negative outputs of ReLU.
+
+### Granularity
+
+The scale and zero point can be shared at different granularities, and this choice trades accuracy against overhead. **Per-tensor** quantization uses one $(s, z)$ pair for an entire weight matrix; it is the cheapest but suffers when different rows or columns have very different magnitudes. **Per-channel** (per-row or per-column) quantization uses a separate scale for each output channel, which is the standard for weight matrices because the cost of storing one extra float per channel is negligible. **Per-group** or **block-wise** quantization shares a scale across a small contiguous block of weights (for example, 32, 64, or 128 consecutive values); this is what modern 4-bit methods such as NF4 and GGUF use, because at very low bit widths a single tensor-wide scale loses too much resolution.
+
+## The Mathematics of Quantization Error
+
+Why does this work at all, and how much accuracy do we lose? The answer comes from analyzing the rounding error.
+
+### Rounding Error of a Uniform Quantizer
+
+Consider a single value $x$ in the interior of the range (not clipped). Writing $e = \hat{x} - x$ for the reconstruction error, rounding to the nearest level guarantees
+
+$$
+|e| \le \frac{s}{2}.
+$$
+
+The error is bounded by half the spacing between levels. If we model the fractional part of $x/s$ as uniformly distributed over $[-\tfrac{1}{2}, \tfrac{1}{2}]$, a standard and accurate assumption when the step $s$ is small relative to the variation in $x$, then the error $e$ is uniform on $[-\tfrac{s}{2}, \tfrac{s}{2}]$ and its mean square is
+
+$$
+\mathbb{E}[e^2] = \frac{1}{s}\int_{-s/2}^{s/2} e^2 \, de = \frac{s^2}{12}.
+$$
+
+This is the classic result that the quantization noise power is $s^2/12$. Because $s = (\beta - \alpha)/(2^b - 1)$ scales as $2^{-b}$ for a fixed range, the noise power scales as $2^{-2b}$, so the **signal-to-quantization-noise ratio improves by about 6 dB for every additional bit**. Each bit roughly halves the error. This is the quantitative reason that going from 16 bits to 8 bits is nearly free in quality (8 extra bits would have bought enormous headroom we did not need) while going to 4 bits or 2 bits starts to bite.
+
+### The Clipping versus Resolution Tradeoff
+
+The bound above assumed $x$ lies inside $[\alpha, \beta]$. The total error has two sources, and they pull in opposite directions:
+
+- **Rounding (resolution) error**, of order $s^2/12$, which grows as the range $[\alpha, \beta]$ widens, because a wider range with a fixed number of levels means coarser steps.
+- **Clipping (saturation) error**, incurred when $x$ falls outside $[\alpha, \beta]$ and is clamped to the nearest endpoint, which grows as the range narrows and excludes more of the tail.
+
+Choosing the range to be the full min and max of the data eliminates clipping but wastes resolution on rare outliers. Choosing a tighter range (for example a percentile, or a value that minimizes mean-squared error, or one that minimizes the Kullback-Leibler divergence between the original and quantized distributions, as in TensorRT's calibration) trades a little clipping for much better resolution on the bulk of the distribution. This calibration problem, picking $[\alpha, \beta]$, is the heart of post-training quantization, and outliers are exactly why naive low-bit quantization of transformer activations fails: a handful of large-magnitude activation channels stretch the range and crush the resolution for everything else.
+
+### Post-Training Quantization versus Quantization-Aware Training
+
+There are two regimes for getting a quantized model:
+
+- **Post-training quantization (PTQ)** takes an already trained model and quantizes it, optionally using a small unlabeled **calibration** set to choose ranges (and, in advanced methods, to adjust weights). It is cheap, needs no labels, and is what you reach for first. Dynamic, static, GPTQ, and AWQ are all PTQ methods.
+- **Quantization-aware training (QAT)** simulates quantization during training or fine-tuning, inserting "fake quantize" operations in the forward pass so the model learns weights robust to the rounding. The gradient is passed through the non-differentiable rounding with the **straight-through estimator**, which treats $\operatorname{round}(\cdot)$ as the identity on the backward pass. QAT recovers more accuracy at low bit widths but costs a training run, so it is used when PTQ alone gives up too much.
+
+The executed examples below are PTQ, because PTQ is what most practitioners deploy and it runs comfortably on a CPU.
+
+## Production Code
+
+### From-Scratch Int8 Quantize and Dequantize with Error Analysis
+
+Before reaching for a library, it is worth implementing the affine quantizer directly. The numbers it prints are the numbers the theory above predicts: the maximum absolute error is bounded by $s/2$, and the root-mean-square error sits near $s/\sqrt{12}$. This cell runs on CPU in milliseconds.
+
+```{python}
+import numpy as np
+
+np.random.seed(0)
+
+def quantize_affine(x, num_bits=8, symmetric=False):
+    """Affine min-max quantization to signed integers. Returns codes, scale, zero_point."""
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    if symmetric:
+        beta = float(np.max(np.abs(x)))
+        alpha = -beta
+    else:
+        alpha = float(np.min(x))
+        beta = float(np.max(x))
+    # Guard against a degenerate zero-width range.
+    scale = (beta - alpha) / (qmax - qmin) if beta > alpha else 1.0
+    zero_point = int(round(qmin - alpha / scale)) if not symmetric else 0
+    zero_point = int(np.clip(zero_point, qmin, qmax))
+    q = np.clip(np.round(x / scale) + zero_point, qmin, qmax).astype(np.int32)
+    return q, scale, zero_point
+
+def dequantize_affine(q, scale, zero_point):
+    return scale * (q.astype(np.float64) - zero_point)
+
+# A roughly normal weight vector with a couple of mild outliers.
+x = np.random.randn(10000).astype(np.float64)
+x[0], x[1] = 6.0, -5.5
+
+for sym in (False, True):
+    q, scale, zp = quantize_affine(x, num_bits=8, symmetric=sym)
+    xhat = dequantize_affine(q, scale, zp)
+    err = xhat - x
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    max_abs = float(np.max(np.abs(err)))
+    label = "symmetric" if sym else "asymmetric"
+    print(f"{label:>10s}: scale={scale:.6f}  zero_point={zp:4d}  "
+          f"RMSE={rmse:.6f}  max|err|={max_abs:.6f}  (s/2={scale/2:.6f}, "
+          f"s/sqrt12={scale/np.sqrt(12):.6f})")
+```
+
+The printed `max|err|` should sit at or just below `s/2`, and the `RMSE` should track `s/sqrt12`, exactly the $s^2/12$ noise-power result derived above. Notice that the asymmetric quantizer spends a code on the zero point and adapts to the data's offset, while the symmetric one centers the range at zero.
+
+We can also confirm the per-bit behavior, that each added bit roughly halves the error and improves the signal-to-noise ratio by about 6 dB.
+
+```{python}
+signal_power = float(np.mean(x ** 2))
+print(f"{'bits':>4s} {'RMSE':>10s} {'SQNR(dB)':>10s}")
+prev_rmse = None
+for b in (4, 5, 6, 7, 8):
+    q, scale, zp = quantize_affine(x, num_bits=b, symmetric=False)
+    xhat = dequantize_affine(q, scale, zp)
+    mse = float(np.mean((xhat - x) ** 2))
+    sqnr_db = 10.0 * np.log10(signal_power / mse)
+    ratio = "" if prev_rmse is None else f"  (x{prev_rmse / np.sqrt(mse):.2f} better than {b-1} bits)"
+    print(f"{b:>4d} {np.sqrt(mse):>10.6f} {sqnr_db:>10.2f}{ratio}")
+    prev_rmse = np.sqrt(mse)
+```
+
+Each extra bit should improve the signal-to-quantization-noise ratio by close to 6 dB and shrink the RMSE by close to a factor of two, the predicted $2^{-b}$ scaling.
+
+### PyTorch Post-Training Dynamic Quantization (Int8) on CPU
+
+PyTorch ships a mature, free, built-in quantization workflow. The simplest production-ready entry point is **dynamic quantization**, which quantizes the weights of `Linear` layers to int8 ahead of time and quantizes activations on the fly per inference. It needs no calibration data and no GPU, and it targets exactly the layers that dominate a transformer's parameter count. The example below builds a small MLP, quantizes it, and measures real model size and latency on CPU.
+
+```{python}
+import io
+import time
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+torch.set_num_threads(1)  # make the latency measurement reproducible
+
+class MLP(nn.Module):
+    def __init__(self, d_in=512, d_hidden=2048, d_out=512, n_blocks=4):
+        super().__init__()
+        layers = [nn.Linear(d_in, d_hidden), nn.ReLU()]
+        for _ in range(n_blocks - 1):
+            layers += [nn.Linear(d_hidden, d_hidden), nn.ReLU()]
+        layers += [nn.Linear(d_hidden, d_out)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+fp32_model = MLP().eval()
+
+# Apply post-training dynamic quantization to all Linear layers.
+int8_model = torch.quantization.quantize_dynamic(
+    fp32_model, {nn.Linear}, dtype=torch.qint8
+).eval()
+
+def model_size_mb(model):
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    return buf.getbuffer().nbytes / 1e6
+
+def benchmark(model, x, n_warmup=5, n_iters=50):
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            model(x)
+        t0 = time.perf_counter()
+        for _ in range(n_iters):
+            model(x)
+        t1 = time.perf_counter()
+    return (t1 - t0) / n_iters * 1e3  # ms per forward pass
+
+x = torch.randn(32, 512)  # batch of 32
+
+fp32_mb = model_size_mb(fp32_model)
+int8_mb = model_size_mb(int8_model)
+fp32_ms = benchmark(fp32_model, x)
+int8_ms = benchmark(int8_model, x)
+
+with torch.no_grad():
+    y_fp32 = fp32_model(x)
+    y_int8 = int8_model(x)
+rel_err = (y_int8 - y_fp32).norm() / y_fp32.norm()
+
+print(f"fp32 size: {fp32_mb:7.3f} MB   latency: {fp32_ms:7.3f} ms/forward")
+print(f"int8 size: {int8_mb:7.3f} MB   latency: {int8_ms:7.3f} ms/forward")
+print(f"compression: {fp32_mb / int8_mb:.2f}x smaller")
+print(f"relative output error ||int8 - fp32|| / ||fp32||: {rel_err.item():.4e}")
+```
+
+The int8 model should be close to four times smaller on disk (each 32-bit weight becomes one int8 byte plus small per-channel scale overhead), and the relative output error should be on the order of $10^{-2}$ or smaller, a tiny perturbation for the memory saved. Latency on CPU depends heavily on the build and the matrix sizes; dynamic quantization helps most when the linear layers are large and memory-bound, and may not beat a well-optimized fp32 path on tiny shapes, which is itself a useful lesson printed in real numbers rather than asserted.
+
+### A Note on Static Quantization
+
+Dynamic quantization quantizes activations at runtime. **Static quantization** instead calibrates activation ranges ahead of time by running a few representative batches through the model, then bakes fixed activation scales into the graph, which removes the per-inference quantization overhead and is faster at serving time. The cost is a calibration step and more setup (inserting observers, fusing modules). PyTorch exposes this through `torch.ao.quantization` with `prepare`/`convert`, and it is the right choice when you control the deployment and can afford a calibration pass. For LLMs specifically, the weight-only methods in the next section have largely displaced generic static quantization, so we show static quantization's existence and defer the heavy machinery to the PyTorch documentation.
+
+### GPTQ (Requires GPU / Large Model)
+
+GPTQ is a one-shot, layer-by-layer **weight-only** PTQ method that quantizes to 4 or 3 bits while compensating for the error introduced in each weight by adjusting the not-yet-quantized weights, using approximate second-order (Hessian) information derived from a small calibration set. It is the workhorse for serving open LLMs at 4 bits. The invocation below uses the Hugging Face stack and a real calibration pass; it needs a GPU and the model weights, so it is shown, not executed.
+
+```python
+# requires GPU / large model: weight-only 4-bit GPTQ via Hugging Face + optimum/gptqmodel.
+# pip install transformers optimum gptqmodel accelerate datasets
+from transformers import AutoModelForCausalLM, AutoTokenizer, GPTQConfig
+
+model_id = "meta-llama/Llama-3.1-8B"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+# bits=4 with per-group scales (group_size=128) is the common, robust setting.
+# The calibration corpus is a small unlabeled text sample used to estimate the Hessian.
+gptq_config = GPTQConfig(bits=4, group_size=128, dataset="c4", tokenizer=tokenizer)
+
+quantized = AutoModelForCausalLM.from_pretrained(
+    model_id, device_map="auto", quantization_config=gptq_config
+)
+quantized.save_pretrained("Llama-3.1-8B-GPTQ-4bit")
+tokenizer.save_pretrained("Llama-3.1-8B-GPTQ-4bit")
+```
+
+### AWQ (Requires GPU / Large Model)
+
+AWQ (Activation-aware Weight Quantization) starts from the observation that a small fraction of weight channels are far more important than the rest, identifiable by the magnitude of the activations that multiply them. AWQ protects those salient channels by scaling them before quantization (a mathematically equivalent reparameterization that shifts difficulty off the important weights), which preserves accuracy at 4 bits without backpropagation and is fast to apply. It is shown, not executed.
+
+```python
+# requires GPU / large model: 4-bit AWQ via the autoawq library.
+# pip install autoawq transformers accelerate
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model_id = "meta-llama/Llama-3.1-8B"
+model = AutoAWQForCausalLM.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+quant_config = {"w_bit": 4, "q_group_size": 128, "zero_point": True, "version": "GEMM"}
+model.quantize(tokenizer, quant_config=quant_config)  # uses a small calibration set internally
+
+model.save_quantized("Llama-3.1-8B-AWQ-4bit")
+tokenizer.save_pretrained("Llama-3.1-8B-AWQ-4bit")
+```
+
+### bitsandbytes 4-bit NF4 (Requires GPU)
+
+bitsandbytes provides on-the-fly 4-bit loading using the **NF4 (4-bit NormalFloat)** data type, whose 16 levels are placed at the quantiles of a normal distribution rather than uniformly, which matches the roughly Gaussian distribution of neural-network weights and so spends its few levels where the weights actually are. Combined with double quantization (quantizing the per-block scales themselves) it underpins QLoRA fine-tuning. It requires a CUDA GPU, so per the constraints of this chapter it is shown only.
+
+```python
+# requires GPU: 4-bit NF4 loading via bitsandbytes (do not run on CPU-only machines).
+# pip install bitsandbytes transformers accelerate
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",          # quantile-spaced 4-bit levels
+    bnb_4bit_use_double_quant=True,     # quantize the scales too, saving more memory
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B", quantization_config=bnb_config, device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+```
+
+### GGUF and llama.cpp (Requires Specialized Build / Often GPU)
+
+GGUF is the on-disk format used by the open-source llama.cpp project, which serves quantized models efficiently on CPUs, Apple Silicon, and GPUs. Its quantization schemes (named like `Q4_K_M`, `Q5_K_M`, `Q8_0`) are block-wise with mixed bit allocations, assigning more bits to the more sensitive parts of the network. It is the standard for local, on-device inference. Conversion and quantization happen through the llama.cpp tooling, shown here as the commands a reader would run.
+
+```bash
+# requires the llama.cpp build / specialized tooling.
+# 1. Convert a Hugging Face model to a 16-bit GGUF.
+python convert_hf_to_gguf.py meta-llama/Llama-3.1-8B --outfile llama-3.1-8b-f16.gguf
+
+# 2. Quantize the GGUF to a 4-bit K-quant (Q4_K_M is a strong size/quality default).
+./llama-quantize llama-3.1-8b-f16.gguf llama-3.1-8b-Q4_K_M.gguf Q4_K_M
+
+# 3. Serve it (offload layers to GPU with -ngl if available).
+./llama-cli -m llama-3.1-8b-Q4_K_M.gguf -p "Explain quantization in one sentence." -ngl 99
+```
+
+## Pitfalls and When to Use
+
+**Activation outliers break naive low-bit quantization.** Transformer activations develop a few channels with very large magnitudes, and these stretch the quantization range so much that everything else loses resolution. This is why weight-only methods (GPTQ, AWQ, NF4) dominate LLM serving: they leave activations in higher precision and quantize only weights, sidestepping the worst of the outlier problem. Methods that do quantize activations (such as LLM.int8() and SmoothQuant) must handle the outliers explicitly, by keeping outlier channels in higher precision or by migrating the difficulty into the weights.
+
+**Per-tensor scales are too coarse at low bit widths.** At 8 bits a per-tensor or per-channel scale is usually fine. At 4 bits and below you need per-group (block-wise) scales, because a single scale across a large matrix cannot simultaneously serve the small and large weights. If a 4-bit model is unexpectedly bad, an over-coarse group size is a prime suspect.
+
+**Measure end-task quality, not just reconstruction error.** A small weight RMSE does not guarantee a small drop on your benchmark, and a model that looks fine on perplexity can regress on a specific capability (math, code, long-context retrieval). Always evaluate the quantized model on the task you care about, and prefer reporting your own measured numbers over trusting generic claims.
+
+**Not every layer should be quantized equally.** Embeddings, the final projection, layer norms, and the first and last blocks are often more sensitive. Mixed-precision schemes (such as the GGUF K-quants) deliberately keep sensitive tensors at higher precision, and blindly quantizing everything to the same width leaves quality on the table.
+
+**Pick the method by the constraint you are solving.** Use **PyTorch dynamic int8** for CPU serving of non-LLM models and small linear-heavy networks, where it is a one-line, no-calibration win. Use **GPTQ or AWQ at 4 bits** to fit a large LLM on a single GPU for serving, choosing AWQ when calibration time matters and GPTQ when you want the established Hessian-based accuracy. Use **bitsandbytes NF4** when you want to fine-tune a large model on a single GPU via QLoRA, where 4-bit loading is the enabling trick. Use **GGUF / llama.cpp** for local and on-device inference across CPU, Apple Silicon, and consumer GPUs. In every case, the decision is set by your hardware budget and your tolerance for a small, measured quality drop, and the right discipline is to quantize, then measure, then decide.
+
+## References
+
+1. Jacob, B. et al. "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference." CVPR 2018. https://arxiv.org/abs/1712.05877
+2. Nagel, M. et al. "A White Paper on Neural Network Quantization." 2021. https://arxiv.org/abs/2106.08295
+3. Gholami, A. et al. "A Survey of Quantization Methods for Efficient Neural Network Inference." 2021. https://arxiv.org/abs/2103.13630
+4. Frantar, E. et al. "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers." ICLR 2023. https://arxiv.org/abs/2210.17323
+5. Lin, J. et al. "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration." MLSys 2024. https://arxiv.org/abs/2306.00978
+6. Dettmers, T. et al. "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale." NeurIPS 2022. https://arxiv.org/abs/2208.07339
+7. Dettmers, T. et al. "QLoRA: Efficient Finetuning of Quantized LLMs" (NF4, double quantization). NeurIPS 2023. https://arxiv.org/abs/2305.14314
+8. Xiao, G. et al. "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models." ICML 2023. https://arxiv.org/abs/2211.10438
+9. Bengio, Y. et al. "Estimating or Propagating Gradients Through Stochastic Neurons" (straight-through estimator). 2013. https://arxiv.org/abs/1308.3432
+10. gerganov, G. et al. "llama.cpp" (GGUF format and K-quants). https://github.com/ggml-org/llama.cpp

@@ -1,0 +1,387 @@
+# Efficient Training: Mixed Precision, Checkpointing, and Sharding
+
+Training a frontier model is, more than anything, an exercise in memory management. A modern transformer's compute is straightforward to reason about (it scales with parameters times tokens), but the *memory* needed to take a single optimizer step is where naive implementations fall over. A run that would fit comfortably in a researcher's mental model routinely fails to fit in the 80 gigabytes of an H100, not because the model is too large to store, but because the *transient* state of a training step (activations, gradients, optimizer moments, and an extra master copy of the weights) is several times larger than the weights themselves.
+
+This chapter develops the three techniques that, together, make large-scale training feasible on real hardware: **mixed precision**, which halves the storage and roughly halves the bandwidth of most tensors while protecting numerical stability where it matters; **activation checkpointing** (also called gradient checkpointing), which trades a controlled amount of recomputation for a large reduction in activation memory; and **sharding** (the ZeRO and FSDP family), which splits the per-step state across many devices so that no single device holds the whole thing. We treat each as an engineering practice with a derivation behind it, then show production code. The CPU-feasible parts (checkpointing, autocast, gradient accumulation) are executed and measured; the GPU-and-cluster parts (FSDP, ZeRO, FP8) are shown with the real library invocations so a reader can run them on the appropriate hardware.
+
+## 1. Where the Memory Goes
+
+Before optimizing, account honestly for what a training step holds. Let the model have $\Psi$ trainable parameters. A standard mixed-precision Adam step keeps, per parameter:
+
+- the **half-precision weights** used in the forward and backward pass, $2\Psi$ bytes (fp16 or bf16),
+- the **half-precision gradients**, $2\Psi$ bytes,
+- and an Adam optimizer state in fp32 consisting of a **master copy of the weights**, the **first moment** $m$, and the **second moment** $v$, contributing $4\Psi + 4\Psi + 4\Psi = 12\Psi$ bytes.
+
+That is $16\Psi$ bytes of *model and optimizer* state alone, independent of batch size. For a 7 billion parameter model this is already about 112 gigabytes, which exceeds a single high-end accelerator before a single activation is stored. This $16\Psi$ accounting is exactly the figure the ZeRO paper uses to motivate sharding (Rajbhandari et al., 2020).
+
+The second contributor is **activations**: the intermediate tensors saved during the forward pass so the backward pass can compute gradients. Unlike the model state, activation memory scales with batch size and sequence length. For a transformer with $L$ layers, hidden size $h$, batch size $b$, and sequence length $s$, the stored activations are on the order of
+
+$$
+M_{\text{act}} \;\approx\; c \cdot L \cdot b \cdot s \cdot h
+$$
+
+bytes, where the constant $c$ collects the several activation tensors saved per layer (attention scores, the feed-forward intermediates, normalization inputs, and so on). The key structural fact is the linear dependence on $L$: every layer you add stores its own activations, and for long sequences and many layers this term can dwarf the model state.
+
+The three techniques in this chapter attack three different terms. Mixed precision shrinks the per-element cost of weights, gradients, and activations. Checkpointing attacks $M_{\text{act}}$ by *not storing* most activations and recomputing them on demand. Sharding attacks the $16\Psi$ model-and-optimizer term by dividing it across $N$ devices.
+
+```{mermaid}
+flowchart TD
+    A["Training step memory"] --> B["Model and optimizer state 16 psi bytes"]
+    A --> C["Activations c L b s h bytes"]
+    B --> D["Sharding ZeRO and FSDP divide by N devices"]
+    C --> E["Checkpointing recompute instead of store"]
+    B --> F["Mixed precision smaller per element"]
+    C --> F
+```
+
+## 2. Mixed Precision
+
+### 2.1 The Idea and the Hazard
+
+Floating-point formats trade range and precision against size. The historical fp32 format uses 8 exponent bits and 23 mantissa bits. The two half-precision formats used in training differ in how they split their 16 bits:
+
+- **fp16** has 5 exponent bits and 10 mantissa bits. It has *more precision* than bf16 but a much *narrower dynamic range*, with a smallest normal positive value around $6 \times 10^{-5}$. Gradients in deep networks routinely underflow this and silently become zero.
+- **bf16** (bfloat16) keeps all 8 exponent bits of fp32 and has only 7 mantissa bits. It has the *same dynamic range* as fp32, so underflow is rarely an issue, at the cost of coarser precision.
+
+Mixed-precision training, introduced by Micikevicius et al. (2018), runs the bulk of the matrix multiplications in half precision (fast, half the memory traffic) while keeping a few operations and an fp32 master copy of the weights to protect accuracy. The central numerical hazard is the **accumulation of small updates**: an Adam update $\Delta\theta$ can be many orders of magnitude smaller than $\theta$, and adding a tiny number to a much larger one in low precision rounds the update away to nothing. Keeping the master weights in fp32 preserves these updates; the half-precision copy used in the forward and backward pass is refreshed from the master each step.
+
+### 2.2 Loss Scaling for fp16
+
+With bf16 the wide exponent range usually makes extra tricks unnecessary, which is why most modern large-model training uses bf16. With fp16, gradient underflow is real and the standard remedy is **loss scaling**. Multiply the loss by a large constant $S$ before the backward pass. By the chain rule every gradient is scaled by the same $S$,
+
+$$
+\frac{\partial (S \cdot \mathcal{L})}{\partial \theta} \;=\; S \cdot \frac{\partial \mathcal{L}}{\partial \theta},
+$$
+
+which shifts small gradients up into the representable range of fp16. Before the optimizer applies the update, the gradients are divided back by $S$. Dynamic loss scaling adjusts $S$ automatically: it raises $S$ when no overflow (inf or nan) has occurred for a while, and halves $S$ and skips the step when an overflow is detected. In PyTorch this is the job of `torch.cuda.amp.GradScaler`.
+
+### 2.3 Executed Demo: Autocast in bf16 on CPU
+
+The concept of automatic mixed precision is visible even on a CPU, which supports bf16 autocast for the common operations. The demo below runs a small matmul-heavy block under `torch.autocast` and confirms that the autocast region produces bf16 intermediate activations while the model parameters stay in fp32. It also shows that the bf16 result stays numerically close to the fp32 result, which is the property that makes mixed precision usable.
+
+```{python}
+import torch
+
+torch.manual_seed(0)
+
+# A small two-layer block. Parameters live in fp32 (the master copy).
+lin1 = torch.nn.Linear(512, 512)
+lin2 = torch.nn.Linear(512, 512)
+x = torch.randn(64, 512)
+
+# Full-precision reference.
+with torch.no_grad():
+    ref = lin2(torch.relu(lin1(x)))
+
+# Same computation under bf16 autocast. The matmuls run in bf16,
+# but the parameters themselves remain fp32.
+with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+    h = torch.relu(lin1(x))
+    out = lin2(h)
+
+print("param dtype (unchanged):", lin1.weight.dtype)
+print("autocast activation dtype:", h.dtype)
+print("reference output dtype:   ", ref.dtype)
+
+rel_err = (out.float() - ref).norm() / ref.norm()
+print(f"relative error fp32 vs bf16 autocast: {rel_err.item():.4e}")
+```
+
+The activation tensor inside the autocast region is bf16 while the parameters report fp32, and the relative error is small (a fraction of a percent), confirming that the lower precision is confined to the fast path and does not corrupt the parameters. On a GPU this same pattern roughly halves activation memory and uses the tensor cores, which is where the real speedup comes from.
+
+## 3. Activation Checkpointing
+
+### 3.1 The Recompute Tradeoff
+
+The backward pass needs the activations produced in the forward pass. The default behavior is to *store* every activation needed downstream, which is the $M_{\text{act}} \approx c \cdot L \cdot b \cdot s \cdot h$ term from Section 1. **Activation checkpointing** stores only a small set of *checkpoint* activations (typically the inputs to each segment of the network) and discards the rest. During the backward pass, each segment's interior activations are *recomputed* on the fly from its stored input, used to compute gradients, and then discarded again.
+
+The tradeoff is precise. Partition a network of $L$ layers into $\sqrt{L}$ segments of $\sqrt{L}$ layers each. Storing only segment boundaries reduces the activation memory from $O(L)$ to $O(\sqrt{L})$, at the cost of one extra forward pass over the recomputed segments, roughly a constant-factor increase in compute (about $1.3\times$ to $2\times$ wall-clock in practice). This $O(\sqrt{L})$ memory at the cost of one extra forward pass is the classic result of Chen et al. (2016). The benefit is large: checkpointing is often the difference between a sequence length or batch size that fits and one that does not.
+
+$$
+\text{memory: } O(L) \to O(\sqrt{L}), \qquad \text{compute: } 1\times \to \text{about } 1.3\text{ to }2\times .
+$$
+
+### 3.2 Executed Demo: Measuring the Memory-vs-Recompute Tradeoff on CPU
+
+We make the tradeoff concrete with a small deep network on CPU. We instrument the forward pass with a counter so the *recomputation* is directly observable: a checkpointed segment's forward function runs once in the forward pass and a second time during the backward pass, so its call count doubles. We also confirm the gradients are numerically identical with and without checkpointing, because recomputation is exact, it changes *when* activations are computed, not *what* they are.
+
+```{python}
+import torch
+import torch.utils.checkpoint as cp
+
+torch.manual_seed(0)
+
+# A stack of identical blocks. A module-level counter records how many
+# times each block's forward runs, so recomputation is observable.
+forward_calls = {"count": 0}
+
+class Block(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.lin = torch.nn.Linear(dim, dim)
+    def forward(self, x):
+        forward_calls["count"] += 1
+        return torch.tanh(self.lin(x))
+
+DIM, N_BLOCKS = 128, 8
+blocks = torch.nn.ModuleList([Block(DIM) for _ in range(N_BLOCKS)])
+x0 = torch.randn(32, DIM, requires_grad=True)
+
+def run(use_checkpoint):
+    forward_calls["count"] = 0
+    h = x0
+    for blk in blocks:
+        if use_checkpoint:
+            # use_reentrant=False is the recommended modern variant.
+            h = cp.checkpoint(blk, h, use_reentrant=False)
+        else:
+            h = blk(h)
+    loss = h.pow(2).sum()
+    grads = torch.autograd.grad(loss, blocks[0].lin.weight, retain_graph=False)
+    return loss.item(), grads[0], forward_calls["count"]
+
+loss_plain, grad_plain, calls_plain = run(use_checkpoint=False)
+loss_ckpt,  grad_ckpt,  calls_ckpt  = run(use_checkpoint=True)
+
+print(f"plain        : forward calls = {calls_plain:2d}  (one pass)")
+print(f"checkpointed : forward calls = {calls_ckpt:2d}  (forward + recompute in backward)")
+print(f"loss match : {abs(loss_plain - loss_ckpt) < 1e-6}")
+print(f"grad max abs difference: {(grad_plain - grad_ckpt).abs().max().item():.2e}")
+```
+
+The checkpointed run records exactly twice as many forward calls (each block runs once in the forward pass and is recomputed once in the backward pass), while the loss and gradients match to numerical precision. That doubled forward count is the recompute cost you pay; in exchange, the interior activations of every block are never simultaneously resident, which is what saves memory. The next demo measures the memory side directly.
+
+```{python}
+import torch
+import torch.utils.checkpoint as cp
+
+torch.manual_seed(0)
+
+# A deeper, wider stack so the activation footprint is clearly measurable.
+DIM, N_BLOCKS, BATCH = 256, 24, 128
+
+class Block(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.lin = torch.nn.Linear(dim, dim)
+    def forward(self, x):
+        return torch.tanh(self.lin(x))
+
+blocks = torch.nn.ModuleList([Block(DIM) for _ in range(N_BLOCKS)])
+
+def saved_activation_bytes(use_checkpoint):
+    # A saved-tensors hook intercepts exactly the tensors autograd retains
+    # for the backward pass, which is precisely the activation footprint.
+    seen, total = set(), 0
+    def pack(t):
+        nonlocal total
+        key = t.untyped_storage().data_ptr()
+        if key not in seen:
+            seen.add(key)
+            total += t.untyped_storage().nbytes()
+        return t
+    def unpack(t):
+        return t
+
+    x = torch.randn(BATCH, DIM, requires_grad=True)
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        h = x
+        for blk in blocks:
+            h = cp.checkpoint(blk, h, use_reentrant=False) if use_checkpoint else blk(h)
+        loss = h.pow(2).sum()
+    return total
+
+bytes_plain = saved_activation_bytes(False)
+bytes_ckpt  = saved_activation_bytes(True)
+
+print(f"saved activation bytes, plain        : {bytes_plain/1024:8.1f} KiB")
+print(f"saved activation bytes, checkpointed : {bytes_ckpt/1024:8.1f} KiB")
+print(f"reduction factor                     : {bytes_plain / max(bytes_ckpt,1):.2f}x")
+```
+
+The plain run saves an activation tensor for every block (the input to each `tanh` and `Linear`), so its retained-activation total grows with the stack depth. The checkpointed run saves only the small set of segment-boundary tensors and recomputes the interior on demand, so its retained total is markedly smaller and the reduction factor exceeds one. The exact ratio depends on depth and width (deeper stacks save more, because the saved term grows with $L$), but the direction is the structural point: checkpointing converts a linear-in-depth activation cost into a much smaller resident footprint, paid for with the recomputation measured in the previous cell.
+
+## 4. Gradient Accumulation
+
+### 4.1 Decoupling Batch Size from Memory
+
+Often the *statistically* desirable batch size does not fit in memory. **Gradient accumulation** decouples the two. Instead of processing a batch of size $B$ in one step, process $K$ micro-batches of size $B/K$, accumulating their gradients, and apply the optimizer once after all $K$. Because the gradient of a sum is the sum of gradients,
+
+$$
+\nabla_\theta \frac{1}{B}\sum_{i=1}^{B} \ell_i
+\;=\;
+\frac{1}{K}\sum_{k=1}^{K} \left( \frac{1}{B/K}\sum_{i \in \text{micro}_k} \nabla_\theta \ell_i \right),
+$$
+
+the accumulated gradient is identical to the gradient of the full batch, provided each micro-batch loss is scaled by $1/K$ before backward (so the accumulated sum forms the correct mean). The cost is $K$ times more forward and backward passes per optimizer step, but the peak activation memory is that of a single micro-batch, not the full batch.
+
+### 4.2 Executed Demo: Accumulation Equals Full-Batch
+
+The demo trains nothing; it verifies the identity. We compute the gradient of the mean loss over a full batch, then compute it again by accumulating over micro-batches with the $1/K$ scaling, and confirm the two gradients match to numerical precision.
+
+```{python}
+import torch
+
+torch.manual_seed(0)
+
+model = torch.nn.Linear(16, 4)
+B, K = 64, 4                       # full batch 64, split into 4 micro-batches
+X = torch.randn(B, 16)
+Y = torch.randint(0, 4, (B,))
+loss_fn = torch.nn.CrossEntropyLoss()
+
+# Full-batch gradient (the reference).
+model.zero_grad()
+loss_fn(model(X), Y).backward()
+full_grad = model.weight.grad.clone()
+
+# Accumulated gradient over K micro-batches, each scaled by 1/K.
+model.zero_grad()
+micro = B // K
+for k in range(K):
+    xb = X[k*micro:(k+1)*micro]
+    yb = Y[k*micro:(k+1)*micro]
+    (loss_fn(model(xb), yb) / K).backward()   # accumulates into .grad
+accum_grad = model.weight.grad.clone()
+
+diff = (full_grad - accum_grad).abs().max().item()
+print(f"max abs gradient difference (full vs accumulated): {diff:.2e}")
+print(f"identical to numerical precision: {diff < 1e-5}")
+```
+
+The two gradients agree to within floating-point rounding, confirming that gradient accumulation gives exactly the large-batch update while only ever holding one micro-batch worth of activations. In production this is the standard way to reach an effective batch size of millions of tokens on hardware that cannot hold it in one pass, and it composes cleanly with mixed precision and checkpointing.
+
+## 5. Sharding: ZeRO and FSDP
+
+### 5.1 The Insight
+
+Data parallelism replicates the entire model on every device and averages gradients across devices each step. That is simple but wasteful: every one of $N$ devices stores the full $16\Psi$ bytes of model and optimizer state, even though each could hold only a slice. The **Zero Redundancy Optimizer (ZeRO)** observes that this replication is unnecessary and partitions the state across the $N$ data-parallel devices in three progressively aggressive stages (Rajbhandari et al., 2020):
+
+- **ZeRO-1** partitions the **optimizer state** (the $12\Psi$ fp32 master weights and Adam moments). Per-device state drops from $16\Psi$ toward $4\Psi + 12\Psi/N$.
+- **ZeRO-2** additionally partitions the **gradients** ($2\Psi$).
+- **ZeRO-3** additionally partitions the **parameters** themselves ($2\Psi$), so each device permanently holds only $1/N$ of the weights and gathers the others just in time for each layer's forward and backward.
+
+At stage 3 the per-device memory for model and optimizer state is approximately $16\Psi / N$, which is the entire point: doubling the device count roughly halves the per-device footprint, letting aggregate model size grow with the cluster. The price is communication: ZeRO-3 must all-gather each layer's parameters before using them and reduce-scatter the gradients after, so it trades memory for network bandwidth. PyTorch's native **Fully Sharded Data Parallel (FSDP)** is the same algorithm as ZeRO-3, integrated into the framework (Zhao et al., 2023).
+
+```{mermaid}
+flowchart LR
+    A["Plain data parallel each device holds 16 psi"] --> B["ZeRO-1 shard optimizer state"]
+    B --> C["ZeRO-2 also shard gradients"]
+    C --> D["ZeRO-3 / FSDP also shard parameters about 16 psi over N"]
+```
+
+### 5.2 Show-Only: FSDP (requires multiple GPUs)
+
+The following wraps a model in PyTorch FSDP. It requires an initialized distributed process group with at least one GPU per rank, so it is shown rather than executed here.
+
+```python
+# requires GPUs and a multi-process launch (torchrun); not runnable on CPU.
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import functools
+
+dist.init_process_group("nccl")
+torch.cuda.set_device(dist.get_rank())
+
+model = build_transformer().cuda()   # your model
+
+# Wrap each transformer block as its own FSDP unit so parameters are
+# gathered and freed at block granularity (lowest peak memory).
+auto_wrap = functools.partial(
+    transformer_auto_wrap_policy,
+    transformer_layer_cls={TransformerBlock},   # your block class
+)
+
+model = FSDP(
+    model,
+    sharding_strategy=ShardingStrategy.FULL_SHARD,   # ZeRO-3 equivalent
+    auto_wrap_policy=auto_wrap,
+    mixed_precision=torch.distributed.fsdp.MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,     # reduce gradients in fp32 for stability
+    ),
+    device_id=torch.cuda.current_device(),
+)
+
+# Train as usual; FSDP handles all-gather and reduce-scatter internally.
+# Launch with: torchrun --nproc_per_node=8 train.py
+```
+
+### 5.3 Show-Only: ZeRO via DeepSpeed (requires GPUs)
+
+The DeepSpeed library exposes the same ZeRO stages through a JSON config, which is the most common way ZeRO is used in practice. The config selects the stage and optionally offloads partitioned state to CPU or NVMe to fit even larger models.
+
+```python
+# requires GPUs; DeepSpeed is configured by a JSON file. Not runnable on CPU.
+ds_config = {
+    "train_micro_batch_size_per_gpu": 4,
+    "gradient_accumulation_steps": 8,
+    "bf16": {"enabled": True},
+    "zero_optimization": {
+        "stage": 3,                       # 1, 2, or 3
+        "offload_optimizer": {"device": "cpu"},   # spill Adam state to CPU RAM
+        "offload_param":     {"device": "cpu"},   # spill parameters to CPU RAM
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+    },
+}
+
+import deepspeed
+model_engine, optimizer, _, _ = deepspeed.initialize(
+    model=model, model_parameters=model.parameters(), config=ds_config,
+)
+# Training loop uses model_engine.backward(loss) and model_engine.step().
+# Launch with: deepspeed --num_gpus=8 train.py
+```
+
+The Hugging Face `accelerate` library wraps both FSDP and DeepSpeed behind a single `accelerator.prepare(...)` call and a YAML config, so the same training script can switch sharding backends without code changes. That is the mature, open-source path most teams take in 2025.
+
+## 6. FP8 and the Precision Frontier
+
+The newest accelerators (NVIDIA Hopper and Blackwell) add hardware support for **fp8**, an 8-bit float that comes in two variants: **E4M3** (4 exponent, 3 mantissa bits) for the forward pass where precision matters more, and **E5M2** (5 exponent, 2 mantissa bits) for gradients where range matters more. The promise is another near-halving of memory traffic and a large throughput gain on the tensor cores, but fp8's tiny mantissa makes per-tensor *scaling* essential: each tensor is multiplied by a scale factor chosen so its values land in the representable range, analogous to loss scaling but applied per tensor and tracked over time (delayed scaling). NVIDIA's open-source **Transformer Engine** library implements this and is the standard way to train in fp8 today (Micikevicius et al., 2022).
+
+```python
+# requires Hopper or Blackwell GPUs (fp8 tensor cores); not runnable on CPU.
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, DelayedScaling
+
+# Drop-in fp8-capable layers (te.Linear, te.LayerNormLinear, te.TransformerLayer).
+model = te.TransformerLayer(hidden_size=4096, ffn_hidden_size=16384,
+                            num_attention_heads=32)
+
+fp8_recipe = DelayedScaling(fp8_format=Format.HYBRID,   # E4M3 fwd, E5M2 bwd
+                            amax_history_len=16)
+
+# Only the matmuls inside the autocast region run in fp8; everything else
+# stays in bf16, and a delayed-scaling history tracks per-tensor scales.
+with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+    out = model(hidden_states)
+```
+
+FP8 is the current production frontier rather than a universal default: it gives the largest wins on the biggest matmuls, requires recent hardware, and demands careful scaling to avoid divergence. For most training in 2025, bf16 plus checkpointing plus FSDP is the workhorse, with fp8 layered on top when the hardware and the scale justify it.
+
+## 7. Pitfalls and When to Use
+
+**Mixed precision.** Prefer bf16 when the hardware supports it; its fp32-equal exponent range avoids the loss-scaling machinery that fp16 requires. If you must use fp16, use dynamic loss scaling and watch for skipped steps (frequent overflow means the scale is too high or the run is unstable). Keep reductions, softmax, and loss computation in fp32, low precision in a sum over many terms accumulates error. Never store the optimizer master weights in half precision; that reintroduces the underflow that mixed precision exists to avoid.
+
+**Checkpointing.** It is a memory-for-compute trade, not free. Apply it where activation memory dominates (deep stacks, long sequences) and skip it on cheap layers where the recompute is not worth it. With the modern `use_reentrant=False` variant, checkpointing composes correctly with autograd and mixed precision; the older reentrant form has sharp edges around tensors that do not require grad and around RNG state. If your modules use dropout or other randomness, ensure RNG state is preserved across recompute (PyTorch's checkpoint does this by default) or the recomputed activations will not match the forward pass.
+
+**Gradient accumulation.** Remember to scale each micro-batch loss by $1/K$, forgetting this inflates the effective learning rate by a factor of $K$. Batch-norm statistics do *not* accumulate correctly across micro-batches (each sees only a micro-batch), which is one reason large-model training uses layer norm. With distributed training, disable gradient synchronization on the non-final micro-batches (`model.no_sync()`) so you communicate once per optimizer step, not once per micro-batch.
+
+**Sharding.** ZeRO-3 and FSDP trade memory for communication; on a slow interconnect the all-gather and reduce-scatter can dominate and erase the benefit, so match the sharding stage to your network. Start at the least aggressive stage that fits (ZeRO-1, then 2, then 3), since each step adds communication. Wrap at transformer-block granularity so parameters are gathered and freed per block rather than all at once. CPU and NVMe offload extends the reachable model size but adds latency, use it to make a run *possible*, not to make a fitting run *faster*. Mismatched precision between the sharded reduce and the parameters is a common source of silent divergence; reduce gradients in fp32 even when parameters are bf16.
+
+**FP8.** Only on Hopper or Blackwell, and only after a bf16 baseline is stable. Watch the amax history and per-tensor scales; divergence in fp8 usually traces to a tensor whose scale drifted out of range. Treat it as the last optimization, not the first.
+
+The through-line is that these techniques are *composable and ordered*. A typical large-scale recipe is bf16 autocast for speed and activation memory, activation checkpointing on the transformer blocks, gradient accumulation to reach the target batch size, and FSDP or ZeRO to shard the model and optimizer state across the cluster, with fp8 added on the newest hardware once the rest is stable. Each attacks a different term in the memory budget of Section 1, and together they are what make training at the frontier fit on real machines.
+
+## References
+
+1. Micikevicius, P. et al. "Mixed Precision Training." *ICLR* 2018. https://arxiv.org/abs/1710.03740
+2. Chen, T. et al. "Training Deep Nets with Sublinear Memory Cost." 2016. https://arxiv.org/abs/1604.06174
+3. Rajbhandari, S. et al. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models." *SC* 2020. https://arxiv.org/abs/1910.02054
+4. Zhao, Y. et al. "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel." *VLDB* 2023. https://arxiv.org/abs/2304.11277
+5. Micikevicius, P. et al. "FP8 Formats for Deep Learning." 2022. https://arxiv.org/abs/2209.05433
+6. Rasley, J. et al. "DeepSpeed: System Optimizations Enable Training Deep Learning Models with Over 100 Billion Parameters." *KDD* 2020. https://doi.org/10.1145/3394486.3406703

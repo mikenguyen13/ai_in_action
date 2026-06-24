@@ -1,0 +1,392 @@
+# Mixture of Experts
+
+## 1. Introduction
+
+A dense transformer applies every parameter to every token. Doubling the width of the feed-forward blocks doubles both the parameter count and the cost of every forward pass, so capacity and compute are chained together. **Mixture of Experts (MoE)** breaks that chain. It replaces a single dense feed-forward network with a bank of parallel networks, the experts, and a small learned router that sends each token to only a few of them. The model can hold an enormous number of parameters while spending compute proportional to the few experts each token actually visits.
+
+This decoupling of total parameters from active parameters is the central reason MoE sits underneath most frontier-scale language models shipped through 2025. The Switch Transformer scaled to over a trillion parameters while keeping per-token compute fixed, and open releases such as Mixtral 8x7B and DeepSeek-V3 made sparse MoE the default architecture for the largest open-weight models. The technique is conceptually simple, a gate plus a set of experts, but it introduces a genuinely new engineering problem: the router must spread load evenly across experts, or the model wastes most of its capacity on a handful of overused experts while the rest starve.
+
+This chapter develops the mathematics of sparse top-k routing and the load-balancing loss that makes training stable, then builds a complete sparse MoE layer from scratch in PyTorch on the CPU, small enough to run in seconds yet faithful to the production design. It closes with the GPU-scale invocations a reader would actually use (Switch Transformer, Mixtral, expert-parallel training), shown but not executed because they require accelerators, and with the pitfalls that decide whether an MoE model trains well or collapses.
+
+## 2. The Core Idea: Conditional Computation
+
+In a dense transformer block the feed-forward sublayer computes, for a token representation $x \in \mathbb{R}^{d}$,
+
+$$
+\mathrm{FFN}(x) = W_2\,\sigma(W_1 x),
+$$
+
+and this is applied identically to every token. The MoE block replaces $\mathrm{FFN}$ with $E$ experts $\{f_1, \dots, f_E\}$, each itself a feed-forward network with its own parameters, plus a router (or gate) $g$ that produces a distribution over experts. The output for a token is a weighted combination of the experts the router selects,
+
+$$
+y = \sum_{i \in \mathcal{T}(x)} g_i(x)\, f_i(x),
+$$
+
+where $\mathcal{T}(x)$ is the set of experts chosen for $x$. If $\mathcal{T}(x)$ is all $E$ experts the layer is *dense* MoE and costs $E$ times a single FFN. The frontier design is *sparse*: $\mathcal{T}(x)$ is the top $k$ experts by gate score, with $k$ much smaller than $E$ (commonly $k = 1$ or $k = 2$). A token then pays for only $k$ experts no matter how large $E$ grows, which is exactly the property that lets total parameters scale independently of per-token compute.
+
+The distinction between *total* and *active* parameters is the vocabulary of MoE. Mixtral 8x7B has eight experts per layer and routes to two, so it carries roughly 47 billion total parameters but activates about 13 billion per token. Capacity that large at the cost of a 13 billion parameter forward pass is the whole point.
+
+## 3. The Gating Network
+
+The router is a single linear map followed by a softmax over experts. Given a token $x$, the router logits are
+
+$$
+h(x) = W_g\, x \in \mathbb{R}^{E}, \qquad W_g \in \mathbb{R}^{E \times d},
+$$
+
+and the gate weights are the softmax of those logits,
+
+$$
+p_i(x) = \frac{\exp\!\big(h_i(x)\big)}{\sum_{j=1}^{E} \exp\!\big(h_j(x)\big)}.
+$$
+
+For sparse routing we keep only the top $k$ logits. Let $\mathcal{T}(x)$ index the $k$ largest entries of $h(x)$. There are two standard conventions for the combine weights $g_i$. The first softmaxes over the full set of experts and then keeps the selected weights; the second, used in Switch and many later models, renormalizes the softmax over the selected experts alone so the surviving weights sum to one,
+
+$$
+g_i(x) = \frac{\exp\!\big(h_i(x)\big)}{\sum_{j \in \mathcal{T}(x)} \exp\!\big(h_j(x)\big)}, \qquad i \in \mathcal{T}(x).
+$$
+
+Renormalizing keeps the output on the same scale regardless of how confident the router is, which stabilizes training. The reference implementation below uses this renormalized top-k form.
+
+The top-k selection is not differentiable in the indices, the choice of which experts to use is a hard, discrete decision. Gradients still flow to the router through the *weights* $g_i(x)$ of the experts that were selected, because those weights are smooth functions of the logits. The router therefore learns: if an expert produces output that reduces the loss, the gradient increases that expert's weight, which raises its logit, which makes the router more likely to select it again. This indirect learning signal is enough in practice, but it is also the source of the load-balancing problem in the next section.
+
+## 4. The Load-Balancing Problem
+
+Left to itself, the router tends to collapse. Early in training a few experts are slightly better by chance, the router sends them more tokens, those experts receive more gradient and improve faster, and the router sends them still more tokens. This positive feedback loop concentrates traffic on a small subset of experts. The unused experts receive almost no gradient and never improve, so the effective capacity of the model shrinks toward that of a much smaller dense network. This failure is called **routing collapse**, and preventing it is the defining engineering challenge of MoE training.
+
+The standard remedy, introduced with the Switch Transformer, is an auxiliary **load-balancing loss** added to the task loss. Consider a batch of $T$ tokens routed across $E$ experts. Define two quantities per expert. Let $f_i$ be the fraction of tokens dispatched to expert $i$,
+
+$$
+f_i = \frac{1}{T}\sum_{t=1}^{T} \mathbb{1}\!\left[\, i \in \mathcal{T}(x_t)\,\right],
+$$
+
+and let $P_i$ be the average router probability mass assigned to expert $i$ over the batch,
+
+$$
+P_i = \frac{1}{T}\sum_{t=1}^{T} p_i(x_t).
+$$
+
+The auxiliary loss is the scaled dot product of these two vectors,
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha \cdot E \cdot \sum_{i=1}^{E} f_i\, P_i,
+$$
+
+with $\alpha$ a small coefficient (Switch used $\alpha = 10^{-2}$). The factor $E$ makes the loss scale-independent of the number of experts: when load is perfectly uniform, $f_i = P_i = 1/E$ for every expert, the sum equals $E \cdot (1/E)^2 = 1/E$, and $E \cdot \mathcal{L}_{\text{aux}}/\alpha = 1$. Any imbalance pushes the value above one.
+
+The design is subtle and worth dwelling on. The term $f_i$ counts hard dispatch decisions and is not differentiable, but it acts only as a per-expert weight on the differentiable probability $P_i$. The gradient therefore flows through $P_i$, and it is largest for experts that are *both* overloaded (large $f_i$) *and* receiving high router confidence (large $P_i$). Minimizing $\sum_i f_i P_i$ pushes the router to lower the probability it assigns to whichever experts are currently overworked, which spreads tokens toward the idle experts. The product form is what couples the hard load counts to the soft, trainable router so a single differentiable loss can flatten the distribution.
+
+A complementary signal sometimes added is the **router z-loss**, $\mathcal{L}_z = \frac{\beta}{T}\sum_t \big(\log \sum_j e^{h_j(x_t)}\big)^2$, which penalizes large router logits and improves numerical stability of the softmax. The implementation below focuses on the load-balancing loss, which is the one that prevents collapse.
+
+## 5. Expert Capacity and Token Dropping
+
+A second practical constraint appears when MoE runs on real hardware. Experts are implemented as fixed-size tensors, so each expert can process only a bounded number of tokens per batch. This bound is the **expert capacity**,
+
+$$
+C = \Big\lceil \text{capacity\_factor} \cdot \frac{T \cdot k}{E} \Big\rceil,
+$$
+
+where $T \cdot k / E$ is the number of tokens an expert would receive under perfectly uniform routing and the capacity factor (commonly 1.0 to 1.5) adds headroom for imbalance. If more than $C$ tokens route to one expert, the overflow tokens are **dropped**: they skip the expert entirely and pass through only the residual connection. Capacity factor thus trades memory and compute (higher factor, fewer drops, more padding) against efficiency (lower factor, more drops). Token dropping is a feature of the batched GPU implementation, not of the mathematics, and our CPU reference computes the true routing without dropping so the mechanism is visible in isolation; the production code section returns to capacity as a deployment concern.
+
+## 6. Production Code
+
+We now build a sparse top-k MoE layer end to end in PyTorch, running on the CPU. The implementation is deliberately small and deterministic so every number below is reproducible, yet it contains the real pieces: a linear router, renormalized top-k gating, per-expert dispatch, the load-balancing auxiliary loss, and a measurement of how evenly tokens spread across experts. Mature open-source building blocks (PyTorch, NumPy) carry all the weight here; nothing in this section needs a GPU.
+
+### 6.1 A Sparse Top-k MoE Layer
+
+The expert is an ordinary two-layer feed-forward network. The router is a single linear layer. The forward pass computes router logits, selects the top $k$ experts per token, renormalizes their gate weights, dispatches each token's representation to its chosen experts, and accumulates the gated outputs. We also compute the load-balancing loss from the same routing decisions so it can be added to a task loss during training.
+
+```{python}
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+
+class Expert(nn.Module):
+    """A single feed-forward expert."""
+
+    def __init__(self, d_model: int, d_hidden: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, d_model),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SparseMoE(nn.Module):
+    """Sparse top-k mixture-of-experts feed-forward layer."""
+
+    def __init__(self, d_model: int, d_hidden: int, num_experts: int,
+                 k: int, aux_alpha: float = 1e-2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k = k
+        self.aux_alpha = aux_alpha
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [Expert(d_model, d_hidden) for _ in range(num_experts)]
+        )
+
+    def forward(self, x):
+        # x: (tokens, d_model). Flatten any batch/seq dims before calling.
+        tokens, d_model = x.shape
+        logits = self.router(x)                       # (tokens, num_experts)
+        probs = F.softmax(logits, dim=-1)             # full router distribution
+
+        # Top-k selection and renormalized gate weights over the chosen experts.
+        topk_vals, topk_idx = probs.topk(self.k, dim=-1)   # (tokens, k)
+        gate = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+
+        # Dispatch: accumulate gated expert outputs into the result.
+        y = torch.zeros_like(x)
+        # Per-expert dispatch fraction f_i (hard counts), for the aux loss.
+        f = torch.zeros(self.num_experts, device=x.device)
+        for e in range(self.num_experts):
+            # Which (token, slot) pairs selected expert e?
+            mask = topk_idx == e                       # (tokens, k) bool
+            token_sel = mask.any(dim=-1)               # (tokens,) bool
+            if token_sel.any():
+                # Gate weight this expert contributes to each selected token.
+                w = (gate * mask).sum(dim=-1)[token_sel]   # (n_sel,)
+                out = self.experts[e](x[token_sel])        # (n_sel, d_model)
+                y[token_sel] += w.unsqueeze(-1) * out
+            f[e] = token_sel.float().mean()
+
+        # Load-balancing auxiliary loss: alpha * E * sum_i f_i * P_i.
+        P = probs.mean(dim=0)                          # (num_experts,)
+        aux_loss = self.aux_alpha * self.num_experts * torch.sum(f * P)
+        return y, aux_loss, {"f": f.detach(), "P": P.detach()}
+
+
+d_model, d_hidden = 32, 64
+num_experts, k = 8, 2
+moe = SparseMoE(d_model, d_hidden, num_experts, k)
+
+n_params = sum(p.numel() for p in moe.parameters())
+expert_params = sum(p.numel() for p in moe.experts[0].parameters())
+print(f"experts: {num_experts}, top-k: {k}")
+print(f"total params:  {n_params:,}")
+print(f"active params per token (router + {k} experts): "
+      f"{moe.router.weight.numel() + k * expert_params:,}")
+```
+
+The active-parameter count is far below the total: every token uses the router plus $k$ of the $E$ experts, so adding experts grows capacity without growing per-token compute. This is the decoupling from Section 2 made concrete.
+
+### 6.2 Routing and Utilization on Synthetic Input
+
+We push a batch of synthetic tokens through the layer and inspect the routing. Two checks matter. First, the output shape must match the input, the MoE is a drop-in replacement for a dense FFN. Second, we measure expert utilization, the fraction of tokens each expert receives, which is what the load-balancing loss is trying to flatten. On a randomly initialized router the load is already somewhat uneven, which is exactly the situation the auxiliary loss is designed to correct during training.
+
+```{python}
+torch.manual_seed(1)
+T = 512                                  # tokens in the batch
+x = torch.randn(T, d_model)
+
+y, aux_loss, stats = moe(x)
+
+print(f"input shape:  {tuple(x.shape)}")
+print(f"output shape: {tuple(y.shape)}")
+print(f"aux load-balancing loss: {aux_loss.item():.4f}")
+
+f = stats["f"]                           # fraction of tokens per expert
+util_pct = (f / f.sum() * 100).tolist()
+print("\nexpert utilization (% of dispatched tokens):")
+for e, u in enumerate(util_pct):
+    bar = "#" * int(round(u))
+    print(f"  expert {e}: {u:5.1f}%  {bar}")
+
+ideal = 100.0 / num_experts
+spread = max(util_pct) - min(util_pct)
+print(f"\nideal uniform share: {ideal:.1f}% per expert")
+print(f"observed spread (max - min): {spread:.1f} percentage points")
+```
+
+The spread between the busiest and idlest expert is the imbalance the auxiliary loss penalizes. A perfectly balanced router would put every bar at the ideal share; a collapsed router would pile almost all tokens onto one or two experts.
+
+### 6.3 Training Drives the Router Toward Balance
+
+To show the load-balancing loss working, we train the layer for a short loop on a trivial reconstruction objective (make the output match a fixed linear target), adding the auxiliary loss to the task loss. We track the imbalance over steps. The point is not the task itself but that the combined loss flattens the expert distribution, the mechanism from Section 4 in action.
+
+```{python}
+torch.manual_seed(2)
+
+# A small, fixed reconstruction task so the run is fast and deterministic.
+target_map = nn.Linear(d_model, d_model)
+for p in target_map.parameters():
+    p.requires_grad_(False)
+
+model = SparseMoE(d_model, d_hidden, num_experts, k, aux_alpha=1e-2)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+data = torch.randn(256, d_model)
+with torch.no_grad():
+    targets = target_map(data)
+
+
+def imbalance(f):
+    # Coefficient of variation of the per-expert load; 0 means perfectly even.
+    return (f.std(unbiased=False) / (f.mean() + 1e-9)).item()
+
+
+print(f"{'step':>5} {'task_loss':>10} {'aux_loss':>9} {'imbalance':>10}")
+for step in range(201):
+    y, aux, stats = model(data)
+    task_loss = F.mse_loss(y, targets)
+    loss = task_loss + aux
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if step % 50 == 0:
+        print(f"{step:5d} {task_loss.item():10.4f} {aux.item():9.4f} "
+              f"{imbalance(stats['f']):10.4f}")
+```
+
+The task loss falls steadily while the auxiliary loss holds the routing in check, which is the behavior we want: the primary objective improves without the router being free to collapse onto a few experts. The cleaner demonstration that the auxiliary term matters is the controlled ablation in the next subsection, where the same run with the loss removed drifts to a markedly worse imbalance. In a real model the auxiliary coefficient $\alpha$ is tuned so that it balances load without overwhelming the language-modeling loss.
+
+### 6.4 The Effect of the Auxiliary Loss
+
+A final controlled comparison isolates the auxiliary loss. We train two routers from the same initialization, one with the load-balancing loss and one without, and compare the final imbalance. Turning the auxiliary loss off should let the router drift toward collapse.
+
+```{python}
+torch.manual_seed(3)
+
+
+def train_router(use_aux: bool, steps: int = 200):
+    torch.manual_seed(7)               # identical init for a fair comparison
+    m = SparseMoE(d_model, d_hidden, num_experts, k, aux_alpha=1e-2)
+    o = torch.optim.Adam(m.parameters(), lr=1e-3)
+    d = torch.randn(256, d_model)
+    with torch.no_grad():
+        t = target_map(d)
+    final = None
+    for _ in range(steps):
+        y, aux, stats = m(d)
+        loss = F.mse_loss(y, t) + (aux if use_aux else 0.0)
+        o.zero_grad()
+        loss.backward()
+        o.step()
+        final = stats["f"]
+    return imbalance(final)
+
+
+imb_with = train_router(use_aux=True)
+imb_without = train_router(use_aux=False)
+print(f"final imbalance WITH    aux loss: {imb_with:.4f}")
+print(f"final imbalance WITHOUT  aux loss: {imb_without:.4f}")
+print(f"the auxiliary loss reduces imbalance by "
+      f"{(1 - imb_with / imb_without) * 100:.1f}%"
+      if imb_without > imb_with else
+      "the runs ended at similar imbalance on this toy task")
+```
+
+This is the load-balancing loss earning its place: with the same data, optimizer, and initialization, the only difference is the auxiliary term, and it produces a measurably more even distribution of work across experts.
+
+### 6.5 Scaling Up: Switch Transformer and Mixtral (requires GPU / large model)
+
+The CPU layer above is the same design that runs at frontier scale, but training or serving a real MoE model needs accelerators, sharded experts, and optimized dispatch kernels. The code below is the genuine library invocation a reader would use on a GPU; it is shown, not executed, because no GPU is available in this environment.
+
+Loading and running Mixtral 8x7B (a sparse MoE with eight experts and top-2 routing) through Hugging Face Transformers:
+
+```python
+# requires GPU / large model: Mixtral 8x7B needs multi-GPU or heavy offload.
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model_id = "mistralai/Mixtral-8x7B-v0.1"
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",            # shards experts across available GPUs
+)
+
+inputs = tok("Mixture of experts routes each token to", return_tensors="pt").to(model.device)
+out = model.generate(**inputs, max_new_tokens=40)
+print(tok.decode(out[0], skip_special_tokens=True))
+```
+
+Hugging Face also exposes the Switch Transformer directly, including its top-1 routing and capacity-based token dropping:
+
+```python
+# requires GPU / large model: Switch-Base has 8 to 128 experts per layer.
+from transformers import SwitchTransformersForConditionalGeneration, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("google/switch-base-8")
+model = SwitchTransformersForConditionalGeneration.from_pretrained(
+    "google/switch-base-8", device_map="auto", torch_dtype="bfloat16"
+)
+inputs = tok("The <extra_id_0> walks in the park", return_tensors="pt").to(model.device)
+print(tok.decode(model.generate(**inputs)[0], skip_special_tokens=True))
+```
+
+Memory pressure is the binding constraint for MoE inference, because all experts must be resident even though each token uses only $k$ of them. Quantization with `bitsandbytes` is the usual mitigation; it is shown here only, since quantized kernels target the GPU:
+
+```python
+# requires GPU: bitsandbytes 4-bit quantization to fit a large MoE in memory.
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+import torch
+
+quant = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_quant_type="nf4",
+)
+model = AutoModelForCausalLM.from_pretrained(
+    "mistralai/Mixtral-8x7B-v0.1", quantization_config=quant, device_map="auto"
+)
+```
+
+### 6.6 Expert-Parallel Training (requires GPU cluster)
+
+At training scale the experts of a single layer are distributed across devices, a scheme called **expert parallelism**. Each device holds a subset of the experts, and an all-to-all collective shuffles tokens to the device that owns their selected expert, runs the expert, then shuffles the results back. The mature open-source tooling for this is DeepSpeed-MoE and Megatron-LM; the snippet shows the DeepSpeed MoE layer wrapping the same expert-and-gate structure built above, configured for expert parallelism across a GPU cluster.
+
+```python
+# requires GPU cluster: expert-parallel MoE across multiple devices.
+import deepspeed
+import torch.nn as nn
+
+expert = nn.Sequential(nn.Linear(d_model, d_hidden), nn.GELU(),
+                       nn.Linear(d_hidden, d_model))
+
+moe_layer = deepspeed.moe.layer.MoE(
+    hidden_size=d_model,
+    expert=expert,
+    num_experts=64,            # total experts across the cluster
+    ep_size=8,                 # experts sharded over 8 GPUs (expert parallel)
+    k=2,                       # top-2 routing
+    use_residual=False,
+)
+# The all-to-all token shuffle and the load-balancing loss are handled
+# inside the layer; the returned aux loss is added to the task loss.
+output, aux_loss, _ = moe_layer(hidden_states)
+```
+
+The conceptual model is unchanged from the CPU implementation: route to top-k, gate, combine, and balance the load. Expert parallelism is purely a systems answer to the fact that the experts no longer fit on one device.
+
+## 7. Pitfalls and When to Use
+
+**Routing collapse is the failure mode to watch.** Without an effective load-balancing loss the router concentrates tokens on a few experts and the rest never train. Monitor per-expert utilization during training, not just the loss curve; a healthy run keeps every expert busy. The auxiliary coefficient $\alpha$ is the main knob: too small and load drifts toward collapse, too large and balancing fights the language-modeling objective and degrades quality. The Switch value of $10^{-2}$ is a reasonable starting point.
+
+**Capacity factor trades memory against dropped tokens.** A capacity factor near 1.0 minimizes padding but drops tokens whenever load is uneven, and dropped tokens get no expert computation at all, which hurts quality. A higher factor wastes compute on padding. The right value depends on how well balanced the router is, so capacity and the auxiliary loss must be tuned together.
+
+**MoE is memory-bound at inference even though it is compute-light.** Every expert must be resident in memory, so a model with 47 billion total parameters needs memory for all of them even while computing as if it had 13 billion. This is why MoE shines for training-time efficiency and high-throughput serving but is awkward on memory-constrained single devices. Quantization and expert offloading are the standard mitigations.
+
+**Fine-tuning behaves differently from dense models.** Sparse MoE models can overfit faster on small downstream datasets because each expert sees only a slice of the data, and the router can shift its routing under fine-tuning in ways that destabilize training. Lower learning rates, careful regularization, and sometimes freezing the router are common practice.
+
+**When to reach for MoE.** Use it when you want to grow model capacity under a fixed per-token compute budget, typically at large scale where the parameter count is the bottleneck and you have the memory to hold all experts and the infrastructure for expert-parallel training or high-throughput batched serving. Prefer a dense model when memory is the binding constraint, when the deployment is latency-sensitive on a single small device, or when the model is small enough that the routing machinery and its training instabilities are not worth the added capacity. MoE is a scaling tool: it pays off precisely when you have more parameters to spend than compute to spend on them, and it asks in return that you take load balancing seriously.
+
+## References
+
+1. Shazeer, N. et al. "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer." 2017. https://arxiv.org/abs/1701.06538
+2. Fedus, W., Zoph, B., and Shazeer, N. "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity." Journal of Machine Learning Research, 2022. https://arxiv.org/abs/2101.03961
+3. Lepikhin, D. et al. "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding." 2020. https://arxiv.org/abs/2006.16668
+4. Jiang, A. Q. et al. "Mixtral of Experts." 2024. https://arxiv.org/abs/2401.04088
+5. DeepSeek-AI. "DeepSeek-V3 Technical Report." 2024. https://arxiv.org/abs/2412.19437
+6. Zoph, B. et al. "ST-MoE: Designing Stable and Transferable Sparse Expert Models." 2022. https://arxiv.org/abs/2202.08906
+7. Rajbhandari, S. et al. "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale." 2022. https://arxiv.org/abs/2201.05596
+8. Zhou, Y. et al. "Mixture-of-Experts with Expert Choice Routing." Advances in Neural Information Processing Systems, 2022. https://arxiv.org/abs/2202.09368

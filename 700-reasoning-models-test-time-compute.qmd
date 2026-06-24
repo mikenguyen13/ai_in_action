@@ -1,20 +1,22 @@
-# Reasoning Models and Test-Time Compute
+# Reasoning Models and Test-Time Compute {#sec-700-reasoning-models-test-time-compute}
 
-## 1. Introduction
+## 1. Introduction {#sec-700-introduction}
 
 Between the original transformer and the instruction-tuned chat models of 2023, the dominant lever for improving large language models was *scale at training time*: more parameters, more data, more pre-training compute. In late 2024 a second lever appeared, and it changed the frontier. **Reasoning models** are trained to spend variable *inference-time* compute, generating an explicit, often long internal chain of thought before committing to an answer, trading latency and tokens for accuracy. This opened a second scaling axis, **test-time compute**, alongside pre-training scale, and essentially every frontier model shipped through 2025 sits on it.
 
-The shift matters enough that a treatment of LLMs that stops at instruction-tuned chat models is a generation behind. This chapter develops what reasoning models are, the empirical scaling behaviour that justifies them, the two roads to building them (OpenAI's o-series and DeepSeek's open R1), the test-time compute methods that operationalize "thinking," the economics of a thinking budget, and the honest limits, including the benchmarks that reveal what reasoning models still cannot do.
+The shift matters enough that a treatment of LLMs that stops at instruction-tuned chat models is a generation behind. This chapter develops what reasoning models are, the mathematics that explains why spending compute at inference helps, the two roads to building them (OpenAI's o-series and DeepSeek's open R1), the test-time compute methods that operationalize thinking, the economics of a thinking budget, and the honest limits. It then turns to **production code**: runnable demonstrations of self-consistency majority voting and best-of-N selection that reproduce the compute-versus-accuracy tradeoff on a laptop, plus show-only invocations for the GPU-scale methods (tree search, process reward models, large reasoning models) that a reader can run on appropriate hardware.
 
-## 2. The Core Idea: A Second Scaling Axis
+## 2. The Core Idea: A Second Scaling Axis {#sec-700-core-idea}
 
-A standard chat model maps a prompt to an answer in a single forward pass per token, emitting the answer directly. A reasoning model is trained instead to first produce a long *reasoning trace*, exploring approaches, checking intermediate steps, backtracking, and only then emit a final answer. Chain-of-thought prompting had shown since 2022 that *eliciting* such traces helps; the new idea is to make extended, self-correcting reasoning a *trained behaviour* reinforced by outcome rewards, rather than something coaxed out by prompt engineering.
+A standard chat model maps a prompt to an answer in a single decoding pass, emitting the answer directly. A reasoning model is trained instead to first produce a long *reasoning trace*, exploring approaches, checking intermediate steps, backtracking, and only then emit a final answer. Chain-of-thought prompting had shown since 2022 that *eliciting* such traces helps. The new idea is to make extended, self-correcting reasoning a *trained behaviour* reinforced by outcome rewards, rather than something coaxed out by prompt engineering.
 
-The empirical payoff is an **inference-time scaling law**: within a model, accuracy on hard reasoning tasks rises smoothly as you allow more thinking tokens, much as accuracy rose with parameters and data at training time. This gives a genuinely new control knob, the same deployed model can be made more capable on a hard problem simply by letting it think longer, without retraining.
+The empirical payoff is an **inference-time scaling law**: within a single model, accuracy on hard reasoning tasks rises smoothly as you allow more thinking tokens, much as accuracy rose with parameters and data at training time. This gives a genuinely new control knob. The same deployed model can be made more capable on a hard problem simply by letting it think longer, with no retraining.
 
-Accuracy on hard reasoning tasks rises with compute (log scale) along two complementary axes. Pre-training scale (bigger model or more data) and test-time compute (thinking longer per query) each push accuracy upward, with test-time compute extending the curve at inference for a fixed model.
+The two axes are complementary, not competing. A strong base model trained at scale is what makes the reasoning reinforcement-learning stage effective, and reasoning then extracts more capability from that base at inference.
 
 ```{mermaid}
+%%| label: fig-700-two-axes
+%%| fig-cap: "Two complementary scaling axes. Pre-training scale and test-time compute each push accuracy upward as compute grows on a log scale."
 xychart-beta
     title "Two scaling axes accuracy versus compute on log scale"
     x-axis "Compute on log scale" [low, medium, high, "very high"]
@@ -23,72 +25,420 @@ xychart-beta
     line "Test-time compute" [30, 58, 78, 90]
 ```
 
-The two axes are complementary, not competing: a strong base model trained at scale is what makes the reasoning RL stage effective, and reasoning then extracts more capability from that base at inference.
+## 3. The Mathematics of Test-Time Compute {#sec-700-math}
 
-## 3. The o-Series: Reasoning as a Product
+Why should sampling more or thinking longer help at all? The methods divide into two families with distinct mathematics: **parallel** compute (draw many samples, then aggregate or select) and **sequential** compute (one long self-correcting trace). We derive the parallel case rigorously, because it is what we can execute on a laptop, then state the sequential case.
 
-OpenAI's **o1**, released September 12, 2024, was the first widely deployed reasoning model. It was trained to "think before answering," hid its raw chain of thought behind a summarized version, and demonstrated the inference-scaling curve on competition mathematics, coding, and science.
+### 3.1 Setup {#sec-700-setup}
 
-**o3 and o4-mini** followed: o3 was previewed in December 2024 and reached general availability with o4-mini in April 2025. The headline results made the paradigm impossible to ignore. On the **ARC-AGI-1** abstraction benchmark, designed specifically to resist memorization, o3 scored about **87.5%** in a high-compute configuration (at a cost reported on the order of thousands of dollars per task), versus the low single digits typical of prior LLMs. On **FrontierMath**, a set of research-level problems where earlier models scored around 2%, o3 reached roughly 25%. These were not incremental gains; they were the signature of a new capability regime, bought with inference compute.
+Fix a prompt $x$ and let a model $\pi$ induce a distribution over complete responses $y \sim \pi(\cdot \mid x)$. Each response carries a final answer $a(y)$ drawn from a (finite) answer set $\mathcal{A}$. Let $a^\star$ denote the correct answer. A *single sample* succeeds with probability
 
-The o-series also crystallized the *thinking budget* as a product control: users and developers can request "low," "medium," or "high" reasoning effort, directly trading cost and latency for accuracy, the inference-time scaling law exposed as an API parameter.
+$$
+p \;=\; \Pr_{y \sim \pi}\big[\, a(y) = a^\star \,\big].
+$$ {#eq-700-single}
 
-## 4. DeepSeek-R1: Reasoning from Reinforcement Learning, in the Open
+Test-time compute methods draw $N$ independent samples $y_1, \dots, y_N$ and combine their answers into one prediction $\hat a_N$. The two canonical combiners are **self-consistency** (majority vote over $a(y_i)$) and **best-of-N** (select the candidate a verifier scores highest).
+
+### 3.2 Best-of-N with a perfect verifier: the pass@N bound {#sec-700-passn}
+
+Suppose we have an oracle verifier that recognizes a correct answer whenever one appears among the $N$ samples. Best-of-N then succeeds exactly when at least one sample is correct. With independent samples,
+
+$$
+\Pr[\hat a_N = a^\star] \;=\; 1 - (1 - p)^N \;=\; \text{pass@}N.
+$$ {#eq-700-passn}
+
+This rises monotonically from $p$ toward $1$ and, for small $p$, climbs almost linearly at first ($\approx Np$ for $Np \ll 1$) before saturating. The expected number of samples to obtain a first success is $1/p$, the mean of a geometric distribution, which is the compute budget an oracle-verified pipeline must plan for. Equation @eq-700-passn is the optimistic ceiling: it assumes the verifier never selects a wrong answer over a right one. Real verifiers do not, and section @sec-700-imperfect makes that gap precise.
+
+### 3.3 Self-consistency: majority vote as a denoiser {#sec-700-majority}
+
+Self-consistency needs no external verifier. It marginalizes over reasoning paths by taking the most frequent final answer. Consider first the clean binary case: the correct answer competes against a single dominant distractor, each sample is correct with probability $p$, and we vote over $N$ (odd) samples. The vote is correct when the number of correct samples $K \sim \text{Binomial}(N, p)$ exceeds $N/2$:
+
+$$
+\Pr[\hat a_N = a^\star] \;=\; \sum_{k = \lceil N/2 \rceil}^{N} \binom{N}{k} p^{k} (1-p)^{N-k}.
+$$ {#eq-700-majority}
+
+If $p > \tfrac12$, this probability tends to $1$ as $N \to \infty$ (the law of large numbers drives the empirical fraction of correct votes to $p > \tfrac12$). If $p < \tfrac12$, it tends to $0$: **majority voting amplifies whatever the model believes most often, so it only helps when the model is better than chance on that problem.** A Hoeffding bound makes the rate explicit. With $\Delta = p - \tfrac12 > 0$,
+
+$$
+\Pr[\text{majority wrong}] \;=\; \Pr\!\Big[\tfrac{K}{N} \le \tfrac12\Big] \;\le\; \exp\!\big(-2 N \Delta^2\big).
+$$ {#eq-700-hoeffding}
+
+The error decays exponentially in the number of samples, but the rate is governed by the squared margin $\Delta^2$. A model that is barely above chance ($\Delta$ small) needs many samples to realize the benefit, which is exactly the compute-versus-accuracy tradeoff we will plot. The realistic multi-distractor case (correct mass $p$, the rest spread over several wrong answers) behaves better than the two-way bound, because the wrong votes are split and the plurality threshold is easier to clear. We measure that case directly in code in section @sec-700-self-consistency.
+
+### 3.4 Best-of-N with an imperfect verifier {#sec-700-imperfect}
+
+In practice the selector is a learned **reward model** or **verifier** that scores candidates with noise, so it sometimes ranks a wrong answer above a right one. Model candidate $i$ by a latent quality $q_i \in [0,1]$ (probability-correct, say), and let the verifier observe a noisy score $s_i = q_i + \varepsilon_i$ with $\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$. Best-of-N selects $\hat\imath = \arg\max_i s_i$ and is judged correct when the selected candidate's true quality clears a threshold, $q_{\hat\imath} > \tau$.
+
+Two regimes emerge. When $\sigma \to 0$ (perfect verifier) the selector picks the genuinely best of $N$ draws, and accuracy approaches the pass@N ceiling of @eq-700-passn. As $\sigma$ grows, selection degrades toward picking at random among the $N$, and the curve *plateaus early*: beyond some $N$, additional samples mostly add verifier noise rather than signal. The practical lesson, which the code in section @sec-700-best-of-n makes quantitative, is that **the verifier, not the sampler, sets the ceiling on best-of-N.** Spending more compute on samples a weak verifier cannot rank is wasted.
+
+### 3.5 Sequential compute: depth instead of breadth {#sec-700-sequential}
+
+Parallel methods explore breadth by drawing independent samples. Sequential test-time compute instead spends tokens *within one trajectory*: the model writes a long trace, checks intermediate results, and revises. Formally, a long chain of thought factorizes the answer through a latent sequence of steps $z_1, \dots, z_T$,
+
+$$
+\pi(a \mid x) \;=\; \sum_{z_{1:T}} \pi(a \mid x, z_{1:T}) \prod_{t=1}^{T} \pi(z_t \mid x, z_{<t}),
+$$ {#eq-700-cot}
+
+and the value of depth is that intermediate steps can be *conditioned on and corrected*: a later step can detect that an earlier one was wrong and override it, something a single forward answer cannot do. This is the behaviour that outcome-reward reinforcement learning incentivizes directly (the subject of the reinforcement-learning chapter). The research consensus through 2025 is that breadth and depth **compose**, and the optimal split depends on the problem: easy problems waste compute under heavy search, while the hardest benefit from both.
+
+## 4. The o-Series: Reasoning as a Product {#sec-700-o-series}
+
+OpenAI's **o1**, released September 12, 2024, was the first widely deployed reasoning model. It was trained to think before answering, hid its raw chain of thought behind a summarized version, and demonstrated the inference-scaling curve on competition mathematics, coding, and science.
+
+**o3 and o4-mini** followed: o3 was previewed in December 2024 and reached general availability with o4-mini in April 2025. On the **ARC-AGI-1** abstraction benchmark, designed specifically to resist memorization, o3 scored about **87.5%** in a high-compute configuration (at a cost reported on the order of thousands of dollars per task), versus the low single digits typical of prior LLMs. On **FrontierMath**, a set of research-level problems where earlier models scored around 2%, o3 reached roughly 25%. These were the signature of a new capability regime, bought with inference compute.
+
+The o-series also crystallized the *thinking budget* as a product control: developers can request low, medium, or high reasoning effort, directly trading cost and latency for accuracy, the inference-time scaling law exposed as an API parameter.
+
+## 5. DeepSeek-R1: Reasoning from Reinforcement Learning, in the Open {#sec-700-r1}
 
 The o-series demonstrated *that* reasoning worked but disclosed little about *how*. **DeepSeek-R1**, released in January 2025 and later peer-reviewed in *Nature* (September 2025), opened the recipe and delivered a striking scientific result: sophisticated reasoning can **emerge from reinforcement learning alone**.
 
-The key artifact was **R1-Zero**, trained by applying RL directly to a base model with *no* supervised fine-tuning cold-start. Given only a reward for producing correct, verifiable answers (and a format reward), the model spontaneously learned to generate long chains of thought, to allocate more steps to harder problems, and to exhibit self-correction, the paper's much-quoted "aha moment," where the model learns to pause and re-evaluate. The reinforcement-learning machinery behind this, **Group Relative Policy Optimization (GRPO)**, which estimates its baseline from a group of sampled answers and dispenses with a separate value network, is developed fully in the next chapter on reinforcement learning for LLMs; here the point is the *result*: reasoning need not be hand-taught through demonstrations, it can be *incentivized* and allowed to emerge.
+The key artifact was **R1-Zero**, trained by applying reinforcement learning directly to a base model with *no* supervised fine-tuning cold-start. Given only a reward for producing correct, verifiable answers (plus a format reward), the model spontaneously learned to generate long chains of thought, to allocate more steps to harder problems, and to exhibit self-correction, the paper's much-quoted aha moment where the model learns to pause and re-evaluate. The reinforcement-learning machinery behind this, **Group Relative Policy Optimization (GRPO)**, which estimates its baseline from a group of sampled answers and dispenses with a separate value network, is developed fully in the chapter on reinforcement learning for LLMs. Here the point is the *result*: reasoning need not be hand-taught through demonstrations, it can be *incentivized* and allowed to emerge.
 
 The full R1 added a small amount of cold-start data and a multi-stage pipeline to fix R1-Zero's readability and language-mixing issues, but the scientific headline stands. Because DeepSeek released open weights and a detailed report, R1 became the reference point for an entire wave of open reasoning models and reasoning research.
 
-## 5. Test-Time Compute Methods
+## 6. Test-Time Compute Methods {#sec-700-methods}
 
-"Let the model think longer" can be realized in several distinct ways, which it is worth separating because they have different cost and reliability profiles.
+Let the model think longer can be realized in several distinct ways, worth separating because they have different cost and reliability profiles.
 
-- **Long chain-of-thought (sequential).** The model generates one long, self-correcting trace. Capability comes from depth: revisiting, checking, and backtracking within a single sample. This is what o1/o3 and R1 primarily do, and it is what RL trains.
-- **Parallel sampling with selection.** Draw *N* independent answers and choose among them, **best-of-N** against a verifier or reward model, or **self-consistency**, which marginalizes over reasoning paths by majority-voting the final answers. Cost scales linearly in *N*; accuracy improves then plateaus.
-- **Verifier-guided search.** Use a **process reward model** (which scores intermediate steps, not just final answers) to guide a search, beam search or tree search, over reasoning steps, expanding promising partial traces. More compute-efficient per unit of accuracy than blind sampling, at the cost of needing a good step-level verifier.
+- **Long chain-of-thought (sequential).** One long, self-correcting trace. Capability comes from depth: revisiting, checking, and backtracking within a single sample. This is what o1/o3 and R1 primarily do, and what outcome-reward reinforcement learning trains.
+- **Parallel sampling with selection.** Draw $N$ independent answers and choose among them: **best-of-N** against a verifier or reward model, or **self-consistency**, which majority-votes the final answers. Cost scales linearly in $N$; accuracy improves then plateaus.
+- **Verifier-guided search.** Use a **process reward model** (which scores intermediate steps, not just final answers) to guide a beam or tree search over reasoning steps, expanding promising partial traces. More compute-efficient per unit of accuracy than blind sampling, at the cost of needing a good step-level verifier.
 - **Sequential revision.** Have the model critique and revise its own answer over multiple rounds.
 
-A useful framing is *parallel* versus *sequential* test-time compute: parallel methods (sampling, search) explore breadth; sequential methods (long CoT, revision) exploit depth. The research consensus through 2025 is that the two compose, and that the optimal allocation between them depends on the problem, easy problems waste compute under heavy search, while the hardest benefit from both depth and breadth.
+```{mermaid}
+%%| label: fig-700-methods
+%%| fig-cap: "Test-time compute methods organized by breadth versus depth."
+flowchart TD
+    A["Test-time compute"] --> B["Parallel breadth"]
+    A --> C["Sequential depth"]
+    B --> D["Self-consistency majority vote"]
+    B --> E["Best-of-N with verifier"]
+    B --> F["Tree search with process reward model"]
+    C --> G["Long chain of thought"]
+    C --> H["Self critique and revision"]
+```
 
-## 6. Reasoning Distillation
+## 7. Reasoning Distillation {#sec-700-distillation}
 
-A practical and important finding from the R1 work: the long reasoning traces produced by a strong reasoning model can be used as supervised training data to teach *smaller, cheaper, dense* models to reason. DeepSeek distilled R1's traces into a range of small models that substantially outperformed same-size models trained conventionally. This **reasoning distillation** matters economically, it pushes capable reasoning down the model-size curve, so that the expensive reasoning RL need only be run once on a large model and its behaviour can then be transferred cheaply. It also reframes reasoning traces themselves as a valuable synthetic-data asset, a theme picked up in the post-training chapter.
+A practical finding from the R1 work: the long reasoning traces produced by a strong reasoning model can serve as supervised training data to teach *smaller, cheaper, dense* models to reason. DeepSeek distilled R1's traces into a range of small models that substantially outperformed same-size models trained conventionally. This **reasoning distillation** pushes capable reasoning down the model-size curve: the expensive reasoning reinforcement learning need only run once on a large model, and its behaviour transfers cheaply. It also reframes reasoning traces themselves as a valuable synthetic-data asset.
 
-## 7. The Economics of a Thinking Budget
+## 8. The Economics of a Thinking Budget {#sec-700-economics}
 
-Reasoning is not free, and its cost structure differs from ordinary inference. A reasoning model may emit thousands of hidden thinking tokens per query, Qwen3, for instance, exposed thinking budgets of tens of thousands of tokens, and the user typically pays for those tokens and waits for them. This reshapes the LLM cost model covered earlier in the book: the relevant unit is no longer "tokens in the answer" but "tokens spent thinking to reach the answer," and the right amount varies by query.
+Reasoning is not free, and its cost structure differs from ordinary inference. A reasoning model may emit thousands of hidden thinking tokens per query (Qwen3, for instance, exposed thinking budgets of tens of thousands of tokens), and the user typically pays for those tokens and waits for them. The relevant unit is no longer tokens in the answer but tokens spent thinking to reach the answer, and the right amount varies by query.
 
-The operational implications are concrete. Latency-sensitive applications cannot afford maximum reasoning on every call; the discipline is to *route*, spend heavy reasoning only on queries that need it, and answer easy queries directly. "Overthinking," where a model burns budget on trivial questions, is a real failure mode and an active area of work (adaptive or budget-aware reasoning). The thinking budget is thus both a capability knob and a cost-control problem, and treating it as either alone is a mistake.
+The operational implications are concrete. Latency-sensitive applications cannot afford maximum reasoning on every call; the discipline is to *route*, spending heavy reasoning only on queries that need it and answering easy queries directly. Overthinking, where a model burns budget on trivial questions, is a real failure mode and an active area of work (adaptive or budget-aware reasoning). The thinking budget is thus both a capability knob and a cost-control problem.
 
-## 8. When Reasoning Helps, and When It Does Not
+## 9. Production Code {#sec-700-production-code}
 
-Reasoning models shine on problems with **verifiable structure and multiple steps**: competition mathematics, algorithmic coding, formal logic, and scientific problems where intermediate work can be checked. The reason is partly architectural and partly training-driven, RL with verifiable rewards (next chapter) requires a checkable answer, so the capability is sharpest exactly where answers are checkable.
+This section is **executed on CPU**. Every number printed below is computed at render time by the code shown, on small deterministic examples that finish in seconds. The two core parallel methods, self-consistency and best-of-N, are implemented from first principles so the compute-versus-accuracy tradeoff of section @sec-700-math is reproduced rather than asserted. A short block then exercises a real (tiny) Hugging Face model to show the mechanics and per-sample latency of parallel sampling, followed by show-only invocations for the GPU-scale methods.
 
-The gains are smaller, and sometimes negative, on tasks that are not decomposable into verifiable steps: open-ended writing, simple factual lookup, or tasks dominated by knowledge rather than inference. On easy queries, extended reasoning can *reduce* quality by overthinking, and it always costs more. A mature system therefore treats reasoning as a tool to be applied selectively, not a universal upgrade.
+### 9.1 Self-consistency: majority voting over sampled chains {#sec-700-self-consistency}
 
-## 9. Evaluation and the Limits of Reasoning
+We simulate a model whose per-sample success probability on a problem is $p$, with the wrong mass spread over several distractors (the realistic multi-distractor case of section @sec-700-majority). Majority voting should amplify accuracy when $p$ is above the plurality threshold and degrade it otherwise. The simulation is deterministic given the seed.
 
-The reasoning era forced new benchmarks, because the old ones saturated. As models approached ceiling on MMLU and similar tests, evaluation migrated to harder, less saturable sets: **GPQA-Diamond** (graduate-level science), **FrontierMath** (research mathematics), **SWE-bench Verified** (real software issues), and **Humanity's Last Exam**.
+```{python}
+#| label: code-700-self-consistency
+#| code-fold: false
+import numpy as np
+from collections import Counter
 
-The most instructive case is **ARC-AGI**. o3's ~87.5% on ARC-AGI-1 was hailed as a breakthrough in fluid, on-the-fly abstraction. But when **ARC-AGI-2** was released in 2025, redesigned to defeat brute-force search and to require more compositional adaptation, the same class of models that saturated version 1 scored in the **low single digits** at moderate compute. The gap is the lesson: reasoning models made enormous progress on problems amenable to search and verification, yet a measurable *adaptation gap* to human-style generalization persists. High accuracy on a benchmark a model was effectively optimized against is not evidence of general intelligence, and ARC-AGI-2 is the cleanest demonstration that the frontier, however impressive, has not closed that gap.
+rng = np.random.default_rng(0)
 
-A second caution concerns the reasoning trace itself. The visible chain of thought is not guaranteed to be a faithful account of the computation that produced the answer; treating it as a transparent explanation, for audit or safety purposes, is unsound without separate evidence of faithfulness. The trace is a *means to an answer*, not a certified justification of it.
 
-## 10. Conclusion
+def majority_vote(answers):
+    """Return the plurality answer (ties broken by first-seen)."""
+    return Counter(answers).most_common(1)[0][0]
 
-Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone, a finding whose machinery is the subject of the next chapter. The methods (long chain-of-thought, parallel sampling, verifier-guided search), the economics (paying to think, and routing to avoid overthinking), and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Reasoning did not make the older lessons obsolete; it added a second dimension on top of them, and understanding that dimension is now prerequisite to understanding the field.
 
-## References
+def self_consistency_accuracy(p, n_samples, n_distractors, n_trials, rng):
+    """Empirical accuracy of majority voting over n_samples chains.
 
-1.  OpenAI. "Learning to Reason with LLMs" (o1). September 12, 2024. https://openai.com/index/learning-to-reason-with-llms/
-2.  OpenAI. "Introducing OpenAI o3 and o4-mini." April 16, 2025. https://openai.com/index/introducing-o3-and-o4-mini/
-3.  DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." *Nature*, September 2025. https://www.nature.com/articles/s41586-025-09422-z
-4.  Chollet, F. et al. "ARC Prize 2024 / o3 breakthrough on ARC-AGI-1." https://arcprize.org/blog/oai-o3-pub-breakthrough
-5.  ARC Prize. "Announcing ARC-AGI-2 and ARC Prize 2025." 2025. https://arcprize.org/blog/announcing-arc-agi-2-and-arc-prize-2025
-6.  Snell, C. et al. "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters." 2024. https://arxiv.org/abs/2408.03314
-7.  Wang, X. et al. "Self-Consistency Improves Chain of Thought Reasoning in Language Models." 2022. https://arxiv.org/abs/2203.11171
-8.  Lightman, H. et al. "Let's Verify Step by Step" (process reward models). 2023. https://arxiv.org/abs/2305.20050
-9.  Glazer, E. et al. "FrontierMath: A Benchmark for Evaluating Advanced Mathematical Reasoning in AI." 2024. https://arxiv.org/abs/2411.04872
-10. Qwen Team. "Qwen3 Technical Report" (thinking budgets). 2025. https://github.com/QwenLM/Qwen3
+    The correct answer is labeled 0. With probability p a chain emits 0,
+    otherwise it emits one of n_distractors wrong answers uniformly.
+    """
+    wins = 0
+    for _ in range(n_trials):
+        chains = np.where(
+            rng.random(n_samples) < p,
+            0,                                   # correct
+            rng.integers(1, n_distractors + 1, n_samples),  # a distractor
+        )
+        if majority_vote(chains.tolist()) == 0:
+            wins += 1
+    return wins / n_trials
+
+
+p = 0.45  # below 1/2: each single chain is wrong more often than right
+print(f"per-sample correctness p = {p}")
+print(f"{'N samples':>10} | {'self-consistency accuracy':>26}")
+print("-" * 41)
+sc_curve = {}
+for N in [1, 3, 5, 11, 21, 41]:
+    acc = self_consistency_accuracy(p, N, n_distractors=4, n_trials=4000, rng=rng)
+    sc_curve[N] = acc
+    print(f"{N:>10} | {acc:>26.3f}")
+```
+
+Even with $p = 0.45$ (each individual chain is wrong more often than right), majority voting climbs well past the single-sample accuracy. The wrong mass is split across four distractors, so the *plurality* threshold sits below one half, and the correct answer wins the vote with rising probability as $N$ grows. This is the multi-distractor regime that real chain-of-thought self-consistency exploits.
+
+### 9.2 Best-of-N: selection is bounded by the verifier {#sec-700-best-of-n}
+
+Best-of-N samples $N$ candidates and keeps the one a verifier scores highest. Following section @sec-700-imperfect, each candidate has a latent quality $q$ and the verifier observes $q$ plus Gaussian noise of scale $\sigma$. We sweep $N$ for three verifier qualities to show that a weak verifier plateaus while a perfect one approaches the pass@N ceiling.
+
+```{python}
+#| label: code-700-best-of-n
+#| code-fold: false
+import numpy as np
+
+rng = np.random.default_rng(7)
+
+
+def best_of_n_accuracy(N, n_problems, sigma, a=2.0, b=3.0, tau=0.6, rng=None):
+    """Accuracy of best-of-N under a noisy verifier.
+
+    Candidate quality q ~ Beta(a, b). Verifier score s = q + N(0, sigma).
+    A problem is solved if the selected candidate's true quality exceeds tau.
+    """
+    solved = 0
+    for _ in range(n_problems):
+        q = rng.beta(a, b, size=N)
+        score = q + rng.normal(0.0, sigma, size=N)
+        chosen = int(np.argmax(score))
+        if q[chosen] > tau:
+            solved += 1
+    return solved / n_problems
+
+
+Ns = [1, 2, 4, 8, 16, 32]
+verifiers = [(0.0, "perfect verifier"), (0.15, "good verifier"), (0.40, "weak verifier")]
+
+header = f"{'verifier':<18}" + "".join(f"N={N:<6}" for N in Ns)
+print(header)
+print("-" * len(header))
+for sigma, label in verifiers:
+    cells = "".join(
+        f"{best_of_n_accuracy(N, 3000, sigma, rng=rng):<8.3f}" for N in Ns
+    )
+    print(f"{label:<18}{cells}")
+```
+
+The perfect verifier keeps climbing toward the pass@N ceiling, the good verifier rises more slowly, and the weak verifier flattens out early. Doubling $N$ from 16 to 32 buys the weak verifier almost nothing, the extra samples are answers it cannot reliably rank. This is the single most important practical fact about best-of-N: **invest in the verifier before you invest in more samples.**
+
+### 9.3 The compute-versus-accuracy tradeoff curve {#sec-700-tradeoff-curve}
+
+We now plot both methods on one axis: accuracy as a function of the sample budget $N$ (which is directly proportional to inference compute and cost). This is the figure that motivates the entire chapter.
+
+```{python}
+#| label: fig-700-tradeoff
+#| code-fold: false
+#| fig-cap: "Compute versus accuracy for parallel test-time methods. Self-consistency amplifies a weak-but-above-plurality model; best-of-N is bounded by verifier quality. The dashed line is the single-sample baseline."
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(11)
+Ns = [1, 2, 4, 8, 16, 32]
+
+sc = [self_consistency_accuracy(0.45, N, 4, 4000, rng) for N in Ns]
+bo_perfect = [best_of_n_accuracy(N, 3000, 0.0, rng=rng) for N in Ns]
+bo_weak = [best_of_n_accuracy(N, 3000, 0.40, rng=rng) for N in Ns]
+
+fig, ax = plt.subplots(figsize=(7, 4.2))
+ax.plot(Ns, sc, "o-", label="self-consistency (p=0.45)")
+ax.plot(Ns, bo_perfect, "s-", label="best-of-N (perfect verifier)")
+ax.plot(Ns, bo_weak, "^-", label="best-of-N (weak verifier)")
+ax.axhline(bo_weak[0], ls="--", color="gray", lw=1, label="single-sample baseline")
+ax.set_xscale("log", base=2)
+ax.set_xticks(Ns)
+ax.set_xticklabels(Ns)
+ax.set_xlabel("sample budget N (proportional to inference compute)")
+ax.set_ylabel("task accuracy")
+ax.set_title("Test-time compute versus accuracy")
+ax.legend(loc="lower right", fontsize=8)
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+plt.show()
+
+print("accuracy gain from N=1 to N=32:")
+print(f"  self-consistency       : {sc[0]:.3f} -> {sc[-1]:.3f}")
+print(f"  best-of-N perfect verif : {bo_perfect[0]:.3f} -> {bo_perfect[-1]:.3f}")
+print(f"  best-of-N weak verif    : {bo_weak[0]:.3f} -> {bo_weak[-1]:.3f}")
+```
+
+### 9.4 Parallel sampling mechanics with a real model {#sec-700-real-model}
+
+The simulations above isolate the *statistics* of test-time compute. To show the *mechanics* on a genuine language model, we run best-of-N sampling with a tiny open model from the Hugging Face hub, measuring per-candidate latency and the token budget that parallel sampling consumes. We score each candidate by its mean per-token log-probability under the model (its own confidence), the simplest verifier available without a separate reward model. The model is intentionally tiny so the cell runs in seconds on CPU; the *code path* is identical to a production best-of-N over a real reasoning model.
+
+```{python}
+#| label: code-700-real-model
+#| code-fold: false
+import time
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.manual_seed(0)
+
+model_name = "sshleifer/tiny-gpt2"  # tiny, CPU-friendly; swap for any causal LM
+tok = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name)
+model.eval()
+
+n_params = sum(p.numel() for p in model.parameters())
+print(f"model = {model_name}")
+print(f"parameters = {n_params:,}")
+
+prompt = "Question: what is 2 plus 2? Let's think step by step."
+enc = tok(prompt, return_tensors="pt")
+
+
+def mean_token_logprob(model, sequence_ids):
+    """Self-scored confidence: mean log p(token | prefix) over the sequence."""
+    with torch.no_grad():
+        logits = model(sequence_ids).logits[:, :-1, :]
+    logp = torch.log_softmax(logits, dim=-1)
+    chosen = logp.gather(-1, sequence_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    return chosen.mean().item()
+
+
+N = 8
+total_new_tokens = 0
+t0 = time.time()
+candidates = []
+with torch.no_grad():
+    for _ in range(N):
+        out = model.generate(
+            **enc,
+            do_sample=True,
+            max_new_tokens=16,
+            temperature=1.0,
+            top_k=50,
+            pad_token_id=tok.eos_token_id,
+        )
+        total_new_tokens += out.shape[1] - enc["input_ids"].shape[1]
+        candidates.append((mean_token_logprob(model, out), out))
+elapsed = time.time() - t0
+
+candidates.sort(key=lambda c: c[0], reverse=True)
+best_score, best_ids = candidates[0]
+
+print(f"sampled N = {N} candidates in {elapsed:.2f}s "
+      f"({elapsed / N * 1000:.0f} ms/candidate)")
+print(f"total new thinking tokens generated = {total_new_tokens}")
+print(f"best self-score (mean log-prob) = {best_score:.3f}")
+print(f"selected continuation: {tok.decode(best_ids[0], skip_special_tokens=True)!r}")
+```
+
+The numbers reported (parameter count, milliseconds per candidate, total tokens generated) are the operational quantities a production system tracks: latency scales linearly with $N$, and the token budget is what the user pays for. With a tiny random-initialized model the candidate scores are nearly indistinguishable, which is itself the point of section @sec-700-imperfect: **a weak scorer cannot separate candidates, so selection adds compute without adding accuracy.** Swapping `model_name` for a capable reasoning model (and the self-score for a trained reward model) is the only change needed for production.
+
+### 9.5 Show-only: GPU and large-model methods {#sec-700-show-only}
+
+The following blocks are **not executed** in this chapter, because they require a GPU and large model weights. Each shows the real open-source library invocation so a reader can run it on appropriate hardware. None of these blocks fabricate output.
+
+**Self-consistency on a real reasoning model via vLLM.** Mature open-source serving with `vllm` makes parallel sampling efficient by batching the $N$ samples through one engine call.
+
+```python
+# requires GPU and a served model; pip install vllm
+from collections import Counter
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")  # open weights
+params = SamplingParams(n=40, temperature=0.7, max_tokens=2048)  # 40 chains
+
+prompt = "Solve and put the final integer answer in \\boxed{}: ..."
+outputs = llm.generate([prompt], params)[0].outputs
+
+answers = [extract_boxed(o.text) for o in outputs]   # your final-answer parser
+final = Counter(answers).most_common(1)[0][0]         # self-consistency vote
+```
+
+**Best-of-N with a trained reward model.** Replace the self-score of section @sec-700-real-model with an open reward model loaded through `transformers`.
+
+```python
+# requires GPU; the reward model assigns a scalar score to each full candidate
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+rm_name = "Skywork/Skywork-Reward-Llama-3.1-8B"  # open-weights reward model
+rm_tok = AutoTokenizer.from_pretrained(rm_name)
+rm = AutoModelForSequenceClassification.from_pretrained(
+    rm_name, torch_dtype=torch.bfloat16, device_map="auto"
+)
+
+def reward(prompt, candidate):
+    msgs = [{"role": "user", "content": prompt},
+            {"role": "assistant", "content": candidate}]
+    ids = rm_tok.apply_chat_template(msgs, return_tensors="pt").to(rm.device)
+    with torch.no_grad():
+        return rm(ids).logits[0, 0].item()
+
+best = max(candidates, key=lambda c: reward(prompt, c))  # best-of-N selection
+```
+
+**Process reward model and tree search.** A process reward model (PRM) scores *intermediate* steps, letting a search expand only promising partial traces. This is the most compute-efficient method per unit accuracy but needs step-level supervision.
+
+```python
+# requires GPU; PRM scores each reasoning step, search keeps the top-k partial traces
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+prm = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-Math-PRM-7B", device_map="auto"
+)  # open-weights process reward model
+
+# Beam search over reasoning steps (sketch):
+#   1. expand each live trace by sampling k next-step continuations
+#   2. score every candidate step with the PRM
+#   3. keep the top-b partial traces by cumulative step reward
+#   4. repeat until a final answer is produced, then return the best beam
+```
+
+**Large reasoning model via API thinking budget.** Frontier reasoning models expose the thinking budget directly; the open path is to host an R1-style model and set `max_tokens` high. Note: do not load such a model under `bitsandbytes` on a CPU-only host; quantized kernels need a GPU.
+
+```python
+# requires GPU to host; the "reasoning effort" knob is the thinking-token budget
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+low_effort = SamplingParams(temperature=0.6, max_tokens=512)    # answer fast
+high_effort = SamplingParams(temperature=0.6, max_tokens=8192)  # think long
+# Route per query: cheap path for easy prompts, high_effort only when needed.
+```
+
+## 10. Pitfalls and When to Use {#sec-700-pitfalls}
+
+**When reasoning helps.** Reasoning models shine on problems with **verifiable structure and multiple steps**: competition mathematics, algorithmic coding, formal logic, and scientific problems where intermediate work can be checked. The capability is sharpest exactly where answers are checkable, because reinforcement learning with verifiable rewards (the reinforcement-learning chapter) requires a checkable answer.
+
+**When it does not.** Gains shrink, and can go negative, on tasks that do not decompose into verifiable steps: open-ended writing, simple factual lookup, or knowledge-dominated tasks. On easy queries extended reasoning can *reduce* quality by overthinking, and it always costs more. Treat reasoning as a tool applied selectively, not a universal upgrade.
+
+**Concrete pitfalls.**
+
+- **Majority voting below the plurality threshold.** Equation @eq-700-hoeffding is a warning: if the model is below the plurality threshold on a problem, self-consistency drives accuracy *down*. Verify the model is better than the threshold before voting.
+- **Trusting a weak verifier.** Section @sec-700-best-of-n showed best-of-N plateaus at the verifier's ceiling. Spending more samples against a noisy verifier is wasted compute. Measure verifier accuracy first.
+- **Paying for overthinking.** A fixed maximum thinking budget on every query is a cost bug. Route: cheap path for easy prompts, heavy reasoning only when needed (section @sec-700-economics).
+- **Independence assumptions.** The pass@N and Hoeffding bounds assume independent samples. Low temperature collapses diversity and breaks independence, so the samples agree on the same (possibly wrong) answer and voting buys nothing. Maintain enough sampling temperature for genuine diversity.
+- **Treating the trace as an explanation.** The visible chain of thought is not guaranteed to faithfully describe the computation that produced the answer. Using it for audit or safety without separate faithfulness evidence is unsound. The trace is a *means to an answer*, not a certified justification.
+
+## 11. Evaluation and the Limits of Reasoning {#sec-700-evaluation}
+
+The reasoning era forced new benchmarks because the old ones saturated. As models approached ceiling on MMLU and similar tests, evaluation migrated to harder, less saturable sets: **GPQA-Diamond** (graduate-level science), **FrontierMath** (research mathematics), **SWE-bench Verified** (real software issues), and **Humanity's Last Exam**.
+
+The most instructive case is **ARC-AGI**. o3's roughly 87.5% on ARC-AGI-1 was hailed as a breakthrough in fluid, on-the-fly abstraction. But when **ARC-AGI-2** was released in 2025, redesigned to defeat brute-force search and to require more compositional adaptation, the same class of models that saturated version 1 scored in the **low single digits** at moderate compute. The gap is the lesson: reasoning models made enormous progress on problems amenable to search and verification, yet a measurable *adaptation gap* to human-style generalization persists. High accuracy on a benchmark a model was effectively optimized against is not evidence of general intelligence, and ARC-AGI-2 is the cleanest demonstration that the frontier, however impressive, has not closed that gap.
+
+## 12. Conclusion {#sec-700-conclusion}
+
+Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Understanding that dimension is now prerequisite to understanding the field.
+
+## References {#sec-700-references}
+
+1.  OpenAI. "Learning to Reason with LLMs" (o1). September 12, 2024. <https://openai.com/index/learning-to-reason-with-llms/>
+2.  OpenAI. "Introducing OpenAI o3 and o4-mini." April 16, 2025. <https://openai.com/index/introducing-o3-and-o4-mini/>
+3.  DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." *Nature*, September 2025. <https://www.nature.com/articles/s41586-025-09422-z>
+4.  Chollet, F. et al. "ARC Prize 2024 / o3 breakthrough on ARC-AGI-1." <https://arcprize.org/blog/oai-o3-pub-breakthrough>
+5.  ARC Prize. "Announcing ARC-AGI-2 and ARC Prize 2025." 2025. <https://arcprize.org/blog/announcing-arc-agi-2-and-arc-prize-2025>
+6.  Snell, C. et al. "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters." 2024. <https://arxiv.org/abs/2408.03314>
+7.  Wang, X. et al. "Self-Consistency Improves Chain of Thought Reasoning in Language Models." 2022. <https://arxiv.org/abs/2203.11171>
+8.  Lightman, H. et al. "Let's Verify Step by Step" (process reward models). 2023. <https://arxiv.org/abs/2305.20050>
+9.  Glazer, E. et al. "FrontierMath: A Benchmark for Evaluating Advanced Mathematical Reasoning in AI." 2024. <https://arxiv.org/abs/2411.04872>
+10. Qwen Team. "Qwen3 Technical Report" (thinking budgets). 2025. <https://github.com/QwenLM/Qwen3>
+11. Wei, J. et al. "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models." 2022. <https://arxiv.org/abs/2201.11903>
+12. Cobbe, K. et al. "Training Verifiers to Solve Math Word Problems" (GSM8K, best-of-N verification). 2021. <https://arxiv.org/abs/2110.14168>
+13. Yao, S. et al. "Tree of Thoughts: Deliberate Problem Solving with Large Language Models." 2023. <https://arxiv.org/abs/2305.10601>

@@ -1,0 +1,352 @@
+# Pruning and Sparsity {#sec-pruning-and-sparsity}
+
+A trained neural network is almost always larger than it needs to be. Many of its weights are tiny, contribute little to the function the network computes, and could be removed with negligible effect on accuracy. **Pruning** is the family of techniques that finds and removes such weights, turning a dense model into a **sparse** one. The payoff is smaller storage, lower memory bandwidth, and, when the hardware and software cooperate, faster inference. At frontier scale, where a single dense matrix multiply in an LLM moves billions of parameters, pruning is one of the few levers that can cut serving cost without retraining from scratch.
+
+This chapter develops pruning from its mathematical foundations to production practice. We start with the optimization problem pruning is really solving, derive the magnitude criterion and the more principled second-order criteria, and then run real pruning on a small network on the CPU. We cover the lottery ticket hypothesis with an executable iterative-magnitude-pruning loop, then describe the frontier methods (2:4 structured sparsity on tensor cores, and SparseGPT for one-shot LLM pruning) that require GPUs and large models, giving the exact library invocations a reader could run on the right hardware.
+
+## The Pruning Problem
+
+Let a network compute a function $f(x; \theta)$ with parameters $\theta \in \mathbb{R}^d$, trained to minimize a loss $\mathcal{L}(\theta)$. Pruning seeks a binary mask $m \in \{0,1\}^d$ that zeroes out a target fraction of the weights while keeping the loss as low as possible. With the elementwise (Hadamard) product $\odot$, the problem is
+
+$$
+\min_{m \in \{0,1\}^d,\ \theta'}\ \mathcal{L}(m \odot \theta')
+\quad\text{subject to}\quad \|m\|_0 \le k ,
+$$
+
+where $k$ is the number of weights we are willing to keep and $\|m\|_0$ counts the surviving entries. The **sparsity** of the result is $s = 1 - k/d$, the fraction of weights set to zero.
+
+This is a combinatorial problem: there are $\binom{d}{k}$ possible masks, so we cannot search exhaustively. Every practical pruning method is a heuristic for choosing $m$ cheaply, usually paired with some retraining of the surviving weights $\theta'$ to recover whatever accuracy the masking destroyed. The methods differ in three choices: the **saliency criterion** that ranks weights for removal, the **granularity** (individual weights versus whole structures), and the **schedule** (one shot versus iterative, with or without fine-tuning).
+
+### Two Granularities: Unstructured and Structured
+
+The granularity choice is the one that most affects whether pruning actually speeds anything up.
+
+**Unstructured pruning** removes individual weights wherever they sit, producing a mask with an irregular zero pattern. It reaches the highest sparsity for a given accuracy, because it has the most freedom, but the resulting matrix is only "sparse" in the bookkeeping sense. A dense matrix multiply does not get faster just because some entries are zero, the multiply-accumulate still touches every element. Realizing speedups requires a sparse kernel and a hardware path that can skip zeros, which on commodity GPUs is hard to do well below very high sparsities.
+
+**Structured pruning** removes whole aligned blocks: entire output neurons (rows of a weight matrix), whole convolutional filters, attention heads, or whole channels. The pruned network is a genuinely smaller dense network, so a standard dense kernel runs faster with no special support. The price is a worse accuracy-versus-sparsity tradeoff, because forcing zeros into aligned groups is a stronger constraint than allowing them anywhere.
+
+A middle ground, **semi-structured** or **N:M sparsity**, fixes a small pattern (for example, exactly 2 nonzeros in every contiguous block of 4) that modern tensor cores can exploit directly. We return to the 2:4 case as the frontier production method.
+
+```{mermaid}
+flowchart TD
+    A["Trained dense model"] --> B["Choose granularity"]
+    B --> C["Unstructured: prune individual weights"]
+    B --> D["Structured: prune neurons, heads, channels"]
+    B --> E["Semi-structured: 2 of 4 pattern"]
+    C --> F["Highest sparsity, needs sparse kernel for speed"]
+    D --> G["Smaller dense model, speeds up immediately"]
+    E --> H["Tensor-core accelerated, fixed pattern"]
+```
+
+## Saliency: Which Weights to Remove
+
+### The Magnitude Criterion
+
+The simplest and still most widely used saliency measure is weight magnitude: remove the weights with the smallest absolute value, keep the rest. The intuition is that a weight close to zero contributes little to any activation, so deleting it perturbs the output little. Formally, magnitude pruning to keep $k$ weights chooses
+
+$$
+m_i = \mathbb{1}\!\left[\, |\theta_i| \ge \tau \,\right],
+\qquad
+\tau = \text{the } k\text{-th largest value of } \{|\theta_1|, \dots, |\theta_d|\} .
+$$
+
+Despite its crudeness, magnitude pruning is remarkably hard to beat at moderate sparsity, especially when followed by fine-tuning. It is parameter-free, costs a single sort, and composes with any architecture. Most production pruning pipelines start here.
+
+### Why Magnitude Is Only an Approximation
+
+Magnitude ignores the loss landscape. A small weight that sits on a steep direction of the loss can matter more than a large weight on a flat direction. The principled criterion asks directly: how much does the loss rise if we set weight $\theta_i$ to zero? Expand the loss around the trained parameters $\theta^\star$, where the gradient $g = \nabla \mathcal{L}(\theta^\star) \approx 0$, to second order:
+
+$$
+\delta \mathcal{L} = \mathcal{L}(\theta^\star + \delta\theta) - \mathcal{L}(\theta^\star)
+\approx g^\top \delta\theta + \tfrac{1}{2}\, \delta\theta^\top H\, \delta\theta
+\approx \tfrac{1}{2}\, \delta\theta^\top H\, \delta\theta ,
+$$
+
+where $H = \nabla^2 \mathcal{L}(\theta^\star)$ is the Hessian and the linear term drops at a converged minimum. To delete weight $i$ we impose the constraint $\delta\theta_i + \theta_i^\star = 0$, that is $e_i^\top \delta\theta = -\theta_i^\star$, and choose the remaining perturbation to minimize the loss increase. This constrained quadratic minimization has the classic **Optimal Brain Surgeon** solution
+
+$$
+\delta\theta = -\frac{\theta_i^\star}{[H^{-1}]_{ii}}\, H^{-1} e_i,
+\qquad
+\delta \mathcal{L}_i = \frac{1}{2}\,\frac{(\theta_i^\star)^2}{[H^{-1}]_{ii}} .
+$$
+
+The quantity $\delta \mathcal{L}_i$ is the **saliency** of weight $i$: the loss increase from removing it, after optimally adjusting all other weights to compensate. Two things are worth noting. First, if the Hessian were the identity, the saliency reduces to $\tfrac{1}{2}(\theta_i^\star)^2$, and ranking by it is exactly magnitude pruning. Magnitude is the saliency you get by pretending the loss curvature is isotropic. Second, the full criterion requires $H^{-1}$, which is intractable for large models ($H$ is $d \times d$). The practical frontier methods, including SparseGPT below, are precisely clever approximations that make a layer-wise version of this inverse-Hessian computation feasible.
+
+### Layer-wise Reconstruction
+
+Rather than the global Hessian, the methods that scale to LLMs solve a **layer-wise** problem. For a single linear layer with weight $W$ and a calibration batch of inputs $X$, find a sparse $\widehat{W}$ that best reproduces the original layer's outputs:
+
+$$
+\widehat{W} = \arg\min_{\widehat{W}}\ \big\| W X - \widehat{W} X \big\|_F^2
+\quad\text{subject to a sparsity mask on } \widehat{W} .
+$$
+
+This reconstruction objective only needs the layer's input statistics $X X^\top$, a manageable matrix whose inverse plays the role of the local Hessian. SparseGPT solves exactly this, one layer at a time, which is why it can prune a model with tens of billions of parameters in a few GPU hours without any gradient-based retraining.
+
+## Production Code
+
+We now make this concrete. Everything in this section runs on the CPU on a small network, so it is fast, deterministic, and reproducible. We use **PyTorch** and its built-in pruning utilities (`torch.nn.utils.prune`), which are the mature, free, open-source standard for prototyping pruning. The frontier GPU and LLM methods follow as clearly labeled show-only blocks.
+
+### A Dense Baseline
+
+We train a small multilayer perceptron on a two-moons classification problem. This is deliberately tiny so the whole chapter executes in seconds, but the pruning APIs are identical to those used on large models.
+
+```{python}
+#| label: prune-baseline
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+X, y = make_moons(n_samples=4000, noise=0.2, random_state=0)
+X = X.astype(np.float32)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=0)
+Xtr = torch.from_numpy(Xtr); ytr = torch.from_numpy(ytr).long()
+Xte = torch.from_numpy(Xte); yte = torch.from_numpy(yte).long()
+
+
+class MLP(nn.Module):
+    def __init__(self, h=128):
+        super().__init__()
+        self.fc1 = nn.Linear(2, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, 2)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+def accuracy(model, X, y):
+    model.eval()
+    with torch.no_grad():
+        return (model(X).argmax(1) == y).float().mean().item()
+
+
+def train(model, epochs=200, lr=1e-2):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    for _ in range(epochs):
+        opt.zero_grad()
+        F.cross_entropy(model(Xtr), ytr).backward()
+        opt.step()
+    return model
+
+
+base = train(MLP())
+acc0 = accuracy(base, Xte, yte)
+
+total = sum(p.numel() for p in base.parameters())
+print(f"dense test accuracy: {acc0:.4f}")
+print(f"total parameters: {total:,}")
+```
+
+### Unstructured and Structured Pruning
+
+PyTorch's pruning utilities work by registering a binary mask as a buffer and reparameterizing the layer so the forward pass uses `mask * weight`. The original weights are kept under `weight_orig` until you make the pruning permanent with `prune.remove`. Below we apply unstructured L1 (magnitude) pruning, then structured pruning that removes whole output neurons.
+
+```{python}
+#| label: prune-unstructured-structured
+import copy
+import torch.nn.utils.prune as prune
+
+
+def global_sparsity(model):
+    z = t = 0
+    for layer in [model.fc1, model.fc2, model.fc3]:
+        z += int((layer.weight == 0).sum())
+        t += layer.weight.numel()
+    return z / t
+
+
+# --- Unstructured magnitude pruning: remove 60% smallest weights per layer ---
+m = copy.deepcopy(base)
+for layer in [m.fc1, m.fc2, m.fc3]:
+    prune.l1_unstructured(layer, name="weight", amount=0.6)
+
+print("== Unstructured L1 magnitude pruning (60% per layer) ==")
+print(f"sparsity after pruning: {100*global_sparsity(m):.1f}%")
+print(f"accuracy (pruned, no fine-tune): {accuracy(m, Xte, yte):.4f}")
+
+# The mask plus original weight live separately; make it permanent before export.
+for layer in [m.fc1, m.fc2, m.fc3]:
+    prune.remove(layer, "weight")
+print(f"sparsity after prune.remove: {100*global_sparsity(m):.1f}%")
+
+# --- Structured pruning: drop 50% of fc1 output neurons by L2 row norm ---
+m2 = copy.deepcopy(base)
+prune.ln_structured(m2.fc1, name="weight", amount=0.5, n=2, dim=0)
+rows_alive = int((m2.fc1.weight.abs().sum(dim=1) != 0).sum())
+print("\n== Structured pruning (drop 50% of fc1 output neurons) ==")
+print(f"fc1 output neurons alive: {rows_alive} / {m2.fc1.weight.shape[0]}")
+print(f"accuracy (structured, no fine-tune): {accuracy(m2, Xte, yte):.4f}")
+```
+
+Two lessons fall out of the numbers. Aggressive one-shot pruning without fine-tuning hurts accuracy, and unstructured pruning at a given sparsity is gentler than structured pruning, because it has more freedom in where to place zeros. In a real pipeline you would fine-tune after pruning to recover most of the lost accuracy, which is exactly what the iterative loop below does.
+
+### Iterative Magnitude Pruning and the Lottery Ticket Hypothesis
+
+The **lottery ticket hypothesis** (Frankle and Carbin, 2019) makes a striking claim: a randomly initialized dense network contains a sparse subnetwork (a "winning ticket") that, when trained in isolation from the *same* initial weights, can match the full network's accuracy. The recipe to find one is **iterative magnitude pruning** with weight rewinding: train, prune the smallest weights, reset the survivors to their original initial values $\theta_0$, and retrain. Repeating this peels the network down to a small sparse core that still trains well.
+
+The loop below runs this on our MLP. We save the initialization, then prune 20% of the surviving weights each round, rewind the survivors to $\theta_0$, and retrain. Watch the accuracy hold up as sparsity climbs.
+
+```{python}
+#| label: prune-lottery-ticket
+torch.manual_seed(0)
+net = MLP()
+init_state = copy.deepcopy(net.state_dict())  # theta_0, the winning-ticket init
+
+
+def layers(model):
+    return [model.fc1, model.fc2, model.fc3]
+
+
+def sparsity(model):
+    z = t = 0
+    for l in layers(model):
+        z += int((l.weight == 0).sum())
+        t += l.weight.numel()
+    return z / t
+
+
+prune_per_round = 0.2
+rounds = 6
+
+net = train(net, epochs=150)
+print(f"{'round':>5} {'sparsity%':>9} {'acc_rewind':>11}")
+for r in range(rounds):
+    # Prune the smallest 20% of remaining weights, globally across layers.
+    params = [(l, "weight") for l in layers(net)]
+    prune.global_unstructured(
+        params, pruning_method=prune.L1Unstructured, amount=prune_per_round
+    )
+    sp = sparsity(net)
+    # Rewind surviving weights to their original init values, keep the masks.
+    for l, key in zip(layers(net), ["fc1.weight", "fc2.weight", "fc3.weight"]):
+        with torch.no_grad():
+            l.weight_orig.copy_(init_state[key])
+    net = train(net, epochs=150)
+    print(f"{r+1:>5} {100*sp:>8.1f} {accuracy(net, Xte, yte):>11.4f}")
+```
+
+The accuracy stays essentially flat as the network is pruned past 70% sparsity, the empirical signature of a winning ticket. The same procedure with a *fresh random* reinitialization at each round (instead of rewinding to $\theta_0$) typically degrades faster, which is the control experiment that motivates the hypothesis. The mechanism that makes iterative pruning work, retraining after each cut so the surviving weights can adapt, is exactly the same one used at scale, only the rewind detail is specific to the lottery-ticket study.
+
+### Storage Savings From Sparsity
+
+A pruned weight matrix stored in a sparse format costs space only for its nonzeros plus index overhead. The Compressed Sparse Row (CSR) format used by **SciPy** is the standard free implementation. At high sparsity the savings are real, though the index overhead means sparse storage only pays off well above roughly 70% sparsity for 32-bit data.
+
+```{python}
+#| label: prune-storage
+import scipy.sparse as sp
+
+# Prune the network hard (90% global) and measure storage of the largest matrix.
+torch.manual_seed(0)
+dense_net = train(MLP(), epochs=150)
+params = [(l, "weight") for l in layers(dense_net)]
+prune.global_unstructured(params, pruning_method=prune.L1Unstructured, amount=0.9)
+for l in layers(dense_net):
+    prune.remove(l, "weight")
+
+W = dense_net.fc2.weight.detach().numpy()
+dense_bytes = W.size * 4                       # float32
+csr = sp.csr_matrix(W)
+sparse_bytes = csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes
+
+print(f"fc2 sparsity: {100*(W == 0).mean():.1f}%")
+print(f"fc2 dense float32: {dense_bytes:,} bytes")
+print(f"fc2 CSR sparse:    {sparse_bytes:,} bytes")
+print(f"storage ratio (sparse/dense): {sparse_bytes/dense_bytes:.2f}x")
+```
+
+## Frontier Methods: GPU and LLM Scale
+
+The CPU demos above use exactly the same APIs that production pipelines use, but the methods that matter at frontier scale need GPU tensor cores or large calibration runs. The blocks below are **show-only**: they are the real library invocations, not executed here because they require a CUDA GPU and large models. They are written so a reader with the right hardware can run them directly.
+
+### 2:4 Structured Sparsity on Tensor Cores
+
+NVIDIA Ampere and later GPUs implement **2:4 semi-structured sparsity** in hardware: in every contiguous group of four weights, two must be zero, and the Sparse Tensor Core then runs the matrix multiply at up to twice the dense throughput. This is the one form of sparsity that reliably accelerates dense-style inference on commodity accelerators, because the fixed 2:4 pattern is exactly what the silicon is built to skip. PyTorch exposes it through `torch.sparse` and the semi-structured prune helper.
+
+```python
+# Requires GPU (NVIDIA Ampere or newer) with Sparse Tensor Cores. Show-only.
+import torch
+from torch.sparse import to_sparse_semi_structured
+from torch.ao.pruning import WeightNormSparsifier
+
+linear = torch.nn.Linear(4096, 4096).half().cuda().eval()
+
+# Enforce the 2:4 mask: exactly 2 nonzeros per block of 4 along the contraction dim.
+sparsifier = WeightNormSparsifier(
+    sparsity_level=0.5, sparse_block_shape=(1, 4), zeros_per_block=2
+)
+sparsifier.prepare(linear, config=[{"tensor_fqn": "weight"}])
+sparsifier.step()
+sparsifier.squash_mask()
+
+# Convert the masked weight to the hardware 2:4 packed layout for fast matmul.
+linear.weight = torch.nn.Parameter(to_sparse_semi_structured(linear.weight))
+
+x = torch.rand(8192, 4096, dtype=torch.half, device="cuda")
+y = linear(x)  # runs on the Sparse Tensor Core path
+```
+
+### SparseGPT: One-Shot Pruning of an LLM
+
+**SparseGPT** (Frantar and Alistarh, 2023) prunes a large language model to 50% or 2:4 sparsity in one shot, with no gradient-based retraining, by solving the layer-wise reconstruction problem from earlier in this chapter. It walks the model layer by layer, uses a small calibration set to estimate each layer's input covariance $X X^\top$, and updates the surviving weights to compensate for the pruned ones using an efficient approximation of the inverse-Hessian update. The result is a model that keeps most of its quality at 50% sparsity, computed in a few GPU hours even at 175B parameters.
+
+```python
+# Requires a GPU and a large model plus a calibration dataset. Show-only.
+# Reference implementation: github.com/IST-DASLab/sparsegpt (open source).
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-hf", torch_dtype=torch.float16, device_map="cuda"
+)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+# Pseudocode for the SparseGPT layer loop (see the reference repo for the kernel):
+#   for each transformer block:
+#       collect calibration activations X for each linear layer
+#       H = X @ X.T                          # local Hessian proxy
+#       prune to 50% (or 2:4) by smallest |W| / diag(H^-1) saliency
+#       update surviving weights with the inverse-Hessian correction
+#
+# Then run the packaged tool, for example:
+#   python sparsegpt_llama.py meta-llama/Llama-2-7b-hf c4 \
+#       --sparsity 0.5 --prunen 2 --prunem 4 --save pruned/
+```
+
+A complementary open method, **Wanda** (Sun et al., 2023), reaches similar 2:4 results even more cheaply by pruning on the product of weight magnitude and input activation norm, $|W_{ij}| \cdot \|X_j\|_2$, with no weight update at all. Both are free and open source, and both target the same 2:4 pattern so the pruned model lands on the tensor-core fast path.
+
+## Pitfalls and When to Use
+
+**Unstructured sparsity rarely speeds up dense hardware.** This is the single most common disappointment. Zeroing 60% of a weight matrix does not make a standard GEMM 60% faster, because the kernel still iterates over every element. Without a true sparse kernel or the 2:4 hardware path, unstructured pruning buys storage savings and nothing else. If your goal is latency, prefer structured pruning (a genuinely smaller dense model) or the 2:4 pattern (tensor-core accelerated).
+
+**Prune then fine-tune, do not prune and stop.** One-shot magnitude pruning at high sparsity can wreck accuracy, as the structured demo above shows. The accuracy is recovered by retraining the survivors. Iterative pruning with fine-tuning between rounds reaches far higher sparsity at a given accuracy than a single aggressive cut. At LLM scale, where retraining is expensive, the layer-wise reconstruction of SparseGPT and Wanda substitutes for gradient fine-tuning.
+
+**Make the mask permanent before you export.** A model pruned with `torch.nn.utils.prune` still carries the original dense weights under `weight_orig` plus a mask. Calling `prune.remove` collapses them into a single pruned tensor. Forgetting this means you ship the full dense model and get none of the storage benefit.
+
+**Sparse storage has overhead.** CSR and similar formats store indices alongside values, so for 32-bit data they only beat dense storage above roughly 70% sparsity. At low sparsity a dense tensor is smaller. Measure, do not assume.
+
+**Calibration data matters for one-shot LLM pruning.** SparseGPT and Wanda estimate layer statistics from a small calibration set. A calibration set that is unrepresentative of deployment data yields a model that reconstructs the wrong distribution. Use in-domain text and enough samples for the covariance estimate to stabilize.
+
+**Pruning composes with quantization, in that order.** Pruning removes weights, quantization shrinks the bit-width of those that remain. The two are complementary, and the usual pipeline prunes first, then quantizes the sparse model, because pruning changes which weights exist before you decide how many bits to spend on them. Quantization is the subject of its own chapter; the practical point here is that sparsity and low precision stack.
+
+When should you reach for pruning at all? Use **structured pruning** when you need a faster model on ordinary hardware and can afford a short fine-tune. Use **2:4 semi-structured sparsity** when you serve on Ampere-or-newer GPUs and want a hardware-accelerated speedup with modest accuracy loss. Use **one-shot methods (SparseGPT, Wanda)** when you must compress a large pretrained model and cannot afford to retrain it. Reach for **unstructured magnitude pruning** when the goal is storage or when you have a sparse-aware deployment target. In every case, treat the accuracy-versus-sparsity curve as something to measure on your own data, not a number to assume.
+
+## References
+
+1. LeCun, Y., Denker, J., Solla, S. "Optimal Brain Damage." *NeurIPS*, 1989. https://proceedings.neurips.cc/paper/1989/hash/6c9882bbac1c7093bd25041881277658-Abstract.html
+2. Hassibi, B., Stork, D. "Second Order Derivatives for Network Pruning: Optimal Brain Surgeon." *NeurIPS*, 1992. https://proceedings.neurips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html
+3. Han, S., Pool, J., Tran, J., Dally, W. "Learning both Weights and Connections for Efficient Neural Networks." *NeurIPS*, 2015. https://arxiv.org/abs/1506.02626
+4. Frankle, J., Carbin, M. "The Lottery Ticket Hypothesis: Finding Sparse, Trainable Neural Networks." *ICLR*, 2019. https://arxiv.org/abs/1803.03635
+5. Mishra, A. et al. "Accelerating Sparse Deep Neural Networks" (NVIDIA 2:4 sparsity). 2021. https://arxiv.org/abs/2104.08378
+6. Frantar, E., Alistarh, D. "SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot." *ICML*, 2023. https://arxiv.org/abs/2301.00774
+7. Sun, M., Liu, Z., Bair, A., Kolter, J. Z. "A Simple and Effective Pruning Approach for Large Language Models" (Wanda). *ICLR*, 2024. https://arxiv.org/abs/2306.11695
+8. Blalock, D., Ortiz, J., Frankle, J., Guttag, J. "What is the State of Neural Network Pruning?" *MLSys*, 2020. https://arxiv.org/abs/2003.03033
