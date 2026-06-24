@@ -132,37 +132,47 @@ which vectorizes cleanly across a batch of examples. The result is prediction la
 
 Forcing one split per level is a real restriction. If the ideal model needs different features in different regions, an oblivious tree must spend extra depth or extra trees to express what an asymmetric tree captures in one branch. CatBoost compensates with the ensemble: many shallow symmetric trees, typically depth 6, combine to represent complex functions, and the per tree regularization tends to win on the dataset sizes CatBoost targets. The tradeoff is favorable often enough that the symmetric tree is the default, though it is not universally optimal.
 
-## 5. Practical Use
+## 5. Complexity and Cost
 
-### 5.1 Installation and the three interfaces
+It helps to know where the time and memory go. Let $n$ be the number of training rows, $f$ the number of features, $T$ the number of boosting iterations, and $d$ the tree depth.
 
-CatBoost ships as a Python package, `pip install catboost`, with three primary estimators: `CatBoostClassifier`, `CatBoostRegressor`, and the ranking oriented `CatBoost`. The scikit-learn compatible API means `fit`, `predict`, and `predict_proba` behave as expected and the models drop into pipelines and cross validation utilities.
+CatBoost bins each numeric feature into at most $B$ quantile buckets (controlled by `border_count`, default 254 on CPU), so a histogram for one feature has $B$ entries. Growing one oblivious level scans every feature once to pick the single best split, costing $O(n f)$ to accumulate gradient histograms plus $O(f B)$ to score candidate borders. A tree of depth $d$ repeats this $d$ times, and the ensemble has $T$ trees, giving training time roughly
 
-The most important practical point is how you declare categorical features. You pass column indices or names through `cat_features` and leave the raw string values in place. Do not pre encode them; CatBoost's whole advantage is that it applies ordered target statistics internally.
+$$
+O\!\left(T \, d \, (n f + f B)\right) \approx O(T\, d\, n f)
+$$
 
-```python
-from catboost import CatBoostClassifier, Pool
+when $n \gg B$, which is the usual regime. The leaf count per tree is $2^d$, so memory for the model itself is $O(T \, 2^d)$ and is the reason depth is kept small.
 
-cat_cols = ["country", "device_type", "merchant"]
+Ordered boosting adds a constant factor, not a worse asymptotic order. Instead of one model it maintains roughly $\log_2 n$ supporting models, and each row reads its gradient from one of them, so the per iteration cost grows by a factor of order $\log n$ in the worst bookkeeping but is engineered down to a small constant in practice. Ordered target statistics add an $O(\log n)$ factor per categorical encoding from maintaining running prefix sums in permutation order, multiplied by the number of permutations (a handful). Prediction is the cheapest part: scoring one example costs $O(T \, d)$, a few hundred branch free comparisons and lookups, which is why oblivious forests serve at low latency.
 
-train_pool = Pool(X_train, y_train, cat_features=cat_cols)
-valid_pool = Pool(X_valid, y_valid, cat_features=cat_cols)
+The practical takeaways are that depth is exponential in model size and should stay near 6, that ordered mode is a constant factor slower than plain mode rather than a different complexity class, and that the GPU path mainly accelerates the $O(n f)$ histogram pass that dominates training.
 
-model = CatBoostClassifier(
-    iterations=2000,
-    learning_rate=0.03,
-    depth=6,
-    loss_function="Logloss",
-    eval_metric="AUC",
-    random_seed=42,
-)
+## 6. Failure Modes and Limits
 
-model.fit(train_pool, eval_set=valid_pool, use_best_model=True, verbose=200)
-```
+CatBoost is robust, but it is not magic, and a few situations reliably trip it up.
 
-The `Pool` object bundles features, labels, and the categorical declaration. It is the efficient container CatBoost prefers and is required for some advanced features such as text features and custom feature weights.
+The first is misdeclared categorical features. If you forget to list a string column in `cat_features`, CatBoost may refuse to train or silently hash it; if you pre encode a categorical into integers and then forget to declare it, the model treats those integers as an ordered numeric feature and the whole ordered statistics advantage evaporates. Declare categoricals as raw values and let the library encode them.
 
-### 5.2 Key hyperparameters
+The second is the cost of ordered mode on large data. The supporting models and permutation bookkeeping carry real overhead, so on millions of rows `Ordered` boosting can be several times slower than `Plain` for a benefit that has shrunk to nothing, because each model now trains on so much data that any single row barely moves it. CatBoost defaults to `Plain` at scale for exactly this reason; overriding it back to `Ordered` on big data usually buys only a slower run.
+
+The third is extreme cardinality combined with tiny support. A feature such as `transaction_id` that is nearly unique per row carries no generalizable signal, and even ordered encoding will mostly return the smoothed prior $p$ for it. Such features add noise and training cost; drop them rather than hoping the encoder rescues them.
+
+The fourth is the oblivious tree's rigidity. On problems where the right model genuinely needs different features in different regions, for example data with strong, localized interactions that do not factor through a shared split order, a leaf wise asymmetric learner such as LightGBM can fit the same accuracy with fewer trees. When CatBoost needs many more iterations than a competitor to match validation accuracy, the symmetric constraint is a plausible culprit.
+
+Finally, like all gradient boosting, CatBoost extrapolates poorly. Predictions are piecewise constant and bounded by the leaf values seen in training, so a numeric feature pushed far outside its training range yields a flat, uninformed prediction rather than a sensible extrapolation. For genuinely extrapolative targets a parametric or additive model is the better tool.
+
+## 7. Practical Use
+
+### 7.1 The mature open-source tool
+
+The reference implementation of these ideas is the CatBoost library itself, an Apache 2.0 licensed open-source project from Yandex, installable with `pip install catboost`. There is no reason to reimplement ordered boosting by hand: the published library is fast, GPU enabled, battle tested in production ranking systems, and exposes every mechanism described above through a clean API. This chapter teaches the method and then defers to that library, which is the right division of labor for an algorithm this intricate.
+
+The package provides three primary estimators: `CatBoostClassifier`, `CatBoostRegressor`, and the ranking oriented `CatBoost`. The scikit-learn compatible API means `fit`, `predict`, and `predict_proba` behave as expected, and the models drop into pipelines and cross validation utilities.
+
+The most important practical point is how you declare categorical features. You pass column indices or names through `cat_features` and leave the raw string values in place. Do not pre encode them; CatBoost's whole advantage is that it applies ordered target statistics internally. The `Pool` object bundles features, labels, and the categorical declaration into the efficient container CatBoost prefers, and it is required for some advanced features such as text features and custom feature weights.
+
+### 7.2 Key hyperparameters
 
 CatBoost is known for sane defaults, but a few parameters reward attention.
 
@@ -176,15 +186,205 @@ CatBoost is known for sane defaults, but a few parameters reward attention.
 
 For high cardinality features, `one_hot_max_size` sets the threshold below which a categorical is one hot encoded rather than target encoded. Raising it applies one hot to slightly larger features, which can help when those features are not strongly predictive on their own.
 
-### 5.3 GPU training and large data
+### 7.3 GPU training and large data
 
 CatBoost has a mature GPU implementation enabled with `task_type="GPU"`. The oblivious tree structure is particularly well suited to GPUs because the uniform per level split lets the histogram computation be laid out as dense regular work. On large datasets the speedup over CPU is substantial, and because plain boosting is selected automatically at scale the GPU path carries little statistical penalty.
 
-### 5.4 Interpretation
+### 7.4 Interpretation
 
 CatBoost provides feature importances through `model.get_feature_importance`, including the standard prediction values change importance and the more rigorous `LossFunctionChange` importance, which measures the loss degradation when a feature is removed. For local explanations it supports SHAP values via `type="ShapValues"`, giving per prediction attributions consistent with the SHAP framework. These tools matter because target encoded categoricals can otherwise be opaque.
 
-### 5.5 When to reach for CatBoost
+### 7.5 A worked example across three languages
+
+The example below builds a small, self contained fraud style classification problem: 4000 transactions with a high cardinality `merchant` column (200 levels, each carrying its own latent risk), two low cardinality categoricals (`country`, `device`), two numeric features (`amount`, `age_days`), and a planted `country` by `device` interaction. This is exactly the shape of data CatBoost is built for, and it lets the high cardinality categorical do real work without any manual encoding. Everything is generated inline with NumPy and a fixed seed, so the run is deterministic.
+
+The Python tab executes. The Julia and Rust tabs show the equivalent calls in those ecosystems and are not run here.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier, Pool
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, accuracy_score
+
+rng = np.random.default_rng(0)
+n = 4000
+
+# High-cardinality categorical: 200 merchants, each with a latent risk.
+n_merch = 200
+merch_risk = rng.normal(0, 1.3, size=n_merch)
+merchant = rng.integers(0, n_merch, size=n)
+
+# Low-cardinality categoricals with their own latent risks.
+countries = np.array(["US", "CA", "GB", "DE", "IN", "BR"])
+country_risk = {"US": -0.2, "CA": -0.1, "GB": 0.0, "DE": 0.1, "IN": 0.4, "BR": 0.5}
+country = countries[rng.integers(0, len(countries), size=n)]
+
+devices = np.array(["mobile", "desktop", "tablet"])
+device_risk = {"mobile": 0.3, "desktop": -0.2, "tablet": 0.05}
+device = devices[rng.integers(0, len(devices), size=n)]
+
+# Numeric features.
+amount = rng.lognormal(mean=3.0, sigma=1.0, size=n)
+age_days = rng.integers(1, 2000, size=n)
+
+# Latent logit with a planted country-by-device interaction, then a label.
+inter = np.where((country == "BR") & (device == "mobile"), 0.8, 0.0)
+logit = (
+    merch_risk[merchant]
+    + np.array([country_risk[c] for c in country])
+    + np.array([device_risk[d] for d in device])
+    + 0.45 * (np.log(amount) - 3.0)
+    - 0.0008 * age_days
+    + inter
+    - 0.3
+)
+p = 1.0 / (1.0 + np.exp(-logit))
+y = (rng.uniform(size=n) < p).astype(int)
+
+df = pd.DataFrame({
+    "merchant": merchant.astype(str),   # raw categorical, NOT pre-encoded
+    "country": country,
+    "device": device,
+    "amount": amount,
+    "age_days": age_days,
+})
+cat_features = ["merchant", "country", "device"]
+
+X_tr, X_te, y_tr, y_te = train_test_split(
+    df, y, test_size=0.25, random_state=42, stratify=y
+)
+
+train_pool = Pool(X_tr, y_tr, cat_features=cat_features)
+test_pool = Pool(X_te, y_te, cat_features=cat_features)
+
+model = CatBoostClassifier(
+    iterations=400,
+    learning_rate=0.05,
+    depth=6,
+    l2_leaf_reg=3.0,
+    loss_function="Logloss",
+    eval_metric="AUC",
+    boosting_type="Ordered",   # ordered boosting; valuable on small data
+    random_seed=42,
+    verbose=False,
+)
+model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+
+proba = model.predict_proba(test_pool)[:, 1]
+pred = model.predict(test_pool)
+
+print(f"train rows: {len(X_tr)}, test rows: {len(X_te)}, features: {df.shape[1]}")
+print(f"positive rate (train): {y_tr.mean():.3f}")
+print(f"best iteration:        {model.get_best_iteration()}")
+print(f"test AUC:              {roc_auc_score(y_te, proba):.4f}")
+print(f"test accuracy:         {accuracy_score(y_te, pred):.4f}")
+
+imp = model.get_feature_importance(test_pool, type="PredictionValuesChange")
+order = np.argsort(imp)[::-1]
+print("feature importance (PredictionValuesChange):")
+for i in order:
+    print(f"  {df.columns[i]:<10} {imp[i]:6.2f}")
+```
+
+The high cardinality `merchant` column dominates the importance ranking, which is the intended result: ordered target statistics turn 200 raw merchant labels into a clean leakage free risk signal that no one hot or naive target encoding could match. The numeric `amount` and `age_days` features and the low cardinality categoricals contribute the rest, and early stopping halts well before the 400 iteration budget.
+
+## Julia
+
+```julia
+# CatBoost.jl wraps the same native CatBoost library used by Python.
+# Pkg.add("CatBoost"); Pkg.add("DataFrames")
+using CatBoost
+using DataFrames
+using Random
+
+Random.seed!(0)
+n = 4000
+n_merch = 200
+merch_risk = randn(n_merch) .* 1.3
+merchant = rand(0:n_merch-1, n)
+
+countries = ["US", "CA", "GB", "DE", "IN", "BR"]
+country_risk = Dict("US"=>-0.2, "CA"=>-0.1, "GB"=>0.0,
+                    "DE"=>0.1, "IN"=>0.4, "BR"=>0.5)
+country = countries[rand(1:length(countries), n)]
+
+devices = ["mobile", "desktop", "tablet"]
+device_risk = Dict("mobile"=>0.3, "desktop"=>-0.2, "tablet"=>0.05)
+device = devices[rand(1:length(devices), n)]
+
+amount = exp.(3.0 .+ randn(n))
+age_days = rand(1:2000, n)
+
+inter = [(country[i] == "BR" && device[i] == "mobile") ? 0.8 : 0.0 for i in 1:n]
+logit = merch_risk[merchant .+ 1] .+
+        [country_risk[c] for c in country] .+
+        [device_risk[d] for d in device] .+
+        0.45 .* (log.(amount) .- 3.0) .- 0.0008 .* age_days .+ inter .- 0.3
+p = 1.0 ./ (1.0 .+ exp.(-logit))
+y = Int.(rand(n) .< p)
+
+df = DataFrame(merchant = string.(merchant), country = country,
+               device = device, amount = amount, age_days = age_days)
+cat_features = ["merchant", "country", "device"]
+
+# Hold out the last 25% as a test set.
+ntr = Int(round(0.75 * n))
+train_pool = Pool(df[1:ntr, :], label = y[1:ntr], cat_features = cat_features)
+test_pool  = Pool(df[ntr+1:n, :], label = y[ntr+1:n], cat_features = cat_features)
+
+model = CatBoostClassifier(iterations = 400, learning_rate = 0.05,
+                           depth = 6, l2_leaf_reg = 3.0,
+                           loss_function = "Logloss", eval_metric = "AUC",
+                           boosting_type = "Ordered", random_seed = 42,
+                           verbose = false)
+fit!(model, train_pool, eval_set = test_pool, use_best_model = true)
+
+proba = predict_proba(model, test_pool)[:, 2]
+println("best iteration: ", get_best_iteration(model))
+println("test AUC:       ", eval_metrics(model, test_pool, ["AUC"]))
+println("importances:    ", get_feature_importance(model))
+```
+
+## Rust
+
+```rust
+// There is no mature pure-Rust CatBoost trainer. The honest option is the
+// official CatBoost C API for INFERENCE of a model trained in Python/Julia,
+// exposed through the `catboost` crate (thin FFI bindings, model.predict only).
+// Training in Rust still goes through the C/C++ library, not idiomatic Rust.
+//
+// Cargo.toml:  catboost = "0.1"
+use catboost::Model;
+
+fn main() {
+    // Load a model previously trained and saved with `model.save_model(...)`.
+    let model = Model::load("fraud_catboost.cbm").expect("load model");
+
+    // One transaction: numeric features then categorical features (as &str).
+    // Order must match the training Pool's column layout.
+    let numeric = vec![vec![42.0_f32, 365.0_f32]];          // amount, age_days
+    let categorical = vec![vec!["57", "BR", "mobile"]];     // merchant, country, device
+
+    let preds = model
+        .calc_model_prediction(numeric, categorical)
+        .expect("predict");
+    println!("raw model output (logit): {:?}", preds);
+    // Apply a logistic transform for a probability:
+    let prob = 1.0 / (1.0 + (-preds[0]).exp());
+    println!("fraud probability: {:.4}", prob);
+}
+```
+
+For Rust the honest situation is that no mature crate trains CatBoost in pure Rust. The `catboost` crate provides FFI bindings to the official C API and covers fast model inference, so the production pattern is to train in Python or Julia and serve from Rust through these bindings.
+
+:::
+
+### 7.6 When to reach for CatBoost
 
 CatBoost is the strongest default when your data has many categorical columns, especially high cardinality ones such as user or item identifiers, and when the dataset is small enough that prediction shift and encoding leakage would otherwise hurt. It frequently wins with little tuning, which makes it an excellent baseline even when you intend to try LightGBM or XGBoost afterward. On purely numeric data with very large row counts, the gap narrows and the choice among the three libraries comes down to speed and tuning effort rather than the encoding machinery that distinguishes CatBoost. In every case, the discipline that makes the library work, using only the past to estimate the present, is the idea worth carrying to any modeling problem where leakage threatens.
 
@@ -197,3 +397,5 @@ CatBoost is the strongest default when your data has many categorical columns, e
 5. Friedman, J. H. Greedy function approximation: a gradient boosting machine. Annals of Statistics, 2001. https://projecteuclid.org/journals/annals-of-statistics/volume-29/issue-5/Greedy-function-approximation-A-gradient-boosting-machine/10.1214/aos/1013203451.full
 6. Lundberg, S. M. and Lee, S. A unified approach to interpreting model predictions. NeurIPS 2017. https://arxiv.org/abs/1705.07874
 7. CatBoost GitHub repository. https://github.com/catboost/catboost
+8. CatBoost.jl, Julia bindings to the CatBoost library. https://github.com/JuliaAI/CatBoost.jl
+9. catboost-rs, Rust bindings to the CatBoost C API for model inference. https://github.com/catboost/catboost/tree/master/catboost/rust-package

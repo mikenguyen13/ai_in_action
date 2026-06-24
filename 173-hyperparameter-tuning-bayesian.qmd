@@ -169,11 +169,197 @@ When the problem is low dimensional, continuous, and the evaluation budget is ve
 
 A practical rule of thumb is to use a GP surrogate when the search space is continuous, the dimension is below roughly twenty, and evaluations are extremely expensive so that sample efficiency dominates. Use TPE when the space is high dimensional, mixed type, or conditional, which describes most deep learning tuning, and when a few hundred evaluations are affordable. In both cases, combine the surrogate with early stopping or pruning of weak trials, warm start the search with a handful of random or low discrepancy Sobol points to seed the surrogate, and budget enough initial random evaluations that the surrogate is not misled by a tiny biased sample. Always log every trial, because the accumulated evaluation history is itself a valuable asset for analysis and for warm starting future searches.
 
-## 7. Practical Considerations and Pitfalls
+## 7. A Worked Bayesian Optimization Loop
+
+The right way to use Bayesian optimization in production is to reach for a mature library, not to reimplement the loop. The reference code below is therefore deliberately split. The Python tab builds the loop explicitly on top of scikit-learn's `GaussianProcessRegressor` so that every step from Sections 2 through 5, fitting the GP surrogate, evaluating expected improvement, and selecting the next point, is visible and runnable in a few dozen lines. This is the version to read when you want to understand the machinery. For real work you would instead drive [Optuna](https://optuna.org), [scikit-optimize](https://scikit-optimize.github.io), or [BoTorch](https://botorch.org), which add pruning, parallelism, robust kernel handling, and persistence; the call into Optuna shown in Section 6.1 is all the user code those libraries require.
+
+The task is a small, self-contained tuning problem with everything generated inline. We synthesize a moderately hard binary classification dataset with scikit-learn's `make_classification`, then tune two hyperparameters of a gradient-boosted tree: the learning rate on a log scale and the maximum tree depth. The objective is the negative five-fold cross-validated accuracy, which is exactly the expensive, noisy, gradient-free black box the chapter has been describing. We optimize over the unit square and map each coordinate to its raw range inside the objective, which is the standard trick for keeping a stationary kernel well conditioned across heterogeneous axes. To make the value of the surrogate concrete, the loop reports the best configuration found and compares it against pure random search given the identical evaluation budget.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import warnings
+import numpy as np
+from scipy.stats import norm
+from scipy.stats.qmc import LatinHypercube
+from sklearn.datasets import make_classification
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import cross_val_score
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+# A self-contained, moderately hard binary classification task.
+X, y = make_classification(
+    n_samples=600, n_features=20, n_informative=8, n_redundant=4,
+    class_sep=0.8, random_state=42,
+)
+
+# Tune a gradient-boosted tree over two hyperparameters. We search the unit
+# square and map it to the raw ranges inside the objective:
+#   u0 -> log10(learning_rate) in [-3, 0]   (lr in [1e-3, 1])
+#   u1 -> max_depth            in [1, 6]
+SPACE_LO = np.array([-3.0, 1.0])
+SPACE_HI = np.array([0.0, 6.0])
+
+def to_raw(u):
+    return SPACE_LO + u * (SPACE_HI - SPACE_LO)
+
+def objective(u):
+    """Expensive, noisy, gradient-free black box: negative CV accuracy."""
+    log_lr, depth = to_raw(u)
+    clf = GradientBoostingClassifier(
+        learning_rate=10.0 ** log_lr,
+        max_depth=int(round(depth)),
+        n_estimators=60,
+        random_state=0,
+    )
+    return -cross_val_score(clf, X, y, cv=5, scoring="accuracy").mean()
+
+def expected_improvement(mu, sigma, f_best, xi=0.01):
+    """EI for minimization; see Section 5.2."""
+    sigma = np.maximum(sigma, 1e-9)
+    z = (f_best - mu - xi) / sigma
+    return sigma * (z * norm.cdf(z) + norm.pdf(z))
+
+n_init, n_iter = 5, 12
+U = LatinHypercube(d=2, seed=1).random(n_init)   # space-filling warm start
+Y = np.array([objective(u) for u in U])
+
+# Matern 5/2 surrogate with a learned noise term (the WhiteKernel) so the
+# GP does not treat the noisy CV scores as exact.
+kernel = (ConstantKernel(1.0, (1e-2, 1e2))
+          * Matern(length_scale=[0.5, 0.5], nu=2.5)
+          + WhiteKernel(1e-2, (1e-4, 1e-1)))
+cand = LatinHypercube(d=2, seed=7).random(2048)   # cheap candidate pool
+
+for _ in range(n_iter):
+    gp = GaussianProcessRegressor(
+        kernel=kernel, normalize_y=True, n_restarts_optimizer=2,
+        random_state=0,
+    ).fit(U, Y)
+    mu, sd = gp.predict(cand, return_std=True)
+    u_next = cand[np.argmax(expected_improvement(mu, sd, Y.min()))]
+    U = np.vstack([U, u_next])
+    Y = np.append(Y, objective(u_next))
+
+best = int(np.argmin(Y))
+log_lr, depth = to_raw(U[best])
+print(f"Observations U,Y shapes: {U.shape}, {Y.shape}")
+print(f"Evaluations: {len(Y)}  (init {n_init} + BO {n_iter})")
+print(f"Best CV accuracy: {-Y[best]:.4f}")
+print(f"  learning_rate = {10.0 ** log_lr:.4f}")
+print(f"  max_depth     = {int(round(depth))}")
+
+# The fitted kernel exposes the learned length scales (Section 3.1) and the
+# noise variance the WhiteKernel attributed to CV jitter.
+ls = gp.kernel_.k1.k2.length_scale
+noise = gp.kernel_.k2.noise_level
+print(f"Learned length scales: log10(lr)={ls[0]:.3f}, depth={ls[1]:.3f}")
+print(f"Learned CV-noise variance: {noise:.5f}")
+
+# Same total budget spent on pure random search, for reference.
+Ur = LatinHypercube(d=2, seed=99).random(len(Y))
+rand_best = -np.array([objective(u) for u in Ur]).min()
+print(f"Random search best (same budget): {rand_best:.4f}")
+trace = -np.minimum.accumulate(Y)
+print("Best-so-far accuracy: " + " ".join(f"{v:.3f}" for v in trace))
+```
+
+The GP-guided search reaches its best configuration within the first couple of informed iterations and edges out random search at the same budget, which is the expected payoff in this low dimensional, expensive regime. The printed length scales make the surrogate's reasoning legible: a short length scale on an axis means the GP believes the objective changes quickly there and so it samples that axis more carefully. The `WhiteKernel` term is doing real work too: the learned noise variance is the slice of score variation the surrogate attributes to cross-validation jitter rather than to the mean surface, and modeling it is what stops the GP from overfitting the noise, the single most common mistake when hand-rolling a GP loop. In anything beyond a teaching example, replace this entire cell with the few lines of Optuna or scikit-optimize from Section 6, which manage the surrogate, the acquisition optimization, and trial bookkeeping for you.
+
+## Julia
+
+```julia
+# ] add BayesianOptimization GaussianProcesses Distributions
+using BayesianOptimization, GaussianProcesses, Distributions
+
+# Same objective shape: map the unit square to (log10 lr, max_depth) and
+# return the cross-validated loss from your training routine.
+function objective(u)
+    log_lr = -3.0 + u[1] * 3.0          # log10(lr) in [-3, 0]
+    depth  = round(Int, 1.0 + u[2] * 5) # max_depth in [1, 6]
+    return train_and_cv_loss(10.0^log_lr, depth)   # your model, returns a loss
+end
+
+# Matern 5/2 GP surrogate with a learned mean and noise term.
+model = ElasticGPE(2;
+    mean = MeanConst(0.0),
+    kernel = Mat52Ard([0.0, 0.0], 0.0),
+    logNoise = -2.0)
+set_priors!(model.mean, [Normal(0, 1)])
+
+# Expected-improvement acquisition, optimized over [0,1]^2.
+opt = BOpt(objective, model,
+    ExpectedImprovement(),
+    MAPGPOptimizer(every = 5),
+    [0.0, 0.0], [1.0, 1.0];
+    maxiterations = 17, sense = Min,
+    initializer = ScaledSobolIterator([0.0, 0.0], [1.0, 1.0], 5))
+
+result = boptimize!(opt)
+println("Best loss:    ", result.observed_optimum)
+println("Best config:  ", result.observed_optimizer)
+```
+
+## Rust
+
+```rust
+// Cargo.toml: friedrich = "0.5"   (Gaussian-process regression)
+// `friedrich` provides the GP surrogate; the BO loop (EI + candidate
+// selection) is written by hand, mirroring the Python tab. There is no
+// widely adopted, full-featured Bayesian-optimization crate in Rust today,
+// so a thin GP crate plus an explicit loop is the closest mature option.
+use friedrich::gaussian_process::GaussianProcess;
+use friedrich::kernel::Matern2_5;
+use friedrich::prior::ConstantPrior;
+
+fn expected_improvement(mu: f64, sigma: f64, f_best: f64, xi: f64) -> f64 {
+    let sigma = sigma.max(1e-9);
+    let z = (f_best - mu - xi) / sigma;
+    let normal = statrs::distribution::Normal::new(0.0, 1.0).unwrap();
+    use statrs::distribution::{Continuous, ContinuousCDF};
+    sigma * (z * normal.cdf(z) + normal.pdf(z))
+}
+
+fn main() {
+    // inputs: Vec<Vec<f64>> in [0,1]^2, outputs: Vec<f64> = objective values
+    let (mut inputs, mut outputs) = sobol_warm_start(5); // your space-filling init
+    for _ in 0..12 {
+        let gp = GaussianProcess::builder(inputs.clone(), outputs.clone())
+            .set_kernel(Matern2_5::default())
+            .set_prior(ConstantPrior::default())
+            .fit_kernel()      // optimize length scales by marginal likelihood
+            .fit_prior()
+            .train();
+        // Score a candidate pool with EI and pick the argmax.
+        let cand = sobol_candidates(2048);
+        let next = cand.into_iter().max_by(|a, b| {
+            let (ma, va) = (gp.predict(a), gp.predict_variance(a));
+            let (mb, vb) = (gp.predict(b), gp.predict_variance(b));
+            let f_best = outputs.iter().cloned().fold(f64::INFINITY, f64::min);
+            expected_improvement(ma, va.sqrt(), f_best, 0.01)
+                .partial_cmp(&expected_improvement(mb, vb.sqrt(), f_best, 0.01))
+                .unwrap()
+        }).unwrap();
+        let y = objective(&next);   // your expensive evaluation
+        inputs.push(next);
+        outputs.push(y);
+    }
+}
+```
+
+:::
+
+## 8. Practical Considerations and Pitfalls
 
 Several issues recur in deployment. Noise must be modeled rather than ignored, since treating a noisy score as exact makes the surrogate overconfident and the search brittle. Parallel evaluation breaks the strict sequential loop, so practitioners use constant liar or fantasizing heuristics that impute pending evaluations to keep proposing diverse points. Search space design matters more than algorithm choice. Putting learning rate and regularization strengths on a log scale, and bounding ranges tightly around physically plausible values, often improves results more than switching surrogates. Multi fidelity methods such as Hyperband and BOHB exploit cheap proxies, for example training for fewer epochs or on subsets of data, to discard poor configurations early and reallocate budget toward promising ones, and they frequently outperform pure Bayesian optimization under a fixed wall clock budget [6]. Finally, the benefit of Bayesian optimization over random search shrinks as dimensionality grows and as the evaluation budget grows large, so the method is most valuable precisely in the regime it was designed for, namely expensive objectives evaluated tens to low hundreds of times.
 
-## 8. Summary
+## 9. Summary
 
 Bayesian hyperparameter tuning frames model configuration as the optimization of an expensive, noisy, gradient free black box. It fits a cheap probabilistic surrogate to past evaluations and uses an acquisition function to decide where to look next, balancing exploitation of good regions against exploration of uncertain ones. Gaussian process surrogates offer principled uncertainty and strong sample efficiency in low dimensional continuous spaces but scale poorly in observations and dimensions. Tree-structured Parzen estimators model the density ratio of good to bad configurations, handle conditional and mixed type spaces gracefully, and power the default samplers in Optuna and Hyperopt. Expected improvement remains the workhorse acquisition function, with upper confidence bound and information-theoretic criteria offering alternatives. In practice the right move is to match the surrogate to the search space, combine it with pruning and multi fidelity strategies, and design the search space with as much care as the optimizer.
 

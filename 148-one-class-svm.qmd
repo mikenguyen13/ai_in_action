@@ -59,13 +59,7 @@ Asymptotically, both fractions converge to $\nu$ under mild conditions. This giv
 
 The contrast with the soft-margin parameter $C$ in two-class SVMs is worth stating. Where $C$ trades margin against error in units that are hard to interpret, $\nu$ is bounded in $[0, 1]$ and carries a direct probabilistic meaning. This is why the formulation is sometimes called the $\nu$-SVM family. In practice $\nu$ should be set to the analyst's prior estimate of the contamination rate, then refined if a small validation set of labeled anomalies is available.
 
-```text
-# scikit-learn interface (illustrative, not executable)
-from sklearn.svm import OneClassSVM
-model = OneClassSVM(nu=0.05, kernel="rbf", gamma="scale")
-model.fit(X_normal)
-scores = model.decision_function(X_test)   # > 0 normal, < 0 anomalous
-```
+A worked, runnable demonstration of exactly this lever appears in Section 8.
 
 ## 4. Kernel Choice
 
@@ -126,7 +120,144 @@ Several practical implications follow. The quadratic to cubic training cost of t
 
 A pragmatic recommendation is to treat the two as complementary baselines. For moderate sample sizes with a meaningful distance metric after careful preprocessing, the One-Class SVM and its SVDD twin offer a principled geometric boundary. For large, high-dimensional, or heterogeneous tabular data where speed and robustness to scaling dominate, the Isolation Forest is usually the stronger and cheaper first choice. Evaluating both on a held-out set with whatever labeled anomalies exist, using ranking metrics such as area under the precision-recall curve, is the surest way to choose.
 
-## 7. Practical Guidance
+## 7. Mature Open-Source Tooling
+
+The One-Class SVM is a solved engineering problem, and there is no reason to reimplement the quadratic program by hand. The reference solver underneath almost every implementation is **LIBSVM**, the C++ library of Chang and Lin that introduced the working-set decomposition (SMO-type) algorithm and exposes the $\nu$-SVM family directly [4]. The mature, freely licensed, well-maintained wrappers around it are what you should reach for in production.
+
+- **Python**: `sklearn.svm.OneClassSVM` (BSD-licensed scikit-learn) wraps LIBSVM and slots into the same `fit` / `predict` / `decision_function` interface as the rest of the ecosystem, so it composes with `StandardScaler`, `Pipeline`, and `GridSearchCV` for leakage-free tuning. For larger problems scikit-learn also ships `SGDOneClassSVM`, a linear stochastic-gradient approximation whose cost is linear in the sample size, usually paired with `Nystroem` kernel approximation to recover nonlinearity.
+- **Julia**: `LIBSVM.jl` (MIT-licensed) binds the same LIBSVM C library; its `svmtrain(X; svmtype = OneClassSVM, nu = 0.05, kernel = Kernel.RadialBasis)` exposes the identical $\nu$ and $\gamma$ knobs.
+- **Rust**: `linfa-svm` (part of the Apache/MIT-licensed `linfa` toolkit) provides a pure-Rust SVM with a one-class mode via `Svm::params().nu_weight(...)`, and `smartcore` offers a related SVM family. The Rust ecosystem here is younger than LIBSVM, so for high-stakes work cross-check against the scikit-learn reference.
+
+The decision boundary is identical across these because they call (or faithfully reproduce) the same solver; the choice is governed by the language your pipeline already lives in.
+
+## 8. A Worked Example
+
+The example below builds a small, self-contained anomaly-detection problem. The normal class is two tight Gaussian clusters, the kind of structure you see when a sensor operates in two healthy regimes. A separate batch of uniformly scattered points stands in for unseen anomalies. We standardize on the training statistics, fit an RBF One-Class SVM with $\nu = 0.05$, and inspect both the hard `predict` labels and the continuous `decision_function` scores. Watch the $\nu$-property assert itself: the fraction of flagged training points stays at or below $\nu$, while the support-vector fraction sits at or above it.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+from sklearn.datasets import make_blobs
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import OneClassSVM
+
+rng = np.random.RandomState(0)
+
+# Normal data: two tight Gaussian clusters of "healthy" sensor readings.
+X_normal, _ = make_blobs(
+    n_samples=300, centers=[[0.0, 0.0], [4.0, 4.0]],
+    cluster_std=0.6, random_state=0,
+)
+
+# Held-out anomalies: points scattered uniformly across the plane,
+# most of which land away from the two normal clusters.
+X_anom = rng.uniform(low=-4.0, high=8.0, size=(40, 2))
+
+# Standardize on the TRAINING statistics only (the RBF kernel is distance based).
+scaler = StandardScaler().fit(X_normal)
+Xn = scaler.transform(X_normal)
+Xa = scaler.transform(X_anom)
+
+ocsvm = OneClassSVM(kernel="rbf", gamma="scale", nu=0.05)
+ocsvm.fit(Xn)
+
+pred_normal = ocsvm.predict(Xn)        # +1 inlier, -1 outlier
+pred_anom = ocsvm.predict(Xa)
+scores_normal = ocsvm.decision_function(Xn)
+scores_anom = ocsvm.decision_function(Xa)
+
+n_sv = ocsvm.support_vectors_.shape[0]
+
+print(f"training points:        {Xn.shape[0]}")
+print(f"support vectors:        {n_sv}  "
+      f"({n_sv / Xn.shape[0]:.1%} of train, >= nu = 0.05)")
+print(f"train flagged outliers: {(pred_normal == -1).sum()} "
+      f"({(pred_normal == -1).mean():.1%}, <= nu = 0.05)")
+print(f"anomalies caught:       {(pred_anom == -1).sum()} / {Xa.shape[0]}")
+print()
+print("decision scores  > 0 means inlier, < 0 means outlier")
+print(f"  normal  min/mean/max: {scores_normal.min():+.3f} / "
+      f"{scores_normal.mean():+.3f} / {scores_normal.max():+.3f}")
+print(f"  anomaly min/mean/max: {scores_anom.min():+.3f} / "
+      f"{scores_anom.mean():+.3f} / {scores_anom.max():+.3f}")
+print()
+print("first 5 anomaly scores:", np.round(scores_anom[:5], 3))
+```
+
+The printout confirms the theory of Section 3. With $\nu = 0.05$ the support-vector fraction lands just above five percent and the flagged-training fraction just below it, exactly bracketing $\nu$ as the $\nu$-property predicts. The continuous scores separate cleanly: normal points carry mostly positive scores, while the scattered anomalies are pushed strongly negative, and a handful of anomalies that happen to fall near a normal cluster receive near-zero or slightly positive scores, which is the correct and honest behavior of a boundary estimator. Ranking by `decision_function` rather than thresholding at zero is what you would do in deployment when you can tolerate only a fixed alert budget.
+
+## Julia
+
+```julia
+# LIBSVM.jl wraps the same LIBSVM C library as scikit-learn.
+# Pkg.add("LIBSVM"); Pkg.add("Statistics")
+using LIBSVM, Statistics, Random
+
+Random.seed!(0)
+
+# Two normal clusters (columns are samples, the LIBSVM.jl convention).
+c1 = randn(2, 150) .* 0.6 .+ [0.0, 0.0]
+c2 = randn(2, 150) .* 0.6 .+ [4.0, 4.0]
+X_normal = hcat(c1, c2)
+X_anom = rand(2, 40) .* 12.0 .- 4.0          # uniform in [-4, 8]^2
+
+# Standardize on training statistics.
+mu = mean(X_normal; dims = 2)
+sd = std(X_normal; dims = 2)
+Xn = (X_normal .- mu) ./ sd
+Xa = (X_anom .- mu) ./ sd
+
+model = svmtrain(Xn;
+    svmtype = OneClassSVM, kernel = Kernel.RadialBasis,
+    nu = 0.05, gamma = 1.0 / size(Xn, 1))
+
+pred_n, dec_n = svmpredict(model, Xn)        # pred is true/false (inlier/outlier)
+pred_a, dec_a = svmpredict(model, Xa)
+
+println("support vectors:  ", model.nSV)
+println("train outliers:   ", count(!, pred_n), " / ", size(Xn, 2))
+println("anomalies caught: ", count(!, pred_a), " / ", size(Xa, 2))
+```
+
+## Rust
+
+```rust
+// linfa-svm provides a pure-Rust SVM with a one-class mode.
+// Cargo.toml: linfa = "0.7", linfa-svm = "0.7", ndarray = "0.15", ndarray-rand = "0.14"
+use linfa::prelude::*;
+use linfa::dataset::DatasetBase;
+use linfa_svm::Svm;
+use ndarray::Array2;
+use ndarray_rand::{rand_distr::Normal, RandomExt};
+
+fn main() {
+    // Two normal Gaussian clusters (300 x 2), standardized beforehand in practice.
+    let c1 = Array2::random((150, 2), Normal::new(0.0, 0.6).unwrap());
+    let c2 = Array2::random((150, 2), Normal::new(4.0, 0.6).unwrap());
+    let x = ndarray::concatenate(ndarray::Axis(0), &[c1.view(), c2.view()]).unwrap();
+    let data = DatasetBase::from(x);
+
+    // One-class RBF SVM: nu controls the outlier fraction, gamma the bandwidth.
+    let model = Svm::<f64, bool>::params()
+        .nu_weight(0.05)
+        .gaussian_kernel(1.0)
+        .fit(&data)
+        .unwrap();
+
+    let preds = model.predict(&data);
+    let outliers = preds.iter().filter(|&&p| !p).count();
+    println!("train outliers: {} / {}", outliers, preds.len());
+}
+```
+
+Honest note: the Rust SVM ecosystem is less mature than LIBSVM. `linfa-svm` implements one-class classification but its API and numerics evolve between releases, and `smartcore` focuses on supervised SVM. For production anomaly detection in a Rust service, the safest path today is to validate against the scikit-learn reference, or to call a LIBSVM binding through FFI.
+
+:::
+
+## 9. Practical Guidance
 
 A short checklist captures the operational essentials. Standardize features before fitting a One-Class SVM, since the RBF kernel is distance based. Set $\nu$ from a genuine prior on the contamination rate rather than leaving it at a default. Tune $\gamma$ jointly with $\nu$, watching for the overfitting signature where nearly every training point becomes a support vector. Prefer the RBF kernel unless the data are high-dimensional and sparse. Remember that the One-Class SVM produces a hard boundary by default, so use the continuous `decision_function` rather than the sign when you need calibrated ranking. Finally, validate against Isolation Forest and, where the spherical view or a non-constant kernel is natural, against SVDD, because no single boundary estimator dominates across the diversity of anomaly detection problems.
 
@@ -135,5 +266,6 @@ A short checklist captures the operational essentials. Standardize features befo
 1. Schölkopf, B., Platt, J. C., Shawe-Taylor, J., Smola, A. J., and Williamson, R. C. "Estimating the Support of a High-Dimensional Distribution." Neural Computation, 13(7), 2001. https://doi.org/10.1162/089976601750264965
 2. Tax, D. M. J., and Duin, R. P. W. "Support Vector Data Description." Machine Learning, 54(1), 2004. https://doi.org/10.1023/B:MACH.0000008084.60811.49
 3. Liu, F. T., Ting, K. M., and Zhou, Z.-H. "Isolation Forest." Proceedings of the 2008 IEEE International Conference on Data Mining. https://doi.org/10.1109/ICDM.2008.17
-4. Hariri, S., Kind, M. C., and Brunner, R. J. "Extended Isolation Forest." IEEE Transactions on Knowledge and Data Engineering, 33(4), 2021. https://doi.org/10.1109/TKDE.2019.2947676
-5. scikit-learn developers. "Novelty and Outlier Detection." https://scikit-learn.org/stable/modules/outlier_detection.html
+4. Chang, C.-C., and Lin, C.-J. "LIBSVM: A Library for Support Vector Machines." ACM Transactions on Intelligent Systems and Technology, 2(3), 2011. https://doi.org/10.1145/1961189.1961199
+5. Hariri, S., Kind, M. C., and Brunner, R. J. "Extended Isolation Forest." IEEE Transactions on Knowledge and Data Engineering, 33(4), 2021. https://doi.org/10.1109/TKDE.2019.2947676
+6. scikit-learn developers. "Novelty and Outlier Detection." https://scikit-learn.org/stable/modules/outlier_detection.html

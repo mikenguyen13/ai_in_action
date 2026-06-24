@@ -48,7 +48,13 @@ $$
 
 This objective is asymmetric in a revealing way. When $p_{ij}$ is large but $q_{ij}$ is small, meaning true neighbors are placed far apart, the penalty is severe. When $p_{ij}$ is small but $q_{ij}$ is large, meaning unrelated points are placed close, the penalty is mild. t-SNE therefore works hard to keep neighbors together and cares little about the placement of non neighbors. This is why local structure is faithful and global structure is not.
 
-Optimization proceeds by gradient descent, typically with momentum and a trick called early exaggeration that multiplies the $p_{ij}$ during the opening iterations to encourage tight, well separated clusters. Naive t-SNE costs $O(N^2)$ per iteration. The Barnes Hut approximation reduces this to $O(N \log N)$ by treating distant groups of points as single summarized masses, and the FFT based variant in openTSNE scales further.
+Optimization proceeds by gradient descent, typically with momentum and a trick called early exaggeration that multiplies the $p_{ij}$ during the opening iterations to encourage tight, well separated clusters. The gradient itself has a clean physical reading,
+
+$$
+\frac{\partial \mathrm{KL}}{\partial y_i} = 4 \sum_{j \neq i} (p_{ij} - q_{ij})\,\bigl(1 + \lVert y_i - y_j \rVert^2\bigr)^{-1} (y_i - y_j),
+$$
+
+a sum of springs: pairs whose modeled closeness $q_{ij}$ falls short of their true affinity $p_{ij}$ attract, and pairs that are too close repel. Naive t-SNE costs $O(N^2)$ per iteration. The Barnes Hut approximation reduces this to $O(N \log N)$ by treating distant groups of points as single summarized masses, and the FFT based variant in openTSNE scales further.
 
 ```text
 1. compute pairwise affinities p_ij from input (set per-point sigma via perplexity)
@@ -90,6 +96,12 @@ The crucial difference from t-SNE is the second term. It carries a repulsive for
 4. initialize layout (spectral embedding of the graph)
 5. SGD: attract along edges, repel via negative sampling
 ```
+
+### 3.3 Complexity and the Practical Choice Between Them
+
+The two methods share a skeleton: build a local neighborhood structure, then optimize a low dimensional layout that preserves it. They differ in how each step scales. Modern t-SNE builds its affinities from approximate nearest neighbors in roughly $O(N \log N)$ and runs Barnes Hut or FFT accelerated gradient steps at the same per iteration cost. UMAP builds an approximate $k$-NN graph by nearest neighbor descent, also near $O(N \log N)$, and its negative sampling SGD touches only $O(N k)$ edges per epoch rather than every pair. In wall clock terms UMAP is usually the faster of the two on large datasets and converges in fewer passes, which is the main reason it became the default for million cell genomics atlases.
+
+The differences that matter in day to day use follow directly from the objectives. UMAP's cross entropy carries an explicit repulsion term, so it tends to preserve a little more of the coarse arrangement of clusters and to admit a `transform` method that places new points into a fixed embedding. Standard t-SNE has no such out of sample map and treats inter cluster distance as essentially free. As a first cut: reach for UMAP when the dataset is large, when new points must be embedded later, or when you want embeddings into a moderate dimension as a preprocessing step; reach for t-SNE when the dataset is modest and resolving fine local cluster structure is the priority. Neither is a metric preserving projection, a point Section 5 makes precise.
 
 ## 4. Hyperparameters That Matter
 
@@ -143,7 +155,139 @@ There are qualified exceptions. UMAP, unlike classic t-SNE, can embed into a mod
 
 Use t-SNE or UMAP when the goal is to look at the data, to sanity check that learned representations separate known classes, or to generate hypotheses about structure that you will then confirm by other means. Reach for PCA when you need a fast, deterministic, linear summary or a faithful sense of global variance, and for autoencoders or supervised embeddings when you need stable features for a model. Prefer UMAP over t-SNE when you have large datasets, need to embed new points, or want a slightly more trustworthy global arrangement; prefer t-SNE when fine grained local cluster structure is the priority and the dataset is modest. In all cases, run multiple hyperparameter settings, fix and report seeds, and never read cluster size, inter cluster distance, or apparent topology as quantitative fact without independent confirmation.
 
-## 7. Summary
+## 7. Hands On with Mature Libraries
+
+This chapter is library driven by design. Both algorithms are subtle to implement well, and the open source community has already produced battle tested, well optimized, freely licensed implementations. Reaching for them is the right call: scikit-learn's `sklearn.manifold.TSNE` ships the Barnes Hut t-SNE with sensible `init="pca"` and `learning_rate="auto"` defaults, `umap-learn` provides the reference UMAP with its `transform` method for out of sample points, and `openTSNE` offers an FFT accelerated t-SNE with an approximate transform when you outgrow scikit-learn. All three are BSD licensed and pip installable. Writing your own from scratch is a fine learning exercise but a poor production decision.
+
+The example below builds a small, self contained dataset, five Gaussian blobs of 600 points living in 50 dimensional space, where the ground truth cluster identity is known. Because the labels are known we can quantify what the picture would otherwise only suggest. We report two diagnostics. The silhouette score, computed in the two dimensional embedding against the true labels, measures how cleanly the known groups separate, near one for crisp separation. A local neighborhood overlap, the average fraction of each point's ten nearest neighbors in the original 50-D space that remain among its ten nearest neighbors after embedding, measures local faithfulness. The modest overlap value is itself a lesson: even when clusters separate beautifully, the fine grained ordering of neighbors is heavily reshuffled by the squeeze to two dimensions, exactly the distortion Section 5 warns against. Everything is seeded for reproducibility.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+from sklearn.datasets import make_blobs
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+from sklearn.neighbors import NearestNeighbors
+import umap
+
+# Five well-separated Gaussian blobs in 50-D. The intrinsic structure is the
+# cluster identity; the ambient dimension is too high to plot directly.
+X, y = make_blobs(
+    n_samples=600, n_features=50, centers=5,
+    cluster_std=2.5, random_state=0,
+)
+print(f"data: {X.shape[0]} points in {X.shape[1]}-D, {len(np.unique(y))} clusters")
+
+def local_overlap(X_high, X_low, k=10):
+    """Mean fraction of each point's k nearest neighbors preserved by embedding."""
+    idx_hi = NearestNeighbors(n_neighbors=k + 1).fit(X_high) \
+        .kneighbors(return_distance=False)[:, 1:]
+    idx_lo = NearestNeighbors(n_neighbors=k + 1).fit(X_low) \
+        .kneighbors(return_distance=False)[:, 1:]
+    return float(np.mean([len(set(a) & set(b)) / k
+                          for a, b in zip(idx_hi, idx_lo)]))
+
+# t-SNE: PCA init and auto learning rate are the recommended modern defaults.
+tsne = TSNE(n_components=2, perplexity=30, init="pca",
+            learning_rate="auto", max_iter=1000, random_state=42)
+Z_tsne = tsne.fit_transform(X)
+
+# UMAP: a fixed random_state makes the run deterministic (single-threaded).
+reducer = umap.UMAP(n_components=2, n_neighbors=15,
+                    min_dist=0.1, random_state=42)
+Z_umap = reducer.fit_transform(X)
+
+print(f"t-SNE embedding {Z_tsne.shape}, final KL divergence = {tsne.kl_divergence_:.4f}")
+print(f"UMAP  embedding {Z_umap.shape}")
+print(f"silhouette    t-SNE={silhouette_score(Z_tsne, y):.3f}  "
+      f"UMAP={silhouette_score(Z_umap, y):.3f}")
+print(f"10-NN overlap t-SNE={local_overlap(X, Z_tsne):.3f}  "
+      f"UMAP={local_overlap(X, Z_umap):.3f}")
+
+# Out-of-sample: UMAP can place new points; standard t-SNE cannot.
+X_new, _ = make_blobs(n_samples=5, n_features=50, centers=5,
+                      cluster_std=2.5, random_state=1)
+Z_new = reducer.transform(X_new)
+print(f"UMAP placed {Z_new.shape[0]} new points via transform "
+      f"(t-SNE has no out-of-sample map)")
+```
+
+Both methods drive the silhouette near one, confirming that the five blobs separate cleanly in the picture. Yet the ten nearest neighbor overlap is far from one: the squeeze into two dimensions scrambles most of the fine grained local ordering even as it keeps the clusters apart. That gap between a crisp looking plot and a low neighborhood fidelity is the quantitative form of the warnings in Section 5, and it is why the embedding is a hypothesis generating picture rather than a faithful metric. The final line exercises UMAP's `transform`, the out of sample capability that standard t-SNE simply does not have.
+
+## Julia
+
+```julia
+# ] add TSne UMAP Distances Clustering
+using TSne, UMAP, Random
+
+Random.seed!(0)
+# Five blobs in 50-D: stack Gaussian clusters around random centers.
+centers = [randn(50) .* 6 for _ in 1:5]
+X = reduce(vcat, [hcat([c .+ 2.5 .* randn(50) for _ in 1:120]...)' for c in centers])
+y = repeat(1:5, inner = 120)
+
+# t-SNE: TSne.tsne(X, out_dims, reduce_dims, max_iter, perplexity)
+Z_tsne = tsne(X, 2, 0, 1000, 30.0)
+
+# UMAP: umap returns a (n_components x n_samples) matrix, so transpose.
+Z_umap = umap(permutedims(X), 2; n_neighbors = 15, min_dist = 0.1)'
+
+println("t-SNE embedding size: ", size(Z_tsne))
+println("UMAP  embedding size: ", size(Z_umap))
+
+# UMAP.jl exposes a model object whose transform places new points:
+model = UMAP_(permutedims(X), 2; n_neighbors = 15, min_dist = 0.1)
+Z_new = UMAP.transform(model, permutedims(X[1:5, :]))'
+println("UMAP placed ", size(Z_new, 1), " new points via transform")
+```
+
+## Rust
+
+```rust
+// Cargo.toml:  bhtsne = "0.5"
+// bhtsne is the mature Barnes-Hut t-SNE crate. There is no mature UMAP
+// crate in the Rust ecosystem; for UMAP in production, call umap-learn
+// from Python (e.g. via PyO3) or use the Julia/Python tabs above.
+use bhtsne::tSNE;
+
+fn main() {
+    // Five blobs in 50-D, flattened row-major into a Vec<f32>.
+    let (n, d, k) = (600usize, 50usize, 5usize);
+    let centers: Vec<Vec<f32>> = (0..k)
+        .map(|c| (0..d).map(|j| ((c * 7 + j) as f32 % 11.0) - 5.0).collect())
+        .collect();
+    let mut data: Vec<f32> = Vec::with_capacity(n * d);
+    for i in 0..n {
+        let c = &centers[i % k];
+        // Cheap deterministic jitter stands in for Gaussian noise.
+        for j in 0..d {
+            let jitter = (((i * 31 + j * 17) % 13) as f32 - 6.0) * 0.4;
+            data.push(c[j] + jitter);
+        }
+    }
+
+    let samples: Vec<&[f32]> = data.chunks(d).collect();
+    let mut tsne = tSNE::new(&samples);
+    tsne.embedding_dim(2)
+        .perplexity(30.0)
+        .epochs(1000)
+        .barnes_hut(0.5, |a, b| {
+            a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+        });
+
+    let embedding = tsne.embedding(); // flat Vec<f32>, length n * 2
+    println!("t-SNE embedding: {} points x 2 dims", embedding.len() / 2);
+}
+```
+
+:::
+
+The three implementations agree on the workflow even though they live in different ecosystems. Python is the most mature path and the one to prefer in practice: scikit-learn and `umap-learn` are widely deployed, documented, and tested. Julia's `TSne.jl` and `UMAP.jl` are clean native ports, and `UMAP.jl` exposes a `transform` like Python. Rust's `bhtsne` crate is a solid Barnes Hut t-SNE, but the Rust ecosystem has no mature UMAP crate, so honest production advice there is to call `umap-learn` across the language boundary rather than reimplement it.
+
+## 8. Summary
 
 t-SNE and UMAP are powerful instruments for seeing high dimensional data, and their power rests on the manifold assumption that meaningful structure is locally Euclidean and globally curved. Both convert local neighborhoods into a graph or probability structure and then lay out points to preserve those neighborhoods, t-SNE through a KL divergence on Student t similarities and UMAP through a cross entropy on fuzzy graph memberships. They reward us with vivid pictures and punish us when we forget that the pictures distort sizes, distances, and sometimes topology. Treat their output as a hypothesis generating visualization, govern it with careful hyperparameter sweeps and fixed seeds, and look elsewhere when you need stable features or a faithful metric. Used with that discipline, they are among the most useful tools in the practitioner's kit.
 

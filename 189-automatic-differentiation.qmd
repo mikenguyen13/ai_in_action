@@ -2,6 +2,8 @@
 
 Automatic differentiation, often abbreviated as autodiff or AD, is the algorithmic machinery that computes exact derivatives of functions expressed as computer programs. It sits at the foundation of nearly every modern machine learning system, because training a model by gradient descent requires the gradient of a scalar loss with respect to millions or billions of parameters. This chapter develops the subject rigorously. We distinguish autodiff from its two siblings, numerical and symbolic differentiation, formalize the two principal modes of accumulation, introduce dual numbers and the Wengert tape as concrete computational devices, and examine how production frameworks realize these ideas.
 
+Autodiff is a method you should almost never reimplement in production. The mature open-source engines, PyTorch's `autograd`, JAX's transformation system, Julia's `Zygote.jl` and `ForwardDiff.jl`, and Rust's `candle`, have each absorbed years of work on numerical stability, memory management, and accelerator support. The point of this chapter is therefore twofold. First, build enough of the theory that you can reason about which mode to use, why a backward pass costs what it does, and how a gradient can silently go wrong. Second, drive that understanding through a real library rather than a toy. The worked example pairs a transparent forty-line reverse-mode tape, written only to make the mechanism visible, with `torch.autograd` doing the actual work of training a model on a concrete dataset. The from-scratch tape is a teaching aid you can read end to end; the library is what you would ship.
+
 ## 1. Three Ways to Differentiate
 
 Given a function $f: \mathbb{R}^n \to \mathbb{R}^m$ implemented as code, there are three broadly distinct strategies for obtaining its derivatives.
@@ -156,13 +158,206 @@ df(2.0)               # returns 3*x**2 + cos(x) at x = 2
 
 The dynamic approach favors expressiveness and ease of debugging, since the program is plain imperative code. The static or transformation approach favors performance and deployment, since the captured graph can be compiled and optimized as a whole. Contemporary systems blur the boundary. PyTorch added tracing and graph capture facilities to obtain compiled performance from define by run code, while JAX retains the feel of ordinary functions despite compiling them. The convergence reflects a shared goal of offering imperative ergonomics with compiled efficiency.
 
-## 8. Subtleties and Correctness
+## 8. A Worked Example: From-Scratch Tape Meets a Production Engine
+
+Theory becomes convincing when the from-scratch mechanism and a production engine agree to the last digit and then the engine goes on to do real work. This section does exactly that. We first build a minimal reverse-mode tape in about forty lines, just enough to expose the adjoint accumulation of Section 4, and check it against `torch.autograd` on the running example $f(x_1, x_2) = x_1 x_2 + \sin(x_1)$. We then hand the real task to PyTorch: fitting a logistic regression by full-batch gradient descent on a synthetic but realistic classification dataset generated inline with scikit-learn's `make_classification`. The gradient of the cross-entropy loss with respect to every weight is obtained by a single `loss.backward()` per step, never derived by hand, which is the entire economic argument of reverse mode made concrete.
+
+The toy `Var` class stores each value together with the edges $(\text{parent}, \partial v / \partial \text{parent})$ that produced it, exactly the tape entries described in Section 5. Its `backward` method topologically sorts the graph and walks it in reverse, accumulating $\bar{v}_i = \sum_j \bar{v}_j \, \partial v_j / \partial v_i$. This is the same algorithm PyTorch runs, only without the tensor support, fused kernels, and accelerator dispatch that make the real engine fast and stable. For production work prefer the mature tools throughout; the hand-written tape exists so you can read every line of the mechanism you are trusting.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+import torch
+from sklearn.datasets import make_classification
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, log_loss
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+# ------------------------------------------------------------------
+# Part 1. A ~40-line reverse-mode tape, checked against torch.autograd.
+# Each Var records its value and a list of (parent, local_derivative)
+# edges. The backward pass walks the tape in reverse, accumulating
+# adjoints d(output)/d(var) by the chain rule.
+# ------------------------------------------------------------------
+class Var:
+    def __init__(self, value, parents=()):
+        self.value = float(value)
+        self.parents = parents          # list of (Var, local partial)
+        self.grad = 0.0
+
+    def __add__(self, other):
+        other = other if isinstance(other, Var) else Var(other)
+        return Var(self.value + other.value, [(self, 1.0), (other, 1.0)])
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Var) else Var(other)
+        return Var(self.value * other.value,
+                   [(self, other.value), (other, self.value)])
+
+    def sin(self):
+        return Var(np.sin(self.value), [(self, np.cos(self.value))])
+
+    def backward(self):
+        topo, seen = [], set()
+        def build(v):
+            if id(v) in seen:
+                return
+            seen.add(id(v))
+            for p, _ in v.parents:
+                build(p)
+            topo.append(v)
+        build(self)
+        self.grad = 1.0
+        for v in reversed(topo):
+            for parent, local in v.parents:
+                parent.grad += v.grad * local   # adjoint accumulation
+
+# f(x1, x2) = x1 * x2 + sin(x1); analytic grad = (x2 + cos(x1), x1)
+x1, x2 = Var(2.0), Var(3.0)
+y = x1 * x2 + x1.sin()
+y.backward()
+
+tx1 = torch.tensor(2.0, requires_grad=True)
+tx2 = torch.tensor(3.0, requires_grad=True)
+ty = tx1 * tx2 + torch.sin(tx1)
+ty.backward()
+
+print("=== From-scratch reverse-mode tape vs. torch.autograd ===")
+print(f"value  f(2,3)   ours={y.value:.6f}   torch={ty.item():.6f}")
+print(f"grad wrt x1     ours={x1.grad:.6f}  torch={tx1.grad.item():.6f}")
+print(f"grad wrt x2     ours={x2.grad:.6f}  torch={tx2.grad.item():.6f}")
+
+# ------------------------------------------------------------------
+# Part 2. Use torch.autograd to fit logistic regression by full-batch
+# gradient descent on a real, self-contained synthetic dataset. The
+# gradient of the cross-entropy loss w.r.t. all weights comes from a
+# single reverse pass per step, never derived by hand.
+# ------------------------------------------------------------------
+Xnp, ynp = make_classification(
+    n_samples=600, n_features=8, n_informative=5, n_redundant=1,
+    class_sep=1.2, random_state=42,
+)
+Xtr, Xte, ytr, yte = train_test_split(
+    Xnp, ynp, test_size=0.25, random_state=42, stratify=ynp)
+
+scaler = StandardScaler().fit(Xtr)
+Xtr_t = torch.tensor(scaler.transform(Xtr), dtype=torch.float32)
+Xte_t = torch.tensor(scaler.transform(Xte), dtype=torch.float32)
+ytr_t = torch.tensor(ytr, dtype=torch.float32)
+
+w = torch.zeros(Xtr_t.shape[1], requires_grad=True)
+b = torch.zeros(1, requires_grad=True)
+bce = torch.nn.BCEWithLogitsLoss()
+lr, n_steps = 0.5, 300
+
+grad_norm = float("nan")
+for step in range(n_steps):
+    logits = Xtr_t @ w + b
+    loss = bce(logits, ytr_t) + 1e-3 * (w * w).sum()   # L2 regularizer
+    loss.backward()                                    # one reverse pass
+    grad_norm = float(w.grad.norm())                   # gradient magnitude
+    with torch.no_grad():
+        w -= lr * w.grad
+        b -= lr * b.grad
+        w.grad.zero_(); b.grad.zero_()
+
+with torch.no_grad():
+    p_te = torch.sigmoid(Xte_t @ w + b).numpy()
+yhat = (p_te >= 0.5).astype(int)
+
+print("\n=== Logistic regression trained via torch.autograd ===")
+print(f"dataset          : make_classification, "
+      f"{Xnp.shape[0]} samples x {Xnp.shape[1]} features")
+print(f"final train loss : {loss.item():.4f}")
+print(f"test accuracy    : {accuracy_score(yte, yhat):.3f}")
+print(f"test log-loss    : {log_loss(yte, p_te):.4f}")
+print(f"weight vector    : {np.round(w.detach().numpy(), 3)}")
+print(f"||grad|| last step: {grad_norm:.2e}")
+```
+
+The first block prints identical values and gradients from the hand-written tape and from PyTorch, confirming that the adjoint rule of Section 4 is exactly what the engine computes. The second block then trains a real classifier: every parameter update is driven by a gradient that reverse mode produced for the cost of roughly one extra forward pass, regardless of how many weights there are. The near-zero gradient norm at the final step shows the optimizer has reached a flat region of the regularized loss.
+
+## Julia
+
+In Julia the same two ideas are first-class library calls. `ForwardDiff.jl` supplies forward mode through dual numbers, ideal for the scalar-input directional derivative, while `Zygote.jl` supplies reverse-mode source-to-source differentiation for the many-parameter gradient. Neither requires you to write a tape.
+
+```julia
+using ForwardDiff, Zygote
+
+# Forward mode (dual numbers): directional derivative of f at (2, 3).
+f(v) = v[1] * v[2] + sin(v[1])
+g_fwd = ForwardDiff.gradient(f, [2.0, 3.0])   # [3 + cos(2), 2]
+
+# Reverse mode: gradient of a logistic-regression loss w.r.t. weights.
+using Random, Statistics
+Random.seed!(0)
+n, d = 600, 8
+X = randn(n, d)
+ytrue = (X * randn(d) .+ 0.3 .* randn(n)) .> 0      # synthetic labels
+y = Float64.(ytrue)
+
+sigmoid(z) = 1 ./ (1 .+ exp.(-z))
+function loss(w, b)
+    p = sigmoid(X * w .+ b)
+    -mean(@. y * log(p + 1e-9) + (1 - y) * log(1 - p + 1e-9)) +
+        1e-3 * sum(abs2, w)
+end
+
+w = zeros(d); b = 0.0
+for _ in 1:300
+    gw, gb = Zygote.gradient(loss, w, b)   # one reverse pass each step
+    w .-= 0.5 .* gw
+    b  -= 0.5 * gb
+end
+println("forward-mode gradient: ", g_fwd)
+println("final loss:            ", loss(w, b))
+```
+
+`Zygote.gradient` returns the gradient with respect to every argument from a single reverse pass, the direct analogue of `loss.backward()`. For production training the Flux.jl and Lux.jl ecosystems wrap these engines with optimizers and layers.
+
+## Rust
+
+Rust's mature deep-learning crate, `candle` (developed by Hugging Face), provides reverse-mode autodiff over tensors with a `backward()` call that mirrors PyTorch closely. Forward-mode dual numbers are available separately through crates such as `num-dual`.
+
+```rust
+use candle_core::{Device, Tensor, DType};
+
+fn main() -> candle_core::Result<()> {
+    let dev = Device::Cpu;
+
+    // Reverse mode: gradient of f(x1, x2) = x1 * x2 + sin(x1).
+    let x1 = Tensor::new(2.0f32, &dev)?.detach().var()?; // requires grad
+    let x2 = Tensor::new(3.0f32, &dev)?.detach().var()?;
+    let y = (&x1 * &x2)?.add(&x1.sin()?)?;
+    let grads = y.backward()?;                            // one reverse pass
+    let g1 = grads.get(&x1).unwrap().to_scalar::<f32>()?; // 3 + cos(2)
+    let g2 = grads.get(&x2).unwrap().to_scalar::<f32>()?; // 2.0
+    println!("grad wrt x1 = {g1:.6}, grad wrt x2 = {g2:.6}");
+
+    // A logistic-regression training step uses the same backward() call:
+    // build logits = X.matmul(&w)? + b, a binary-cross-entropy loss, then
+    // loss.backward()? yields grads for w and b to feed an SGD update.
+    Ok(())
+}
+```
+
+Honest note: `candle`'s API is younger and less ergonomic than PyTorch's, and exact method names (`var`, `backward`, gradient lookup) track the crate version, so consult the current `candle_core` docs. For pure forward-mode scalar work, `num-dual` or `autodiff` (the experimental `std::autodiff` built on Enzyme) are the closest analogues to `ForwardDiff.jl`.
+
+:::
+
+## 9. Subtleties and Correctness
 
 Automatic differentiation is exact only where the underlying function is differentiable. Several practical concerns deserve mention. Nonsmooth primitives such as the absolute value or the rectified linear unit are not differentiable at isolated points, and frameworks adopt conventions, for instance assigning a subgradient value at the kink. Control flow is differentiated along the branch actually taken, so the computed derivative is valid only locally and may be discontinuous across branch boundaries. In place mutation of buffers can invalidate stored intermediate values that the backward pass relies on, which is why frameworks track versions and raise errors when a needed value has been overwritten. Finally, numerical stability of the derivative is a separate matter from numerical stability of the function. A primitive such as the logarithm of a sum of exponentials must be implemented with a numerically stable backward rule to avoid overflow and catastrophic cancellation in the gradient.
 
-## 9. Summary
+## 10. Summary
 
-Automatic differentiation computes exact derivatives of programs by mechanically applying the chain rule to the elementary operations a program performs. It avoids the approximation error of finite differences and the expression swell of symbolic differentiation, while reusing intermediate values for efficiency. Forward mode propagates tangents from inputs to outputs and is realized cleanly with dual numbers, excelling when inputs are few. Reverse mode propagates adjoints from outputs to inputs using a recorded tape, excelling when inputs are many and outputs few, which is the regime of machine learning loss functions and the reason backpropagation is simply reverse mode applied to neural networks. Modern frameworks implement these ideas through operator overloading with dynamic tapes or through source transformation with static or traced graphs, and increasingly combine both to deliver imperative flexibility together with compiled performance.
+Automatic differentiation computes exact derivatives of programs by mechanically applying the chain rule to the elementary operations a program performs. It avoids the approximation error of finite differences and the expression swell of symbolic differentiation, while reusing intermediate values for efficiency. Forward mode propagates tangents from inputs to outputs and is realized cleanly with dual numbers, excelling when inputs are few. Reverse mode propagates adjoints from outputs to inputs using a recorded tape, excelling when inputs are many and outputs few, which is the regime of machine learning loss functions and the reason backpropagation is simply reverse mode applied to neural networks. Modern frameworks implement these ideas through operator overloading with dynamic tapes or through source transformation with static or traced graphs, and increasingly combine both to deliver imperative flexibility together with compiled performance. In practice you reach for a mature engine, PyTorch, JAX, Zygote.jl and ForwardDiff.jl, or candle, rather than writing a tape; the value of understanding the mechanism is knowing which mode to invoke, what its backward pass costs, and where its exactness can quietly break.
 
 ## References
 
@@ -174,3 +369,6 @@ Automatic differentiation computes exact derivatives of programs by mechanically
 6. Bradbury, J., et al. "JAX: Composable Transformations of Python and NumPy Programs." 2018. https://github.com/jax-ml/jax
 7. Chen, T., Xu, B., Zhang, C., and Guestrin, C. "Training Deep Nets with Sublinear Memory Cost." 2016. https://arxiv.org/abs/1604.06174
 8. Pearlmutter, B. A. "Fast Exact Multiplication by the Hessian." Neural Computation, 1994. https://doi.org/10.1162/neco.1994.6.1.147
+9. Innes, M. "Don't Unroll Adjoint: Differentiating SSA-Form Programs." 2019. https://arxiv.org/abs/1810.07951
+10. Revels, J., Lubin, M., and Papamarkou, T. "Forward-Mode Automatic Differentiation in Julia." 2016. https://arxiv.org/abs/1607.07892
+11. Hugging Face. "candle: Minimalist ML framework for Rust." https://github.com/huggingface/candle

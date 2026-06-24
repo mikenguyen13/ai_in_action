@@ -1,6 +1,6 @@
 # Autoencoders for Dimensionality Reduction
 
-Dimensionality reduction is the practice of mapping high dimensional data into a lower dimensional space while preserving as much of the structure that matters as possible. Classical methods such as principal component analysis (PCA) accomplish this with linear algebra. Autoencoders generalize the idea to nonlinear maps learned by neural networks. This chapter develops the encoder-decoder architecture, explains why the bottleneck forces compression, establishes the precise relationship between linear autoencoders and PCA, surveys undercomplete and regularized variants, and closes with a bridge to representation learning, where the learned code becomes the central object of interest rather than a byproduct of reconstruction.
+Dimensionality reduction is the practice of mapping high dimensional data into a lower dimensional space while preserving as much of the structure that matters as possible. Classical methods such as principal component analysis (PCA) accomplish this with linear algebra. Autoencoders generalize the idea to nonlinear maps learned by neural networks. This chapter develops the encoder-decoder architecture, explains why the bottleneck forces compression, establishes the precise relationship between linear autoencoders and PCA, surveys undercomplete and regularized variants, analyzes cost and failure modes, and closes with a bridge to representation learning, where the learned code becomes the central object of interest rather than a byproduct of reconstruction. A worked example near the end trains a small autoencoder with the mature open-source PyTorch library and pits it head to head against PCA on a curved manifold, with parallel Julia (Flux.jl) and Rust (candle) versions.
 
 ## 1. The Encoder-Decoder Architecture
 
@@ -117,7 +117,225 @@ The variational autoencoder reframes the bottleneck probabilistically. Instead o
 
 Modern self-supervised representation learning has largely moved beyond pixel level reconstruction. Contrastive methods learn codes by pulling together representations of different views of the same input and pushing apart representations of different inputs, and masked prediction methods, which reconstruct deliberately hidden portions of the input, power the pretraining of large language models and masked image models. These approaches abandon full input reconstruction yet inherit the autoencoder's defining move: define a self-supervised objective whose solution requires a representation that captures the structure of the data. The encoder-decoder skeleton, the bottleneck that forces selectivity, and the use of a learned code as a transferable feature are the durable ideas, and they remain the conceptual foundation on which contemporary representation learning is built.
 
-## 7. Practical Considerations
+## 7. Complexity, When to Use It, and Failure Modes
+
+### 7.1 Computational Cost
+
+Training cost scales with the size of the network and the dataset. A forward and backward pass through a multilayer perceptron with layer widths $m_0 = d, m_1, \dots, m_L = k$ in the encoder (mirrored in the decoder) costs $O\!\left(\sum_\ell m_{\ell-1} m_\ell\right)$ floating point operations per example, and training runs that pass over $n$ examples for $E$ epochs, giving roughly $O\!\left(E \, n \sum_\ell m_{\ell-1} m_\ell\right)$ total work. The dominant term is usually the first layer, $O(d \cdot m_1)$, when the input dimension $d$ is large. Memory at training time holds the parameters plus the per batch activations needed for backpropagation. Inference, the only part that matters once the encoder is deployed as a feature extractor, is a single forward pass through the encoder at $O\!\left(\sum_\ell m_{\ell-1} m_\ell\right)$ per example.
+
+Contrast this with PCA, whose truncated randomized SVD costs $O(n d m)$ once and has no hyperparameters to tune and no optimization to babysit. An autoencoder is strictly more expensive: it adds epochs, learning rates, architecture choices, and the risk of a bad local optimum. That cost is only justified when the data's nonlinearity is real, which leads to the next point.
+
+### 7.2 When to Reach for an Autoencoder
+
+Prefer an autoencoder over a linear method when the data plausibly lie on a curved manifold that a flat subspace cannot capture, when you have enough unlabeled data to fit a flexible model without overfitting, and when a nonlinear code measurably improves a downstream task you can evaluate. Prefer PCA, kernel PCA, or a spectral manifold method when the dataset is small, when a transparent and globally optimal solution matters, or when a quick linear baseline already reaches the accuracy you need. The disciplined workflow is to fit PCA first, record its reconstruction error and downstream score, and only adopt an autoencoder if it clears that bar by a margin worth the added complexity. The example at the end of this chapter runs exactly that comparison.
+
+### 7.3 Failure Modes
+
+Several pathologies recur in practice.
+
+- **Identity collapse.** If the bottleneck is too wide or the network too powerful relative to the constraint, the model approximates the identity and the code carries no useful compression. The remedy is a narrower $k$, a regularizer, or a denoising objective.
+- **Memorization without generalization.** The lowest training reconstruction error often corresponds to a code that has overfit. Select $k$ and architecture by validation reconstruction and, crucially, by downstream task performance, never by training loss alone.
+- **Unscaled inputs.** Because squared error sums over coordinates, a feature measured in large units dominates the loss and the code purely as an artifact of scale. Standardize or normalize before training.
+- **Optimization sensitivity.** The objective is nonconvex, so results depend on initialization, learning rate, and seed. Fix the seed for reproducibility and run a small sweep when stability matters.
+- **An arbitrary, unaligned code.** Unlike PCA, the autoencoder code has no canonical orientation, ordering, or scale, and successive runs can produce rotated or permuted axes. If you need stable, interpretable coordinates, add a regularizer (sparsity, contraction) or fall back to PCA.
+
+### 7.4 Mature Open-Source Tooling
+
+There is no reason to hand-roll training loops, optimizers, or autodiff. The autoencoder in this chapter is a few layers expressed in [PyTorch](https://pytorch.org/), the most widely used open-source deep learning framework, with [Keras](https://keras.io/) on top of [TensorFlow](https://www.tensorflow.org/) and [JAX](https://jax.readthedocs.io/) (via [Flax](https://flax.readthedocs.io/)) as equally capable free alternatives. For the linear and kernel baselines, [scikit-learn](https://scikit-learn.org/) ships `PCA`, `KernelPCA`, and `IncrementalPCA` out of the box. For the manifold visualizations an autoencoder competes with, the open-source [UMAP](https://umap-learn.readthedocs.io/) and scikit-learn's `TSNE` and `Isomap` are the standard references. In the Julia ecosystem [Flux.jl](https://fluxml.ai/) provides the same building blocks, and in Rust the [candle](https://github.com/huggingface/candle) and [burn](https://burn.dev/) crates do. The tabs below show the same undercomplete autoencoder in all three languages. Build on these mature, well-tested libraries rather than reimplementing backpropagation; reserve a from-scratch implementation for learning, not production.
+
+## 8. A Worked Example: Unrolling a Swiss Roll
+
+The cleanest way to see why a nonlinear autoencoder beats a linear projection is to give both a dataset that is genuinely curved. The Swiss roll is the textbook case: points sampled from a two dimensional sheet that has been rolled up inside three dimensional space. The data truly have two intrinsic degrees of freedom, but they wind around so that no flat plane can separate the near and far layers of the roll. PCA, restricted to a linear projection, smears the layers together; an autoencoder with nonlinear layers can unroll the sheet and lay it flat in its two dimensional code.
+
+The example below generates the roll with scikit-learn's `make_swiss_roll`, standardizes it, and trains a small symmetric autoencoder in PyTorch to compress $\mathbb{R}^3$ to a $\mathbb{R}^2$ code. It then compares against a two-component PCA on two axes: reconstruction error, and how well a plain logistic classifier can recover a label that varies along the roll's intrinsic coordinate from each two dimensional embedding. Everything is seeded so the numbers reproduce.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.datasets import make_swiss_roll
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+SEED = 0
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# A 3D Swiss roll: data lie on a curved 2D manifold embedded in R^3.
+# A linear projection cannot unroll it; a nonlinear autoencoder can.
+X, color = make_swiss_roll(n_samples=2000, noise=0.05, random_state=SEED)
+# Label tracks position ALONG the roll (its intrinsic unrolled coordinate).
+# The two classes interleave in R^3 because the sheet wraps around, so a
+# straight cut in raw space cannot separate them, but an unrolled code can.
+y = (np.sin(color / 3.0) > 0).astype(int)
+
+Xtr, Xte, ytr, yte = train_test_split(
+    X, y, test_size=0.25, random_state=SEED, stratify=y
+)
+scaler = StandardScaler().fit(Xtr)
+Xtr = scaler.transform(Xtr).astype(np.float32)
+Xte = scaler.transform(Xte).astype(np.float32)
+
+D, K = X.shape[1], 2  # reduce R^3 -> R^2
+
+
+class Autoencoder(nn.Module):
+    def __init__(self, d, k):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(d, 32), nn.ReLU(),
+            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(16, k),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(k, 16), nn.ReLU(),
+            nn.Linear(16, 32), nn.ReLU(),
+            nn.Linear(32, d),
+        )
+
+    def forward(self, x):
+        h = self.encoder(x)
+        return self.decoder(h), h
+
+
+model = Autoencoder(D, K)
+opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+loss_fn = nn.MSELoss()
+
+Xtr_t = torch.from_numpy(Xtr)
+for epoch in range(600):
+    model.train()
+    opt.zero_grad()
+    recon, _ = model(Xtr_t)
+    loss = loss_fn(recon, Xtr_t)
+    loss.backward()
+    opt.step()
+
+# Encode train/test to the 2D code and measure test reconstruction error.
+model.eval()
+with torch.no_grad():
+    recon_te, Hte = model(torch.from_numpy(Xte))
+    ae_mse = loss_fn(recon_te, torch.from_numpy(Xte)).item()
+    Htr = model.encoder(Xtr_t).numpy()
+Hte = Hte.numpy()
+
+# Linear baseline: PCA to the same 2 dimensions.
+pca = PCA(n_components=K, random_state=SEED).fit(Xtr)
+pca_mse = float(np.mean((Xte - pca.inverse_transform(pca.transform(Xte))) ** 2))
+
+
+# Downstream probe: how linearly separable is the label in each 2D code?
+def probe(Ztr, Zte):
+    clf = LogisticRegression(max_iter=1000).fit(Ztr, ytr)
+    return clf.score(Zte, yte)
+
+
+ae_acc = probe(Htr, Hte)
+pca_acc = probe(pca.transform(Xtr), pca.transform(Xte))
+
+print(f"input dim d = {D}, code dim k = {K}")
+print(f"AE  test reconstruction MSE: {ae_mse:.4f}")
+print(f"PCA test reconstruction MSE: {pca_mse:.4f}")
+print(f"AE  code shape: {Hte.shape}")
+print("AE  first three codes:")
+print(np.round(Hte[:3], 3))
+print(f"downstream logistic-probe accuracy  AE: {ae_acc:.3f}  PCA: {pca_acc:.3f}")
+```
+
+The autoencoder reaches a far lower reconstruction error than PCA on the same two dimensional budget, because its nonlinear layers fold the curved sheet flat where a linear projection cannot. The downstream probe makes the practical payoff explicit: a plain linear classifier recovers the roll's intrinsic label well above chance from the autoencoder code, but only at chance from the PCA code, because PCA leaves the interleaved layers of the roll overlapping. This is precisely the regime in which the extra cost of an autoencoder pays off.
+
+## Julia
+
+```julia
+# Equivalent undercomplete autoencoder with Flux.jl (not executed here).
+using Flux, MLJ, Random, Statistics
+using Flux: mse, train!
+
+Random.seed!(0)
+
+# Assume X (3 x n, standardized) and labels y are available, e.g. from a
+# Swiss-roll generator; Flux expects features in columns.
+d, k = 3, 2
+
+encoder = Chain(Dense(d, 32, relu), Dense(32, 16, relu), Dense(16, k))
+decoder = Chain(Dense(k, 16, relu), Dense(16, 32, relu), Dense(32, d))
+model   = Chain(encoder, decoder)
+
+opt   = Flux.setup(Adam(1e-2), model)
+loss(m, x) = mse(m(x), x)
+
+for epoch in 1:600
+    grads = Flux.gradient(m -> loss(m, Xtr), model)
+    Flux.update!(opt, model, grads[1])
+end
+
+# Encode to the 2D code and report test reconstruction error.
+H       = encoder(Xte)
+ae_mse  = mse(decoder(H), Xte)
+println("AE test reconstruction MSE: ", ae_mse)
+println("AE code shape: ", size(H))
+```
+
+## Rust
+
+```rust
+// Equivalent undercomplete autoencoder with candle (not executed here).
+// candle is Hugging Face's minimalist, mature deep-learning crate for Rust;
+// burn (https://burn.dev/) is an equally good alternative with a higher-level
+// training loop. Assume `xtr` is a standardized (n x 3) Tensor.
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{loss, linear, Linear, Module, Optimizer, VarBuilder, VarMap, AdamW, ParamsAdamW};
+
+struct Autoencoder { e1: Linear, e2: Linear, e3: Linear,
+                     d1: Linear, d2: Linear, d3: Linear }
+
+impl Autoencoder {
+    fn encode(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let h = self.e1.forward(x)?.relu()?;
+        let h = self.e2.forward(&h)?.relu()?;
+        self.e3.forward(&h)
+    }
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let h = self.encode(x)?;
+        let h = self.d1.forward(&h)?.relu()?;
+        let h = self.d2.forward(&h)?.relu()?;
+        self.d3.forward(&h)
+    }
+}
+
+fn main() -> candle_core::Result<()> {
+    let dev = Device::Cpu;
+    let vm = VarMap::new();
+    let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+    let (d, k) = (3usize, 2usize);
+    let model = Autoencoder {
+        e1: linear(d, 32, vb.pp("e1"))?, e2: linear(32, 16, vb.pp("e2"))?,
+        e3: linear(16, k, vb.pp("e3"))?, d1: linear(k, 16, vb.pp("d1"))?,
+        d2: linear(16, 32, vb.pp("d2"))?, d3: linear(32, d, vb.pp("d3"))?,
+    };
+    let mut opt = AdamW::new(vm.all_vars(), ParamsAdamW { lr: 1e-2, ..Default::default() })?;
+
+    // xtr: standardized training tensor of shape (n, 3).
+    for _ in 0..600 {
+        let recon = model.forward(&xtr)?;
+        let l = loss::mse(&recon, &xtr)?;
+        opt.backward_step(&l)?;
+    }
+    let code = model.encode(&xtr)?;       // (n, 2) code
+    println!("AE code shape: {:?}", code.dims());
+    Ok(())
+}
+```
+
+:::
+
+## 9. Practical Considerations
 
 Several choices determine whether an autoencoder produces a useful reduction. Inputs should be scaled or normalized so that no coordinate dominates the squared error purely because of its units. The bottleneck width $k$ should be selected by sweeping a range and inspecting reconstruction error together with downstream task performance, not reconstruction alone, because the lowest reconstruction error often corresponds to a code that has merely memorized rather than generalized. Symmetric encoder and decoder depths are a sensible default, and weight tying can reduce parameters and nudge linear models toward the PCA solution. When the goal is a clean low dimensional embedding for analysis, a regularized variant such as a denoising or contractive autoencoder usually yields a more stable and more transferable code than an unregularized bottleneck of the same width. Finally, always compare against PCA as a baseline: if a linear projection reaches comparable reconstruction and downstream accuracy, the simpler, deterministic, and globally optimal method is the better engineering choice, and the autoencoder earns its place only when the data's nonlinearity makes the extra capacity pay off.
 

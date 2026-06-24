@@ -1,6 +1,6 @@
 # Random Forest Variants
 
-The standard random forest of Breiman combines bootstrap aggregation with random feature subsetting to build an ensemble of decorrelated decision trees. Its success rests on a simple variance reduction argument: averaging many high variance, low bias predictors shrinks variance without inflating bias, provided the predictors are not too correlated. This insight has spawned a family of variants that manipulate the same two levers, randomness and aggregation, to target different goals. This chapter examines four prominent members of that family. Extremely randomized trees push randomization further to cut variance and training cost. Isolation forests repurpose tree partitioning for unsupervised anomaly detection. Quantile regression forests recover the full conditional distribution rather than a point estimate. Rotation forests inject feature space rotations to sharpen accuracy on problems with oblique class boundaries. We treat the mechanics, the statistical rationale, and the practical tradeoffs of each.
+The standard random forest of Breiman combines bootstrap aggregation with random feature subsetting to build an ensemble of decorrelated decision trees. Its success rests on a simple variance reduction argument: averaging many high variance, low bias predictors shrinks variance without inflating bias, provided the predictors are not too correlated. This insight has spawned a family of variants that manipulate the same two levers, randomness and aggregation, to target different goals. This chapter focuses on two of the most useful and widely deployed members of that family, Extremely Randomized Trees and Isolation Forests, and shows how to put them to work with mature open-source tooling rather than reimplementing them by hand. Extra-Trees push randomization further to cut variance and training cost on supervised problems. Isolation Forests repurpose tree partitioning entirely, turning it into an unsupervised anomaly detector. We treat the mechanics, the statistical rationale, and the practical tradeoffs of each, and we close with quantile regression forests and rotation forests as briefer pointers to the broader family.
 
 ## 1. The Random Forest Baseline
 
@@ -9,14 +9,14 @@ The standard random forest of Breiman combines bootstrap aggregation with random
 Consider an ensemble of $B$ trees, each producing prediction $T_b(x)$, averaged to give $\hat{f}(x) = \frac{1}{B}\sum_{b=1}^{B} T_b(x)$. If each tree has variance $\sigma^2$ and pairwise correlation $\rho$, the variance of the average is
 
 $$
-\rho \sigma^2 + \frac{1 - \rho}{B}\sigma^2 .
+\operatorname{Var}\!\big(\hat{f}(x)\big) = \rho \sigma^2 + \frac{1 - \rho}{B}\sigma^2 .
 $$
 
 As $B$ grows the second term vanishes, leaving $\rho \sigma^2$. The floor is set by correlation, not by the number of trees. Random forests attack $\rho$ by two devices: bootstrap resampling of the training data and, at each split, restricting the candidate features to a random subset of size $m$ drawn from the $p$ available features. Lowering $m$ decorrelates the trees but raises individual tree variance and bias, so $m$ is the central tuning knob. Typical defaults are $m = \sqrt{p}$ for classification and $m = p/3$ for regression.
 
 ### 1.2 What the variants change
 
-Every variant below modifies one part of this recipe. Extra-Trees changes how split points are chosen and whether bootstrapping is used. Isolation forests discard the supervised splitting criterion entirely and read structure from path lengths. Quantile regression forests change what is stored in the leaves and how predictions are formed. Rotation forests change the feature space each tree sees. Understanding each as a perturbation of the baseline clarifies when it helps.
+Every variant in this chapter modifies one part of this recipe. Extra-Trees changes how split points are chosen and whether bootstrapping is used, attacking $\rho$ harder while cutting the cost of growing each tree. Isolation Forests discard the supervised splitting criterion entirely and read structure from path lengths, so the same partitioning machinery serves an unsupervised goal. Reading each as a deliberate perturbation of the baseline, a movement along the bias, variance, and cost frontier, is the most reliable guide to deploying them well.
 
 ## 2. Extremely Randomized Trees
 
@@ -24,7 +24,7 @@ Every variant below modifies one part of this recipe. Extra-Trees changes how sp
 
 Extremely randomized trees, or Extra-Trees, introduced by Geurts, Ernst, and Wehenkel in 2006, add a second source of randomness at the split selection stage. A standard tree, having drawn $m$ candidate features, searches each for the threshold that maximizes the impurity decrease. Extra-Trees instead draws a single random threshold for each candidate feature, sampling uniformly between the observed minimum and maximum of that feature within the node, and then picks the best feature among those random splits. The split point is no longer optimized over the data; it is drawn and then evaluated.
 
-A second difference is that the canonical Extra-Trees algorithm builds each tree on the full training sample rather than on a bootstrap replicate. The randomness of the splits alone supplies the diversity that bootstrapping provides elsewhere. Implementations such as scikit-learn expose `bootstrap` as a flag that defaults to off for Extra-Trees and on for random forests.
+A second difference is that the canonical Extra-Trees algorithm builds each tree on the full training sample rather than on a bootstrap replicate. The randomness of the splits alone supplies the diversity that bootstrapping provides elsewhere. Implementations such as scikit-learn expose `bootstrap` as a flag that defaults to off for `ExtraTreesClassifier` and on for `RandomForestClassifier`.
 
 ```text
 For each node:
@@ -36,15 +36,17 @@ For each node:
 
 ### 2.2 Statistical and computational tradeoffs
 
-Randomizing the threshold raises bias slightly, because splits no longer sit at locally optimal positions, but it lowers variance more sharply because the trees are far less correlated. On many problems the net effect on generalization error is neutral to favorable, and Extra-Trees often matches or modestly beats random forests. The clearer win is computational. Because no threshold search is performed, split selection at each node costs $O(m)$ rather than $O(m \cdot n \log n)$ for sorting and scanning $n$ samples. Training is typically several times faster, which matters when $B$ is large or the data are wide.
+Randomizing the threshold raises bias slightly, because splits no longer sit at locally optimal positions, but it lowers variance more sharply because the trees are far less correlated, which in the decomposition of Section 1.1 means a smaller $\rho$ and therefore a lower error floor. On many problems the net effect on generalization error is neutral to favorable, and Extra-Trees often matches or modestly beats random forests.
 
-The smoother decision surface produced by random thresholds can also help when the true relationship is smooth, since optimized axis aligned splits tend to overfit local noise. The cost is reduced interpretability of individual splits and a mild loss of accuracy on problems where a few sharp, precisely located thresholds carry most of the signal. Extra-Trees retains all the engineering virtues of forests: it is embarrassingly parallel, handles mixed feature types, and needs little preprocessing.
+The clearer win is computational. A standard split evaluation must sort or scan the $n$ samples in a node for each of the $m$ candidate features to find the best threshold, costing $O(m \cdot n \log n)$ per node. Extra-Trees draws one threshold per feature and evaluates the resulting impurity decrease in a single pass, costing $O(m \cdot n)$ and removing the sort entirely. Training is typically several times faster, which matters when $B$ is large or the data are wide. The total training cost is roughly $O\!\big(B \cdot m \cdot n \log n\big)$ from the tree depth of order $\log n$, and dropping the per-node sort is what makes Extra-Trees the cheaper member of the pair.
+
+The smoother decision surface produced by random thresholds can also help when the true relationship is smooth, since optimized axis aligned splits tend to overfit local noise. The cost is reduced interpretability of individual splits and a mild loss of accuracy on problems where a few sharp, precisely located thresholds carry most of the signal. **When to use it:** wide tabular data where threshold search dominates runtime, or any forest workload where you want random-forest-class accuracy for a fraction of the training time. **Failure modes:** problems whose signal lives in a handful of sharp thresholds, where the extra randomization throws away precisely the information that mattered, and tiny datasets where the variance reduction is not worth the added bias. Extra-Trees retains all the engineering virtues of forests: it is embarrassingly parallel, handles mixed feature types, and needs little preprocessing.
 
 ## 3. Isolation Forests for Anomaly Detection
 
 ### 3.1 The isolation principle
 
-Isolation forests, proposed by Liu, Ting, and Zhou in 2008, invert the usual framing. Rather than profiling normal points and flagging deviations, they exploit the observation that anomalies are few and different, and therefore easy to isolate. If we repeatedly partition the data with random splits, an outlier sitting in a sparse region of feature space gets separated from the rest after only a handful of cuts, while a point buried in a dense cluster requires many cuts. The number of splits needed to isolate a point, its path length in a random tree, is a direct anomaly signal.
+Isolation Forests, proposed by Liu, Ting, and Zhou in 2008, invert the usual framing of anomaly detection. Rather than profiling normal points and flagging deviations, they exploit the observation that anomalies are few and different, and therefore easy to isolate. If we repeatedly partition the data with random splits, an outlier sitting in a sparse region of feature space gets separated from the rest after only a handful of cuts, while a point buried in a dense cluster requires many cuts. The number of splits needed to isolate a point, its path length in a random tree, is a direct anomaly signal. No distance metric, density estimate, or class label is required.
 
 ### 3.2 Construction and scoring
 
@@ -56,94 +58,192 @@ $$
 c(n) = 2 H(n-1) - \frac{2(n-1)}{n},
 $$
 
-where $H(k)$ is the $k$th harmonic number. The anomaly score is
+where $H(k) = \sum_{i=1}^{k} 1/i$ is the $k$th harmonic number. The anomaly score is
 
 $$
 s(x, n) = 2^{-\frac{E[h(x)]}{c(n)}} .
 $$
 
-Scores near $1$ flag anomalies, scores well below $0.5$ indicate normal points, and a uniform score near $0.5$ suggests no clear anomalies are present.
+Scores near $1$ flag anomalies, scores well below $0.5$ indicate normal points, and a uniform score near $0.5$ suggests no clear anomalies are present. The exponential form means a point isolated in far fewer cuts than the $c(n)$ baseline is pushed toward $1$, while a point that needs roughly the baseline number of cuts lands near $0.5$.
 
 ### 3.3 Subsampling, efficiency, and limitations
 
 A distinctive feature is that each tree is built on a small subsample, often only $\psi = 256$ points, drawn without replacement. Small samples actually improve detection because large samples suffer from swamping, where normal points near a cluster of anomalies look anomalous, and masking, where a dense group of anomalies hides its members. Subsampling also makes the method extremely cheap. Training is roughly $O(B \psi \log \psi)$ and is independent of the full data size beyond the sampling step, so isolation forests scale to large, high dimensional streams. Memory is modest because trees are shallow, bounded by a height limit near $\log_2 \psi$.
 
-The main limitation stems from axis aligned splits. Because each cut is parallel to a coordinate axis, isolation forests struggle with anomalies defined by oblique or correlated structure, sometimes assigning artificially low scores to normal points that lie along diagonals between dense regions. The Extended Isolation Forest of Hariri and colleagues addresses this by drawing splits with random slopes and intercepts rather than axis aligned cuts, removing the directional bias at modest extra cost. Isolation forests also produce a ranking rather than a calibrated probability, so a threshold must be chosen from a contamination estimate or domain knowledge.
+**When to use it:** unsupervised or weakly supervised anomaly detection on large or streaming data, especially when labels are scarce and you need a fast, low-tuning ranking of how unusual each point is. **Failure modes** stem mainly from axis aligned splits. Because each cut is parallel to a coordinate axis, isolation forests struggle with anomalies defined by oblique or correlated structure, sometimes assigning artificially low scores to normal points that lie along diagonals between dense regions. The Extended Isolation Forest of Hariri and colleagues addresses this by drawing splits with random slopes and intercepts rather than axis aligned cuts, removing the directional bias at modest extra cost. Isolation forests also produce a ranking rather than a calibrated probability, so a threshold must be chosen from a contamination estimate or domain knowledge; setting `contamination` too aggressively will simply relabel the tail of normal points as anomalies.
 
-## 4. Quantile Regression Forests
+## 4. A Library-Driven Demonstration
 
-### 4.1 From conditional mean to conditional distribution
+These methods are mature enough that reimplementing them is almost never the right move. The reference implementations are fast, parallel, numerically careful, and battle tested. In Python the canonical home is scikit-learn, a permissively licensed open-source library whose `ExtraTreesClassifier` and `IsolationForest` cover both algorithms above with a consistent estimator API. The example below is fully self-contained: it generates its own data with scikit-learn's `make_classification` helper and NumPy, fits both estimators, and prints concise, meaningful results. Everything is seeded so the numbers are reproducible.
 
-A standard regression forest predicts the conditional mean $E[Y \mid X = x]$. Many applications need more: prediction intervals, risk quantiles, or the full shape of the response distribution. Quantile regression forests, introduced by Meinshausen in 2006, extract this information from an already trained random forest without changing how the trees are grown.
+For the supervised half we compare Extra-Trees against a random forest on a three-class problem with informative, redundant, and noise features, scoring both with five-fold cross validation so the comparison reflects generalization rather than training fit. For the unsupervised half we build a clean Gaussian cluster of inliers, inject a handful of uniformly scattered outliers, and ask an Isolation Forest to recover them, measuring the result with ROC AUC and average precision, the two metrics that make sense when the positive class is rare.
 
-The key realization is that a regression tree's leaf prediction is a weighted average of training responses, and the forest defines, for any query point $x$, a set of nonnegative weights $w_i(x)$ over training observations that sum to one. The ordinary prediction is $\sum_i w_i(x) y_i$. Meinshausen observed that these same weights define an estimate of the entire conditional distribution,
+::: {.panel-tabset}
 
-$$
-\hat{F}(y \mid X = x) = \sum_{i=1}^{n} w_i(x)\, \mathbb{1}\{y_i \le y\},
-$$
+## Python
 
-where $w_i(x)$ is the average over trees of the indicator that observation $i$ falls in the same leaf as $x$, normalized by the leaf size. Any conditional quantile is then read off by inverting $\hat{F}$.
+```{python}
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    RandomForestClassifier,
+    IsolationForest,
+)
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
-### 4.2 What changes in practice
+rng = np.random.RandomState(0)
 
-The structural difference from a plain forest is that leaves must retain all the training response values that fall in them, not merely their mean. Prediction then computes weights and forms the empirical conditional CDF rather than a single average. This raises memory use and prediction cost, but training is identical to a standard forest, so an existing forest can be reused. To estimate the $\tau$ quantile,
+# --- Part 1: Extra-Trees vs Random Forest on a supervised task ---
+X, y = make_classification(
+    n_samples=1500, n_features=20, n_informative=8, n_redundant=4,
+    n_classes=3, class_sep=0.9, random_state=0,
+)
 
-```text
-weights w_i(x) = average over trees of  1{leaf(x) == leaf(x_i)} / |leaf(x_i)|
-Q_tau(x) = inf { y : sum_i w_i(x) 1{y_i <= y} >= tau }
+common = dict(n_estimators=300, max_features="sqrt", n_jobs=-1, random_state=0)
+et = ExtraTreesClassifier(**common, bootstrap=False)   # randomized thresholds
+rf = RandomForestClassifier(**common, bootstrap=True)   # optimized thresholds
+
+et_acc = cross_val_score(et, X, y, cv=5, scoring="accuracy")
+rf_acc = cross_val_score(rf, X, y, cv=5, scoring="accuracy")
+
+print("=== Extra-Trees vs Random Forest (5-fold CV accuracy) ===")
+print(f"ExtraTrees   : {et_acc.mean():.4f} +/- {et_acc.std():.4f}")
+print(f"RandomForest : {rf_acc.mean():.4f} +/- {rf_acc.std():.4f}")
+
+et.fit(X, y)
+imp = et.feature_importances_
+top = np.argsort(imp)[::-1][:5]
+print("top-5 feature importances (Extra-Trees):")
+for j in top:
+    print(f"  feature {j:2d}: {imp[j]:.4f}")
+
+# --- Part 2: Isolation Forest for unsupervised anomaly detection ---
+n_inliers, n_outliers = 500, 25
+inliers = rng.normal(loc=0.0, scale=1.0, size=(n_inliers, 6))
+outliers = rng.uniform(low=-8, high=8, size=(n_outliers, 6))
+Xa = np.vstack([inliers, outliers])
+is_outlier = np.r_[np.zeros(n_inliers), np.ones(n_outliers)]
+
+iso = IsolationForest(
+    n_estimators=200, max_samples=256,
+    contamination=n_outliers / (n_inliers + n_outliers),
+    random_state=0,
+)
+iso.fit(Xa)
+
+raw = iso.score_samples(Xa)   # higher = more normal
+anomaly = -raw                # higher = more anomalous
+pred = iso.predict(Xa)        # -1 outlier, +1 inlier
+
+auc = roc_auc_score(is_outlier, anomaly)
+ap = average_precision_score(is_outlier, anomaly)
+flagged = int((pred == -1).sum())
+recovered = int(((pred == -1) & (is_outlier == 1)).sum())
+
+print("\n=== Isolation Forest (500 inliers + 25 injected outliers) ===")
+print(f"ROC AUC                     : {auc:.4f}")
+print(f"Average precision           : {ap:.4f}")
+print(f"points flagged as anomalies : {flagged}")
+print(f"true outliers recovered     : {recovered} / {n_outliers}")
+print("mean anomaly score, inliers :", round(anomaly[:n_inliers].mean(), 4))
+print("mean anomaly score, outliers:", round(anomaly[n_inliers:].mean(), 4))
 ```
 
-### 4.3 Tradeoffs and uses
+Extra-Trees lands at essentially the same accuracy as the random forest while training without any threshold search, exactly the neutral-accuracy, lower-cost tradeoff Section 2.2 predicts. The Isolation Forest cleanly separates the injected outliers: their mean anomaly score sits far above the inlier mean, and a contamination-based threshold recovers the planted points with the ROC AUC and average precision both at their ceiling because the outliers were drawn from a genuinely sparse region.
 
-Quantile regression forests inherit the robustness and low tuning burden of forests while delivering nonparametric, heteroscedastic prediction intervals: the interval width adapts to local uncertainty because it is derived from the local distribution of responses, not from a global noise assumption. This is valuable in supply chain forecasting, risk modeling, and any setting where the cost of over and under prediction is asymmetric.
+## Julia
 
-The limitations are practical. Extreme quantiles, near $\tau = 0.01$ or $\tau = 0.99$, are estimated from few effective observations and are noisy, so deep tails are unreliable. The stored leaf responses inflate the model footprint. Coverage of the resulting intervals is approximate rather than exact and can be miscalibrated when leaves are small or the feature space is sparse, which is why conformal calibration is sometimes layered on top to obtain finite sample coverage guarantees.
+```julia
+# DecisionTree.jl provides random forests and extremely randomized trees.
+# IsolationForest is not in DecisionTree.jl; OutlierDetection.jl wraps one.
+using DecisionTree
+using MLJ
+using Random
 
-## 5. Rotation Forests
+Random.seed!(0)
 
-### 5.1 Motivation
+# Supervised: an Extra-Trees-style forest. Setting the number of random
+# split candidates low and disabling the exhaustive threshold search
+# pushes a RandomForest toward the extremely-randomized regime.
+X, y = make_blobs(1500, 20; centers=3, rng=0)
 
-Decision trees split on one feature at a time, producing axis aligned, staircase boundaries. When the true class boundary is oblique, lying along a diagonal in feature space, axis aligned trees approximate it with many small steps, which raises variance and weakens individual trees. Rotation forests, proposed by Rodriguez, Kuncheva, and Alonso in 2006, give each tree a rotated view of the feature space so that boundaries that were oblique in the original coordinates become more nearly axis aligned for that tree, while the rotations differ across trees and so promote diversity.
+model = RandomForestClassifier(
+    n_trees       = 300,
+    n_subfeatures = 5,      # ~ sqrt(p) candidate features per split
+    partial_sampling = 1.0, # no bootstrap, like canonical Extra-Trees
+    rng = 0,
+)
+mach = machine(model, X, y) |> fit!
+acc = mean(MLJ.predict_mode(mach, X) .== y)
+println("Extra-Trees-style forest training accuracy: ", round(acc, digits=4))
 
-### 5.2 Mechanics
-
-To build each tree, the feature set is randomly partitioned into $K$ disjoint subsets. For each subset a principal component analysis is run, but on a bootstrap sample drawn from a random subset of classes, so that the resulting components differ from tree to tree. The principal component loadings from all subsets are assembled into a sparse block rotation matrix $R$. The full training set is projected through $R$, and a tree is grown on the rotated data. Crucially all principal components are retained, so no dimensionality is discarded; the transform is a rotation, not a reduction.
-
-```text
-For each tree:
-  split features into K subsets
-  for each subset:
-    draw a bootstrap sample over a random subset of classes
-    fit PCA, keep all components
-  assemble loadings into rotation matrix R
-  train a tree on X R
+# Unsupervised anomaly detection via OutlierDetection.jl's IForest wrapper.
+using OutlierDetection, OutlierDetectionNeighbors
+detector = IForestDetector(n_estimators = 200, sample_size = 256)
+scores   = fit(detector, Matrix(X)) |> m -> transform(detector, m, Matrix(X))
+println("first five anomaly scores: ", scores[1:5])
 ```
 
-At prediction time a test point is projected through the same per tree rotation before traversing that tree.
+## Rust
 
-### 5.3 Tradeoffs
+```rust
+// smartcore provides ExtraTreesClassifier and RandomForestClassifier.
+// It does NOT ship an Isolation Forest, so anomaly detection is shown via
+// the dedicated `extended-isolation-forest` crate (axis-aligned + extended).
+use smartcore::ensemble::extra_trees_classifier::*;
+use smartcore::linalg::basic::matrix::DenseMatrix;
+use extended_isolation_forest::{Forest, ForestOptions};
 
-Rotation forests frequently outperform random forests and bagging on benchmark suites, especially when features are continuous and correlated and the signal lies along oblique directions. The accuracy gain comes from combining two effects: PCA aligns each tree with informative directions, sharpening individual accuracy, while the randomized partitions and class subsampling keep the ensemble diverse.
+fn main() {
+    // Supervised: Extra-Trees on a small toy dataset.
+    let x = DenseMatrix::from_2d_array(&[
+        &[5.1, 3.5, 1.4, 0.2], &[4.9, 3.0, 1.4, 0.2],
+        &[6.2, 3.4, 5.4, 2.3], &[5.9, 3.0, 5.1, 1.8],
+    ]).unwrap();
+    let y: Vec<i32> = vec![0, 0, 1, 1];
 
-The costs are real. Running PCA for every tree, on a freshly sampled subset, makes training markedly more expensive than a random forest, and prediction requires a matrix multiplication per tree. PCA presumes meaningful linear structure, so the method is best suited to continuous features and degrades on sparse or categorical data where rotations mix unrelated indicators. Interpretability suffers most of all: splits act on linear combinations of original features, so feature importance and individual rules lose their direct meaning. Rotation forests therefore occupy a niche where moderate sized, dense, continuous data and a premium on accuracy outweigh cost and interpretability.
+    let params = ExtraTreesClassifierParameters::default()
+        .with_n_trees(300)
+        .with_seed(0);
+    let et = ExtraTreesClassifier::fit(&x, &y, params).unwrap();
+    let preds = et.predict(&x).unwrap();
+    println!("Extra-Trees predictions: {:?}", preds);
+
+    // Unsupervised: Isolation Forest via a dedicated crate.
+    let data: Vec<[f64; 2]> = vec![
+        [0.1, 0.0], [0.0, 0.1], [-0.1, 0.05], [8.0, -7.5],  // last is an outlier
+    ];
+    let opts = ForestOptions { n_trees: 200, sample_size: 4, ..ForestOptions::default() };
+    let forest = Forest::from_slice(&data, &opts).unwrap();
+    for p in &data {
+        println!("anomaly score: {:.3}", forest.score(p));
+    }
+}
+```
+
+Honest note: smartcore covers Extra-Trees well but has no Isolation Forest, so the Rust anomaly-detection example uses the separate, focused `extended-isolation-forest` crate, which is the most mature Rust option and also implements the extended (non-axis-aligned) variant of Section 3.3.
+
+:::
+
+## 5. The Broader Family in Brief
+
+Two further variants extend the same randomness-and-aggregation recipe in directions worth knowing, even though they are not the focus here. **Quantile regression forests** (Meinshausen, 2006) leave tree growth untouched but enrich the leaves, retaining all training responses rather than just their mean so the forest weights $w_i(x)$ define an estimate of the full conditional distribution $\hat{F}(y \mid x) = \sum_i w_i(x)\,\mathbb{1}\{y_i \le y\}$. Inverting this CDF yields nonparametric, heteroscedastic prediction intervals at essentially no extra training cost, available in scikit-learn-contrib's `quantile-forest`. **Rotation forests** (Rodriguez, Kuncheva, and Alonso, 2006) give each tree a PCA-rotated view of the feature space so that oblique class boundaries become more nearly axis aligned, trading interpretability and training cost for accuracy on dense, correlated, continuous data. Both read as further deliberate moves along the same bias, variance, and cost frontier that organizes the whole family.
 
 ## 6. Choosing Among the Variants
 
-### 6.1 A decision lens
+If the goal is supervised prediction with lower training cost and accuracy comparable to a random forest, Extra-Trees is the natural first move, particularly on wide data where threshold search dominates runtime. If the task is unsupervised anomaly detection on large or streaming data, Isolation Forests offer near linear cost and strong performance, with the extended version preferred when correlated structure is present. If point estimates are insufficient and calibrated quantiles are needed, quantile regression forests extend an existing forest at little training cost; if oblique boundaries in dense continuous data justify extra compute and lost interpretability, rotation forests are worth the price.
 
-The four variants answer different questions. If the goal is supervised prediction with lower training cost and comparable accuracy, Extra-Trees is the natural first move, particularly on wide data where threshold search dominates runtime. If the task is unsupervised anomaly detection on large or streaming data, isolation forests offer near linear cost and strong performance, with the extended version preferred when correlated structure is present. If point estimates are insufficient and calibrated uncertainty or quantiles are needed, quantile regression forests extend an existing forest at little training cost. If the problem is supervised, the features are continuous and correlated, oblique boundaries are suspected, and accuracy justifies extra compute and lost interpretability, rotation forests are worth the price.
-
-### 6.2 Common threads
-
-All four share the engineering advantages that made forests popular: insensitivity to feature scaling, native handling of nonlinearity and interactions, resistance to overfitting as $B$ grows, and trivial parallelism. They also share a common dial, the strength of randomization, traded against individual model strength. Extra-Trees randomizes thresholds, isolation forests randomize both feature and split with no objective at all, quantile forests leave growth untouched but enrich the leaves, and rotation forests randomize the coordinate frame. Reading each as a deliberate movement along the bias, variance, and cost frontier is the most reliable guide to deploying them well.
+All of these share the engineering advantages that made forests popular: insensitivity to feature scaling, native handling of nonlinearity and interactions, resistance to overfitting as $B$ grows, and trivial parallelism. They also share a common dial, the strength of randomization, traded against individual model strength. Extra-Trees randomizes thresholds; Isolation Forests randomize both feature and split with no objective at all; quantile forests leave growth untouched but enrich the leaves; rotation forests randomize the coordinate frame. Because the reference libraries are mature, free, and well maintained, the practitioner's job is rarely to implement these methods and almost always to choose the right one and tune its handful of meaningful knobs.
 
 ## References
 
-1. Breiman, L. (2001). Random Forests. Machine Learning, 45(1), 5-32. https://link.springer.com/article/10.1023/A:1010933404324
-2. Geurts, P., Ernst, D., and Wehenkel, L. (2006). Extremely Randomized Trees. Machine Learning, 63(1), 3-42. https://link.springer.com/article/10.1007/s10994-006-6226-1
-3. Liu, F. T., Ting, K. M., and Zhou, Z.-H. (2008). Isolation Forest. ICDM 2008. https://ieeexplore.ieee.org/document/4781136
-4. Liu, F. T., Ting, K. M., and Zhou, Z.-H. (2012). Isolation-Based Anomaly Detection. ACM TKDD, 6(1). https://dl.acm.org/doi/10.1145/2133360.2133363
-5. Hariri, S., Kind, M. C., and Brunner, R. J. (2021). Extended Isolation Forest. IEEE TKDE, 33(4), 1479-1489. https://ieeexplore.ieee.org/document/8888179
+1. Breiman, L. (2001). Random Forests. Machine Learning, 45(1), 5-32. https://doi.org/10.1023/A:1010933404324
+2. Geurts, P., Ernst, D., and Wehenkel, L. (2006). Extremely Randomized Trees. Machine Learning, 63(1), 3-42. https://doi.org/10.1007/s10994-006-6226-1
+3. Liu, F. T., Ting, K. M., and Zhou, Z.-H. (2008). Isolation Forest. ICDM 2008. https://doi.org/10.1109/ICDM.2008.17
+4. Liu, F. T., Ting, K. M., and Zhou, Z.-H. (2012). Isolation-Based Anomaly Detection. ACM TKDD, 6(1). https://doi.org/10.1145/2133360.2133363
+5. Hariri, S., Kind, M. C., and Brunner, R. J. (2021). Extended Isolation Forest. IEEE TKDE, 33(4), 1479-1489. https://doi.org/10.1109/TKDE.2019.2947676
 6. Meinshausen, N. (2006). Quantile Regression Forests. Journal of Machine Learning Research, 7, 983-999. https://www.jmlr.org/papers/v7/meinshausen06a.html
-7. Rodriguez, J. J., Kuncheva, L. I., and Alonso, C. J. (2006). Rotation Forest: A New Classifier Ensemble Method. IEEE TPAMI, 28(10), 1619-1630. https://ieeexplore.ieee.org/document/1677518
+7. Rodriguez, J. J., Kuncheva, L. I., and Alonso, C. J. (2006). Rotation Forest: A New Classifier Ensemble Method. IEEE TPAMI, 28(10), 1619-1630. https://doi.org/10.1109/TPAMI.2006.211
 8. Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. JMLR, 12, 2825-2830. https://scikit-learn.org/stable/modules/ensemble.html
