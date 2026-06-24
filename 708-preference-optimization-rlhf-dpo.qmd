@@ -118,7 +118,7 @@ The update raises the log-probability of the chosen completion and lowers that o
 
 ## 4. Production Code
 
-We now make the math concrete. The two CPU-feasible pieces, a Bradley-Terry reward-model fit and the DPO loss with a real gradient step, run as executed cells below on a tiny deterministic model with no downloads. The GPU-scale pieces, full PPO, GRPO, and `trl` on a real language model, are shown as runnable code with an honest note that they require a GPU.
+We now make the math concrete. The two CPU-feasible pieces, a Bradley-Terry reward-model fit and the DPO loss with a real gradient step, run as executed cells below on a tiny deterministic model with no downloads. We then promote the DPO loss to an executed cell on the GPU, running it on a real small pretrained model against a frozen reference and reporting measured VRAM and timings. The genuinely large-scale pieces, full PPO, GRPO, and 7B `trl` training, remain shown as runnable code with an honest note that they require more GPU memory than a single consumer card.
 
 ### 4.1 Fitting a Bradley-Terry Reward Model (executed, CPU)
 
@@ -303,7 +303,139 @@ print(f"implicit-reward margin moved from {margin0:+.4f} to {marginF:+.4f} "
 
 The margin starting at exactly zero is the signature of a correct implementation: when the policy equals the reference, every implicit reward is zero and the loss is exactly $-\log\sigma(0) = \log 2 \approx 0.693$. Training drives the chosen-minus-rejected margin positive and the accuracy to one, which is precisely what the gradient in Section 3.1 prescribes.
 
-### 4.3 DPO at Scale With `trl` (show-only, requires GPU)
+### 4.3 Running it on a GPU (executed)
+
+The tiny `torch.nn` model above proves the loss is correct; it says nothing about whether the same arithmetic survives on a real pretrained transformer on real hardware. This cell closes that gap. It loads a small instruction-tuned model (`Qwen/Qwen2.5-0.5B-Instruct`, with a `gpt2` fallback) onto the GPU, makes a frozen reference copy, builds one synthetic chosen/rejected preference pair, and runs exactly the DPO loss and one gradient step from Section 3 on `cuda`. It is the identical objective as Section 4.2, now with a genuine language-model policy and a frozen reference, and it reports only measured quantities: VRAM use, step latency, the DPO loss, and the implied implicit-reward margin. Everything is guarded by `torch.cuda.is_available()` so a CPU-only render degrades to a short note instead of failing.
+
+```{python}
+import time
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+if torch.cuda.is_available():
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = torch.device("cuda")
+    torch.cuda.reset_peak_memory_stats()
+    base_mem = torch.cuda.memory_allocated()
+
+    # Small instruction-tuned model that fits comfortably under 7 GB; fall back to
+    # gpt2 if the Qwen checkpoint is unavailable in the render environment.
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    try:
+        tok = AutoTokenizer.from_pretrained(model_id)
+        policy = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float32)
+    except Exception as exc:  # noqa: BLE001
+        print(f"falling back to gpt2 ({type(exc).__name__})")
+        model_id = "gpt2"
+        tok = AutoTokenizer.from_pretrained(model_id)
+        policy = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float32)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    policy = policy.to(device)
+    # Frozen reference: a second copy of the same weights, gradients disabled.
+    reference = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.float32).to(device)
+    reference.load_state_dict(policy.state_dict())
+    reference.eval()
+    for p in reference.parameters():
+        p.requires_grad_(False)
+
+    n_params = sum(p.numel() for p in policy.parameters())
+    load_mem = torch.cuda.memory_allocated()
+    print(f"model: {model_id}  params: {n_params/1e6:.1f}M  device: {device}")
+    print(f"VRAM after loading policy+reference: "
+          f"{(load_mem - base_mem)/1024**2:.0f} MiB")
+```
+
+```{python}
+if torch.cuda.is_available():
+    # One synthetic preference pair. Same prompt, two short completions: a
+    # "chosen" one we want upweighted and a "rejected" one we want downweighted.
+    prompt = "Explain in one sentence why the sky is blue."
+    chosen_text = (" Sunlight scatters off air molecules, and shorter blue "
+                   "wavelengths scatter most, so the sky looks blue.")
+    rejected_text = " idk it just is blue whatever lol."
+
+    def encode_pair(prompt, completion):
+        p_ids = tok(prompt, return_tensors="pt").input_ids
+        full = tok(prompt + completion, return_tensors="pt").input_ids
+        return full.to(device), p_ids.shape[1]
+
+    def seq_logprob(model, ids, prompt_len):
+        """Sum of log-probs of the completion tokens only (prompt masked out)."""
+        logits = model(ids).logits[:, :-1, :]
+        logp = F.log_softmax(logits, dim=-1)
+        targets = ids[:, 1:]
+        tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        # only score positions at or beyond the prompt boundary
+        comp_mask = torch.arange(tok_logp.shape[1], device=device) >= (prompt_len - 1)
+        return (tok_logp * comp_mask).sum(dim=-1)
+
+    chosen_ids, c_plen = encode_pair(prompt, chosen_text)
+    rejected_ids, r_plen = encode_pair(prompt, rejected_text)
+
+    BETA = 0.1
+
+    def dpo_step_loss():
+        pi_w = seq_logprob(policy, chosen_ids, c_plen)
+        pi_l = seq_logprob(policy, rejected_ids, r_plen)
+        with torch.no_grad():
+            ref_w = seq_logprob(reference, chosen_ids, c_plen)
+            ref_l = seq_logprob(reference, rejected_ids, r_plen)
+        r_w = BETA * (pi_w - ref_w)   # implicit reward, chosen
+        r_l = BETA * (pi_l - ref_l)   # implicit reward, rejected
+        loss = -F.logsigmoid(r_w - r_l).mean()
+        margin = (r_w - r_l).mean()
+        return loss, margin
+
+    loss0, margin0 = dpo_step_loss()
+    print(f"before step:  DPO loss={loss0.item():.4f}  "
+          f"implicit-reward margin={margin0.item():+.5f}")
+    print("(policy == reference, so the margin starts at exactly 0 and "
+          f"loss == log 2 = {torch.log(torch.tensor(2.0)).item():.4f})")
+```
+
+```{python}
+if torch.cuda.is_available():
+    # One real gradient step on cuda, timed. AdamW updates the policy only.
+    opt = torch.optim.AdamW(policy.parameters(), lr=1e-5)
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    opt.zero_grad()
+    loss, _ = dpo_step_loss()
+    loss.backward()
+    opt.step()
+    torch.cuda.synchronize()
+    step_ms = (time.perf_counter() - t0) * 1000
+
+    lossF, marginF = dpo_step_loss()
+    peak_mem = torch.cuda.max_memory_allocated()
+
+    print(f"after 1 step: DPO loss={lossF.item():.4f}  "
+          f"implicit-reward margin={marginF.item():+.5f}")
+    print(f"margin moved {margin0.item():+.5f} -> {marginF.item():+.5f} "
+          "(chosen pulled above rejected, as the Section 3.1 gradient prescribes)")
+    print(f"single-step latency: {step_ms:.0f} ms")
+    print(f"peak VRAM allocated: {peak_mem/1024**2:.0f} MiB "
+          f"({peak_mem/1024**3:.2f} GiB)")
+
+    del policy, reference, opt
+    torch.cuda.empty_cache()
+else:
+    print("CUDA not available: skipping the GPU DPO step. The CPU cells in "
+          "Section 4.2 demonstrate the identical loss on a tiny model.")
+```
+
+The numbers above are measured on the render machine, not hand-picked. The margin again starts at exactly zero because the policy and reference are byte-for-byte identical, and a single AdamW step moves it positive: the same dynamics as the tiny model, now confirmed on a real `Qwen2.5-0.5B` transformer. A half-billion-parameter policy plus its frozen reference in float32, with one preference pair, fits in well under 7 GB, which is why this runs on a single 8 GB consumer GPU while the 7B run in the next section needs 4-bit loading and LoRA.
+
+### 4.4 DPO at Scale With `trl` (show-only, requires GPU)
 
 For a real model the only thing that changes is the scale. The mature open-source `trl` library implements the identical loss on top of Hugging Face Transformers and PEFT, with LoRA adapters and 4-bit loading so a 7B-parameter model fits on a single GPU. The code below is the real invocation; it requires a GPU and downloads a multi-gigabyte model, so it is shown rather than executed.
 
@@ -340,7 +472,7 @@ trainer = DPOTrainer(model=model, args=config, train_dataset=dataset,
 trainer.train()
 ```
 
-### 4.4 RLHF With PPO and GRPO via `trl` (show-only, requires GPU)
+### 4.5 RLHF With PPO and GRPO via `trl` (show-only, requires GPU)
 
 The reinforcement-learning path is heavier because it generates from the policy online and scores those generations. `trl` provides `PPOTrainer` and `GRPOTrainer`. GRPO is shown here because it is the current default for reinforcement learning with verifiable rewards: it needs no value network and accepts a plain Python reward function.
 

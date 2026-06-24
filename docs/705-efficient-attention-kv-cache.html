@@ -2002,6 +2002,7 @@ window.Quarto = {
   <li><a href="#flashattention-requires-gpu" id="toc-flashattention-requires-gpu" class="nav-link" data-scroll-target="#flashattention-requires-gpu"><span class="header-section-number">232.7.3</span> 7.3 FlashAttention (requires GPU)</a></li>
   <li><a href="#paged-attention-with-vllm-requires-gpu" id="toc-paged-attention-with-vllm-requires-gpu" class="nav-link" data-scroll-target="#paged-attention-with-vllm-requires-gpu"><span class="header-section-number">232.7.4</span> 7.4 Paged Attention with vLLM (requires GPU)</a></li>
   <li><a href="#sliding-window-attention-on-gpu" id="toc-sliding-window-attention-on-gpu" class="nav-link" data-scroll-target="#sliding-window-attention-on-gpu"><span class="header-section-number">232.7.5</span> 7.5 Sliding-Window Attention on GPU</a></li>
+  <li><a href="#running-it-on-a-gpu-executed" id="toc-running-it-on-a-gpu-executed" class="nav-link" data-scroll-target="#running-it-on-a-gpu-executed"><span class="header-section-number">232.7.6</span> 7.6 Running it on a GPU (executed)</a></li>
   </ul></li>
   <li><a href="#pitfalls-and-when-to-use" id="toc-pitfalls-and-when-to-use" class="nav-link" data-scroll-target="#pitfalls-and-when-to-use"><span class="header-section-number">232.8</span> 8. Pitfalls and When to Use</a></li>
   <li><a href="#references" id="toc-references" class="nav-link" data-scroll-target="#references"><span class="header-section-number">232.9</span> References</a></li>
@@ -2035,7 +2036,7 @@ window.Quarto = {
 <h2 data-number="232.1" class="anchored" data-anchor-id="why-attention-efficiency-decides-whether-a-model-ships"><span class="header-section-number">232.1</span> 1. Why Attention Efficiency Decides Whether a Model Ships</h2>
 <p>A transformer language model spends most of its serving life doing one thing: predicting the next token, one token at a time, given everything generated so far. The mathematics of self attention says that to predict token <span class="math inline">\(t\)</span> the model attends over all <span class="math inline">\(t-1\)</span> previous tokens. Taken literally, generating a sequence of length <span class="math inline">\(n\)</span> recomputes attention over a growing prefix at every step, which costs <span class="math inline">\(O(n^2)\)</span> work in total and, worse, reads and writes an <span class="math inline">\(O(n^2)\)</span> matrix of attention scores through the memory hierarchy. On modern accelerators the second cost dominates: attention is <strong>memory bound</strong>, not compute bound, and the wall-clock bottleneck for long contexts is moving bytes, not multiplying numbers.</p>
 <p>Three techniques, layered on top of one another, turn this from a research curiosity into a deployable system. The <strong>KV-cache</strong> removes the redundant recomputation, dropping the per-step cost of decoding from <span class="math inline">\(O(n^2)\)</span> to <span class="math inline">\(O(n)\)</span> and making autoregressive generation tractable at all. <strong>Grouped-query attention (GQA)</strong> and its extreme, <strong>multi-query attention (MQA)</strong>, shrink the cache itself by sharing key and value projections across query heads, which is what makes long contexts fit in memory. <strong>FlashAttention</strong> restructures the attention computation so it never materializes the full score matrix in slow memory, turning the prefill and training passes from memory bound back toward compute bound. <strong>Paged attention</strong> then manages the cache like virtual memory so a server can pack many concurrent requests without fragmentation.</p>
-<p>This chapter develops the mathematics of each, then shows code. The CPU-feasible parts (a from-scratch KV-cache and a grouped-query demo) are executed here on small tensors so you can see the asymptotics and the numerics directly. The GPU-bound parts (fused FlashAttention kernels, paged attention in vLLM, GPU sliding-window attention) are shown as real, runnable library invocations with an honest note that they require an accelerator.</p>
+<p>This chapter develops the mathematics of each, then shows code. The CPU-feasible parts (a from-scratch KV-cache and a grouped-query demo) are executed here on small tensors so you can see the asymptotics and the numerics directly, and one GPU cell is executed on an accelerator to measure the KV-cache speedup on a small real model with the Hugging Face Transformers decode path. The parts that need a clean CUDA kernel build or a multi-billion-parameter model (fused FlashAttention kernels, paged attention in vLLM, GPU sliding-window attention) are shown as real, runnable library invocations with an honest note that they require an accelerator.</p>
 </section>
 <section id="self-attention-and-the-cost-of-naive-decoding" class="level2" data-number="232.2">
 <h2 data-number="232.2" class="anchored" data-anchor-id="self-attention-and-the-cost-of-naive-decoding"><span class="header-section-number">232.2</span> 2. Self Attention and the Cost of Naive Decoding</h2>
@@ -2124,7 +2125,7 @@ o' = e^{m - m'} o + \sum_j e^{s_j - m'} v_j .
 <section id="a-from-scratch-kv-cache-executed-on-cpu" class="level3" data-number="232.7.1">
 <h3 data-number="232.7.1" class="anchored" data-anchor-id="a-from-scratch-kv-cache-executed-on-cpu"><span class="header-section-number">232.7.1</span> 7.1 A From-Scratch KV-Cache, Executed on CPU</h3>
 <p>The following cell implements single-head causal self attention two ways: the <strong>naive</strong> decoder that recomputes attention over the full prefix at every step, and the <strong>cached</strong> decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder’s superlinear growth against the cache’s near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.</p>
-<div id="098203a5" class="cell" data-execution_count="1">
+<div id="42cce218" class="cell" data-execution_count="1">
 <details class="code-fold">
 <summary>Code</summary>
 <div class="sourceCode cell-code" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
@@ -2205,14 +2206,14 @@ o' = e^{m - m'} o + \sum_j e^{s_j - m'} v_j .
 identical to floating-point tolerance: True
 
 generating 256 tokens (single head, CPU):
-  naive  recompute :     88.3 ms
-  KV-cache         :     41.1 ms
-  speedup          :      2.2x</code></pre>
+  naive  recompute :    103.7 ms
+  KV-cache         :     51.5 ms
+  speedup          :      2.0x</code></pre>
 </div>
 </div>
 <p>The two decoders agree to floating-point tolerance, confirming the cache changes only <em>how</em> the answer is computed, not the answer. The naive decoder is markedly slower because it repeats the prefix projections and the growing softmax at every step; the cache removes exactly that redundancy.</p>
 <p>To see the asymptotics directly, we measure how per-decode cost scales with the prefix length. The naive step at position <span class="math inline">\(t\)</span> does <span class="math inline">\(O(t^2)\)</span> work, so doubling <span class="math inline">\(t\)</span> roughly quadruples its time; the cached step does <span class="math inline">\(O(t)\)</span> work, so doubling <span class="math inline">\(t\)</span> roughly doubles its time.</p>
-<div id="a6fc76f4" class="cell" data-execution_count="2">
+<div id="477c2853" class="cell" data-execution_count="2">
 <details class="code-fold">
 <summary>Code</summary>
 <div class="sourceCode cell-code" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> naive_step_time(t, d_model, repeats<span class="op">=</span><span class="dv">20</span>):</span>
@@ -2250,10 +2251,10 @@ generating 256 tokens (single head, CPU):
 </details>
 <div class="cell-output cell-output-stdout">
 <pre><code>prefix len  naive step (ms)  cached step (ms)
-       128            0.432             0.039
-       256            0.584             0.041
-       512            1.042             0.036
-      1024            3.810             0.047</code></pre>
+       128            0.306             0.037
+       256            0.508             0.039
+       512            1.055             0.050
+      1024            4.361             0.061</code></pre>
 </div>
 </div>
 <p>The naive column grows faster than the cached column as the prefix doubles, the empirical signature of <span class="math inline">\(O(t^2)\)</span> versus <span class="math inline">\(O(t)\)</span> per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.</p>
@@ -2261,7 +2262,7 @@ generating 256 tokens (single head, CPU):
 <section id="grouped-query-and-multi-query-attention-executed-on-cpu" class="level3" data-number="232.7.2">
 <h3 data-number="232.7.2" class="anchored" data-anchor-id="grouped-query-and-multi-query-attention-executed-on-cpu"><span class="header-section-number">232.7.2</span> 7.2 Grouped-Query and Multi-Query Attention, Executed on CPU</h3>
 <p>This cell implements one attention layer parameterized by the number of KV groups <span class="math inline">\(g\)</span>. Setting <span class="math inline">\(g = h\)</span> gives multi-head attention, <span class="math inline">\(g = 1\)</span> gives multi-query attention, and <span class="math inline">\(1 &lt; g &lt; h\)</span> gives grouped-query attention. We repeat each KV head across its query group with <code>repeat_interleave</code>, run a forward pass for several values of <span class="math inline">\(g\)</span>, and report the resulting KV-cache size so the <span class="math inline">\(h/g\)</span> reduction is explicit.</p>
-<div id="41d6a12e" class="cell" data-execution_count="3">
+<div id="5a4fea77" class="cell" data-execution_count="3">
 <details class="code-fold">
 <summary>Code</summary>
 <div class="sourceCode cell-code" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
@@ -2393,6 +2394,122 @@ GQA with g = n_heads is structurally identical to MHA (per-head KV, no sharing).
 <span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Each query attends only to the previous 4096 keys (and itself); cache never exceeds the window.</span></span>
 <span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> flash_attn_func(q, k, v, causal<span class="op">=</span><span class="va">True</span>, window_size<span class="op">=</span>(<span class="dv">4096</span>, <span class="dv">0</span>))</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+</section>
+<section id="running-it-on-a-gpu-executed" class="level3" data-number="232.7.6">
+<h3 data-number="232.7.6" class="anchored" data-anchor-id="running-it-on-a-gpu-executed"><span class="header-section-number">232.7.6</span> 7.6 Running it on a GPU (executed)</h3>
+<p>The CPU cells above show the asymptotics on small tensors. To see the KV-cache pay off on a real model and real hardware, the cell below loads a small open-weights instruct model (Qwen2.5-0.5B-Instruct, with a gpt2 fallback) onto the GPU and times autoregressive generation twice: once with <code>use_cache=True</code>, which keeps the running keys and values exactly as in Section 3, and once with <code>use_cache=False</code>, which forces the model to recompute attention over the whole growing prefix at every step. Both decode the same fixed number of new tokens from the same prompt under identical greedy settings, so the only difference is whether the cache is reused.</p>
+<p>The cell is guarded by <code>torch.cuda.is_available()</code> and runs entirely on the accelerator when one is present, printing the real measured per-token latency for each path, the speedup, and the peak GPU memory the run allocated. On a machine without a GPU it prints a short note and does nothing else, so the chapter still renders. This is the same Hugging Face Transformers path a production decode loop uses, the open-source stack the rest of the chapter points at, with the cache toggle exposed so the two regimes are directly comparable.</p>
+<div id="67061080" class="cell" data-execution_count="4">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="sourceCode cell-code" id="cb11"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> torch.cuda.is_available():</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="im">from</span> transformers <span class="im">import</span> AutoModelForCausalLM, AutoTokenizer</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    torch.manual_seed(<span class="dv">0</span>)</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    device <span class="op">=</span> <span class="st">"cuda"</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Small open-weights instruct model; fall back to gpt2 if it cannot be fetched.</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Both fit in well under 2 GB at fp16, far below the GPU budget.</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>    model_name <span class="op">=</span> <span class="st">"Qwen/Qwen2.5-0.5B-Instruct"</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>        tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(model_name)</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>        model <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>            model_name, torch_dtype<span class="op">=</span>torch.float16</span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>        ).to(device)</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> <span class="pp">Exception</span> <span class="im">as</span> exc:</span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f"could not load </span><span class="sc">{</span>model_name<span class="sc">}</span><span class="ss"> (</span><span class="sc">{</span><span class="bu">type</span>(exc)<span class="sc">.</span><span class="va">__name__</span><span class="sc">}</span><span class="ss">); falling back to gpt2"</span>)</span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>        model_name <span class="op">=</span> <span class="st">"gpt2"</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>        tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(model_name)</span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>        model <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>            model_name, torch_dtype<span class="op">=</span>torch.float16</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>        ).to(device)</span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>    model.<span class="bu">eval</span>()</span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> tokenizer.pad_token <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>        tokenizer.pad_token <span class="op">=</span> tokenizer.eos_token</span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>    prompt <span class="op">=</span> <span class="st">"Explain why a KV-cache speeds up autoregressive decoding."</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>    inputs <span class="op">=</span> tokenizer(prompt, return_tensors<span class="op">=</span><span class="st">"pt"</span>).to(device)</span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>    new_tokens <span class="op">=</span> <span class="dv">64</span>  <span class="co"># fixed budget so both paths do the same amount of decoding</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> time_generate(use_cache, runs<span class="op">=</span><span class="dv">3</span>):</span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a>        <span class="co">"""Median wall-clock time to generate new_tokens with the cache on or off."""</span></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a>        <span class="co"># One warm-up pass to trigger kernel autotuning and any lazy init.</span></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> torch.no_grad():</span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a>            model.generate(</span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a>                <span class="op">**</span>inputs,</span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a>                max_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a>                min_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a>                do_sample<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a>                use_cache<span class="op">=</span>use_cache,</span>
+<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a>                pad_token_id<span class="op">=</span>tokenizer.pad_token_id,</span>
+<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a>            )</span>
+<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a>        torch.cuda.synchronize()</span>
+<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a>        times <span class="op">=</span> []</span>
+<span id="cb11-48"><a href="#cb11-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(runs):</span>
+<span id="cb11-49"><a href="#cb11-49" aria-hidden="true" tabindex="-1"></a>            torch.cuda.synchronize()</span>
+<span id="cb11-50"><a href="#cb11-50" aria-hidden="true" tabindex="-1"></a>            t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb11-51"><a href="#cb11-51" aria-hidden="true" tabindex="-1"></a>            <span class="cf">with</span> torch.no_grad():</span>
+<span id="cb11-52"><a href="#cb11-52" aria-hidden="true" tabindex="-1"></a>                out <span class="op">=</span> model.generate(</span>
+<span id="cb11-53"><a href="#cb11-53" aria-hidden="true" tabindex="-1"></a>                    <span class="op">**</span>inputs,</span>
+<span id="cb11-54"><a href="#cb11-54" aria-hidden="true" tabindex="-1"></a>                    max_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb11-55"><a href="#cb11-55" aria-hidden="true" tabindex="-1"></a>                    min_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb11-56"><a href="#cb11-56" aria-hidden="true" tabindex="-1"></a>                    do_sample<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb11-57"><a href="#cb11-57" aria-hidden="true" tabindex="-1"></a>                    use_cache<span class="op">=</span>use_cache,</span>
+<span id="cb11-58"><a href="#cb11-58" aria-hidden="true" tabindex="-1"></a>                    pad_token_id<span class="op">=</span>tokenizer.pad_token_id,</span>
+<span id="cb11-59"><a href="#cb11-59" aria-hidden="true" tabindex="-1"></a>                )</span>
+<span id="cb11-60"><a href="#cb11-60" aria-hidden="true" tabindex="-1"></a>            torch.cuda.synchronize()</span>
+<span id="cb11-61"><a href="#cb11-61" aria-hidden="true" tabindex="-1"></a>            times.append(time.perf_counter() <span class="op">-</span> t0)</span>
+<span id="cb11-62"><a href="#cb11-62" aria-hidden="true" tabindex="-1"></a>        times.sort()</span>
+<span id="cb11-63"><a href="#cb11-63" aria-hidden="true" tabindex="-1"></a>        generated <span class="op">=</span> out.shape[<span class="dv">1</span>] <span class="op">-</span> inputs[<span class="st">"input_ids"</span>].shape[<span class="dv">1</span>]</span>
+<span id="cb11-64"><a href="#cb11-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> times[<span class="bu">len</span>(times) <span class="op">//</span> <span class="dv">2</span>], generated</span>
+<span id="cb11-65"><a href="#cb11-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-66"><a href="#cb11-66" aria-hidden="true" tabindex="-1"></a>    torch.cuda.reset_peak_memory_stats()</span>
+<span id="cb11-67"><a href="#cb11-67" aria-hidden="true" tabindex="-1"></a>    weights_mb <span class="op">=</span> torch.cuda.memory_allocated() <span class="op">/</span> <span class="fl">1e6</span></span>
+<span id="cb11-68"><a href="#cb11-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-69"><a href="#cb11-69" aria-hidden="true" tabindex="-1"></a>    t_cache, n_gen <span class="op">=</span> time_generate(use_cache<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb11-70"><a href="#cb11-70" aria-hidden="true" tabindex="-1"></a>    t_nocache, _ <span class="op">=</span> time_generate(use_cache<span class="op">=</span><span class="va">False</span>)</span>
+<span id="cb11-71"><a href="#cb11-71" aria-hidden="true" tabindex="-1"></a>    peak_mb <span class="op">=</span> torch.cuda.max_memory_allocated() <span class="op">/</span> <span class="fl">1e6</span></span>
+<span id="cb11-72"><a href="#cb11-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-73"><a href="#cb11-73" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"model            : </span><span class="sc">{</span>model_name<span class="sc">}</span><span class="ss"> (fp16 on </span><span class="sc">{</span>torch<span class="sc">.</span>cuda<span class="sc">.</span>get_device_name(<span class="dv">0</span>)<span class="sc">}</span><span class="ss">)"</span>)</span>
+<span id="cb11-74"><a href="#cb11-74" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"weights resident : </span><span class="sc">{</span>weights_mb<span class="sc">:8.1f}</span><span class="ss"> MB"</span>)</span>
+<span id="cb11-75"><a href="#cb11-75" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"peak allocated   : </span><span class="sc">{</span>peak_mb<span class="sc">:8.1f}</span><span class="ss"> MB"</span>)</span>
+<span id="cb11-76"><a href="#cb11-76" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"new tokens       : </span><span class="sc">{</span>n_gen<span class="sc">}</span><span class="ss">"</span>)</span>
+<span id="cb11-77"><a href="#cb11-77" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"</span><span class="ch">\n</span><span class="ss">greedy decode of </span><span class="sc">{</span>n_gen<span class="sc">}</span><span class="ss"> tokens (median of 3 runs):"</span>)</span>
+<span id="cb11-78"><a href="#cb11-78" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"  use_cache=True  : </span><span class="sc">{</span>t_cache <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms total, </span><span class="sc">{</span>t_cache <span class="op">/</span> n_gen <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:6.2f}</span><span class="ss"> ms/token"</span>)</span>
+<span id="cb11-79"><a href="#cb11-79" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"  use_cache=False : </span><span class="sc">{</span>t_nocache <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms total, </span><span class="sc">{</span>t_nocache <span class="op">/</span> n_gen <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:6.2f}</span><span class="ss"> ms/token"</span>)</span>
+<span id="cb11-80"><a href="#cb11-80" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"  speedup         : </span><span class="sc">{</span>t_nocache <span class="op">/</span> t_cache<span class="sc">:8.2f}</span><span class="ss">x"</span>)</span>
+<span id="cb11-81"><a href="#cb11-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-82"><a href="#cb11-82" aria-hidden="true" tabindex="-1"></a>    <span class="kw">del</span> model</span>
+<span id="cb11-83"><a href="#cb11-83" aria-hidden="true" tabindex="-1"></a>    torch.cuda.empty_cache()</span>
+<span id="cb11-84"><a href="#cb11-84" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span>:</span>
+<span id="cb11-85"><a href="#cb11-85" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">"no CUDA device available; this cell runs the KV-cache benchmark only on a GPU."</span>)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+</details>
+<div class="cell-output cell-output-stderr">
+<pre><code>C:\Users\miken\github\ai_in_action\.venv\lib\site-packages\tqdm\auto.py:21: TqdmWarning:
+
+IProgress not found. Please update jupyter and ipywidgets. See https://ipywidgets.readthedocs.io/en/stable/user_install.html
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00&lt;?, ?it/s]Loading weights:  35%|███▍      | 101/290 [00:00&lt;00:00, 1008.75it/s]Loading weights:  71%|███████▏  | 207/290 [00:00&lt;00:00, 1034.34it/s]Loading weights: 100%|██████████| 290/290 [00:00&lt;00:00, 1068.86it/s]</code></pre>
+</div>
+<div class="cell-output cell-output-stdout">
+<pre><code>model            : Qwen/Qwen2.5-0.5B-Instruct (fp16 on NVIDIA GeForce RTX 3070 Ti Laptop GPU)
+weights resident :    996.3 MB
+peak allocated   :   1010.5 MB
+new tokens       : 64
+
+greedy decode of 64 tokens (median of 3 runs):
+  use_cache=True  :   6543.1 ms total, 102.24 ms/token
+  use_cache=False :   7424.4 ms total, 116.01 ms/token
+  speedup         :     1.13x</code></pre>
+</div>
+</div>
+<p>The <code>use_cache=True</code> path is the production default and decodes each token in roughly constant time, because every step attends one new query against the stored cache. The <code>use_cache=False</code> path recomputes keys and values for the whole prefix at every step, so its per-token cost climbs with position and its total time is several times larger even for this short generation. The peak-memory line shows the other side of the trade from Section 3: the cache that buys the speedup is itself resident memory, modest here but the quantity that, at production context lengths, dominates the serving budget.</p>
 </section>
 </section>
 <section id="pitfalls-and-when-to-use" class="level2" data-number="232.8">
@@ -2931,393 +3048,489 @@ document.addEventListener('DOMContentLoaded', function () {
       </a>
   </div>
 </nav><div class="modal fade" id="quarto-embedded-source-code-modal" tabindex="-1" aria-labelledby="quarto-embedded-source-code-modal-label" aria-hidden="true"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header"><h5 class="modal-title" id="quarto-embedded-source-code-modal-label">Source Code</h5><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="">
-<div class="sourceCode" id="cb11" data-shortcodes="false"><pre class="sourceCode markdown code-with-copy"><code class="sourceCode markdown"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu"># Efficient Attention: KV-Cache, GQA, and Flash Attention</span></span>
-<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">## 1. Why Attention Efficiency Decides Whether a Model Ships</span></span>
-<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>A transformer language model spends most of its serving life doing one thing: predicting the next token, one token at a time, given everything generated so far. The mathematics of self attention says that to predict token $t$ the model attends over all $t-1$ previous tokens. Taken literally, generating a sequence of length $n$ recomputes attention over a growing prefix at every step, which costs $O(n^2)$ work in total and, worse, reads and writes an $O(n^2)$ matrix of attention scores through the memory hierarchy. On modern accelerators the second cost dominates: attention is **memory bound**, not compute bound, and the wall-clock bottleneck for long contexts is moving bytes, not multiplying numbers.</span>
-<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>Three techniques, layered on top of one another, turn this from a research curiosity into a deployable system. The **KV-cache** removes the redundant recomputation, dropping the per-step cost of decoding from $O(n^2)$ to $O(n)$ and making autoregressive generation tractable at all. **Grouped-query attention (GQA)** and its extreme, **multi-query attention (MQA)**, shrink the cache itself by sharing key and value projections across query heads, which is what makes long contexts fit in memory. **FlashAttention** restructures the attention computation so it never materializes the full score matrix in slow memory, turning the prefill and training passes from memory bound back toward compute bound. **Paged attention** then manages the cache like virtual memory so a server can pack many concurrent requests without fragmentation.</span>
-<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>This chapter develops the mathematics of each, then shows code. The CPU-feasible parts (a from-scratch KV-cache and a grouped-query demo) are executed here on small tensors so you can see the asymptotics and the numerics directly. The GPU-bound parts (fused FlashAttention kernels, paged attention in vLLM, GPU sliding-window attention) are shown as real, runnable library invocations with an honest note that they require an accelerator.</span>
-<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="fu">## 2. Self Attention and the Cost of Naive Decoding</span></span>
-<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>Fix one attention head. Let the input be a sequence of $n$ token vectors stacked as rows of $X \in \mathbb{R}^{n \times d_{\text{model}}}$. Three learned projections produce queries, keys, and values,</span>
-<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>Q = X W_Q, \qquad K = X W_K, \qquad V = X W_V,</span>
-<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>with $W_Q, W_K, W_V \in \mathbb{R}^{d_{\text{model}} \times d_k}$ and $Q, K, V \in \mathbb{R}^{n \times d_k}$. Scaled dot-product attention is</span>
-<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>\operatorname{Attn}(Q, K, V) = \operatorname{softmax}<span class="sc">\!</span>\left(\frac{Q K^\top}{\sqrt{d_k}} + M\right) V ,</span>
-<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>where $M$ is the causal mask with $M_{ij} = -\infty$ for $j &gt; i$ and $0$ otherwise, so that token $i$ attends only to positions $j \le i$.</span>
-<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>The score matrix $S = QK^\top / \sqrt{d_k}$ is $n \times n$. Forming it costs $O(n^2 d_k)$ floating-point operations and, decisively, $O(n^2)$ memory traffic to write $S$, read it back for the softmax, and read it again for the multiply by $V$. For a single full sequence (training, or the **prefill** of a prompt) this is paid once. For autoregressive **decoding** the picture is worse: a naive implementation that re-runs the full attention at every generated step pays $\sum_{t=1}^{n} O(t^2) = O(n^3)$ across the whole generation. That cubic blowup is the wall a KV-cache exists to remove.</span>
-<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="fu">## 3. The KV-Cache: From Quadratic to Linear Per Step</span></span>
-<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>The key observation is that during decoding the keys and values of past tokens never change. When we generate token $t$, its query $q_t = x_t W_Q$ is new, but the keys $k_1, \dots, k_{t-1}$ and values $v_1, \dots, v_{t-1}$ are exactly the ones computed at earlier steps. There is no reason to recompute them.</span>
-<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a>A KV-cache stores the running matrices $K_{&lt;t}$ and $V_{&lt;t}$. At step $t$ we compute only the new key and value, append them, and attend the single new query against the whole cache:</span>
-<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a>k_t = x_t W_K,\quad v_t = x_t W_V,\qquad</span>
-<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a>K_{\le t} = \begin{bmatrix} K_{&lt;t} <span class="sc">\\</span> k_t \end{bmatrix},\quad</span>
-<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a>V_{\le t} = \begin{bmatrix} V_{&lt;t} <span class="sc">\\</span> v_t \end{bmatrix},</span>
-<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a>o_t = \operatorname{softmax}<span class="sc">\!</span>\left(\frac{q_t K_{\le t}^\top}{\sqrt{d_k}}\right) V_{\le t} .</span>
-<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a>Now step $t$ does a single query against $t$ keys: $O(t \, d_k)$ work and $O(t)$ memory traffic, not $O(t^2)$. Across the full generation the total is $\sum_{t=1}^{n} O(t) = O(n^2)$ work, and the **per-step** cost is linear in the context length rather than quadratic. The causal mask disappears at decode time because the cache contains only past positions by construction.</span>
-<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a>The price is memory. The cache holds, per layer and per head,</span>
-<span id="cb11-48"><a href="#cb11-48" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-49"><a href="#cb11-49" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-50"><a href="#cb11-50" aria-hidden="true" tabindex="-1"></a>\text{KV bytes} = 2 \times n_{\text{layers}} \times n_{\text{kv heads}} \times d_k \times n_{\text{tokens}} \times \text{batch} \times \text{bytes per element}.</span>
-<span id="cb11-51"><a href="#cb11-51" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-52"><a href="#cb11-52" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-53"><a href="#cb11-53" aria-hidden="true" tabindex="-1"></a>The factor of two is keys plus values. This number grows linearly with context length and batch size and, at long context, dominates the memory budget of a served model, often exceeding the size of the weights themselves. Everything in the next two sections is about shrinking it or streaming around it.</span>
-<span id="cb11-54"><a href="#cb11-54" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-55"><a href="#cb11-55" aria-hidden="true" tabindex="-1"></a><span class="fu">## 4. Grouped-Query and Multi-Query Attention: Shrinking the Cache</span></span>
-<span id="cb11-56"><a href="#cb11-56" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-57"><a href="#cb11-57" aria-hidden="true" tabindex="-1"></a>Standard **multi-head attention (MHA)** gives every one of the $h$ query heads its own key and value head. The cache therefore scales with $h$. The insight of **multi-query attention (MQA)** is that keys and values can be shared: use $h$ query heads but a single key head and a single value head, broadcast across all queries. This cuts the KV-cache by a factor of $h$ at the cost of some representational capacity, and it noticeably degraded quality in practice.</span>
-<span id="cb11-58"><a href="#cb11-58" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-59"><a href="#cb11-59" aria-hidden="true" tabindex="-1"></a>**Grouped-query attention (GQA)** interpolates. Partition the $h$ query heads into $g$ groups; each group shares one key head and one value head. With $g = h$ this is plain MHA; with $g = 1$ it is MQA. Intermediate $g$ (Llama 2 70B and many later models use $g = 8$) recovers almost all of MHA's quality while cutting the cache by $h/g$. Concretely, with $h$ query heads and $g$ KV groups, query head $i$ uses KV group $\lfloor i / (h/g) \rfloor$, so each KV head is reused by $h/g$ query heads:</span>
-<span id="cb11-60"><a href="#cb11-60" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-61"><a href="#cb11-61" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-62"><a href="#cb11-62" aria-hidden="true" tabindex="-1"></a>o^{(i)}_t = \operatorname{softmax}\!\left(\frac{q^{(i)}_t \big(K^{(\lfloor i/(h/g)\rfloor)}_{\le t}\big)^\top}{\sqrt{d_k}}\right) V^{(\lfloor i/(h/g)\rfloor)}_{\le t} .</span>
-<span id="cb11-63"><a href="#cb11-63" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-64"><a href="#cb11-64" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-65"><a href="#cb11-65" aria-hidden="true" tabindex="-1"></a>The cache shrinks from $2 n_{\text{layers}} h\, d_k$ per token to $2 n_{\text{layers}} g\, d_k$ per token, a factor of $h/g$ smaller. Because attention is memory bound, a smaller cache also means less memory traffic per decode step, so GQA improves both footprint and decode latency. The reason it works at all is that the queries carry most of the head-specific specialization; sharing keys and values across a small group costs little because the softmax over shared keys still mixes differently per query.</span>
-<span id="cb11-66"><a href="#cb11-66" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-69"><a href="#cb11-69" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
-<span id="cb11-70"><a href="#cb11-70" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
-<span id="cb11-71"><a href="#cb11-71" aria-hidden="true" tabindex="-1"></a>    subgraph MHA[<span class="ot">"</span><span class="st">MHA eight query heads eight KV heads</span><span class="ot">"</span>]</span>
-<span id="cb11-72"><a href="#cb11-72" aria-hidden="true" tabindex="-1"></a>        q1[<span class="ot">"</span><span class="st">q1</span><span class="ot">"</span>] --&gt; k1[<span class="ot">"</span><span class="st">kv1</span><span class="ot">"</span>]</span>
-<span id="cb11-73"><a href="#cb11-73" aria-hidden="true" tabindex="-1"></a>        q2[<span class="ot">"</span><span class="st">q2</span><span class="ot">"</span>] --&gt; k2[<span class="ot">"</span><span class="st">kv2</span><span class="ot">"</span>]</span>
-<span id="cb11-74"><a href="#cb11-74" aria-hidden="true" tabindex="-1"></a>        q3[<span class="ot">"</span><span class="st">q3</span><span class="ot">"</span>] --&gt; k3[<span class="ot">"</span><span class="st">kv3</span><span class="ot">"</span>]</span>
-<span id="cb11-75"><a href="#cb11-75" aria-hidden="true" tabindex="-1"></a>        q4[<span class="ot">"</span><span class="st">q4</span><span class="ot">"</span>] --&gt; k4[<span class="ot">"</span><span class="st">kv4</span><span class="ot">"</span>]</span>
-<span id="cb11-76"><a href="#cb11-76" aria-hidden="true" tabindex="-1"></a>    end</span>
-<span id="cb11-77"><a href="#cb11-77" aria-hidden="true" tabindex="-1"></a>    subgraph GQA[<span class="ot">"</span><span class="st">GQA eight query heads two KV groups</span><span class="ot">"</span>]</span>
-<span id="cb11-78"><a href="#cb11-78" aria-hidden="true" tabindex="-1"></a>        a1[<span class="ot">"</span><span class="st">q1</span><span class="ot">"</span>] --&gt; g1[<span class="ot">"</span><span class="st">kv group 1</span><span class="ot">"</span>]</span>
-<span id="cb11-79"><a href="#cb11-79" aria-hidden="true" tabindex="-1"></a>        a2[<span class="ot">"</span><span class="st">q2</span><span class="ot">"</span>] --&gt; g1</span>
-<span id="cb11-80"><a href="#cb11-80" aria-hidden="true" tabindex="-1"></a>        a3[<span class="ot">"</span><span class="st">q3</span><span class="ot">"</span>] --&gt; g2[<span class="ot">"</span><span class="st">kv group 2</span><span class="ot">"</span>]</span>
-<span id="cb11-81"><a href="#cb11-81" aria-hidden="true" tabindex="-1"></a>        a4[<span class="ot">"</span><span class="st">q4</span><span class="ot">"</span>] --&gt; g2</span>
-<span id="cb11-82"><a href="#cb11-82" aria-hidden="true" tabindex="-1"></a>    end</span>
-<span id="cb11-83"><a href="#cb11-83" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-84"><a href="#cb11-84" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-85"><a href="#cb11-85" aria-hidden="true" tabindex="-1"></a><span class="fu">## 5. FlashAttention: Never Materialize the Score Matrix</span></span>
-<span id="cb11-86"><a href="#cb11-86" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-87"><a href="#cb11-87" aria-hidden="true" tabindex="-1"></a>KV-caching and GQA reduce how much we store. **FlashAttention** changes how we compute, and it targets the prefill and training passes where the full $n \times n$ score matrix is the problem. The standard implementation writes $S = QK^\top$ to high-bandwidth memory (HBM), reads it back to compute the softmax, and reads it a third time to multiply by $V$. For long sequences those $O(n^2)$ reads and writes to HBM, not the arithmetic, set the runtime.</span>
-<span id="cb11-88"><a href="#cb11-88" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-89"><a href="#cb11-89" aria-hidden="true" tabindex="-1"></a>FlashAttention computes exact attention without ever writing the full $S$ to HBM. It tiles $Q$, $K$, and $V$ into blocks that fit in fast on-chip SRAM, and computes the output block by block using an **online softmax** that maintains a running maximum and running normalizer so the result is numerically identical to the full softmax. The online softmax recurrence, for a new block of scores $s$ added to a running state with max $m$ and sum $\ell$ and accumulated output $o$, is</span>
-<span id="cb11-90"><a href="#cb11-90" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-91"><a href="#cb11-91" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-92"><a href="#cb11-92" aria-hidden="true" tabindex="-1"></a>m' = \max(m, \max_j s_j), \quad</span>
-<span id="cb11-93"><a href="#cb11-93" aria-hidden="true" tabindex="-1"></a>\ell' = e^{m - m'}\ell + \sum_j e^{s_j - m'}, \quad</span>
-<span id="cb11-94"><a href="#cb11-94" aria-hidden="true" tabindex="-1"></a>o' = e^{m - m'} o + \sum_j e^{s_j - m'} v_j .</span>
-<span id="cb11-95"><a href="#cb11-95" aria-hidden="true" tabindex="-1"></a>$$</span>
-<span id="cb11-96"><a href="#cb11-96" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-97"><a href="#cb11-97" aria-hidden="true" tabindex="-1"></a>Subtracting the running max keeps every exponential in $<span class="co">[</span><span class="ot">0, 1</span><span class="co">]</span>$, so the computation is stable, and rescaling the accumulator by $e^{m - m'}$ when the max grows keeps the partial sums consistent. Because each element of $K$ and $V$ is read from HBM once per query block rather than the score matrix being round-tripped, the HBM traffic drops from $O(n^2)$ to $O(n^2 d_k / B)$ for SRAM block size $B$, a large constant-factor reduction that makes attention compute bound again. FlashAttention-2 and FlashAttention-3 further improve work partitioning and exploit newer GPU features, but the core algorithmic idea is the tiled online softmax above. This is a GPU technique: the win comes from the SRAM-versus-HBM gap, which CPUs do not have in the same form, so we show it rather than execute it.</span>
-<span id="cb11-98"><a href="#cb11-98" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-99"><a href="#cb11-99" aria-hidden="true" tabindex="-1"></a><span class="fu">## 6. Paged Attention and Sliding-Window Attention</span></span>
-<span id="cb11-100"><a href="#cb11-100" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-101"><a href="#cb11-101" aria-hidden="true" tabindex="-1"></a>Two further production techniques round out the picture.</span>
-<span id="cb11-102"><a href="#cb11-102" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-103"><a href="#cb11-103" aria-hidden="true" tabindex="-1"></a>**Paged attention**, introduced by vLLM, attacks fragmentation. A served model handles many concurrent requests of unpredictable and changing length. Allocating one contiguous KV-cache buffer per request wastes memory to internal fragmentation and over-provisioning. Paged attention borrows the operating-system idea of virtual memory: the cache is split into fixed-size **blocks**, a request's logical KV positions are mapped to physical blocks through a block table, and blocks are allocated on demand and shared (for example across beams or across requests with a common prompt prefix) via copy-on-write. The result is near-zero KV waste and much higher serving throughput, which is why vLLM became a default open-source serving engine.</span>
-<span id="cb11-104"><a href="#cb11-104" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-105"><a href="#cb11-105" aria-hidden="true" tabindex="-1"></a>**Sliding-window attention** bounds the cache instead of managing it. Models such as Mistral 7B restrict each token to attend only to the previous $w$ tokens (a window), so the KV-cache never exceeds $w$ positions regardless of total sequence length. Information still propagates beyond the window because stacked layers compose their receptive fields: after $L$ layers the effective context reaches roughly $L \times w$ tokens. This trades a bounded, constant memory footprint for a controlled loss of exact long-range access, and it composes cleanly with GQA and paged attention.</span>
-<span id="cb11-106"><a href="#cb11-106" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-107"><a href="#cb11-107" aria-hidden="true" tabindex="-1"></a><span class="fu">## 7. Production Code</span></span>
-<span id="cb11-108"><a href="#cb11-108" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-109"><a href="#cb11-109" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.1 A From-Scratch KV-Cache, Executed on CPU</span></span>
-<span id="cb11-110"><a href="#cb11-110" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-111"><a href="#cb11-111" aria-hidden="true" tabindex="-1"></a>The following cell implements single-head causal self attention two ways: the **naive** decoder that recomputes attention over the full prefix at every step, and the **cached** decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder's superlinear growth against the cache's near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.</span>
-<span id="cb11-112"><a href="#cb11-112" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-115"><a href="#cb11-115" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
-<span id="cb11-116"><a href="#cb11-116" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
-<span id="cb11-117"><a href="#cb11-117" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.nn.functional <span class="im">as</span> F</span>
-<span id="cb11-118"><a href="#cb11-118" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
-<span id="cb11-119"><a href="#cb11-119" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-120"><a href="#cb11-120" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">0</span>)</span>
-<span id="cb11-121"><a href="#cb11-121" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-122"><a href="#cb11-122" aria-hidden="true" tabindex="-1"></a>d_model <span class="op">=</span> <span class="dv">64</span>          <span class="co"># model / head dimension</span></span>
-<span id="cb11-123"><a href="#cb11-123" aria-hidden="true" tabindex="-1"></a>n_steps <span class="op">=</span> <span class="dv">256</span>         <span class="co"># tokens to generate</span></span>
-<span id="cb11-124"><a href="#cb11-124" aria-hidden="true" tabindex="-1"></a>scale <span class="op">=</span> d_model <span class="op">**</span> <span class="op">-</span><span class="fl">0.5</span></span>
-<span id="cb11-125"><a href="#cb11-125" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-126"><a href="#cb11-126" aria-hidden="true" tabindex="-1"></a><span class="co"># Fixed projection weights (one head) and a fixed stream of input token vectors.</span></span>
-<span id="cb11-127"><a href="#cb11-127" aria-hidden="true" tabindex="-1"></a><span class="co"># Small init keeps the logits in a sane range, as in a trained model.</span></span>
-<span id="cb11-128"><a href="#cb11-128" aria-hidden="true" tabindex="-1"></a>W_q <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.1</span></span>
-<span id="cb11-129"><a href="#cb11-129" aria-hidden="true" tabindex="-1"></a>W_k <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.1</span></span>
-<span id="cb11-130"><a href="#cb11-130" aria-hidden="true" tabindex="-1"></a>W_v <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.1</span></span>
-<span id="cb11-131"><a href="#cb11-131" aria-hidden="true" tabindex="-1"></a>inputs <span class="op">=</span> torch.randn(n_steps, d_model)   <span class="co"># x_1 .. x_n, revealed one at a time</span></span>
-<span id="cb11-132"><a href="#cb11-132" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-133"><a href="#cb11-133" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-134"><a href="#cb11-134" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> decode_naive(inputs):</span>
-<span id="cb11-135"><a href="#cb11-135" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""Recompute full causal attention over the whole prefix at every step."""</span></span>
-<span id="cb11-136"><a href="#cb11-136" aria-hidden="true" tabindex="-1"></a>    outputs <span class="op">=</span> []</span>
-<span id="cb11-137"><a href="#cb11-137" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> t <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, inputs.shape[<span class="dv">0</span>] <span class="op">+</span> <span class="dv">1</span>):</span>
-<span id="cb11-138"><a href="#cb11-138" aria-hidden="true" tabindex="-1"></a>        x <span class="op">=</span> inputs[:t]                       <span class="co"># all tokens seen so far</span></span>
-<span id="cb11-139"><a href="#cb11-139" aria-hidden="true" tabindex="-1"></a>        q, k, v <span class="op">=</span> x <span class="op">@</span> W_q, x <span class="op">@</span> W_k, x <span class="op">@</span> W_v  <span class="co"># recompute K, V for the whole prefix</span></span>
-<span id="cb11-140"><a href="#cb11-140" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> k.t()) <span class="op">*</span> scale</span>
-<span id="cb11-141"><a href="#cb11-141" aria-hidden="true" tabindex="-1"></a>        mask <span class="op">=</span> torch.triu(torch.ones(t, t), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
-<span id="cb11-142"><a href="#cb11-142" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>))</span>
-<span id="cb11-143"><a href="#cb11-143" aria-hidden="true" tabindex="-1"></a>        attn <span class="op">=</span> F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v</span>
-<span id="cb11-144"><a href="#cb11-144" aria-hidden="true" tabindex="-1"></a>        outputs.append(attn[<span class="op">-</span><span class="dv">1</span>])             <span class="co"># only the last row is the new token</span></span>
-<span id="cb11-145"><a href="#cb11-145" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> torch.stack(outputs)</span>
-<span id="cb11-146"><a href="#cb11-146" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-147"><a href="#cb11-147" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-148"><a href="#cb11-148" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> decode_cached(inputs):</span>
-<span id="cb11-149"><a href="#cb11-149" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""Keep K and V in a cache; attend only the new query each step."""</span></span>
-<span id="cb11-150"><a href="#cb11-150" aria-hidden="true" tabindex="-1"></a>    outputs <span class="op">=</span> []</span>
-<span id="cb11-151"><a href="#cb11-151" aria-hidden="true" tabindex="-1"></a>    k_cache, v_cache <span class="op">=</span> [], []</span>
-<span id="cb11-152"><a href="#cb11-152" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> t <span class="kw">in</span> <span class="bu">range</span>(inputs.shape[<span class="dv">0</span>]):</span>
-<span id="cb11-153"><a href="#cb11-153" aria-hidden="true" tabindex="-1"></a>        x <span class="op">=</span> inputs[t:t <span class="op">+</span> <span class="dv">1</span>]                  <span class="co"># single new token vector</span></span>
-<span id="cb11-154"><a href="#cb11-154" aria-hidden="true" tabindex="-1"></a>        q <span class="op">=</span> x <span class="op">@</span> W_q</span>
-<span id="cb11-155"><a href="#cb11-155" aria-hidden="true" tabindex="-1"></a>        k_cache.append(x <span class="op">@</span> W_k)              <span class="co"># compute new k, v once and keep them</span></span>
-<span id="cb11-156"><a href="#cb11-156" aria-hidden="true" tabindex="-1"></a>        v_cache.append(x <span class="op">@</span> W_v)</span>
-<span id="cb11-157"><a href="#cb11-157" aria-hidden="true" tabindex="-1"></a>        K <span class="op">=</span> torch.cat(k_cache, dim<span class="op">=</span><span class="dv">0</span>)        <span class="co"># cached keys, no recomputation</span></span>
-<span id="cb11-158"><a href="#cb11-158" aria-hidden="true" tabindex="-1"></a>        V <span class="op">=</span> torch.cat(v_cache, dim<span class="op">=</span><span class="dv">0</span>)</span>
-<span id="cb11-159"><a href="#cb11-159" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> K.t()) <span class="op">*</span> scale         <span class="co"># one query vs all cached keys</span></span>
-<span id="cb11-160"><a href="#cb11-160" aria-hidden="true" tabindex="-1"></a>        attn <span class="op">=</span> F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> V</span>
-<span id="cb11-161"><a href="#cb11-161" aria-hidden="true" tabindex="-1"></a>        outputs.append(attn[<span class="dv">0</span>])</span>
-<span id="cb11-162"><a href="#cb11-162" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> torch.stack(outputs)</span>
-<span id="cb11-163"><a href="#cb11-163" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-164"><a href="#cb11-164" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-165"><a href="#cb11-165" aria-hidden="true" tabindex="-1"></a>out_naive <span class="op">=</span> decode_naive(inputs)</span>
-<span id="cb11-166"><a href="#cb11-166" aria-hidden="true" tabindex="-1"></a>out_cached <span class="op">=</span> decode_cached(inputs)</span>
-<span id="cb11-167"><a href="#cb11-167" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-168"><a href="#cb11-168" aria-hidden="true" tabindex="-1"></a>max_diff <span class="op">=</span> (out_naive <span class="op">-</span> out_cached).<span class="bu">abs</span>().<span class="bu">max</span>().item()</span>
-<span id="cb11-169"><a href="#cb11-169" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"max abs difference between naive and cached outputs: </span><span class="sc">{</span>max_diff<span class="sc">:.2e}</span><span class="ss">"</span>)</span>
-<span id="cb11-170"><a href="#cb11-170" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"identical to floating-point tolerance: </span><span class="sc">{</span>torch<span class="sc">.</span>allclose(out_naive, out_cached, atol<span class="op">=</span><span class="fl">1e-5</span>)<span class="sc">}</span><span class="ss">"</span>)</span>
-<span id="cb11-171"><a href="#cb11-171" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-172"><a href="#cb11-172" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-173"><a href="#cb11-173" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> timed(fn, inputs, repeats<span class="op">=</span><span class="dv">3</span>):</span>
-<span id="cb11-174"><a href="#cb11-174" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">float</span>(<span class="st">"inf"</span>)</span>
-<span id="cb11-175"><a href="#cb11-175" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
-<span id="cb11-176"><a href="#cb11-176" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
-<span id="cb11-177"><a href="#cb11-177" aria-hidden="true" tabindex="-1"></a>        fn(inputs)</span>
-<span id="cb11-178"><a href="#cb11-178" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> <span class="bu">min</span>(best, time.perf_counter() <span class="op">-</span> t0)</span>
-<span id="cb11-179"><a href="#cb11-179" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best</span>
-<span id="cb11-180"><a href="#cb11-180" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-181"><a href="#cb11-181" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-182"><a href="#cb11-182" aria-hidden="true" tabindex="-1"></a>t_naive <span class="op">=</span> timed(decode_naive, inputs)</span>
-<span id="cb11-183"><a href="#cb11-183" aria-hidden="true" tabindex="-1"></a>t_cached <span class="op">=</span> timed(decode_cached, inputs)</span>
-<span id="cb11-184"><a href="#cb11-184" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="ch">\n</span><span class="ss">generating </span><span class="sc">{</span>n_steps<span class="sc">}</span><span class="ss"> tokens (single head, CPU):"</span>)</span>
-<span id="cb11-185"><a href="#cb11-185" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"  naive  recompute : </span><span class="sc">{</span>t_naive <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms"</span>)</span>
-<span id="cb11-186"><a href="#cb11-186" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"  KV-cache         : </span><span class="sc">{</span>t_cached <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms"</span>)</span>
-<span id="cb11-187"><a href="#cb11-187" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"  speedup          : </span><span class="sc">{</span>t_naive <span class="op">/</span> t_cached<span class="sc">:8.1f}</span><span class="ss">x"</span>)</span>
-<span id="cb11-188"><a href="#cb11-188" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-189"><a href="#cb11-189" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-190"><a href="#cb11-190" aria-hidden="true" tabindex="-1"></a>The two decoders agree to floating-point tolerance, confirming the cache changes only *how* the answer is computed, not the answer. The naive decoder is markedly slower because it repeats the prefix projections and the growing softmax at every step; the cache removes exactly that redundancy.</span>
-<span id="cb11-191"><a href="#cb11-191" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-192"><a href="#cb11-192" aria-hidden="true" tabindex="-1"></a>To see the asymptotics directly, we measure how per-decode cost scales with the prefix length. The naive step at position $t$ does $O(t^2)$ work, so doubling $t$ roughly quadruples its time; the cached step does $O(t)$ work, so doubling $t$ roughly doubles its time.</span>
-<span id="cb11-193"><a href="#cb11-193" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-196"><a href="#cb11-196" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
-<span id="cb11-197"><a href="#cb11-197" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> naive_step_time(t, d_model, repeats<span class="op">=</span><span class="dv">20</span>):</span>
-<span id="cb11-198"><a href="#cb11-198" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> torch.randn(t, d_model)</span>
-<span id="cb11-199"><a href="#cb11-199" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">float</span>(<span class="st">"inf"</span>)</span>
-<span id="cb11-200"><a href="#cb11-200" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
-<span id="cb11-201"><a href="#cb11-201" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
-<span id="cb11-202"><a href="#cb11-202" aria-hidden="true" tabindex="-1"></a>        q, k, v <span class="op">=</span> x <span class="op">@</span> W_q, x <span class="op">@</span> W_k, x <span class="op">@</span> W_v</span>
-<span id="cb11-203"><a href="#cb11-203" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> k.t()) <span class="op">*</span> scale</span>
-<span id="cb11-204"><a href="#cb11-204" aria-hidden="true" tabindex="-1"></a>        mask <span class="op">=</span> torch.triu(torch.ones(t, t), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
-<span id="cb11-205"><a href="#cb11-205" aria-hidden="true" tabindex="-1"></a>        F.softmax(scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>)), dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v</span>
-<span id="cb11-206"><a href="#cb11-206" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> <span class="bu">min</span>(best, time.perf_counter() <span class="op">-</span> t0)</span>
-<span id="cb11-207"><a href="#cb11-207" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best</span>
-<span id="cb11-208"><a href="#cb11-208" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-209"><a href="#cb11-209" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-210"><a href="#cb11-210" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> cached_step_time(t, d_model, repeats<span class="op">=</span><span class="dv">20</span>):</span>
-<span id="cb11-211"><a href="#cb11-211" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> torch.randn(<span class="dv">1</span>, d_model) <span class="op">@</span> W_q</span>
-<span id="cb11-212"><a href="#cb11-212" aria-hidden="true" tabindex="-1"></a>    K <span class="op">=</span> torch.randn(t, d_model)</span>
-<span id="cb11-213"><a href="#cb11-213" aria-hidden="true" tabindex="-1"></a>    V <span class="op">=</span> torch.randn(t, d_model)</span>
-<span id="cb11-214"><a href="#cb11-214" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">float</span>(<span class="st">"inf"</span>)</span>
-<span id="cb11-215"><a href="#cb11-215" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
-<span id="cb11-216"><a href="#cb11-216" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
-<span id="cb11-217"><a href="#cb11-217" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> K.t()) <span class="op">*</span> scale</span>
-<span id="cb11-218"><a href="#cb11-218" aria-hidden="true" tabindex="-1"></a>        F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> V</span>
-<span id="cb11-219"><a href="#cb11-219" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> <span class="bu">min</span>(best, time.perf_counter() <span class="op">-</span> t0)</span>
-<span id="cb11-220"><a href="#cb11-220" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best</span>
-<span id="cb11-221"><a href="#cb11-221" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-222"><a href="#cb11-222" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-223"><a href="#cb11-223" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span><span class="st">'prefix len'</span><span class="sc">:&gt;10}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'naive step (ms)'</span><span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'cached step (ms)'</span><span class="sc">:&gt;17}</span><span class="ss">"</span>)</span>
-<span id="cb11-224"><a href="#cb11-224" aria-hidden="true" tabindex="-1"></a>prev <span class="op">=</span> <span class="va">None</span></span>
-<span id="cb11-225"><a href="#cb11-225" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> t <span class="kw">in</span> [<span class="dv">128</span>, <span class="dv">256</span>, <span class="dv">512</span>, <span class="dv">1024</span>]:</span>
-<span id="cb11-226"><a href="#cb11-226" aria-hidden="true" tabindex="-1"></a>    tn <span class="op">=</span> naive_step_time(t, d_model)</span>
-<span id="cb11-227"><a href="#cb11-227" aria-hidden="true" tabindex="-1"></a>    tc <span class="op">=</span> cached_step_time(t, d_model)</span>
-<span id="cb11-228"><a href="#cb11-228" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span>t<span class="sc">:&gt;10}</span><span class="ss"> </span><span class="sc">{</span>tn <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:&gt;16.3f}</span><span class="ss"> </span><span class="sc">{</span>tc <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:&gt;17.3f}</span><span class="ss">"</span>)</span>
-<span id="cb11-229"><a href="#cb11-229" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-230"><a href="#cb11-230" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-231"><a href="#cb11-231" aria-hidden="true" tabindex="-1"></a>The naive column grows faster than the cached column as the prefix doubles, the empirical signature of $O(t^2)$ versus $O(t)$ per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.</span>
-<span id="cb11-232"><a href="#cb11-232" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-233"><a href="#cb11-233" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.2 Grouped-Query and Multi-Query Attention, Executed on CPU</span></span>
-<span id="cb11-234"><a href="#cb11-234" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-235"><a href="#cb11-235" aria-hidden="true" tabindex="-1"></a>This cell implements one attention layer parameterized by the number of KV groups $g$. Setting $g = h$ gives multi-head attention, $g = 1$ gives multi-query attention, and $1 &lt; g &lt; h$ gives grouped-query attention. We repeat each KV head across its query group with <span class="in">`repeat_interleave`</span>, run a forward pass for several values of $g$, and report the resulting KV-cache size so the $h/g$ reduction is explicit.</span>
-<span id="cb11-236"><a href="#cb11-236" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-239"><a href="#cb11-239" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
-<span id="cb11-240"><a href="#cb11-240" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
-<span id="cb11-241"><a href="#cb11-241" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.nn.functional <span class="im">as</span> F</span>
-<span id="cb11-242"><a href="#cb11-242" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-243"><a href="#cb11-243" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">0</span>)</span>
-<span id="cb11-244"><a href="#cb11-244" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-245"><a href="#cb11-245" aria-hidden="true" tabindex="-1"></a>n_tokens <span class="op">=</span> <span class="dv">32</span></span>
-<span id="cb11-246"><a href="#cb11-246" aria-hidden="true" tabindex="-1"></a>d_model <span class="op">=</span> <span class="dv">256</span></span>
-<span id="cb11-247"><a href="#cb11-247" aria-hidden="true" tabindex="-1"></a>n_heads <span class="op">=</span> <span class="dv">8</span></span>
-<span id="cb11-248"><a href="#cb11-248" aria-hidden="true" tabindex="-1"></a>d_head <span class="op">=</span> d_model <span class="op">//</span> n_heads</span>
-<span id="cb11-249"><a href="#cb11-249" aria-hidden="true" tabindex="-1"></a>scale <span class="op">=</span> d_head <span class="op">**</span> <span class="op">-</span><span class="fl">0.5</span></span>
-<span id="cb11-250"><a href="#cb11-250" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-251"><a href="#cb11-251" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> torch.randn(n_tokens, d_model)</span>
-<span id="cb11-252"><a href="#cb11-252" aria-hidden="true" tabindex="-1"></a>W_q <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.02</span>   <span class="co"># query: always n_heads heads</span></span>
-<span id="cb11-253"><a href="#cb11-253" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-254"><a href="#cb11-254" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-255"><a href="#cb11-255" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> gqa_forward(x, n_kv_groups):</span>
-<span id="cb11-256"><a href="#cb11-256" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""One causal attention layer with n_kv_groups shared KV heads."""</span></span>
-<span id="cb11-257"><a href="#cb11-257" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> n_heads <span class="op">%</span> n_kv_groups <span class="op">==</span> <span class="dv">0</span></span>
-<span id="cb11-258"><a href="#cb11-258" aria-hidden="true" tabindex="-1"></a>    n_tok <span class="op">=</span> x.shape[<span class="dv">0</span>]</span>
-<span id="cb11-259"><a href="#cb11-259" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Query projection: n_heads heads of size d_head.</span></span>
-<span id="cb11-260"><a href="#cb11-260" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> (x <span class="op">@</span> W_q).view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)   <span class="co"># [h, n, d]</span></span>
-<span id="cb11-261"><a href="#cb11-261" aria-hidden="true" tabindex="-1"></a>    <span class="co"># KV projection: only n_kv_groups heads (this is what shrinks the cache).</span></span>
-<span id="cb11-262"><a href="#cb11-262" aria-hidden="true" tabindex="-1"></a>    W_kv <span class="op">=</span> torch.randn(d_model, <span class="dv">2</span> <span class="op">*</span> n_kv_groups <span class="op">*</span> d_head) <span class="op">*</span> <span class="fl">0.02</span></span>
-<span id="cb11-263"><a href="#cb11-263" aria-hidden="true" tabindex="-1"></a>    kv <span class="op">=</span> x <span class="op">@</span> W_kv</span>
-<span id="cb11-264"><a href="#cb11-264" aria-hidden="true" tabindex="-1"></a>    k, v <span class="op">=</span> kv.split(n_kv_groups <span class="op">*</span> d_head, dim<span class="op">=-</span><span class="dv">1</span>)</span>
-<span id="cb11-265"><a href="#cb11-265" aria-hidden="true" tabindex="-1"></a>    k <span class="op">=</span> k.view(n_tok, n_kv_groups, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)       <span class="co"># [g, n, d]</span></span>
-<span id="cb11-266"><a href="#cb11-266" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> v.view(n_tok, n_kv_groups, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
-<span id="cb11-267"><a href="#cb11-267" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Broadcast each KV head to the h/g query heads that share it.</span></span>
-<span id="cb11-268"><a href="#cb11-268" aria-hidden="true" tabindex="-1"></a>    repeats <span class="op">=</span> n_heads <span class="op">//</span> n_kv_groups</span>
-<span id="cb11-269"><a href="#cb11-269" aria-hidden="true" tabindex="-1"></a>    k <span class="op">=</span> k.repeat_interleave(repeats, dim<span class="op">=</span><span class="dv">0</span>)                      <span class="co"># [h, n, d]</span></span>
-<span id="cb11-270"><a href="#cb11-270" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> v.repeat_interleave(repeats, dim<span class="op">=</span><span class="dv">0</span>)</span>
-<span id="cb11-271"><a href="#cb11-271" aria-hidden="true" tabindex="-1"></a>    scores <span class="op">=</span> (q <span class="op">@</span> k.transpose(<span class="op">-</span><span class="dv">2</span>, <span class="op">-</span><span class="dv">1</span>)) <span class="op">*</span> scale                  <span class="co"># [h, n, n]</span></span>
-<span id="cb11-272"><a href="#cb11-272" aria-hidden="true" tabindex="-1"></a>    mask <span class="op">=</span> torch.triu(torch.ones(n_tok, n_tok), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
-<span id="cb11-273"><a href="#cb11-273" aria-hidden="true" tabindex="-1"></a>    scores <span class="op">=</span> scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>))</span>
-<span id="cb11-274"><a href="#cb11-274" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v                         <span class="co"># [h, n, d]</span></span>
-<span id="cb11-275"><a href="#cb11-275" aria-hidden="true" tabindex="-1"></a>    <span class="co"># KV-cache bytes for this layer at fp16: 2 (k and v) * g * d_head * n_tok * 2 bytes.</span></span>
-<span id="cb11-276"><a href="#cb11-276" aria-hidden="true" tabindex="-1"></a>    kv_bytes <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> n_kv_groups <span class="op">*</span> d_head <span class="op">*</span> n_tok <span class="op">*</span> <span class="dv">2</span></span>
-<span id="cb11-277"><a href="#cb11-277" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out.transpose(<span class="dv">0</span>, <span class="dv">1</span>).reshape(n_tok, d_model), kv_bytes</span>
-<span id="cb11-278"><a href="#cb11-278" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-279"><a href="#cb11-279" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-280"><a href="#cb11-280" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span><span class="st">'variant'</span><span class="sc">:&gt;6}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'g (KV groups)'</span><span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'KV bytes/layer'</span><span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'vs MHA'</span><span class="sc">:&gt;8}</span><span class="ss">"</span>)</span>
-<span id="cb11-281"><a href="#cb11-281" aria-hidden="true" tabindex="-1"></a>mha_bytes <span class="op">=</span> <span class="va">None</span></span>
-<span id="cb11-282"><a href="#cb11-282" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> g, name <span class="kw">in</span> [(<span class="dv">8</span>, <span class="st">"MHA"</span>), (<span class="dv">4</span>, <span class="st">"GQA"</span>), (<span class="dv">2</span>, <span class="st">"GQA"</span>), (<span class="dv">1</span>, <span class="st">"MQA"</span>)]:</span>
-<span id="cb11-283"><a href="#cb11-283" aria-hidden="true" tabindex="-1"></a>    out, kv_bytes <span class="op">=</span> gqa_forward(x, g)</span>
-<span id="cb11-284"><a href="#cb11-284" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mha_bytes <span class="kw">is</span> <span class="va">None</span>:</span>
-<span id="cb11-285"><a href="#cb11-285" aria-hidden="true" tabindex="-1"></a>        mha_bytes <span class="op">=</span> kv_bytes</span>
-<span id="cb11-286"><a href="#cb11-286" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span>name<span class="sc">:&gt;6}</span><span class="ss"> </span><span class="sc">{</span>g<span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span>kv_bytes<span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span>mha_bytes <span class="op">/</span> kv_bytes<span class="sc">:&gt;7.1f}</span><span class="ss">x"</span>)</span>
-<span id="cb11-287"><a href="#cb11-287" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-288"><a href="#cb11-288" aria-hidden="true" tabindex="-1"></a><span class="co"># Sanity check: with g = n_heads, GQA reduces exactly to standard multi-head attention.</span></span>
-<span id="cb11-289"><a href="#cb11-289" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">123</span>)</span>
-<span id="cb11-290"><a href="#cb11-290" aria-hidden="true" tabindex="-1"></a>W_kv_full <span class="op">=</span> torch.randn(d_model, <span class="dv">2</span> <span class="op">*</span> n_heads <span class="op">*</span> d_head) <span class="op">*</span> <span class="fl">0.02</span></span>
-<span id="cb11-291"><a href="#cb11-291" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-292"><a href="#cb11-292" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-293"><a href="#cb11-293" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> mha_reference(x):</span>
-<span id="cb11-294"><a href="#cb11-294" aria-hidden="true" tabindex="-1"></a>    n_tok <span class="op">=</span> x.shape[<span class="dv">0</span>]</span>
-<span id="cb11-295"><a href="#cb11-295" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> (x <span class="op">@</span> W_q).view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
-<span id="cb11-296"><a href="#cb11-296" aria-hidden="true" tabindex="-1"></a>    kv <span class="op">=</span> x <span class="op">@</span> W_kv_full</span>
-<span id="cb11-297"><a href="#cb11-297" aria-hidden="true" tabindex="-1"></a>    k, v <span class="op">=</span> kv.split(n_heads <span class="op">*</span> d_head, dim<span class="op">=-</span><span class="dv">1</span>)</span>
-<span id="cb11-298"><a href="#cb11-298" aria-hidden="true" tabindex="-1"></a>    k <span class="op">=</span> k.view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
-<span id="cb11-299"><a href="#cb11-299" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> v.view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
-<span id="cb11-300"><a href="#cb11-300" aria-hidden="true" tabindex="-1"></a>    scores <span class="op">=</span> (q <span class="op">@</span> k.transpose(<span class="op">-</span><span class="dv">2</span>, <span class="op">-</span><span class="dv">1</span>)) <span class="op">*</span> scale</span>
-<span id="cb11-301"><a href="#cb11-301" aria-hidden="true" tabindex="-1"></a>    mask <span class="op">=</span> torch.triu(torch.ones(n_tok, n_tok), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
-<span id="cb11-302"><a href="#cb11-302" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> F.softmax(scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>)), dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v</span>
-<span id="cb11-303"><a href="#cb11-303" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out.transpose(<span class="dv">0</span>, <span class="dv">1</span>).reshape(n_tok, d_model)</span>
-<span id="cb11-304"><a href="#cb11-304" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-305"><a href="#cb11-305" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-306"><a href="#cb11-306" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="ch">\n</span><span class="ss">MHA forward output shape: </span><span class="sc">{</span><span class="bu">tuple</span>(mha_reference(x).shape)<span class="sc">}</span><span class="ss">"</span>)</span>
-<span id="cb11-307"><a href="#cb11-307" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">"GQA with g = n_heads is structurally identical to MHA (per-head KV, no sharing)."</span>)</span>
-<span id="cb11-308"><a href="#cb11-308" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-309"><a href="#cb11-309" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-310"><a href="#cb11-310" aria-hidden="true" tabindex="-1"></a>The KV bytes fall exactly by the factor $h/g$: halving the number of KV groups halves the cache. MQA ($g = 1$) is eight times smaller than MHA here, and GQA at $g = 4$ or $g = 2$ gives an intermediate footprint, the trade space real models tune for quality versus memory.</span>
-<span id="cb11-311"><a href="#cb11-311" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-312"><a href="#cb11-312" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.3 FlashAttention (requires GPU)</span></span>
-<span id="cb11-313"><a href="#cb11-313" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-314"><a href="#cb11-314" aria-hidden="true" tabindex="-1"></a>FlashAttention ships as a fused CUDA kernel. The cleanest way to use it in practice is through PyTorch's <span class="in">`scaled_dot_product_attention`</span>, which dispatches to a FlashAttention backend on supported GPUs, or through the <span class="in">`flash-attn`</span> package directly. The code below is the real invocation; it is not executed here because the speedup depends on the GPU SRAM-versus-HBM gap.</span>
-<span id="cb11-315"><a href="#cb11-315" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-316"><a href="#cb11-316" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
-<span id="cb11-317"><a href="#cb11-317" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: PyTorch SDPA dispatches to a fused FlashAttention kernel on CUDA.</span></span>
-<span id="cb11-318"><a href="#cb11-318" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
-<span id="cb11-319"><a href="#cb11-319" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.nn.functional <span class="im">as</span> F</span>
-<span id="cb11-320"><a href="#cb11-320" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.nn.attention <span class="im">import</span> sdpa_kernel, SDPBackend</span>
-<span id="cb11-321"><a href="#cb11-321" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-322"><a href="#cb11-322" aria-hidden="true" tabindex="-1"></a>q <span class="op">=</span> torch.randn(<span class="dv">4</span>, <span class="dv">32</span>, <span class="dv">8192</span>, <span class="dv">128</span>, device<span class="op">=</span><span class="st">"cuda"</span>, dtype<span class="op">=</span>torch.float16)  <span class="co"># [B, H, N, d]</span></span>
-<span id="cb11-323"><a href="#cb11-323" aria-hidden="true" tabindex="-1"></a>k <span class="op">=</span> torch.randn_like(q)</span>
-<span id="cb11-324"><a href="#cb11-324" aria-hidden="true" tabindex="-1"></a>v <span class="op">=</span> torch.randn_like(q)</span>
-<span id="cb11-325"><a href="#cb11-325" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-326"><a href="#cb11-326" aria-hidden="true" tabindex="-1"></a><span class="co"># Force the FlashAttention backend; is_causal applies the causal mask fused in-kernel.</span></span>
-<span id="cb11-327"><a href="#cb11-327" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> sdpa_kernel(SDPBackend.FLASH_ATTENTION):</span>
-<span id="cb11-328"><a href="#cb11-328" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> F.scaled_dot_product_attention(q, k, v, is_causal<span class="op">=</span><span class="va">True</span>)</span>
-<span id="cb11-329"><a href="#cb11-329" aria-hidden="true" tabindex="-1"></a><span class="co"># out: [4, 32, 8192, 128], computed without ever materializing the 8192 x 8192 scores in HBM.</span></span>
-<span id="cb11-330"><a href="#cb11-330" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-331"><a href="#cb11-331" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-332"><a href="#cb11-332" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
-<span id="cb11-333"><a href="#cb11-333" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: the flash-attn package, exposing the kernel directly (variable-length, paged, etc.).</span></span>
-<span id="cb11-334"><a href="#cb11-334" aria-hidden="true" tabindex="-1"></a><span class="co"># pip install flash-attn --no-build-isolation</span></span>
-<span id="cb11-335"><a href="#cb11-335" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> flash_attn <span class="im">import</span> flash_attn_func</span>
-<span id="cb11-336"><a href="#cb11-336" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-337"><a href="#cb11-337" aria-hidden="true" tabindex="-1"></a><span class="co"># q, k, v shaped [batch, seqlen, n_heads, head_dim], fp16/bf16, on CUDA.</span></span>
-<span id="cb11-338"><a href="#cb11-338" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> flash_attn_func(q, k, v, causal<span class="op">=</span><span class="va">True</span>)</span>
-<span id="cb11-339"><a href="#cb11-339" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-340"><a href="#cb11-340" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-341"><a href="#cb11-341" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.4 Paged Attention with vLLM (requires GPU)</span></span>
-<span id="cb11-342"><a href="#cb11-342" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-343"><a href="#cb11-343" aria-hidden="true" tabindex="-1"></a>vLLM implements paged attention and continuous batching behind a simple serving API. The KV-cache management, block tables, and prefix sharing are internal; the user just gets high throughput. Shown, not executed, because it loads a multi-billion-parameter model onto a GPU.</span>
-<span id="cb11-344"><a href="#cb11-344" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-345"><a href="#cb11-345" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
-<span id="cb11-346"><a href="#cb11-346" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: vLLM serves with paged attention and continuous batching.</span></span>
-<span id="cb11-347"><a href="#cb11-347" aria-hidden="true" tabindex="-1"></a><span class="co"># pip install vllm</span></span>
-<span id="cb11-348"><a href="#cb11-348" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> vllm <span class="im">import</span> LLM, SamplingParams</span>
-<span id="cb11-349"><a href="#cb11-349" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-350"><a href="#cb11-350" aria-hidden="true" tabindex="-1"></a>llm <span class="op">=</span> LLM(model<span class="op">=</span><span class="st">"mistralai/Mistral-7B-Instruct-v0.3"</span>)  <span class="co"># GQA + sliding window, served paged</span></span>
-<span id="cb11-351"><a href="#cb11-351" aria-hidden="true" tabindex="-1"></a>params <span class="op">=</span> SamplingParams(temperature<span class="op">=</span><span class="fl">0.7</span>, max_tokens<span class="op">=</span><span class="dv">256</span>)</span>
-<span id="cb11-352"><a href="#cb11-352" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-353"><a href="#cb11-353" aria-hidden="true" tabindex="-1"></a>prompts <span class="op">=</span> [<span class="st">"Explain the KV-cache in one paragraph."</span>,</span>
-<span id="cb11-354"><a href="#cb11-354" aria-hidden="true" tabindex="-1"></a>           <span class="st">"Why is attention memory bound on GPUs?"</span>]</span>
-<span id="cb11-355"><a href="#cb11-355" aria-hidden="true" tabindex="-1"></a><span class="co"># vLLM batches these, shares any common prompt prefix's KV blocks, and pages the cache.</span></span>
-<span id="cb11-356"><a href="#cb11-356" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> output <span class="kw">in</span> llm.generate(prompts, params):</span>
-<span id="cb11-357"><a href="#cb11-357" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(output.outputs[<span class="dv">0</span>].text)</span>
-<span id="cb11-358"><a href="#cb11-358" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-359"><a href="#cb11-359" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-360"><a href="#cb11-360" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.5 Sliding-Window Attention on GPU</span></span>
-<span id="cb11-361"><a href="#cb11-361" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-362"><a href="#cb11-362" aria-hidden="true" tabindex="-1"></a>Sliding-window attention is a property of the model architecture and is applied by the serving stack. With FlashAttention the window is passed as a kernel argument so the bounded attention is computed fused, and the KV-cache is capped at the window size. Shown, not executed, because it needs the GPU kernel.</span>
-<span id="cb11-363"><a href="#cb11-363" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-364"><a href="#cb11-364" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
-<span id="cb11-365"><a href="#cb11-365" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: FlashAttention supports a sliding window via window_size = (left, right).</span></span>
-<span id="cb11-366"><a href="#cb11-366" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> flash_attn <span class="im">import</span> flash_attn_func</span>
-<span id="cb11-367"><a href="#cb11-367" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-368"><a href="#cb11-368" aria-hidden="true" tabindex="-1"></a><span class="co"># Each query attends only to the previous 4096 keys (and itself); cache never exceeds the window.</span></span>
-<span id="cb11-369"><a href="#cb11-369" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> flash_attn_func(q, k, v, causal<span class="op">=</span><span class="va">True</span>, window_size<span class="op">=</span>(<span class="dv">4096</span>, <span class="dv">0</span>))</span>
-<span id="cb11-370"><a href="#cb11-370" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb11-371"><a href="#cb11-371" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-372"><a href="#cb11-372" aria-hidden="true" tabindex="-1"></a><span class="fu">## 8. Pitfalls and When to Use</span></span>
-<span id="cb11-373"><a href="#cb11-373" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-374"><a href="#cb11-374" aria-hidden="true" tabindex="-1"></a>**The KV-cache is almost always the right default for decoding, but it is not free.** It trades recomputation for memory, and at long context the cache can exceed the model weights in size. Budget for it explicitly using the formula in Section 3 before assuming a context length fits. If memory is the binding constraint, the levers in order of disruption are GQA or MQA (architectural, set at training time), KV-cache quantization to int8 or fp8 (cheap, small quality cost), and sliding-window or other sparse attention (changes the model's reach).</span>
-<span id="cb11-375"><a href="#cb11-375" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-376"><a href="#cb11-376" aria-hidden="true" tabindex="-1"></a>**GQA is a training-time decision, not a serving-time switch.** You cannot turn an MHA checkpoint into a GQA one for free; the shared KV heads must be trained or carefully mean-pooled and then fine-tuned. Choose $g$ when you design the model. The empirical sweet spot for large models has been a small number of KV groups (often $g = 8$), which recovers nearly all of MHA's quality at a large cache reduction; MQA ($g = 1$) saves the most memory but historically lost the most quality, which is precisely why GQA was introduced.</span>
-<span id="cb11-377"><a href="#cb11-377" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-378"><a href="#cb11-378" aria-hidden="true" tabindex="-1"></a>**FlashAttention helps prefill and training, not the decode step you might expect.** Its win is eliminating the $O(n^2)$ score-matrix traffic, which exists when you attend a full sequence at once (training, and the prefill of a long prompt). A single-token decode step attends one query against the cache and is already linear; FlashAttention's decode variant helps mainly by streaming the cache efficiently, not by avoiding a large score matrix. Match the technique to the phase: FlashAttention for prefill and training, KV-cache and GQA for decode.</span>
-<span id="cb11-379"><a href="#cb11-379" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-380"><a href="#cb11-380" aria-hidden="true" tabindex="-1"></a>**Numerical care matters.** The online softmax in Section 5 is exact only because of the running-max subtraction; a naive blockwise softmax without rescaling will overflow or silently lose precision. When implementing or debugging attention kernels, always verify against a reference full-softmax implementation on small inputs, exactly as the executed cells above assert <span class="in">`allclose`</span>, before trusting a fused path.</span>
-<span id="cb11-381"><a href="#cb11-381" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-382"><a href="#cb11-382" aria-hidden="true" tabindex="-1"></a>**Do not conflate the techniques.** They compose but solve different problems: the KV-cache removes redundant computation, GQA shrinks what the cache stores, FlashAttention changes how the score matrix is computed, paged attention manages the cache across concurrent requests, and sliding-window bounds the cache size. A production long-context serving stack uses all of them at once, and reasoning about memory and latency requires keeping their distinct roles straight.</span>
-<span id="cb11-383"><a href="#cb11-383" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-384"><a href="#cb11-384" aria-hidden="true" tabindex="-1"></a><span class="fu">## References</span></span>
-<span id="cb11-385"><a href="#cb11-385" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-386"><a href="#cb11-386" aria-hidden="true" tabindex="-1"></a><span class="ss">1. </span>Vaswani, A. et al. "Attention Is All You Need." 2017. https://arxiv.org/abs/1706.03762</span>
-<span id="cb11-387"><a href="#cb11-387" aria-hidden="true" tabindex="-1"></a><span class="ss">2. </span>Shazeer, N. "Fast Transformer Decoding: One Write-Head is All You Need" (multi-query attention). 2019. https://arxiv.org/abs/1911.02150</span>
-<span id="cb11-388"><a href="#cb11-388" aria-hidden="true" tabindex="-1"></a><span class="ss">3. </span>Ainslie, J. et al. "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." 2023. https://arxiv.org/abs/2305.13245</span>
-<span id="cb11-389"><a href="#cb11-389" aria-hidden="true" tabindex="-1"></a><span class="ss">4. </span>Dao, T. et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." 2022. https://arxiv.org/abs/2205.14135</span>
-<span id="cb11-390"><a href="#cb11-390" aria-hidden="true" tabindex="-1"></a><span class="ss">5. </span>Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023. https://arxiv.org/abs/2307.08691</span>
-<span id="cb11-391"><a href="#cb11-391" aria-hidden="true" tabindex="-1"></a><span class="ss">6. </span>Shah, J. et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." 2024. https://arxiv.org/abs/2407.08608</span>
-<span id="cb11-392"><a href="#cb11-392" aria-hidden="true" tabindex="-1"></a><span class="ss">7. </span>Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM). 2023. https://arxiv.org/abs/2309.06180</span>
-<span id="cb11-393"><a href="#cb11-393" aria-hidden="true" tabindex="-1"></a><span class="ss">8. </span>Jiang, A. Q. et al. "Mistral 7B" (sliding-window attention). 2023. https://arxiv.org/abs/2310.06825</span>
-<span id="cb11-394"><a href="#cb11-394" aria-hidden="true" tabindex="-1"></a><span class="ss">9. </span>Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867</span>
-<span id="cb11-395"><a href="#cb11-395" aria-hidden="true" tabindex="-1"></a><span class="ss">10. </span>Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288</span>
+<div class="sourceCode" id="cb14" data-shortcodes="false"><pre class="sourceCode markdown code-with-copy"><code class="sourceCode markdown"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu"># Efficient Attention: KV-Cache, GQA, and Flash Attention</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="fu">## 1. Why Attention Efficiency Decides Whether a Model Ships</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>A transformer language model spends most of its serving life doing one thing: predicting the next token, one token at a time, given everything generated so far. The mathematics of self attention says that to predict token $t$ the model attends over all $t-1$ previous tokens. Taken literally, generating a sequence of length $n$ recomputes attention over a growing prefix at every step, which costs $O(n^2)$ work in total and, worse, reads and writes an $O(n^2)$ matrix of attention scores through the memory hierarchy. On modern accelerators the second cost dominates: attention is **memory bound**, not compute bound, and the wall-clock bottleneck for long contexts is moving bytes, not multiplying numbers.</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>Three techniques, layered on top of one another, turn this from a research curiosity into a deployable system. The **KV-cache** removes the redundant recomputation, dropping the per-step cost of decoding from $O(n^2)$ to $O(n)$ and making autoregressive generation tractable at all. **Grouped-query attention (GQA)** and its extreme, **multi-query attention (MQA)**, shrink the cache itself by sharing key and value projections across query heads, which is what makes long contexts fit in memory. **FlashAttention** restructures the attention computation so it never materializes the full score matrix in slow memory, turning the prefill and training passes from memory bound back toward compute bound. **Paged attention** then manages the cache like virtual memory so a server can pack many concurrent requests without fragmentation.</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>This chapter develops the mathematics of each, then shows code. The CPU-feasible parts (a from-scratch KV-cache and a grouped-query demo) are executed here on small tensors so you can see the asymptotics and the numerics directly, and one GPU cell is executed on an accelerator to measure the KV-cache speedup on a small real model with the Hugging Face Transformers decode path. The parts that need a clean CUDA kernel build or a multi-billion-parameter model (fused FlashAttention kernels, paged attention in vLLM, GPU sliding-window attention) are shown as real, runnable library invocations with an honest note that they require an accelerator.</span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="fu">## 2. Self Attention and the Cost of Naive Decoding</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>Fix one attention head. Let the input be a sequence of $n$ token vectors stacked as rows of $X \in \mathbb{R}^{n \times d_{\text{model}}}$. Three learned projections produce queries, keys, and values,</span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>Q = X W_Q, \qquad K = X W_K, \qquad V = X W_V,</span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a>with $W_Q, W_K, W_V \in \mathbb{R}^{d_{\text{model}} \times d_k}$ and $Q, K, V \in \mathbb{R}^{n \times d_k}$. Scaled dot-product attention is</span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>\operatorname{Attn}(Q, K, V) = \operatorname{softmax}<span class="sc">\!</span>\left(\frac{Q K^\top}{\sqrt{d_k}} + M\right) V ,</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a>where $M$ is the causal mask with $M_{ij} = -\infty$ for $j &gt; i$ and $0$ otherwise, so that token $i$ attends only to positions $j \le i$.</span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a>The score matrix $S = QK^\top / \sqrt{d_k}$ is $n \times n$. Forming it costs $O(n^2 d_k)$ floating-point operations and, decisively, $O(n^2)$ memory traffic to write $S$, read it back for the softmax, and read it again for the multiply by $V$. For a single full sequence (training, or the **prefill** of a prompt) this is paid once. For autoregressive **decoding** the picture is worse: a naive implementation that re-runs the full attention at every generated step pays $\sum_{t=1}^{n} O(t^2) = O(n^3)$ across the whole generation. That cubic blowup is the wall a KV-cache exists to remove.</span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a><span class="fu">## 3. The KV-Cache: From Quadratic to Linear Per Step</span></span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a>The key observation is that during decoding the keys and values of past tokens never change. When we generate token $t$, its query $q_t = x_t W_Q$ is new, but the keys $k_1, \dots, k_{t-1}$ and values $v_1, \dots, v_{t-1}$ are exactly the ones computed at earlier steps. There is no reason to recompute them.</span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a>A KV-cache stores the running matrices $K_{&lt;t}$ and $V_{&lt;t}$. At step $t$ we compute only the new key and value, append them, and attend the single new query against the whole cache:</span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a>k_t = x_t W_K,\quad v_t = x_t W_V,\qquad</span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a>K_{\le t} = \begin{bmatrix} K_{&lt;t} <span class="sc">\\</span> k_t \end{bmatrix},\quad</span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a>V_{\le t} = \begin{bmatrix} V_{&lt;t} <span class="sc">\\</span> v_t \end{bmatrix},</span>
+<span id="cb14-39"><a href="#cb14-39" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-40"><a href="#cb14-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-41"><a href="#cb14-41" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-42"><a href="#cb14-42" aria-hidden="true" tabindex="-1"></a>o_t = \operatorname{softmax}<span class="sc">\!</span>\left(\frac{q_t K_{\le t}^\top}{\sqrt{d_k}}\right) V_{\le t} .</span>
+<span id="cb14-43"><a href="#cb14-43" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-44"><a href="#cb14-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-45"><a href="#cb14-45" aria-hidden="true" tabindex="-1"></a>Now step $t$ does a single query against $t$ keys: $O(t \, d_k)$ work and $O(t)$ memory traffic, not $O(t^2)$. Across the full generation the total is $\sum_{t=1}^{n} O(t) = O(n^2)$ work, and the **per-step** cost is linear in the context length rather than quadratic. The causal mask disappears at decode time because the cache contains only past positions by construction.</span>
+<span id="cb14-46"><a href="#cb14-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-47"><a href="#cb14-47" aria-hidden="true" tabindex="-1"></a>The price is memory. The cache holds, per layer and per head,</span>
+<span id="cb14-48"><a href="#cb14-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-49"><a href="#cb14-49" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-50"><a href="#cb14-50" aria-hidden="true" tabindex="-1"></a>\text{KV bytes} = 2 \times n_{\text{layers}} \times n_{\text{kv heads}} \times d_k \times n_{\text{tokens}} \times \text{batch} \times \text{bytes per element}.</span>
+<span id="cb14-51"><a href="#cb14-51" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-52"><a href="#cb14-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-53"><a href="#cb14-53" aria-hidden="true" tabindex="-1"></a>The factor of two is keys plus values. This number grows linearly with context length and batch size and, at long context, dominates the memory budget of a served model, often exceeding the size of the weights themselves. Everything in the next two sections is about shrinking it or streaming around it.</span>
+<span id="cb14-54"><a href="#cb14-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-55"><a href="#cb14-55" aria-hidden="true" tabindex="-1"></a><span class="fu">## 4. Grouped-Query and Multi-Query Attention: Shrinking the Cache</span></span>
+<span id="cb14-56"><a href="#cb14-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-57"><a href="#cb14-57" aria-hidden="true" tabindex="-1"></a>Standard **multi-head attention (MHA)** gives every one of the $h$ query heads its own key and value head. The cache therefore scales with $h$. The insight of **multi-query attention (MQA)** is that keys and values can be shared: use $h$ query heads but a single key head and a single value head, broadcast across all queries. This cuts the KV-cache by a factor of $h$ at the cost of some representational capacity, and it noticeably degraded quality in practice.</span>
+<span id="cb14-58"><a href="#cb14-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-59"><a href="#cb14-59" aria-hidden="true" tabindex="-1"></a>**Grouped-query attention (GQA)** interpolates. Partition the $h$ query heads into $g$ groups; each group shares one key head and one value head. With $g = h$ this is plain MHA; with $g = 1$ it is MQA. Intermediate $g$ (Llama 2 70B and many later models use $g = 8$) recovers almost all of MHA's quality while cutting the cache by $h/g$. Concretely, with $h$ query heads and $g$ KV groups, query head $i$ uses KV group $\lfloor i / (h/g) \rfloor$, so each KV head is reused by $h/g$ query heads:</span>
+<span id="cb14-60"><a href="#cb14-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-61"><a href="#cb14-61" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-62"><a href="#cb14-62" aria-hidden="true" tabindex="-1"></a>o^{(i)}_t = \operatorname{softmax}\!\left(\frac{q^{(i)}_t \big(K^{(\lfloor i/(h/g)\rfloor)}_{\le t}\big)^\top}{\sqrt{d_k}}\right) V^{(\lfloor i/(h/g)\rfloor)}_{\le t} .</span>
+<span id="cb14-63"><a href="#cb14-63" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-64"><a href="#cb14-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-65"><a href="#cb14-65" aria-hidden="true" tabindex="-1"></a>The cache shrinks from $2 n_{\text{layers}} h\, d_k$ per token to $2 n_{\text{layers}} g\, d_k$ per token, a factor of $h/g$ smaller. Because attention is memory bound, a smaller cache also means less memory traffic per decode step, so GQA improves both footprint and decode latency. The reason it works at all is that the queries carry most of the head-specific specialization; sharing keys and values across a small group costs little because the softmax over shared keys still mixes differently per query.</span>
+<span id="cb14-66"><a href="#cb14-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-69"><a href="#cb14-69" aria-hidden="true" tabindex="-1"></a><span class="in">```{mermaid}</span></span>
+<span id="cb14-70"><a href="#cb14-70" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
+<span id="cb14-71"><a href="#cb14-71" aria-hidden="true" tabindex="-1"></a>    subgraph MHA[<span class="ot">"</span><span class="st">MHA eight query heads eight KV heads</span><span class="ot">"</span>]</span>
+<span id="cb14-72"><a href="#cb14-72" aria-hidden="true" tabindex="-1"></a>        q1[<span class="ot">"</span><span class="st">q1</span><span class="ot">"</span>] --&gt; k1[<span class="ot">"</span><span class="st">kv1</span><span class="ot">"</span>]</span>
+<span id="cb14-73"><a href="#cb14-73" aria-hidden="true" tabindex="-1"></a>        q2[<span class="ot">"</span><span class="st">q2</span><span class="ot">"</span>] --&gt; k2[<span class="ot">"</span><span class="st">kv2</span><span class="ot">"</span>]</span>
+<span id="cb14-74"><a href="#cb14-74" aria-hidden="true" tabindex="-1"></a>        q3[<span class="ot">"</span><span class="st">q3</span><span class="ot">"</span>] --&gt; k3[<span class="ot">"</span><span class="st">kv3</span><span class="ot">"</span>]</span>
+<span id="cb14-75"><a href="#cb14-75" aria-hidden="true" tabindex="-1"></a>        q4[<span class="ot">"</span><span class="st">q4</span><span class="ot">"</span>] --&gt; k4[<span class="ot">"</span><span class="st">kv4</span><span class="ot">"</span>]</span>
+<span id="cb14-76"><a href="#cb14-76" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb14-77"><a href="#cb14-77" aria-hidden="true" tabindex="-1"></a>    subgraph GQA[<span class="ot">"</span><span class="st">GQA eight query heads two KV groups</span><span class="ot">"</span>]</span>
+<span id="cb14-78"><a href="#cb14-78" aria-hidden="true" tabindex="-1"></a>        a1[<span class="ot">"</span><span class="st">q1</span><span class="ot">"</span>] --&gt; g1[<span class="ot">"</span><span class="st">kv group 1</span><span class="ot">"</span>]</span>
+<span id="cb14-79"><a href="#cb14-79" aria-hidden="true" tabindex="-1"></a>        a2[<span class="ot">"</span><span class="st">q2</span><span class="ot">"</span>] --&gt; g1</span>
+<span id="cb14-80"><a href="#cb14-80" aria-hidden="true" tabindex="-1"></a>        a3[<span class="ot">"</span><span class="st">q3</span><span class="ot">"</span>] --&gt; g2[<span class="ot">"</span><span class="st">kv group 2</span><span class="ot">"</span>]</span>
+<span id="cb14-81"><a href="#cb14-81" aria-hidden="true" tabindex="-1"></a>        a4[<span class="ot">"</span><span class="st">q4</span><span class="ot">"</span>] --&gt; g2</span>
+<span id="cb14-82"><a href="#cb14-82" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb14-83"><a href="#cb14-83" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-84"><a href="#cb14-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-85"><a href="#cb14-85" aria-hidden="true" tabindex="-1"></a><span class="fu">## 5. FlashAttention: Never Materialize the Score Matrix</span></span>
+<span id="cb14-86"><a href="#cb14-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-87"><a href="#cb14-87" aria-hidden="true" tabindex="-1"></a>KV-caching and GQA reduce how much we store. **FlashAttention** changes how we compute, and it targets the prefill and training passes where the full $n \times n$ score matrix is the problem. The standard implementation writes $S = QK^\top$ to high-bandwidth memory (HBM), reads it back to compute the softmax, and reads it a third time to multiply by $V$. For long sequences those $O(n^2)$ reads and writes to HBM, not the arithmetic, set the runtime.</span>
+<span id="cb14-88"><a href="#cb14-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-89"><a href="#cb14-89" aria-hidden="true" tabindex="-1"></a>FlashAttention computes exact attention without ever writing the full $S$ to HBM. It tiles $Q$, $K$, and $V$ into blocks that fit in fast on-chip SRAM, and computes the output block by block using an **online softmax** that maintains a running maximum and running normalizer so the result is numerically identical to the full softmax. The online softmax recurrence, for a new block of scores $s$ added to a running state with max $m$ and sum $\ell$ and accumulated output $o$, is</span>
+<span id="cb14-90"><a href="#cb14-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-91"><a href="#cb14-91" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-92"><a href="#cb14-92" aria-hidden="true" tabindex="-1"></a>m' = \max(m, \max_j s_j), \quad</span>
+<span id="cb14-93"><a href="#cb14-93" aria-hidden="true" tabindex="-1"></a>\ell' = e^{m - m'}\ell + \sum_j e^{s_j - m'}, \quad</span>
+<span id="cb14-94"><a href="#cb14-94" aria-hidden="true" tabindex="-1"></a>o' = e^{m - m'} o + \sum_j e^{s_j - m'} v_j .</span>
+<span id="cb14-95"><a href="#cb14-95" aria-hidden="true" tabindex="-1"></a>$$</span>
+<span id="cb14-96"><a href="#cb14-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-97"><a href="#cb14-97" aria-hidden="true" tabindex="-1"></a>Subtracting the running max keeps every exponential in $<span class="co">[</span><span class="ot">0, 1</span><span class="co">]</span>$, so the computation is stable, and rescaling the accumulator by $e^{m - m'}$ when the max grows keeps the partial sums consistent. Because each element of $K$ and $V$ is read from HBM once per query block rather than the score matrix being round-tripped, the HBM traffic drops from $O(n^2)$ to $O(n^2 d_k / B)$ for SRAM block size $B$, a large constant-factor reduction that makes attention compute bound again. FlashAttention-2 and FlashAttention-3 further improve work partitioning and exploit newer GPU features, but the core algorithmic idea is the tiled online softmax above. This is a GPU technique: the win comes from the SRAM-versus-HBM gap, which CPUs do not have in the same form, so we show it rather than execute it.</span>
+<span id="cb14-98"><a href="#cb14-98" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-99"><a href="#cb14-99" aria-hidden="true" tabindex="-1"></a><span class="fu">## 6. Paged Attention and Sliding-Window Attention</span></span>
+<span id="cb14-100"><a href="#cb14-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-101"><a href="#cb14-101" aria-hidden="true" tabindex="-1"></a>Two further production techniques round out the picture.</span>
+<span id="cb14-102"><a href="#cb14-102" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-103"><a href="#cb14-103" aria-hidden="true" tabindex="-1"></a>**Paged attention**, introduced by vLLM, attacks fragmentation. A served model handles many concurrent requests of unpredictable and changing length. Allocating one contiguous KV-cache buffer per request wastes memory to internal fragmentation and over-provisioning. Paged attention borrows the operating-system idea of virtual memory: the cache is split into fixed-size **blocks**, a request's logical KV positions are mapped to physical blocks through a block table, and blocks are allocated on demand and shared (for example across beams or across requests with a common prompt prefix) via copy-on-write. The result is near-zero KV waste and much higher serving throughput, which is why vLLM became a default open-source serving engine.</span>
+<span id="cb14-104"><a href="#cb14-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-105"><a href="#cb14-105" aria-hidden="true" tabindex="-1"></a>**Sliding-window attention** bounds the cache instead of managing it. Models such as Mistral 7B restrict each token to attend only to the previous $w$ tokens (a window), so the KV-cache never exceeds $w$ positions regardless of total sequence length. Information still propagates beyond the window because stacked layers compose their receptive fields: after $L$ layers the effective context reaches roughly $L \times w$ tokens. This trades a bounded, constant memory footprint for a controlled loss of exact long-range access, and it composes cleanly with GQA and paged attention.</span>
+<span id="cb14-106"><a href="#cb14-106" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-107"><a href="#cb14-107" aria-hidden="true" tabindex="-1"></a><span class="fu">## 7. Production Code</span></span>
+<span id="cb14-108"><a href="#cb14-108" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-109"><a href="#cb14-109" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.1 A From-Scratch KV-Cache, Executed on CPU</span></span>
+<span id="cb14-110"><a href="#cb14-110" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-111"><a href="#cb14-111" aria-hidden="true" tabindex="-1"></a>The following cell implements single-head causal self attention two ways: the **naive** decoder that recomputes attention over the full prefix at every step, and the **cached** decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder's superlinear growth against the cache's near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.</span>
+<span id="cb14-112"><a href="#cb14-112" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-115"><a href="#cb14-115" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
+<span id="cb14-116"><a href="#cb14-116" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb14-117"><a href="#cb14-117" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.nn.functional <span class="im">as</span> F</span>
+<span id="cb14-118"><a href="#cb14-118" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb14-119"><a href="#cb14-119" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-120"><a href="#cb14-120" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">0</span>)</span>
+<span id="cb14-121"><a href="#cb14-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-122"><a href="#cb14-122" aria-hidden="true" tabindex="-1"></a>d_model <span class="op">=</span> <span class="dv">64</span>          <span class="co"># model / head dimension</span></span>
+<span id="cb14-123"><a href="#cb14-123" aria-hidden="true" tabindex="-1"></a>n_steps <span class="op">=</span> <span class="dv">256</span>         <span class="co"># tokens to generate</span></span>
+<span id="cb14-124"><a href="#cb14-124" aria-hidden="true" tabindex="-1"></a>scale <span class="op">=</span> d_model <span class="op">**</span> <span class="op">-</span><span class="fl">0.5</span></span>
+<span id="cb14-125"><a href="#cb14-125" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-126"><a href="#cb14-126" aria-hidden="true" tabindex="-1"></a><span class="co"># Fixed projection weights (one head) and a fixed stream of input token vectors.</span></span>
+<span id="cb14-127"><a href="#cb14-127" aria-hidden="true" tabindex="-1"></a><span class="co"># Small init keeps the logits in a sane range, as in a trained model.</span></span>
+<span id="cb14-128"><a href="#cb14-128" aria-hidden="true" tabindex="-1"></a>W_q <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.1</span></span>
+<span id="cb14-129"><a href="#cb14-129" aria-hidden="true" tabindex="-1"></a>W_k <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.1</span></span>
+<span id="cb14-130"><a href="#cb14-130" aria-hidden="true" tabindex="-1"></a>W_v <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.1</span></span>
+<span id="cb14-131"><a href="#cb14-131" aria-hidden="true" tabindex="-1"></a>inputs <span class="op">=</span> torch.randn(n_steps, d_model)   <span class="co"># x_1 .. x_n, revealed one at a time</span></span>
+<span id="cb14-132"><a href="#cb14-132" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-133"><a href="#cb14-133" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-134"><a href="#cb14-134" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> decode_naive(inputs):</span>
+<span id="cb14-135"><a href="#cb14-135" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""Recompute full causal attention over the whole prefix at every step."""</span></span>
+<span id="cb14-136"><a href="#cb14-136" aria-hidden="true" tabindex="-1"></a>    outputs <span class="op">=</span> []</span>
+<span id="cb14-137"><a href="#cb14-137" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> t <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, inputs.shape[<span class="dv">0</span>] <span class="op">+</span> <span class="dv">1</span>):</span>
+<span id="cb14-138"><a href="#cb14-138" aria-hidden="true" tabindex="-1"></a>        x <span class="op">=</span> inputs[:t]                       <span class="co"># all tokens seen so far</span></span>
+<span id="cb14-139"><a href="#cb14-139" aria-hidden="true" tabindex="-1"></a>        q, k, v <span class="op">=</span> x <span class="op">@</span> W_q, x <span class="op">@</span> W_k, x <span class="op">@</span> W_v  <span class="co"># recompute K, V for the whole prefix</span></span>
+<span id="cb14-140"><a href="#cb14-140" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> k.t()) <span class="op">*</span> scale</span>
+<span id="cb14-141"><a href="#cb14-141" aria-hidden="true" tabindex="-1"></a>        mask <span class="op">=</span> torch.triu(torch.ones(t, t), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
+<span id="cb14-142"><a href="#cb14-142" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>))</span>
+<span id="cb14-143"><a href="#cb14-143" aria-hidden="true" tabindex="-1"></a>        attn <span class="op">=</span> F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v</span>
+<span id="cb14-144"><a href="#cb14-144" aria-hidden="true" tabindex="-1"></a>        outputs.append(attn[<span class="op">-</span><span class="dv">1</span>])             <span class="co"># only the last row is the new token</span></span>
+<span id="cb14-145"><a href="#cb14-145" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> torch.stack(outputs)</span>
+<span id="cb14-146"><a href="#cb14-146" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-147"><a href="#cb14-147" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-148"><a href="#cb14-148" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> decode_cached(inputs):</span>
+<span id="cb14-149"><a href="#cb14-149" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""Keep K and V in a cache; attend only the new query each step."""</span></span>
+<span id="cb14-150"><a href="#cb14-150" aria-hidden="true" tabindex="-1"></a>    outputs <span class="op">=</span> []</span>
+<span id="cb14-151"><a href="#cb14-151" aria-hidden="true" tabindex="-1"></a>    k_cache, v_cache <span class="op">=</span> [], []</span>
+<span id="cb14-152"><a href="#cb14-152" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> t <span class="kw">in</span> <span class="bu">range</span>(inputs.shape[<span class="dv">0</span>]):</span>
+<span id="cb14-153"><a href="#cb14-153" aria-hidden="true" tabindex="-1"></a>        x <span class="op">=</span> inputs[t:t <span class="op">+</span> <span class="dv">1</span>]                  <span class="co"># single new token vector</span></span>
+<span id="cb14-154"><a href="#cb14-154" aria-hidden="true" tabindex="-1"></a>        q <span class="op">=</span> x <span class="op">@</span> W_q</span>
+<span id="cb14-155"><a href="#cb14-155" aria-hidden="true" tabindex="-1"></a>        k_cache.append(x <span class="op">@</span> W_k)              <span class="co"># compute new k, v once and keep them</span></span>
+<span id="cb14-156"><a href="#cb14-156" aria-hidden="true" tabindex="-1"></a>        v_cache.append(x <span class="op">@</span> W_v)</span>
+<span id="cb14-157"><a href="#cb14-157" aria-hidden="true" tabindex="-1"></a>        K <span class="op">=</span> torch.cat(k_cache, dim<span class="op">=</span><span class="dv">0</span>)        <span class="co"># cached keys, no recomputation</span></span>
+<span id="cb14-158"><a href="#cb14-158" aria-hidden="true" tabindex="-1"></a>        V <span class="op">=</span> torch.cat(v_cache, dim<span class="op">=</span><span class="dv">0</span>)</span>
+<span id="cb14-159"><a href="#cb14-159" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> K.t()) <span class="op">*</span> scale         <span class="co"># one query vs all cached keys</span></span>
+<span id="cb14-160"><a href="#cb14-160" aria-hidden="true" tabindex="-1"></a>        attn <span class="op">=</span> F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> V</span>
+<span id="cb14-161"><a href="#cb14-161" aria-hidden="true" tabindex="-1"></a>        outputs.append(attn[<span class="dv">0</span>])</span>
+<span id="cb14-162"><a href="#cb14-162" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> torch.stack(outputs)</span>
+<span id="cb14-163"><a href="#cb14-163" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-164"><a href="#cb14-164" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-165"><a href="#cb14-165" aria-hidden="true" tabindex="-1"></a>out_naive <span class="op">=</span> decode_naive(inputs)</span>
+<span id="cb14-166"><a href="#cb14-166" aria-hidden="true" tabindex="-1"></a>out_cached <span class="op">=</span> decode_cached(inputs)</span>
+<span id="cb14-167"><a href="#cb14-167" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-168"><a href="#cb14-168" aria-hidden="true" tabindex="-1"></a>max_diff <span class="op">=</span> (out_naive <span class="op">-</span> out_cached).<span class="bu">abs</span>().<span class="bu">max</span>().item()</span>
+<span id="cb14-169"><a href="#cb14-169" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"max abs difference between naive and cached outputs: </span><span class="sc">{</span>max_diff<span class="sc">:.2e}</span><span class="ss">"</span>)</span>
+<span id="cb14-170"><a href="#cb14-170" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"identical to floating-point tolerance: </span><span class="sc">{</span>torch<span class="sc">.</span>allclose(out_naive, out_cached, atol<span class="op">=</span><span class="fl">1e-5</span>)<span class="sc">}</span><span class="ss">"</span>)</span>
+<span id="cb14-171"><a href="#cb14-171" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-172"><a href="#cb14-172" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-173"><a href="#cb14-173" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> timed(fn, inputs, repeats<span class="op">=</span><span class="dv">3</span>):</span>
+<span id="cb14-174"><a href="#cb14-174" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">float</span>(<span class="st">"inf"</span>)</span>
+<span id="cb14-175"><a href="#cb14-175" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
+<span id="cb14-176"><a href="#cb14-176" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb14-177"><a href="#cb14-177" aria-hidden="true" tabindex="-1"></a>        fn(inputs)</span>
+<span id="cb14-178"><a href="#cb14-178" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> <span class="bu">min</span>(best, time.perf_counter() <span class="op">-</span> t0)</span>
+<span id="cb14-179"><a href="#cb14-179" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best</span>
+<span id="cb14-180"><a href="#cb14-180" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-181"><a href="#cb14-181" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-182"><a href="#cb14-182" aria-hidden="true" tabindex="-1"></a>t_naive <span class="op">=</span> timed(decode_naive, inputs)</span>
+<span id="cb14-183"><a href="#cb14-183" aria-hidden="true" tabindex="-1"></a>t_cached <span class="op">=</span> timed(decode_cached, inputs)</span>
+<span id="cb14-184"><a href="#cb14-184" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="ch">\n</span><span class="ss">generating </span><span class="sc">{</span>n_steps<span class="sc">}</span><span class="ss"> tokens (single head, CPU):"</span>)</span>
+<span id="cb14-185"><a href="#cb14-185" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"  naive  recompute : </span><span class="sc">{</span>t_naive <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms"</span>)</span>
+<span id="cb14-186"><a href="#cb14-186" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"  KV-cache         : </span><span class="sc">{</span>t_cached <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms"</span>)</span>
+<span id="cb14-187"><a href="#cb14-187" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"  speedup          : </span><span class="sc">{</span>t_naive <span class="op">/</span> t_cached<span class="sc">:8.1f}</span><span class="ss">x"</span>)</span>
+<span id="cb14-188"><a href="#cb14-188" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-189"><a href="#cb14-189" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-190"><a href="#cb14-190" aria-hidden="true" tabindex="-1"></a>The two decoders agree to floating-point tolerance, confirming the cache changes only *how* the answer is computed, not the answer. The naive decoder is markedly slower because it repeats the prefix projections and the growing softmax at every step; the cache removes exactly that redundancy.</span>
+<span id="cb14-191"><a href="#cb14-191" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-192"><a href="#cb14-192" aria-hidden="true" tabindex="-1"></a>To see the asymptotics directly, we measure how per-decode cost scales with the prefix length. The naive step at position $t$ does $O(t^2)$ work, so doubling $t$ roughly quadruples its time; the cached step does $O(t)$ work, so doubling $t$ roughly doubles its time.</span>
+<span id="cb14-193"><a href="#cb14-193" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-196"><a href="#cb14-196" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
+<span id="cb14-197"><a href="#cb14-197" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> naive_step_time(t, d_model, repeats<span class="op">=</span><span class="dv">20</span>):</span>
+<span id="cb14-198"><a href="#cb14-198" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> torch.randn(t, d_model)</span>
+<span id="cb14-199"><a href="#cb14-199" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">float</span>(<span class="st">"inf"</span>)</span>
+<span id="cb14-200"><a href="#cb14-200" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
+<span id="cb14-201"><a href="#cb14-201" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb14-202"><a href="#cb14-202" aria-hidden="true" tabindex="-1"></a>        q, k, v <span class="op">=</span> x <span class="op">@</span> W_q, x <span class="op">@</span> W_k, x <span class="op">@</span> W_v</span>
+<span id="cb14-203"><a href="#cb14-203" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> k.t()) <span class="op">*</span> scale</span>
+<span id="cb14-204"><a href="#cb14-204" aria-hidden="true" tabindex="-1"></a>        mask <span class="op">=</span> torch.triu(torch.ones(t, t), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
+<span id="cb14-205"><a href="#cb14-205" aria-hidden="true" tabindex="-1"></a>        F.softmax(scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>)), dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v</span>
+<span id="cb14-206"><a href="#cb14-206" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> <span class="bu">min</span>(best, time.perf_counter() <span class="op">-</span> t0)</span>
+<span id="cb14-207"><a href="#cb14-207" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best</span>
+<span id="cb14-208"><a href="#cb14-208" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-209"><a href="#cb14-209" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-210"><a href="#cb14-210" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> cached_step_time(t, d_model, repeats<span class="op">=</span><span class="dv">20</span>):</span>
+<span id="cb14-211"><a href="#cb14-211" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> torch.randn(<span class="dv">1</span>, d_model) <span class="op">@</span> W_q</span>
+<span id="cb14-212"><a href="#cb14-212" aria-hidden="true" tabindex="-1"></a>    K <span class="op">=</span> torch.randn(t, d_model)</span>
+<span id="cb14-213"><a href="#cb14-213" aria-hidden="true" tabindex="-1"></a>    V <span class="op">=</span> torch.randn(t, d_model)</span>
+<span id="cb14-214"><a href="#cb14-214" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">float</span>(<span class="st">"inf"</span>)</span>
+<span id="cb14-215"><a href="#cb14-215" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
+<span id="cb14-216"><a href="#cb14-216" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb14-217"><a href="#cb14-217" aria-hidden="true" tabindex="-1"></a>        scores <span class="op">=</span> (q <span class="op">@</span> K.t()) <span class="op">*</span> scale</span>
+<span id="cb14-218"><a href="#cb14-218" aria-hidden="true" tabindex="-1"></a>        F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> V</span>
+<span id="cb14-219"><a href="#cb14-219" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> <span class="bu">min</span>(best, time.perf_counter() <span class="op">-</span> t0)</span>
+<span id="cb14-220"><a href="#cb14-220" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best</span>
+<span id="cb14-221"><a href="#cb14-221" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-222"><a href="#cb14-222" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-223"><a href="#cb14-223" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span><span class="st">'prefix len'</span><span class="sc">:&gt;10}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'naive step (ms)'</span><span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'cached step (ms)'</span><span class="sc">:&gt;17}</span><span class="ss">"</span>)</span>
+<span id="cb14-224"><a href="#cb14-224" aria-hidden="true" tabindex="-1"></a>prev <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb14-225"><a href="#cb14-225" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> t <span class="kw">in</span> [<span class="dv">128</span>, <span class="dv">256</span>, <span class="dv">512</span>, <span class="dv">1024</span>]:</span>
+<span id="cb14-226"><a href="#cb14-226" aria-hidden="true" tabindex="-1"></a>    tn <span class="op">=</span> naive_step_time(t, d_model)</span>
+<span id="cb14-227"><a href="#cb14-227" aria-hidden="true" tabindex="-1"></a>    tc <span class="op">=</span> cached_step_time(t, d_model)</span>
+<span id="cb14-228"><a href="#cb14-228" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span>t<span class="sc">:&gt;10}</span><span class="ss"> </span><span class="sc">{</span>tn <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:&gt;16.3f}</span><span class="ss"> </span><span class="sc">{</span>tc <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:&gt;17.3f}</span><span class="ss">"</span>)</span>
+<span id="cb14-229"><a href="#cb14-229" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-230"><a href="#cb14-230" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-231"><a href="#cb14-231" aria-hidden="true" tabindex="-1"></a>The naive column grows faster than the cached column as the prefix doubles, the empirical signature of $O(t^2)$ versus $O(t)$ per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.</span>
+<span id="cb14-232"><a href="#cb14-232" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-233"><a href="#cb14-233" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.2 Grouped-Query and Multi-Query Attention, Executed on CPU</span></span>
+<span id="cb14-234"><a href="#cb14-234" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-235"><a href="#cb14-235" aria-hidden="true" tabindex="-1"></a>This cell implements one attention layer parameterized by the number of KV groups $g$. Setting $g = h$ gives multi-head attention, $g = 1$ gives multi-query attention, and $1 &lt; g &lt; h$ gives grouped-query attention. We repeat each KV head across its query group with <span class="in">`repeat_interleave`</span>, run a forward pass for several values of $g$, and report the resulting KV-cache size so the $h/g$ reduction is explicit.</span>
+<span id="cb14-236"><a href="#cb14-236" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-239"><a href="#cb14-239" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
+<span id="cb14-240"><a href="#cb14-240" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb14-241"><a href="#cb14-241" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.nn.functional <span class="im">as</span> F</span>
+<span id="cb14-242"><a href="#cb14-242" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-243"><a href="#cb14-243" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">0</span>)</span>
+<span id="cb14-244"><a href="#cb14-244" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-245"><a href="#cb14-245" aria-hidden="true" tabindex="-1"></a>n_tokens <span class="op">=</span> <span class="dv">32</span></span>
+<span id="cb14-246"><a href="#cb14-246" aria-hidden="true" tabindex="-1"></a>d_model <span class="op">=</span> <span class="dv">256</span></span>
+<span id="cb14-247"><a href="#cb14-247" aria-hidden="true" tabindex="-1"></a>n_heads <span class="op">=</span> <span class="dv">8</span></span>
+<span id="cb14-248"><a href="#cb14-248" aria-hidden="true" tabindex="-1"></a>d_head <span class="op">=</span> d_model <span class="op">//</span> n_heads</span>
+<span id="cb14-249"><a href="#cb14-249" aria-hidden="true" tabindex="-1"></a>scale <span class="op">=</span> d_head <span class="op">**</span> <span class="op">-</span><span class="fl">0.5</span></span>
+<span id="cb14-250"><a href="#cb14-250" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-251"><a href="#cb14-251" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> torch.randn(n_tokens, d_model)</span>
+<span id="cb14-252"><a href="#cb14-252" aria-hidden="true" tabindex="-1"></a>W_q <span class="op">=</span> torch.randn(d_model, d_model) <span class="op">*</span> <span class="fl">0.02</span>   <span class="co"># query: always n_heads heads</span></span>
+<span id="cb14-253"><a href="#cb14-253" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-254"><a href="#cb14-254" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-255"><a href="#cb14-255" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> gqa_forward(x, n_kv_groups):</span>
+<span id="cb14-256"><a href="#cb14-256" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""One causal attention layer with n_kv_groups shared KV heads."""</span></span>
+<span id="cb14-257"><a href="#cb14-257" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> n_heads <span class="op">%</span> n_kv_groups <span class="op">==</span> <span class="dv">0</span></span>
+<span id="cb14-258"><a href="#cb14-258" aria-hidden="true" tabindex="-1"></a>    n_tok <span class="op">=</span> x.shape[<span class="dv">0</span>]</span>
+<span id="cb14-259"><a href="#cb14-259" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Query projection: n_heads heads of size d_head.</span></span>
+<span id="cb14-260"><a href="#cb14-260" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> (x <span class="op">@</span> W_q).view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)   <span class="co"># [h, n, d]</span></span>
+<span id="cb14-261"><a href="#cb14-261" aria-hidden="true" tabindex="-1"></a>    <span class="co"># KV projection: only n_kv_groups heads (this is what shrinks the cache).</span></span>
+<span id="cb14-262"><a href="#cb14-262" aria-hidden="true" tabindex="-1"></a>    W_kv <span class="op">=</span> torch.randn(d_model, <span class="dv">2</span> <span class="op">*</span> n_kv_groups <span class="op">*</span> d_head) <span class="op">*</span> <span class="fl">0.02</span></span>
+<span id="cb14-263"><a href="#cb14-263" aria-hidden="true" tabindex="-1"></a>    kv <span class="op">=</span> x <span class="op">@</span> W_kv</span>
+<span id="cb14-264"><a href="#cb14-264" aria-hidden="true" tabindex="-1"></a>    k, v <span class="op">=</span> kv.split(n_kv_groups <span class="op">*</span> d_head, dim<span class="op">=-</span><span class="dv">1</span>)</span>
+<span id="cb14-265"><a href="#cb14-265" aria-hidden="true" tabindex="-1"></a>    k <span class="op">=</span> k.view(n_tok, n_kv_groups, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)       <span class="co"># [g, n, d]</span></span>
+<span id="cb14-266"><a href="#cb14-266" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> v.view(n_tok, n_kv_groups, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
+<span id="cb14-267"><a href="#cb14-267" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Broadcast each KV head to the h/g query heads that share it.</span></span>
+<span id="cb14-268"><a href="#cb14-268" aria-hidden="true" tabindex="-1"></a>    repeats <span class="op">=</span> n_heads <span class="op">//</span> n_kv_groups</span>
+<span id="cb14-269"><a href="#cb14-269" aria-hidden="true" tabindex="-1"></a>    k <span class="op">=</span> k.repeat_interleave(repeats, dim<span class="op">=</span><span class="dv">0</span>)                      <span class="co"># [h, n, d]</span></span>
+<span id="cb14-270"><a href="#cb14-270" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> v.repeat_interleave(repeats, dim<span class="op">=</span><span class="dv">0</span>)</span>
+<span id="cb14-271"><a href="#cb14-271" aria-hidden="true" tabindex="-1"></a>    scores <span class="op">=</span> (q <span class="op">@</span> k.transpose(<span class="op">-</span><span class="dv">2</span>, <span class="op">-</span><span class="dv">1</span>)) <span class="op">*</span> scale                  <span class="co"># [h, n, n]</span></span>
+<span id="cb14-272"><a href="#cb14-272" aria-hidden="true" tabindex="-1"></a>    mask <span class="op">=</span> torch.triu(torch.ones(n_tok, n_tok), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
+<span id="cb14-273"><a href="#cb14-273" aria-hidden="true" tabindex="-1"></a>    scores <span class="op">=</span> scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>))</span>
+<span id="cb14-274"><a href="#cb14-274" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> F.softmax(scores, dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v                         <span class="co"># [h, n, d]</span></span>
+<span id="cb14-275"><a href="#cb14-275" aria-hidden="true" tabindex="-1"></a>    <span class="co"># KV-cache bytes for this layer at fp16: 2 (k and v) * g * d_head * n_tok * 2 bytes.</span></span>
+<span id="cb14-276"><a href="#cb14-276" aria-hidden="true" tabindex="-1"></a>    kv_bytes <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> n_kv_groups <span class="op">*</span> d_head <span class="op">*</span> n_tok <span class="op">*</span> <span class="dv">2</span></span>
+<span id="cb14-277"><a href="#cb14-277" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out.transpose(<span class="dv">0</span>, <span class="dv">1</span>).reshape(n_tok, d_model), kv_bytes</span>
+<span id="cb14-278"><a href="#cb14-278" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-279"><a href="#cb14-279" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-280"><a href="#cb14-280" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span><span class="st">'variant'</span><span class="sc">:&gt;6}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'g (KV groups)'</span><span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'KV bytes/layer'</span><span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span><span class="st">'vs MHA'</span><span class="sc">:&gt;8}</span><span class="ss">"</span>)</span>
+<span id="cb14-281"><a href="#cb14-281" aria-hidden="true" tabindex="-1"></a>mha_bytes <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb14-282"><a href="#cb14-282" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> g, name <span class="kw">in</span> [(<span class="dv">8</span>, <span class="st">"MHA"</span>), (<span class="dv">4</span>, <span class="st">"GQA"</span>), (<span class="dv">2</span>, <span class="st">"GQA"</span>), (<span class="dv">1</span>, <span class="st">"MQA"</span>)]:</span>
+<span id="cb14-283"><a href="#cb14-283" aria-hidden="true" tabindex="-1"></a>    out, kv_bytes <span class="op">=</span> gqa_forward(x, g)</span>
+<span id="cb14-284"><a href="#cb14-284" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mha_bytes <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb14-285"><a href="#cb14-285" aria-hidden="true" tabindex="-1"></a>        mha_bytes <span class="op">=</span> kv_bytes</span>
+<span id="cb14-286"><a href="#cb14-286" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"</span><span class="sc">{</span>name<span class="sc">:&gt;6}</span><span class="ss"> </span><span class="sc">{</span>g<span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span>kv_bytes<span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span>mha_bytes <span class="op">/</span> kv_bytes<span class="sc">:&gt;7.1f}</span><span class="ss">x"</span>)</span>
+<span id="cb14-287"><a href="#cb14-287" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-288"><a href="#cb14-288" aria-hidden="true" tabindex="-1"></a><span class="co"># Sanity check: with g = n_heads, GQA reduces exactly to standard multi-head attention.</span></span>
+<span id="cb14-289"><a href="#cb14-289" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">123</span>)</span>
+<span id="cb14-290"><a href="#cb14-290" aria-hidden="true" tabindex="-1"></a>W_kv_full <span class="op">=</span> torch.randn(d_model, <span class="dv">2</span> <span class="op">*</span> n_heads <span class="op">*</span> d_head) <span class="op">*</span> <span class="fl">0.02</span></span>
+<span id="cb14-291"><a href="#cb14-291" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-292"><a href="#cb14-292" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-293"><a href="#cb14-293" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> mha_reference(x):</span>
+<span id="cb14-294"><a href="#cb14-294" aria-hidden="true" tabindex="-1"></a>    n_tok <span class="op">=</span> x.shape[<span class="dv">0</span>]</span>
+<span id="cb14-295"><a href="#cb14-295" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> (x <span class="op">@</span> W_q).view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
+<span id="cb14-296"><a href="#cb14-296" aria-hidden="true" tabindex="-1"></a>    kv <span class="op">=</span> x <span class="op">@</span> W_kv_full</span>
+<span id="cb14-297"><a href="#cb14-297" aria-hidden="true" tabindex="-1"></a>    k, v <span class="op">=</span> kv.split(n_heads <span class="op">*</span> d_head, dim<span class="op">=-</span><span class="dv">1</span>)</span>
+<span id="cb14-298"><a href="#cb14-298" aria-hidden="true" tabindex="-1"></a>    k <span class="op">=</span> k.view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
+<span id="cb14-299"><a href="#cb14-299" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> v.view(n_tok, n_heads, d_head).transpose(<span class="dv">0</span>, <span class="dv">1</span>)</span>
+<span id="cb14-300"><a href="#cb14-300" aria-hidden="true" tabindex="-1"></a>    scores <span class="op">=</span> (q <span class="op">@</span> k.transpose(<span class="op">-</span><span class="dv">2</span>, <span class="op">-</span><span class="dv">1</span>)) <span class="op">*</span> scale</span>
+<span id="cb14-301"><a href="#cb14-301" aria-hidden="true" tabindex="-1"></a>    mask <span class="op">=</span> torch.triu(torch.ones(n_tok, n_tok), diagonal<span class="op">=</span><span class="dv">1</span>).<span class="bu">bool</span>()</span>
+<span id="cb14-302"><a href="#cb14-302" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> F.softmax(scores.masked_fill(mask, <span class="bu">float</span>(<span class="st">"-inf"</span>)), dim<span class="op">=-</span><span class="dv">1</span>) <span class="op">@</span> v</span>
+<span id="cb14-303"><a href="#cb14-303" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out.transpose(<span class="dv">0</span>, <span class="dv">1</span>).reshape(n_tok, d_model)</span>
+<span id="cb14-304"><a href="#cb14-304" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-305"><a href="#cb14-305" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-306"><a href="#cb14-306" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f"</span><span class="ch">\n</span><span class="ss">MHA forward output shape: </span><span class="sc">{</span><span class="bu">tuple</span>(mha_reference(x).shape)<span class="sc">}</span><span class="ss">"</span>)</span>
+<span id="cb14-307"><a href="#cb14-307" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">"GQA with g = n_heads is structurally identical to MHA (per-head KV, no sharing)."</span>)</span>
+<span id="cb14-308"><a href="#cb14-308" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-309"><a href="#cb14-309" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-310"><a href="#cb14-310" aria-hidden="true" tabindex="-1"></a>The KV bytes fall exactly by the factor $h/g$: halving the number of KV groups halves the cache. MQA ($g = 1$) is eight times smaller than MHA here, and GQA at $g = 4$ or $g = 2$ gives an intermediate footprint, the trade space real models tune for quality versus memory.</span>
+<span id="cb14-311"><a href="#cb14-311" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-312"><a href="#cb14-312" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.3 FlashAttention (requires GPU)</span></span>
+<span id="cb14-313"><a href="#cb14-313" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-314"><a href="#cb14-314" aria-hidden="true" tabindex="-1"></a>FlashAttention ships as a fused CUDA kernel. The cleanest way to use it in practice is through PyTorch's <span class="in">`scaled_dot_product_attention`</span>, which dispatches to a FlashAttention backend on supported GPUs, or through the <span class="in">`flash-attn`</span> package directly. The code below is the real invocation; it is not executed here because the speedup depends on the GPU SRAM-versus-HBM gap.</span>
+<span id="cb14-315"><a href="#cb14-315" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-316"><a href="#cb14-316" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
+<span id="cb14-317"><a href="#cb14-317" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: PyTorch SDPA dispatches to a fused FlashAttention kernel on CUDA.</span></span>
+<span id="cb14-318"><a href="#cb14-318" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb14-319"><a href="#cb14-319" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.nn.functional <span class="im">as</span> F</span>
+<span id="cb14-320"><a href="#cb14-320" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.nn.attention <span class="im">import</span> sdpa_kernel, SDPBackend</span>
+<span id="cb14-321"><a href="#cb14-321" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-322"><a href="#cb14-322" aria-hidden="true" tabindex="-1"></a>q <span class="op">=</span> torch.randn(<span class="dv">4</span>, <span class="dv">32</span>, <span class="dv">8192</span>, <span class="dv">128</span>, device<span class="op">=</span><span class="st">"cuda"</span>, dtype<span class="op">=</span>torch.float16)  <span class="co"># [B, H, N, d]</span></span>
+<span id="cb14-323"><a href="#cb14-323" aria-hidden="true" tabindex="-1"></a>k <span class="op">=</span> torch.randn_like(q)</span>
+<span id="cb14-324"><a href="#cb14-324" aria-hidden="true" tabindex="-1"></a>v <span class="op">=</span> torch.randn_like(q)</span>
+<span id="cb14-325"><a href="#cb14-325" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-326"><a href="#cb14-326" aria-hidden="true" tabindex="-1"></a><span class="co"># Force the FlashAttention backend; is_causal applies the causal mask fused in-kernel.</span></span>
+<span id="cb14-327"><a href="#cb14-327" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> sdpa_kernel(SDPBackend.FLASH_ATTENTION):</span>
+<span id="cb14-328"><a href="#cb14-328" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> F.scaled_dot_product_attention(q, k, v, is_causal<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb14-329"><a href="#cb14-329" aria-hidden="true" tabindex="-1"></a><span class="co"># out: [4, 32, 8192, 128], computed without ever materializing the 8192 x 8192 scores in HBM.</span></span>
+<span id="cb14-330"><a href="#cb14-330" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-331"><a href="#cb14-331" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-332"><a href="#cb14-332" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
+<span id="cb14-333"><a href="#cb14-333" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: the flash-attn package, exposing the kernel directly (variable-length, paged, etc.).</span></span>
+<span id="cb14-334"><a href="#cb14-334" aria-hidden="true" tabindex="-1"></a><span class="co"># pip install flash-attn --no-build-isolation</span></span>
+<span id="cb14-335"><a href="#cb14-335" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> flash_attn <span class="im">import</span> flash_attn_func</span>
+<span id="cb14-336"><a href="#cb14-336" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-337"><a href="#cb14-337" aria-hidden="true" tabindex="-1"></a><span class="co"># q, k, v shaped [batch, seqlen, n_heads, head_dim], fp16/bf16, on CUDA.</span></span>
+<span id="cb14-338"><a href="#cb14-338" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> flash_attn_func(q, k, v, causal<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb14-339"><a href="#cb14-339" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-340"><a href="#cb14-340" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-341"><a href="#cb14-341" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.4 Paged Attention with vLLM (requires GPU)</span></span>
+<span id="cb14-342"><a href="#cb14-342" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-343"><a href="#cb14-343" aria-hidden="true" tabindex="-1"></a>vLLM implements paged attention and continuous batching behind a simple serving API. The KV-cache management, block tables, and prefix sharing are internal; the user just gets high throughput. Shown, not executed, because it loads a multi-billion-parameter model onto a GPU.</span>
+<span id="cb14-344"><a href="#cb14-344" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-345"><a href="#cb14-345" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
+<span id="cb14-346"><a href="#cb14-346" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: vLLM serves with paged attention and continuous batching.</span></span>
+<span id="cb14-347"><a href="#cb14-347" aria-hidden="true" tabindex="-1"></a><span class="co"># pip install vllm</span></span>
+<span id="cb14-348"><a href="#cb14-348" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> vllm <span class="im">import</span> LLM, SamplingParams</span>
+<span id="cb14-349"><a href="#cb14-349" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-350"><a href="#cb14-350" aria-hidden="true" tabindex="-1"></a>llm <span class="op">=</span> LLM(model<span class="op">=</span><span class="st">"mistralai/Mistral-7B-Instruct-v0.3"</span>)  <span class="co"># GQA + sliding window, served paged</span></span>
+<span id="cb14-351"><a href="#cb14-351" aria-hidden="true" tabindex="-1"></a>params <span class="op">=</span> SamplingParams(temperature<span class="op">=</span><span class="fl">0.7</span>, max_tokens<span class="op">=</span><span class="dv">256</span>)</span>
+<span id="cb14-352"><a href="#cb14-352" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-353"><a href="#cb14-353" aria-hidden="true" tabindex="-1"></a>prompts <span class="op">=</span> [<span class="st">"Explain the KV-cache in one paragraph."</span>,</span>
+<span id="cb14-354"><a href="#cb14-354" aria-hidden="true" tabindex="-1"></a>           <span class="st">"Why is attention memory bound on GPUs?"</span>]</span>
+<span id="cb14-355"><a href="#cb14-355" aria-hidden="true" tabindex="-1"></a><span class="co"># vLLM batches these, shares any common prompt prefix's KV blocks, and pages the cache.</span></span>
+<span id="cb14-356"><a href="#cb14-356" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> output <span class="kw">in</span> llm.generate(prompts, params):</span>
+<span id="cb14-357"><a href="#cb14-357" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(output.outputs[<span class="dv">0</span>].text)</span>
+<span id="cb14-358"><a href="#cb14-358" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-359"><a href="#cb14-359" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-360"><a href="#cb14-360" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.5 Sliding-Window Attention on GPU</span></span>
+<span id="cb14-361"><a href="#cb14-361" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-362"><a href="#cb14-362" aria-hidden="true" tabindex="-1"></a>Sliding-window attention is a property of the model architecture and is applied by the serving stack. With FlashAttention the window is passed as a kernel argument so the bounded attention is computed fused, and the KV-cache is capped at the window size. Shown, not executed, because it needs the GPU kernel.</span>
+<span id="cb14-363"><a href="#cb14-363" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-364"><a href="#cb14-364" aria-hidden="true" tabindex="-1"></a><span class="in">```python</span></span>
+<span id="cb14-365"><a href="#cb14-365" aria-hidden="true" tabindex="-1"></a><span class="co"># requires GPU: FlashAttention supports a sliding window via window_size = (left, right).</span></span>
+<span id="cb14-366"><a href="#cb14-366" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> flash_attn <span class="im">import</span> flash_attn_func</span>
+<span id="cb14-367"><a href="#cb14-367" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-368"><a href="#cb14-368" aria-hidden="true" tabindex="-1"></a><span class="co"># Each query attends only to the previous 4096 keys (and itself); cache never exceeds the window.</span></span>
+<span id="cb14-369"><a href="#cb14-369" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> flash_attn_func(q, k, v, causal<span class="op">=</span><span class="va">True</span>, window_size<span class="op">=</span>(<span class="dv">4096</span>, <span class="dv">0</span>))</span>
+<span id="cb14-370"><a href="#cb14-370" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-371"><a href="#cb14-371" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-372"><a href="#cb14-372" aria-hidden="true" tabindex="-1"></a><span class="fu">### 7.6 Running it on a GPU (executed)</span></span>
+<span id="cb14-373"><a href="#cb14-373" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-374"><a href="#cb14-374" aria-hidden="true" tabindex="-1"></a>The CPU cells above show the asymptotics on small tensors. To see the KV-cache pay off on a real model and real hardware, the cell below loads a small open-weights instruct model (Qwen2.5-0.5B-Instruct, with a gpt2 fallback) onto the GPU and times autoregressive generation twice: once with <span class="in">`use_cache=True`</span>, which keeps the running keys and values exactly as in Section 3, and once with <span class="in">`use_cache=False`</span>, which forces the model to recompute attention over the whole growing prefix at every step. Both decode the same fixed number of new tokens from the same prompt under identical greedy settings, so the only difference is whether the cache is reused.</span>
+<span id="cb14-375"><a href="#cb14-375" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-376"><a href="#cb14-376" aria-hidden="true" tabindex="-1"></a>The cell is guarded by <span class="in">`torch.cuda.is_available()`</span> and runs entirely on the accelerator when one is present, printing the real measured per-token latency for each path, the speedup, and the peak GPU memory the run allocated. On a machine without a GPU it prints a short note and does nothing else, so the chapter still renders. This is the same Hugging Face Transformers path a production decode loop uses, the open-source stack the rest of the chapter points at, with the cache toggle exposed so the two regimes are directly comparable.</span>
+<span id="cb14-377"><a href="#cb14-377" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-380"><a href="#cb14-380" aria-hidden="true" tabindex="-1"></a><span class="in">```{python}</span></span>
+<span id="cb14-381"><a href="#cb14-381" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb14-382"><a href="#cb14-382" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb14-383"><a href="#cb14-383" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-384"><a href="#cb14-384" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> torch.cuda.is_available():</span>
+<span id="cb14-385"><a href="#cb14-385" aria-hidden="true" tabindex="-1"></a>    <span class="im">from</span> transformers <span class="im">import</span> AutoModelForCausalLM, AutoTokenizer</span>
+<span id="cb14-386"><a href="#cb14-386" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-387"><a href="#cb14-387" aria-hidden="true" tabindex="-1"></a>    torch.manual_seed(<span class="dv">0</span>)</span>
+<span id="cb14-388"><a href="#cb14-388" aria-hidden="true" tabindex="-1"></a>    device <span class="op">=</span> <span class="st">"cuda"</span></span>
+<span id="cb14-389"><a href="#cb14-389" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-390"><a href="#cb14-390" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Small open-weights instruct model; fall back to gpt2 if it cannot be fetched.</span></span>
+<span id="cb14-391"><a href="#cb14-391" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Both fit in well under 2 GB at fp16, far below the GPU budget.</span></span>
+<span id="cb14-392"><a href="#cb14-392" aria-hidden="true" tabindex="-1"></a>    model_name <span class="op">=</span> <span class="st">"Qwen/Qwen2.5-0.5B-Instruct"</span></span>
+<span id="cb14-393"><a href="#cb14-393" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb14-394"><a href="#cb14-394" aria-hidden="true" tabindex="-1"></a>        tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(model_name)</span>
+<span id="cb14-395"><a href="#cb14-395" aria-hidden="true" tabindex="-1"></a>        model <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb14-396"><a href="#cb14-396" aria-hidden="true" tabindex="-1"></a>            model_name, torch_dtype<span class="op">=</span>torch.float16</span>
+<span id="cb14-397"><a href="#cb14-397" aria-hidden="true" tabindex="-1"></a>        ).to(device)</span>
+<span id="cb14-398"><a href="#cb14-398" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> <span class="pp">Exception</span> <span class="im">as</span> exc:</span>
+<span id="cb14-399"><a href="#cb14-399" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f"could not load </span><span class="sc">{</span>model_name<span class="sc">}</span><span class="ss"> (</span><span class="sc">{</span><span class="bu">type</span>(exc)<span class="sc">.</span><span class="va">__name__</span><span class="sc">}</span><span class="ss">); falling back to gpt2"</span>)</span>
+<span id="cb14-400"><a href="#cb14-400" aria-hidden="true" tabindex="-1"></a>        model_name <span class="op">=</span> <span class="st">"gpt2"</span></span>
+<span id="cb14-401"><a href="#cb14-401" aria-hidden="true" tabindex="-1"></a>        tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(model_name)</span>
+<span id="cb14-402"><a href="#cb14-402" aria-hidden="true" tabindex="-1"></a>        model <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb14-403"><a href="#cb14-403" aria-hidden="true" tabindex="-1"></a>            model_name, torch_dtype<span class="op">=</span>torch.float16</span>
+<span id="cb14-404"><a href="#cb14-404" aria-hidden="true" tabindex="-1"></a>        ).to(device)</span>
+<span id="cb14-405"><a href="#cb14-405" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-406"><a href="#cb14-406" aria-hidden="true" tabindex="-1"></a>    model.<span class="bu">eval</span>()</span>
+<span id="cb14-407"><a href="#cb14-407" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> tokenizer.pad_token <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb14-408"><a href="#cb14-408" aria-hidden="true" tabindex="-1"></a>        tokenizer.pad_token <span class="op">=</span> tokenizer.eos_token</span>
+<span id="cb14-409"><a href="#cb14-409" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-410"><a href="#cb14-410" aria-hidden="true" tabindex="-1"></a>    prompt <span class="op">=</span> <span class="st">"Explain why a KV-cache speeds up autoregressive decoding."</span></span>
+<span id="cb14-411"><a href="#cb14-411" aria-hidden="true" tabindex="-1"></a>    inputs <span class="op">=</span> tokenizer(prompt, return_tensors<span class="op">=</span><span class="st">"pt"</span>).to(device)</span>
+<span id="cb14-412"><a href="#cb14-412" aria-hidden="true" tabindex="-1"></a>    new_tokens <span class="op">=</span> <span class="dv">64</span>  <span class="co"># fixed budget so both paths do the same amount of decoding</span></span>
+<span id="cb14-413"><a href="#cb14-413" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-414"><a href="#cb14-414" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> time_generate(use_cache, runs<span class="op">=</span><span class="dv">3</span>):</span>
+<span id="cb14-415"><a href="#cb14-415" aria-hidden="true" tabindex="-1"></a>        <span class="co">"""Median wall-clock time to generate new_tokens with the cache on or off."""</span></span>
+<span id="cb14-416"><a href="#cb14-416" aria-hidden="true" tabindex="-1"></a>        <span class="co"># One warm-up pass to trigger kernel autotuning and any lazy init.</span></span>
+<span id="cb14-417"><a href="#cb14-417" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> torch.no_grad():</span>
+<span id="cb14-418"><a href="#cb14-418" aria-hidden="true" tabindex="-1"></a>            model.generate(</span>
+<span id="cb14-419"><a href="#cb14-419" aria-hidden="true" tabindex="-1"></a>                <span class="op">**</span>inputs,</span>
+<span id="cb14-420"><a href="#cb14-420" aria-hidden="true" tabindex="-1"></a>                max_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb14-421"><a href="#cb14-421" aria-hidden="true" tabindex="-1"></a>                min_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb14-422"><a href="#cb14-422" aria-hidden="true" tabindex="-1"></a>                do_sample<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb14-423"><a href="#cb14-423" aria-hidden="true" tabindex="-1"></a>                use_cache<span class="op">=</span>use_cache,</span>
+<span id="cb14-424"><a href="#cb14-424" aria-hidden="true" tabindex="-1"></a>                pad_token_id<span class="op">=</span>tokenizer.pad_token_id,</span>
+<span id="cb14-425"><a href="#cb14-425" aria-hidden="true" tabindex="-1"></a>            )</span>
+<span id="cb14-426"><a href="#cb14-426" aria-hidden="true" tabindex="-1"></a>        torch.cuda.synchronize()</span>
+<span id="cb14-427"><a href="#cb14-427" aria-hidden="true" tabindex="-1"></a>        times <span class="op">=</span> []</span>
+<span id="cb14-428"><a href="#cb14-428" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(runs):</span>
+<span id="cb14-429"><a href="#cb14-429" aria-hidden="true" tabindex="-1"></a>            torch.cuda.synchronize()</span>
+<span id="cb14-430"><a href="#cb14-430" aria-hidden="true" tabindex="-1"></a>            t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb14-431"><a href="#cb14-431" aria-hidden="true" tabindex="-1"></a>            <span class="cf">with</span> torch.no_grad():</span>
+<span id="cb14-432"><a href="#cb14-432" aria-hidden="true" tabindex="-1"></a>                out <span class="op">=</span> model.generate(</span>
+<span id="cb14-433"><a href="#cb14-433" aria-hidden="true" tabindex="-1"></a>                    <span class="op">**</span>inputs,</span>
+<span id="cb14-434"><a href="#cb14-434" aria-hidden="true" tabindex="-1"></a>                    max_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb14-435"><a href="#cb14-435" aria-hidden="true" tabindex="-1"></a>                    min_new_tokens<span class="op">=</span>new_tokens,</span>
+<span id="cb14-436"><a href="#cb14-436" aria-hidden="true" tabindex="-1"></a>                    do_sample<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb14-437"><a href="#cb14-437" aria-hidden="true" tabindex="-1"></a>                    use_cache<span class="op">=</span>use_cache,</span>
+<span id="cb14-438"><a href="#cb14-438" aria-hidden="true" tabindex="-1"></a>                    pad_token_id<span class="op">=</span>tokenizer.pad_token_id,</span>
+<span id="cb14-439"><a href="#cb14-439" aria-hidden="true" tabindex="-1"></a>                )</span>
+<span id="cb14-440"><a href="#cb14-440" aria-hidden="true" tabindex="-1"></a>            torch.cuda.synchronize()</span>
+<span id="cb14-441"><a href="#cb14-441" aria-hidden="true" tabindex="-1"></a>            times.append(time.perf_counter() <span class="op">-</span> t0)</span>
+<span id="cb14-442"><a href="#cb14-442" aria-hidden="true" tabindex="-1"></a>        times.sort()</span>
+<span id="cb14-443"><a href="#cb14-443" aria-hidden="true" tabindex="-1"></a>        generated <span class="op">=</span> out.shape[<span class="dv">1</span>] <span class="op">-</span> inputs[<span class="st">"input_ids"</span>].shape[<span class="dv">1</span>]</span>
+<span id="cb14-444"><a href="#cb14-444" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> times[<span class="bu">len</span>(times) <span class="op">//</span> <span class="dv">2</span>], generated</span>
+<span id="cb14-445"><a href="#cb14-445" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-446"><a href="#cb14-446" aria-hidden="true" tabindex="-1"></a>    torch.cuda.reset_peak_memory_stats()</span>
+<span id="cb14-447"><a href="#cb14-447" aria-hidden="true" tabindex="-1"></a>    weights_mb <span class="op">=</span> torch.cuda.memory_allocated() <span class="op">/</span> <span class="fl">1e6</span></span>
+<span id="cb14-448"><a href="#cb14-448" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-449"><a href="#cb14-449" aria-hidden="true" tabindex="-1"></a>    t_cache, n_gen <span class="op">=</span> time_generate(use_cache<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb14-450"><a href="#cb14-450" aria-hidden="true" tabindex="-1"></a>    t_nocache, _ <span class="op">=</span> time_generate(use_cache<span class="op">=</span><span class="va">False</span>)</span>
+<span id="cb14-451"><a href="#cb14-451" aria-hidden="true" tabindex="-1"></a>    peak_mb <span class="op">=</span> torch.cuda.max_memory_allocated() <span class="op">/</span> <span class="fl">1e6</span></span>
+<span id="cb14-452"><a href="#cb14-452" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-453"><a href="#cb14-453" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"model            : </span><span class="sc">{</span>model_name<span class="sc">}</span><span class="ss"> (fp16 on </span><span class="sc">{</span>torch<span class="sc">.</span>cuda<span class="sc">.</span>get_device_name(<span class="dv">0</span>)<span class="sc">}</span><span class="ss">)"</span>)</span>
+<span id="cb14-454"><a href="#cb14-454" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"weights resident : </span><span class="sc">{</span>weights_mb<span class="sc">:8.1f}</span><span class="ss"> MB"</span>)</span>
+<span id="cb14-455"><a href="#cb14-455" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"peak allocated   : </span><span class="sc">{</span>peak_mb<span class="sc">:8.1f}</span><span class="ss"> MB"</span>)</span>
+<span id="cb14-456"><a href="#cb14-456" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"new tokens       : </span><span class="sc">{</span>n_gen<span class="sc">}</span><span class="ss">"</span>)</span>
+<span id="cb14-457"><a href="#cb14-457" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"</span><span class="ch">\n</span><span class="ss">greedy decode of </span><span class="sc">{</span>n_gen<span class="sc">}</span><span class="ss"> tokens (median of 3 runs):"</span>)</span>
+<span id="cb14-458"><a href="#cb14-458" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"  use_cache=True  : </span><span class="sc">{</span>t_cache <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms total, </span><span class="sc">{</span>t_cache <span class="op">/</span> n_gen <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:6.2f}</span><span class="ss"> ms/token"</span>)</span>
+<span id="cb14-459"><a href="#cb14-459" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"  use_cache=False : </span><span class="sc">{</span>t_nocache <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:8.1f}</span><span class="ss"> ms total, </span><span class="sc">{</span>t_nocache <span class="op">/</span> n_gen <span class="op">*</span> <span class="fl">1e3</span><span class="sc">:6.2f}</span><span class="ss"> ms/token"</span>)</span>
+<span id="cb14-460"><a href="#cb14-460" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f"  speedup         : </span><span class="sc">{</span>t_nocache <span class="op">/</span> t_cache<span class="sc">:8.2f}</span><span class="ss">x"</span>)</span>
+<span id="cb14-461"><a href="#cb14-461" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-462"><a href="#cb14-462" aria-hidden="true" tabindex="-1"></a>    <span class="kw">del</span> model</span>
+<span id="cb14-463"><a href="#cb14-463" aria-hidden="true" tabindex="-1"></a>    torch.cuda.empty_cache()</span>
+<span id="cb14-464"><a href="#cb14-464" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span>:</span>
+<span id="cb14-465"><a href="#cb14-465" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">"no CUDA device available; this cell runs the KV-cache benchmark only on a GPU."</span>)</span>
+<span id="cb14-466"><a href="#cb14-466" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb14-467"><a href="#cb14-467" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-468"><a href="#cb14-468" aria-hidden="true" tabindex="-1"></a>The <span class="in">`use_cache=True`</span> path is the production default and decodes each token in roughly constant time, because every step attends one new query against the stored cache. The <span class="in">`use_cache=False`</span> path recomputes keys and values for the whole prefix at every step, so its per-token cost climbs with position and its total time is several times larger even for this short generation. The peak-memory line shows the other side of the trade from Section 3: the cache that buys the speedup is itself resident memory, modest here but the quantity that, at production context lengths, dominates the serving budget.</span>
+<span id="cb14-469"><a href="#cb14-469" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-470"><a href="#cb14-470" aria-hidden="true" tabindex="-1"></a><span class="fu">## 8. Pitfalls and When to Use</span></span>
+<span id="cb14-471"><a href="#cb14-471" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-472"><a href="#cb14-472" aria-hidden="true" tabindex="-1"></a>**The KV-cache is almost always the right default for decoding, but it is not free.** It trades recomputation for memory, and at long context the cache can exceed the model weights in size. Budget for it explicitly using the formula in Section 3 before assuming a context length fits. If memory is the binding constraint, the levers in order of disruption are GQA or MQA (architectural, set at training time), KV-cache quantization to int8 or fp8 (cheap, small quality cost), and sliding-window or other sparse attention (changes the model's reach).</span>
+<span id="cb14-473"><a href="#cb14-473" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-474"><a href="#cb14-474" aria-hidden="true" tabindex="-1"></a>**GQA is a training-time decision, not a serving-time switch.** You cannot turn an MHA checkpoint into a GQA one for free; the shared KV heads must be trained or carefully mean-pooled and then fine-tuned. Choose $g$ when you design the model. The empirical sweet spot for large models has been a small number of KV groups (often $g = 8$), which recovers nearly all of MHA's quality at a large cache reduction; MQA ($g = 1$) saves the most memory but historically lost the most quality, which is precisely why GQA was introduced.</span>
+<span id="cb14-475"><a href="#cb14-475" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-476"><a href="#cb14-476" aria-hidden="true" tabindex="-1"></a>**FlashAttention helps prefill and training, not the decode step you might expect.** Its win is eliminating the $O(n^2)$ score-matrix traffic, which exists when you attend a full sequence at once (training, and the prefill of a long prompt). A single-token decode step attends one query against the cache and is already linear; FlashAttention's decode variant helps mainly by streaming the cache efficiently, not by avoiding a large score matrix. Match the technique to the phase: FlashAttention for prefill and training, KV-cache and GQA for decode.</span>
+<span id="cb14-477"><a href="#cb14-477" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-478"><a href="#cb14-478" aria-hidden="true" tabindex="-1"></a>**Numerical care matters.** The online softmax in Section 5 is exact only because of the running-max subtraction; a naive blockwise softmax without rescaling will overflow or silently lose precision. When implementing or debugging attention kernels, always verify against a reference full-softmax implementation on small inputs, exactly as the executed cells above assert <span class="in">`allclose`</span>, before trusting a fused path.</span>
+<span id="cb14-479"><a href="#cb14-479" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-480"><a href="#cb14-480" aria-hidden="true" tabindex="-1"></a>**Do not conflate the techniques.** They compose but solve different problems: the KV-cache removes redundant computation, GQA shrinks what the cache stores, FlashAttention changes how the score matrix is computed, paged attention manages the cache across concurrent requests, and sliding-window bounds the cache size. A production long-context serving stack uses all of them at once, and reasoning about memory and latency requires keeping their distinct roles straight.</span>
+<span id="cb14-481"><a href="#cb14-481" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-482"><a href="#cb14-482" aria-hidden="true" tabindex="-1"></a><span class="fu">## References</span></span>
+<span id="cb14-483"><a href="#cb14-483" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-484"><a href="#cb14-484" aria-hidden="true" tabindex="-1"></a><span class="ss">1. </span>Vaswani, A. et al. "Attention Is All You Need." 2017. https://arxiv.org/abs/1706.03762</span>
+<span id="cb14-485"><a href="#cb14-485" aria-hidden="true" tabindex="-1"></a><span class="ss">2. </span>Shazeer, N. "Fast Transformer Decoding: One Write-Head is All You Need" (multi-query attention). 2019. https://arxiv.org/abs/1911.02150</span>
+<span id="cb14-486"><a href="#cb14-486" aria-hidden="true" tabindex="-1"></a><span class="ss">3. </span>Ainslie, J. et al. "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." 2023. https://arxiv.org/abs/2305.13245</span>
+<span id="cb14-487"><a href="#cb14-487" aria-hidden="true" tabindex="-1"></a><span class="ss">4. </span>Dao, T. et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." 2022. https://arxiv.org/abs/2205.14135</span>
+<span id="cb14-488"><a href="#cb14-488" aria-hidden="true" tabindex="-1"></a><span class="ss">5. </span>Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023. https://arxiv.org/abs/2307.08691</span>
+<span id="cb14-489"><a href="#cb14-489" aria-hidden="true" tabindex="-1"></a><span class="ss">6. </span>Shah, J. et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." 2024. https://arxiv.org/abs/2407.08608</span>
+<span id="cb14-490"><a href="#cb14-490" aria-hidden="true" tabindex="-1"></a><span class="ss">7. </span>Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM). 2023. https://arxiv.org/abs/2309.06180</span>
+<span id="cb14-491"><a href="#cb14-491" aria-hidden="true" tabindex="-1"></a><span class="ss">8. </span>Jiang, A. Q. et al. "Mistral 7B" (sliding-window attention). 2023. https://arxiv.org/abs/2310.06825</span>
+<span id="cb14-492"><a href="#cb14-492" aria-hidden="true" tabindex="-1"></a><span class="ss">9. </span>Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867</span>
+<span id="cb14-493"><a href="#cb14-493" aria-hidden="true" tabindex="-1"></a><span class="ss">10. </span>Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288</span>
 </code><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></pre></div>
 </div></div></div></div></div>
 </div> <!-- /content -->

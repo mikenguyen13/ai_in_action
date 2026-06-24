@@ -2,7 +2,7 @@
 
 A modern large language model stores most of its capability in its weights, and those weights are expensive to keep around. A 7-billion-parameter model in 16-bit precision occupies roughly 14 GB of memory; the same model in 70-billion-parameter form needs about 140 GB, which already exceeds the memory of a single high-end accelerator. The cost is not only storage. Every token generated requires reading the relevant weights from memory into the compute units, and for the autoregressive decoding that dominates inference, the bottleneck is almost always memory bandwidth rather than arithmetic. Reading fewer bytes per weight makes generation faster as well as smaller.
 
-Quantization is the practice of representing weights (and sometimes activations) with fewer bits than the format the model was trained in. Trained in 16-bit or 32-bit floating point, a model can often be served in 8-bit integers, or even 4-bit, with a small and measurable loss of quality. This chapter develops the mathematics of quantization from first principles, derives the error introduced by reducing precision, then turns to production. The CPU-feasible techniques are executed here on small models so you can see real numbers for size, latency, and reconstruction error. The techniques that need a GPU or a large model (GPTQ, AWQ, 4-bit NF4 via bitsandbytes, and GGUF for llama.cpp) are shown with the exact library invocations a reader would run, clearly marked as requiring hardware this chapter does not assume.
+Quantization is the practice of representing weights (and sometimes activations) with fewer bits than the format the model was trained in. Trained in 16-bit or 32-bit floating point, a model can often be served in 8-bit integers, or even 4-bit, with a small and measurable loss of quality. This chapter develops the mathematics of quantization from first principles, derives the error introduced by reducing precision, then turns to production. The CPU-feasible techniques are executed here on small models so you can see real numbers for size, latency, and reconstruction error. The 4-bit NF4 path via bitsandbytes is also executed, on a small real pretrained model that fits on a single consumer GPU, so its memory savings and generation quality are measured rather than asserted. The techniques that genuinely need a large model or multi-GPU setup (GPTQ and AWQ at the 8-billion scale, and GGUF for llama.cpp) are shown with the exact library invocations a reader would run, clearly marked as requiring hardware this chapter does not assume.
 
 ## The Core Idea
 
@@ -254,10 +254,10 @@ tokenizer.save_pretrained("Llama-3.1-8B-AWQ-4bit")
 
 ### bitsandbytes 4-bit NF4 (Requires GPU)
 
-bitsandbytes provides on-the-fly 4-bit loading using the **NF4 (4-bit NormalFloat)** data type, whose 16 levels are placed at the quantiles of a normal distribution rather than uniformly, which matches the roughly Gaussian distribution of neural-network weights and so spends its few levels where the weights actually are. Combined with double quantization (quantizing the per-block scales themselves) it underpins QLoRA fine-tuning. It requires a CUDA GPU, so per the constraints of this chapter it is shown only.
+bitsandbytes provides on-the-fly 4-bit loading using the **NF4 (4-bit NormalFloat)** data type, whose 16 levels are placed at the quantiles of a normal distribution rather than uniformly, which matches the roughly Gaussian distribution of neural-network weights and so spends its few levels where the weights actually are. Combined with double quantization (quantizing the per-block scales themselves) it underpins QLoRA fine-tuning. The pattern below shows the configuration for an 8-billion-parameter model that needs a larger GPU; the executed cell that follows runs the same machinery on a small model that fits on a consumer card.
 
 ```python
-# requires GPU: 4-bit NF4 loading via bitsandbytes (do not run on CPU-only machines).
+# the same config, applied to a large model that needs a bigger GPU than this chapter assumes.
 # pip install bitsandbytes transformers accelerate
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -274,6 +274,102 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
 ```
+
+### Running it on a GPU (executed)
+
+When a CUDA GPU is present, we can run the exact same NF4 path on a small real pretrained model and print measured numbers. The cell below loads `Qwen/Qwen2.5-0.5B-Instruct` twice, once in fp16 and once in 4-bit NF4 with double quantization, measures the resident weight memory of each via `torch.cuda.memory_allocated`, reports the compression ratio, and does a short greedy generation with each to confirm the 4-bit model still produces sensible text. The two copies never coexist: the fp16 weights are freed before the 4-bit copy is loaded, so the peak stays small. The whole thing is guarded by `torch.cuda.is_available()` and falls back to a short message on a CPU-only machine, so the chapter still renders without a GPU. The 0.5-billion-parameter model needs roughly 1 GB in fp16 and well under half that in 4-bit, comfortably inside a single consumer card.
+
+```{python}
+import time
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+torch.manual_seed(0)
+
+if torch.cuda.is_available():
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    prompt = "In one sentence, what is model quantization?"
+
+    def vram_used_gb():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated() / 1e9
+
+    def peak_vram_gb():
+        return torch.cuda.max_memory_allocated() / 1e9
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+    # Baseline: load the model in fp16 and measure the resident weights.
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    fp16_model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.float16, device_map="cuda"
+    ).eval()
+    fp16_weights_gb = vram_used_gb()
+
+    with torch.no_grad():
+        t0 = time.perf_counter()
+        fp16_out = fp16_model.generate(
+            **inputs, max_new_tokens=40, do_sample=False, num_beams=1,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        torch.cuda.synchronize()
+        fp16_gen_s = time.perf_counter() - t0
+    fp16_new = fp16_out[0][inputs["input_ids"].shape[1]:]
+    fp16_text = tokenizer.decode(fp16_new, skip_special_tokens=True)
+
+    # Free the fp16 weights before loading the 4-bit copy so they never coexist.
+    del fp16_model
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    # 4-bit NF4 with double quantization, the same config as the show-only block above.
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+    nf4_model = AutoModelForCausalLM.from_pretrained(
+        model_id, quantization_config=bnb_config, device_map="cuda"
+    ).eval()
+    nf4_weights_gb = vram_used_gb()
+
+    with torch.no_grad():
+        t0 = time.perf_counter()
+        nf4_out = nf4_model.generate(
+            **inputs, max_new_tokens=40, do_sample=False, num_beams=1,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        torch.cuda.synchronize()
+        nf4_gen_s = time.perf_counter() - t0
+    nf4_new = nf4_out[0][inputs["input_ids"].shape[1]:]
+    nf4_text = tokenizer.decode(nf4_new, skip_special_tokens=True)
+
+    ratio = fp16_weights_gb / nf4_weights_gb if nf4_weights_gb > 0 else float("nan")
+
+    print(f"model: {model_id}")
+    print(f"fp16 resident weights: {fp16_weights_gb:6.3f} GB   "
+          f"greedy gen ({len(fp16_new)} tok): {fp16_gen_s:5.2f} s")
+    print(f"nf4  resident weights: {nf4_weights_gb:6.3f} GB   "
+          f"greedy gen ({len(nf4_new)} tok): {nf4_gen_s:5.2f} s")
+    print(f"weight-memory compression: {ratio:.2f}x smaller")
+    print(f"peak VRAM during 4-bit run: {peak_vram_gb():.3f} GB")
+    print()
+    print("fp16 says:", fp16_text.strip())
+    print("nf4  says:", nf4_text.strip())
+
+    del nf4_model
+    torch.cuda.empty_cache()
+else:
+    print("No CUDA GPU available: skipping the bitsandbytes 4-bit example.")
+    print("On a CUDA machine this cell loads Qwen2.5-0.5B in fp16 and in 4-bit NF4,")
+    print("then prints the measured VRAM of each and the compression ratio.")
+```
+
+The NF4 weights should occupy roughly a third to a quarter of the fp16 footprint (4-bit storage plus the small per-block scales, which double quantization further shrinks), and both models should produce a coherent one-sentence answer, confirming that the 4-bit loading preserves the model's behavior while cutting its memory. The exact ratio falls short of a clean 4x because a 0.5-billion-parameter model keeps some tensors (embeddings, the final projection, layer norms) in higher precision, and those unquantized parts are a larger fraction of a small model than of a large one.
 
 ### GGUF and llama.cpp (Requires Specialized Build / Often GPU)
 

@@ -296,6 +296,171 @@ model.save_pretrained("qlora-adapter")
 
 The saved artifact is only the adapter, often a few megabytes, so a single 4-bit base can be shared across many tasks, each with its own tiny adapter. For deployment you either keep adapters separate and hot-swap them, or call `model.merge_and_unload()` to fold a chosen adapter into the (dequantized) base for zero-overhead inference.
 
+### Running it on a GPU (executed)
+
+The 7 billion parameter recipe above is shown rather than executed because it needs a large download and more VRAM than a typical workstation has free. To make QLoRA concrete on real hardware, the next cell runs the identical machinery on a small pretrained model that fits comfortably on a single 8 GB consumer GPU. It loads `Qwen/Qwen2.5-0.5B-Instruct` (falling back to `gpt2` if that download is unavailable) in 4-bit NF4 with double quantization, attaches LoRA adapters with `peft`, prints the trainable-vs-total accounting, and runs one full forward, backward, and optimizer step on a tiny synthetic batch. It measures real VRAM and confirms the loss is finite and the adapter parameters actually move while the quantized base stays put. Everything is guarded by `torch.cuda.is_available()`, with a CPU fallback message, so the book still builds on a machine without a GPU.
+
+```{python}
+import torch
+
+if torch.cuda.is_available():
+    import time
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        BitsAndBytesConfig,
+    )
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+    )
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    torch.cuda.reset_peak_memory_stats()
+
+    device = torch.device("cuda")
+    gpu_name = torch.cuda.get_device_name(0)
+
+    # 4-bit NormalFloat with double quantization; compute in bfloat16. This is
+    # the exact QLoRA configuration used at 7B scale, just on a small base.
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    # Prefer a small instruction-tuned model; fall back to gpt2 if unavailable.
+    candidate_ids = ["Qwen/Qwen2.5-0.5B-Instruct", "gpt2"]
+    model = None
+    model_id = None
+    for candidate in candidate_ids:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(candidate)
+            model = AutoModelForCausalLM.from_pretrained(
+                candidate,
+                quantization_config=bnb_config,
+                device_map={"": 0},
+            )
+            model_id = candidate
+            break
+        except Exception as exc:  # download or load failure: try the next one
+            print(f"could not load {candidate}: {type(exc).__name__}")
+
+    if model is None:
+        print("no base model could be loaded; skipping GPU QLoRA demo")
+    else:
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        load_mem_gb = torch.cuda.memory_allocated() / 1e9
+        print(f"GPU                 : {gpu_name}")
+        print(f"base model          : {model_id}")
+        print(f"VRAM after 4-bit load: {load_mem_gb:.3f} GB")
+
+        # Cast layernorms to fp32 and enable gradient checkpointing for stability,
+        # then attach LoRA adapters over the standard projection set.
+        model = prepare_model_for_kbit_training(model)
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+
+        trainable = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+        total = sum(p.numel() for p in model.parameters())
+        print(f"trainable params    : {trainable:,}")
+        print(f"total params        : {total:,}")
+        print(f"trainable fraction  : {100 * trainable / total:.4f}%")
+
+        # Tiny synthetic batch: a couple of short prompts, labels = inputs so the
+        # causal LM loss is well defined. Short sequences keep memory minimal.
+        prompts = [
+            "Low-rank adaptation freezes the base model and trains",
+            "Quantized fine-tuning stores the frozen weights in",
+        ]
+        batch = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=32,
+        ).to(device)
+        labels = batch["input_ids"].clone()
+
+        # Snapshot one adapter tensor to confirm it actually updates.
+        lora_param = next(
+            p for n, p in model.named_parameters()
+            if p.requires_grad and "lora" in n.lower()
+        )
+        before = lora_param.detach().clone()
+
+        opt = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=2e-4
+        )
+
+        model.train()
+        torch.cuda.synchronize()
+        start = time.time()
+
+        opt.zero_grad()
+        out = model(**batch, labels=labels)
+        loss = out.loss
+        loss.backward()
+        opt.step()
+
+        torch.cuda.synchronize()
+        step_ms = (time.time() - start) * 1e3
+
+        moved = not torch.equal(before, lora_param.detach())
+        peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
+
+        print(f"step loss           : {loss.item():.4f}")
+        print(f"loss is finite      : {torch.isfinite(loss).item()}")
+        print(f"adapter params moved: {moved}")
+        print(f"forward+backward+step: {step_ms:.1f} ms")
+        print(f"peak VRAM           : {peak_mem_gb:.3f} GB")
+
+    # Release everything so later cells and other processes get the VRAM back.
+    del model
+    torch.cuda.empty_cache()
+else:
+    print("CUDA not available; skipping the GPU QLoRA demo.")
+    print("On a CUDA machine this cell runs real 4-bit QLoRA on a small model.")
+```
+
+This is genuine QLoRA on the GPU: the frozen base is held in 4-bit NF4, only the bfloat16 LoRA adapters carry gradients, and the printed peak VRAM (well under 2 GB for the 0.5B base) shows why the method fits where full fine-tuning never could. The same code scales straight up to the 7 billion parameter recipe above by swapping the model id and adding the `trl` trainer; the only reason that larger run is not executed here is the download size and VRAM headroom, not any difference in the technique.
+
+The blocks that follow stay show-only for honest reasons specific to this environment. Multi-GPU FSDP sharding needs more than one device, large-model RLHF needs far more VRAM than a single 8 GB card, and FlashAttention's prebuilt kernels are not reliably available on Windows; each is noted as such rather than faked.
+
+```python
+# Show-only: multi-GPU FSDP QLoRA. Requires 2+ GPUs and accelerate launch,
+# so it cannot run on a single-GPU workstation.
+from accelerate import Accelerator
+
+accelerator = Accelerator()  # picks up an FSDP config from `accelerate config`
+model, opt, loader = accelerator.prepare(model, opt, loader)
+# accelerate launch --num_processes 4 --use_fsdp train_qlora.py
+```
+
+```python
+# Show-only: FlashAttention-2 attention kernels. The prebuilt wheels target
+# Linux+CUDA; on Windows the install is unreliable, so this stays unexecuted.
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    attn_implementation="flash_attention_2",  # Linux/CUDA only
+    device_map={"": 0},
+)
+```
+
 ## Pitfalls and When to Use
 
 **Choosing the rank.** Rank $r$ is the main capability knob. Ranks of 8 to 16 are strong defaults and often match full fine-tuning on instruction tasks. Pushing $r$ higher rarely helps and wastes parameters once the update's intrinsic rank is covered; pushing it too low can underfit a task that genuinely changes the model's behavior. Sweep $r$ on a validation set rather than guessing.

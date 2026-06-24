@@ -4,7 +4,7 @@
 
 Between the original transformer and the instruction-tuned chat models of 2023, the dominant lever for improving large language models was *scale at training time*: more parameters, more data, more pre-training compute. In late 2024 a second lever appeared, and it changed the frontier. **Reasoning models** are trained to spend variable *inference-time* compute, generating an explicit, often long internal chain of thought before committing to an answer, trading latency and tokens for accuracy. This opened a second scaling axis, **test-time compute**, alongside pre-training scale, and essentially every frontier model shipped through 2025 sits on it.
 
-The shift matters enough that a treatment of LLMs that stops at instruction-tuned chat models is a generation behind. This chapter develops what reasoning models are, the mathematics that explains why spending compute at inference helps, the two roads to building them (OpenAI's o-series and DeepSeek's open R1), the test-time compute methods that operationalize thinking, the economics of a thinking budget, and the honest limits. It then turns to **production code**: runnable demonstrations of self-consistency majority voting and best-of-N selection that reproduce the compute-versus-accuracy tradeoff on a laptop, plus show-only invocations for the GPU-scale methods (tree search, process reward models, large reasoning models) that a reader can run on appropriate hardware.
+The shift matters enough that a treatment of LLMs that stops at instruction-tuned chat models is a generation behind. This chapter develops what reasoning models are, the mathematics that explains why spending compute at inference helps, the two roads to building them (OpenAI's o-series and DeepSeek's open R1), the test-time compute methods that operationalize thinking, the economics of a thinking budget, and the honest limits. It then turns to **production code**: runnable demonstrations of self-consistency majority voting and best-of-N selection that reproduce the compute-versus-accuracy tradeoff on a laptop, an executed GPU run of self-consistency on a real small reasoning model, plus show-only invocations for the methods that exceed a single consumer card (tree search, process reward models, multi-GPU serving) that a reader can run on appropriate hardware.
 
 ## 2. The Core Idea: A Second Scaling Axis {#sec-700-core-idea}
 
@@ -131,7 +131,7 @@ The operational implications are concrete. Latency-sensitive applications cannot
 
 ## 9. Production Code {#sec-700-production-code}
 
-This section is **executed on CPU**. Every number printed below is computed at render time by the code shown, on small deterministic examples that finish in seconds. The two core parallel methods, self-consistency and best-of-N, are implemented from first principles so the compute-versus-accuracy tradeoff of section @sec-700-math is reproduced rather than asserted. A short block then exercises a real (tiny) Hugging Face model to show the mechanics and per-sample latency of parallel sampling, followed by show-only invocations for the GPU-scale methods.
+Most of this section is **executed at render time**. Every number printed below is computed by the code shown. The two core parallel methods, self-consistency and best-of-N, are implemented from first principles on CPU so the compute-versus-accuracy tradeoff of section @sec-700-math is reproduced rather than asserted. A short CPU block then exercises a tiny Hugging Face model to show the mechanics and per-sample latency of parallel sampling. Section @sec-700-gpu-executed then runs the *same* self-consistency pipeline on a real reasoning-capable instruct model on the local GPU, guarded so it falls back gracefully on a CPU-only host. A final show-only block holds the methods that exceed a single consumer card (multi-GPU serving, 7B to 8B reward models, process-reward tree search).
 
 ### 9.1 Self-consistency: majority voting over sampled chains {#sec-700-self-consistency}
 
@@ -328,11 +328,138 @@ print(f"best self-score (mean log-prob) = {best_score:.3f}")
 print(f"selected continuation: {tok.decode(best_ids[0], skip_special_tokens=True)!r}")
 ```
 
-The numbers reported (parameter count, milliseconds per candidate, total tokens generated) are the operational quantities a production system tracks: latency scales linearly with $N$, and the token budget is what the user pays for. With a tiny random-initialized model the candidate scores are nearly indistinguishable, which is itself the point of section @sec-700-imperfect: **a weak scorer cannot separate candidates, so selection adds compute without adding accuracy.** Swapping `model_name` for a capable reasoning model (and the self-score for a trained reward model) is the only change needed for production.
+The numbers reported (parameter count, milliseconds per candidate, total tokens generated) are the operational quantities a production system tracks: latency scales linearly with $N$, and the token budget is what the user pays for. With a tiny random-initialized model the candidate scores are nearly indistinguishable, which is itself the point of section @sec-700-imperfect: **a weak scorer cannot separate candidates, so selection adds compute without adding accuracy.** Swapping `model_name` for a capable reasoning model (and the self-score for a trained reward model) is the only change needed for production. The next section does exactly that swap, on a GPU, with a model that actually reasons.
 
-### 9.5 Show-only: GPU and large-model methods {#sec-700-show-only}
+### 9.5 Running it on a GPU (executed) {#sec-700-gpu-executed}
 
-The following blocks are **not executed** in this chapter, because they require a GPU and large model weights. Each shows the real open-source library invocation so a reader can run it on appropriate hardware. None of these blocks fabricate output.
+The tiny CPU model above shows the *mechanics* but cannot *reason*: its samples are gibberish, so the vote is meaningless. Here we run the same self-consistency pipeline on a small but genuinely pretrained instruct model, **Qwen/Qwen2.5-0.5B-Instruct**, on the local NVIDIA GPU. The model is about 0.5B parameters and loads in `float16` in roughly 1 GB of VRAM, well within a consumer card, yet it solves simple grade-school arithmetic well enough that majority voting over several sampled chains is observably better than a single greedy sample. Every number printed below (VRAM, latency, the voted answer, and the agreement fraction) is measured at render time.
+
+The cell is guarded by `torch.cuda.is_available()`. On a GPU host it loads the model on `cuda`, samples $N$ chains per question with the model's chat template, parses the final integer from each chain, takes the **majority vote** (self-consistency), and reports accuracy of the vote against the single-sample baseline plus the peak VRAM used. On a CPU-only host it prints a short note and skips the GPU work, so the chapter still renders everywhere. Generations are kept short and a fixed seed makes the run reproducible; `torch.cuda.empty_cache()` releases the cache at the end.
+
+```{python}
+#| label: code-700-gpu-executed
+#| code-fold: false
+import re
+import time
+from collections import Counter
+
+import torch
+
+if torch.cuda.is_available():
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    torch.manual_seed(0)
+    device = "cuda"
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"  # small, genuinely pretrained, reasons
+
+    torch.cuda.reset_peak_memory_stats()
+    tok = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16
+    ).to(device)
+    model.eval()
+
+    weights_mb = torch.cuda.memory_allocated() / 1024**2
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"model = {model_name}")
+    print(f"parameters = {n_params:,}")
+    print(f"weights resident on GPU = {weights_mb:.0f} MB (float16)")
+
+    # A few grade-school problems with known integer answers.
+    problems = [
+        ("If there are 3 boxes with 4 apples each, how many apples in total?", 12),
+        ("A pen costs 7 dollars. How much do 5 pens cost?", 35),
+        ("Sara had 20 candies and gave away 8. How many are left?", 12),
+        ("There are 6 rows of chairs with 5 chairs per row. How many chairs?", 30),
+    ]
+
+    INSTRUCTION = (
+        " Reason briefly, then end with the line 'Answer: <integer>'."
+    )
+
+    def build_inputs(question):
+        msgs = [{"role": "user", "content": question + INSTRUCTION}]
+        text = tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
+        return tok(text, return_tensors="pt").to(device)
+
+    def extract_answer(text):
+        """Pull the last integer following 'Answer:' (fallback: last integer)."""
+        m = re.findall(r"[Aa]nswer:\s*(-?\d+)", text)
+        if m:
+            return int(m[-1])
+        nums = re.findall(r"-?\d+", text)
+        return int(nums[-1]) if nums else None
+
+    def sample_chains(question, n, max_new_tokens=96):
+        enc = build_inputs(question)
+        prompt_len = enc["input_ids"].shape[1]
+        answers, total_new = [], 0
+        with torch.no_grad():
+            for _ in range(n):
+                out = model.generate(
+                    **enc,
+                    do_sample=True,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.7,
+                    top_p=0.9,
+                    pad_token_id=tok.eos_token_id,
+                )
+                total_new += out.shape[1] - prompt_len
+                gen = tok.decode(
+                    out[0, prompt_len:], skip_special_tokens=True
+                )
+                answers.append(extract_answer(gen))
+        return answers, total_new
+
+    N = 5
+    single_correct = 0
+    vote_correct = 0
+    total_new_tokens = 0
+    t0 = time.time()
+    for question, gold in problems:
+        answers, new_toks = sample_chains(question, N)
+        total_new_tokens += new_toks
+        valid = [a for a in answers if a is not None]
+        single_correct += int(valid and valid[0] == gold)  # one-sample baseline
+        if valid:
+            voted = Counter(valid).most_common(1)[0][0]
+            vote_correct += int(voted == gold)
+            agree = Counter(valid).most_common(1)[0][1] / len(valid)
+            print(
+                f"Q: {question[:46]:<46} gold={gold:<3} "
+                f"votes={valid} -> {voted} (agreement {agree:.2f})"
+            )
+    elapsed = time.time() - t0
+
+    n_q = len(problems)
+    peak_mb = torch.cuda.max_memory_allocated() / 1024**2
+    print("-" * 60)
+    print(f"questions = {n_q}, chains per question N = {N}")
+    print(f"single-sample accuracy = {single_correct}/{n_q} "
+          f"= {single_correct / n_q:.2f}")
+    print(f"self-consistency accuracy = {vote_correct}/{n_q} "
+          f"= {vote_correct / n_q:.2f}")
+    print(f"total chains generated = {n_q * N}, "
+          f"new thinking tokens = {total_new_tokens}")
+    print(f"wall time = {elapsed:.1f}s "
+          f"({elapsed / (n_q * N) * 1000:.0f} ms/chain)")
+    print(f"peak VRAM allocated = {peak_mb:.0f} MB")
+
+    del model
+    torch.cuda.empty_cache()
+else:
+    print("CUDA not available on this host; skipping the GPU self-consistency run.")
+    print("On a CUDA machine this cell loads Qwen2.5-0.5B-Instruct on the GPU,")
+    print("samples N chains per question, and majority-votes the final answers.")
+```
+
+This is the chapter's mathematics on a real reasoning-capable model rather than a simulation. Self-consistency over $N$ sampled chains should match or beat the single-sample baseline on the arithmetic set, and the per-question agreement fraction is the empirical analogue of the per-sample correctness $p$ of section @sec-700-majority: when the model is well above the plurality threshold the vote is near-unanimous and reliably correct, and when it is shaky the chains disagree and the vote can still recover the right answer by plurality. The peak VRAM line confirms a 0.5B model in `float16` fits comfortably on a consumer card, leaving room to raise $N$ or the model size. Swapping `model_name` for a larger open reasoning model such as `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` is the only change needed to scale this up on bigger hardware.
+
+### 9.6 Show-only: multi-GPU and large-model methods {#sec-700-show-only}
+
+The executed cell above runs a real reasoning model on a single consumer GPU. The following blocks go further than a single 8 GB card can comfortably host: 7B to 8B reward models, vLLM serving, and process-reward tree search. They are **not executed** here. Each shows the real open-source library invocation so a reader can run it on appropriate hardware. None of these blocks fabricate output.
 
 **Self-consistency on a real reasoning model via vLLM.** Mature open-source serving with `vllm` makes parallel sampling efficient by batching the $N$ samples through one engine call.
 

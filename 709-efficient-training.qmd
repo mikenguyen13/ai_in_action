@@ -2,7 +2,7 @@
 
 Training a frontier model is, more than anything, an exercise in memory management. A modern transformer's compute is straightforward to reason about (it scales with parameters times tokens), but the *memory* needed to take a single optimizer step is where naive implementations fall over. A run that would fit comfortably in a researcher's mental model routinely fails to fit in the 80 gigabytes of an H100, not because the model is too large to store, but because the *transient* state of a training step (activations, gradients, optimizer moments, and an extra master copy of the weights) is several times larger than the weights themselves.
 
-This chapter develops the three techniques that, together, make large-scale training feasible on real hardware: **mixed precision**, which halves the storage and roughly halves the bandwidth of most tensors while protecting numerical stability where it matters; **activation checkpointing** (also called gradient checkpointing), which trades a controlled amount of recomputation for a large reduction in activation memory; and **sharding** (the ZeRO and FSDP family), which splits the per-step state across many devices so that no single device holds the whole thing. We treat each as an engineering practice with a derivation behind it, then show production code. The CPU-feasible parts (checkpointing, autocast, gradient accumulation) are executed and measured; the GPU-and-cluster parts (FSDP, ZeRO, FP8) are shown with the real library invocations so a reader can run them on the appropriate hardware.
+This chapter develops the three techniques that, together, make large-scale training feasible on real hardware: **mixed precision**, which halves the storage and roughly halves the bandwidth of most tensors while protecting numerical stability where it matters; **activation checkpointing** (also called gradient checkpointing), which trades a controlled amount of recomputation for a large reduction in activation memory; and **sharding** (the ZeRO and FSDP family), which splits the per-step state across many devices so that no single device holds the whole thing. We treat each as an engineering practice with a derivation behind it, then show production code. The CPU-feasible parts (checkpointing, autocast, gradient accumulation) are executed and measured, and the single-GPU memory and speed tradeoff of mixed precision and checkpointing is then measured directly on an NVIDIA GPU; the multi-GPU and cluster parts (FSDP, ZeRO, FP8) are shown with the real library invocations so a reader can run them on the appropriate hardware.
 
 ## 1. Where the Memory Goes
 
@@ -251,9 +251,147 @@ print(f"identical to numerical precision: {diff < 1e-5}")
 
 The two gradients agree to within floating-point rounding, confirming that gradient accumulation gives exactly the large-batch update while only ever holding one micro-batch worth of activations. In production this is the standard way to reach an effective batch size of millions of tokens on hardware that cannot hold it in one pass, and it composes cleanly with mixed precision and checkpointing.
 
-## 5. Sharding: ZeRO and FSDP
+## 5. Putting It on a GPU: Mixed Precision and Checkpointing Measured
 
-### 5.1 The Insight
+The CPU demos above isolate each mechanism, but the payoff of mixed precision and checkpointing is a *memory and speed* tradeoff that only shows its true shape on a GPU with tensor cores and a real VRAM budget. This section measures it directly on a single NVIDIA GPU using a small pretrained model from the mature open-source Hugging Face `transformers` library, so the numbers are real rather than asserted.
+
+### Running it on a GPU (executed)
+
+We fine-tune a small instruction-tuned model (`Qwen/Qwen2.5-0.5B-Instruct`, about half a billion parameters, which fits well under 7 GB) for a handful of steps under four configurations: fp32 versus `torch.autocast(device_type="cuda", dtype=torch.float16)` mixed precision, each with and without gradient checkpointing. For each configuration we report the peak VRAM (`torch.cuda.max_memory_allocated`) and the mean step time, so the memory-for-compute and precision-for-speed tradeoffs are visible as measured quantities. The cell is guarded by `torch.cuda.is_available()`; on a machine without a GPU it prints a short description instead of running.
+
+```{python}
+import time
+import torch
+
+def _device_report():
+    print("CUDA not available in this environment.")
+    print("On a CUDA GPU this cell trains a small pretrained model under four")
+    print("configurations (fp32 vs fp16 autocast, each with and without gradient")
+    print("checkpointing) and prints peak VRAM and step time for each.")
+
+if not torch.cuda.is_available():
+    _device_report()
+else:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    DEVICE = "cuda"
+    MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+
+    # Small instruction-tuned model (about 0.5B params); comfortably under 7 GB.
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    # A tiny fixed batch of text; short sequences keep the demo fast.
+    texts = [
+        "Mixed precision halves the memory traffic of most tensors.",
+        "Activation checkpointing recomputes activations to save memory.",
+        "Sharding splits optimizer state across many devices.",
+        "Gradient accumulation decouples batch size from device memory.",
+    ]
+    enc = tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=64)
+    input_ids = enc["input_ids"].to(DEVICE)
+    attention_mask = enc["attention_mask"].to(DEVICE)
+
+    N_STEPS = 6        # a few steps; first two are warmup and excluded from timing
+    WARMUP = 2
+
+    def run_config(use_amp, use_checkpoint):
+        # Fresh model per config so parameter state and memory start clean.
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME, torch_dtype=torch.float32
+        ).to(DEVICE)
+        model.train()
+        model.config.use_cache = False     # caching conflicts with checkpointing
+        if use_checkpoint:
+            model.gradient_checkpointing_enable()
+
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+        step_times = []
+        last_loss = None
+        for step in range(N_STEPS):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            opt.zero_grad(set_to_none=True)
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    out = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids,
+                    )
+                    loss = out.loss
+            else:
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=input_ids,
+                )
+                loss = out.loss
+
+            loss.backward()
+            opt.step()
+
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            if step >= WARMUP:
+                step_times.append(t1 - t0)
+            last_loss = loss.item()
+
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        mean_ms = 1000.0 * sum(step_times) / max(len(step_times), 1)
+
+        # Release this config's model before the next config runs.
+        del model, opt, out, loss
+        torch.cuda.empty_cache()
+        return peak, mean_ms, last_loss
+
+    configs = [
+        ("fp32, no checkpoint", False, False),
+        ("fp16 autocast, no checkpoint", True, False),
+        ("fp32, checkpoint", False, True),
+        ("fp16 autocast, checkpoint", True, True),
+    ]
+
+    print(f"model: {MODEL_NAME}")
+    print(f"{'config':<32} {'peak VRAM (MiB)':>16} {'step (ms)':>12} {'loss':>10}")
+    results = {}
+    for name, amp, ckpt in configs:
+        peak, ms, loss = run_config(amp, ckpt)
+        results[name] = (peak, ms, loss)
+        print(f"{name:<32} {peak:>16.1f} {ms:>12.2f} {loss:>10.4f}")
+
+    base = results["fp32, no checkpoint"]
+    best_mem = results["fp16 autocast, checkpoint"]
+    fast = results["fp16 autocast, no checkpoint"]
+    print()
+    print(
+        f"fp16 autocast speedup vs fp32 (no checkpoint): "
+        f"{base[1] / max(fast[1], 1e-9):.2f}x"
+    )
+    print(
+        f"peak VRAM reduction, fp16+checkpoint vs fp32 baseline: "
+        f"{base[0] / max(best_mem[0], 1e-9):.2f}x"
+    )
+
+    torch.cuda.empty_cache()
+```
+
+The four rows make the tradeoffs concrete on real hardware. fp16 autocast lowers both the step time (the matmuls run on the tensor cores) and the peak VRAM (activations and the half-precision compute copies are smaller). Gradient checkpointing lowers peak VRAM further by not keeping every block's activations resident, at the cost of a recomputation pass that shows up as a longer step time, exactly the memory-for-compute trade of Section 3 now denominated in megabytes and milliseconds. The combined fp16-plus-checkpoint row is the lowest-memory configuration, which is what lets a fixed GPU hold a larger model, longer sequence, or bigger micro-batch than fp32 alone would allow. The exact figures depend on the GPU, the driver, and the model, but the ordering is the structural result.
+
+A note on what stays show-only below. The single-GPU measurements here cover the techniques that fit on one device. The sharding methods that follow (FSDP and ZeRO) require multiple GPUs and an initialized distributed process group, and fp8 requires Hopper or Blackwell tensor cores, so those remain shown with their real library invocations rather than executed on this machine.
+
+## 6. Sharding: ZeRO and FSDP
+
+### 6.1 The Insight
 
 Data parallelism replicates the entire model on every device and averages gradients across devices each step. That is simple but wasteful: every one of $N$ devices stores the full $16\Psi$ bytes of model and optimizer state, even though each could hold only a slice. The **Zero Redundancy Optimizer (ZeRO)** observes that this replication is unnecessary and partitions the state across the $N$ data-parallel devices in three progressively aggressive stages (Rajbhandari et al., 2020):
 
@@ -270,7 +408,7 @@ flowchart LR
     C --> D["ZeRO-3 / FSDP also shard parameters about 16 psi over N"]
 ```
 
-### 5.2 Show-Only: FSDP (requires multiple GPUs)
+### 6.2 Show-Only: FSDP (requires multiple GPUs)
 
 The following wraps a model in PyTorch FSDP. It requires an initialized distributed process group with at least one GPU per rank, so it is shown rather than executed here.
 
@@ -310,7 +448,7 @@ model = FSDP(
 # Launch with: torchrun --nproc_per_node=8 train.py
 ```
 
-### 5.3 Show-Only: ZeRO via DeepSpeed (requires GPUs)
+### 6.3 Show-Only: ZeRO via DeepSpeed (requires GPUs)
 
 The DeepSpeed library exposes the same ZeRO stages through a JSON config, which is the most common way ZeRO is used in practice. The config selects the stage and optionally offloads partitioned state to CPU or NVMe to fit even larger models.
 
@@ -339,7 +477,7 @@ model_engine, optimizer, _, _ = deepspeed.initialize(
 
 The Hugging Face `accelerate` library wraps both FSDP and DeepSpeed behind a single `accelerator.prepare(...)` call and a YAML config, so the same training script can switch sharding backends without code changes. That is the mature, open-source path most teams take in 2025.
 
-## 6. FP8 and the Precision Frontier
+## 7. FP8 and the Precision Frontier
 
 The newest accelerators (NVIDIA Hopper and Blackwell) add hardware support for **fp8**, an 8-bit float that comes in two variants: **E4M3** (4 exponent, 3 mantissa bits) for the forward pass where precision matters more, and **E5M2** (5 exponent, 2 mantissa bits) for gradients where range matters more. The promise is another near-halving of memory traffic and a large throughput gain on the tensor cores, but fp8's tiny mantissa makes per-tensor *scaling* essential: each tensor is multiplied by a scale factor chosen so its values land in the representable range, analogous to loss scaling but applied per tensor and tracked over time (delayed scaling). NVIDIA's open-source **Transformer Engine** library implements this and is the standard way to train in fp8 today (Micikevicius et al., 2022).
 
@@ -363,7 +501,7 @@ with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
 
 FP8 is the current production frontier rather than a universal default: it gives the largest wins on the biggest matmuls, requires recent hardware, and demands careful scaling to avoid divergence. For most training in 2025, bf16 plus checkpointing plus FSDP is the workhorse, with fp8 layered on top when the hardware and the scale justify it.
 
-## 7. Pitfalls and When to Use
+## 8. Pitfalls and When to Use
 
 **Mixed precision.** Prefer bf16 when the hardware supports it; its fp32-equal exponent range avoids the loss-scaling machinery that fp16 requires. If you must use fp16, use dynamic loss scaling and watch for skipped steps (frequent overflow means the scale is too high or the run is unstable). Keep reductions, softmax, and loss computation in fp32, low precision in a sum over many terms accumulates error. Never store the optimizer master weights in half precision; that reintroduces the underflow that mixed precision exists to avoid.
 
