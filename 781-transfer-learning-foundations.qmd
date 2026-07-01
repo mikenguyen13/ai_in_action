@@ -1,0 +1,296 @@
+# Transfer Learning: Foundations and Strategies {#sec-transfer-learning}
+
+The implicit assumption underlying classical supervised learning is that training data and deployment data are drawn from the same joint distribution $P(X, Y)$. In practice this assumption fails constantly: a model trained on radiology images from one hospital is deployed at another with different imaging equipment; a sentiment classifier trained on English reviews is applied to French text; a named-entity recognizer trained on newswire must handle social media. Collecting new labeled examples for each target setting is expensive, slow, and sometimes impossible. Transfer learning addresses this mismatch by reusing knowledge extracted from a source setting to accelerate and improve learning in a target setting. The empirical payoff is enormous: ImageNet pretraining reduced the error rate on diverse vision benchmarks by many percentage points compared to training from scratch Pan & Yang (2010), and language model pretraining yielded step-change improvements across virtually every NLP benchmark Devlin et al. (2019).
+
+## 1. Formal Setup
+
+A **domain** $\mathcal{D} = \{\mathcal{X}, P(X)\}$ consists of a feature space $\mathcal{X}$ and a marginal distribution $P(X)$ over it. A **task** $\mathcal{T} = \{\mathcal{Y}, f\}$ consists of a label space $\mathcal{Y}$ and a predictive function $f : \mathcal{X} \to \mathcal{Y}$, which in the supervised setting is learned from labeled pairs $\{(x_i, y_i)\}$.
+
+Let the **source domain** be $\mathcal{D}_S = \{\mathcal{X}_S, P_S(X)\}$ with associated task $\mathcal{T}_S = \{\mathcal{Y}_S, f_S\}$, and the **target domain** $\mathcal{D}_T = \{\mathcal{X}_T, P_T(X)\}$ with task $\mathcal{T}_T = \{\mathcal{Y}_T, f_T\}$. Transfer learning is the endeavor of improving $f_T$, learned from possibly few labeled target examples, by exploiting knowledge derived from $(\mathcal{D}_S, \mathcal{T}_S)$.
+
+The domains or tasks may differ in several ways, giving rise to distinct transfer scenarios:
+
+- **Same domain, different label distribution** ($\mathcal{X}_S = \mathcal{X}_T$, $P_S(X) \neq P_T(X)$): classic covariate shift.
+- **Different feature spaces** ($\mathcal{X}_S \neq \mathcal{X}_T$): heterogeneous transfer, e.g., text in two languages.
+- **Same features, different task** ($\mathcal{Y}_S \neq \mathcal{Y}_T$): multi-task learning boundary.
+- **Unlabeled target** ($\mathcal{Y}_T$ entirely unobserved): unsupervised domain adaptation.
+
+**Negative transfer** is the failure mode in which exploiting source knowledge makes target performance worse than training from scratch. It occurs when source and target are sufficiently dissimilar that the source prior misleads the target optimizer, or when transfer forces a shared representation that fits neither domain well. Detecting and avoiding negative transfer is a central practical concern; strategies include domain similarity screening, per-layer transfer decisions, and regularization strength selection by cross-validation.
+
+## 2. Strategy 1 — Linear Models: Regularization Toward Source Parameters
+
+The simplest transfer mechanism for parametric models is parameter-space regularization. Suppose we have learned source parameters $\mathbf{w}_\text{old}$ by minimizing a source loss $\mathcal{L}_S(\mathbf{w})$ over labeled source data. When adapting to the target, instead of minimizing $\mathcal{L}_T(\mathbf{w})$ without constraint, we solve
+
+$$\min_{\mathbf{w}} \; \mathcal{L}_T(\mathbf{w}) + \lambda \|\mathbf{w} - \mathbf{w}_\text{old}\|_2^2$$
+
+The quadratic penalty pulls the optimized parameters toward the source solution, preserving useful learned structure while allowing adaptation where the target data provides sufficient evidence. The scalar $\lambda > 0$ controls the strength of transfer: large $\lambda$ forces the target solution close to the source; small $\lambda$ allows unconstrained adaptation.
+
+A sparse variant replaces the $\ell_2$ penalty with an $\ell_1$ term:
+
+$$\min_{\mathbf{w}} \; \mathcal{L}_T(\mathbf{w}) + \lambda \|\mathbf{w} - \mathbf{w}_\text{old}\|_1$$
+
+This encourages the target parameters to match the source exactly on most coordinates while adapting on a sparse subset, which is appropriate when only a small fraction of features are relevant to the domain shift.
+
+**Bayesian interpretation.** The $\ell_2$ variant admits a clean probabilistic reading. Place a Gaussian prior $\mathbf{w} \sim \mathcal{N}(\mathbf{w}_\text{old}, (2\lambda)^{-1} I)$ over target parameters. Maximum a posteriori estimation under this prior with a log-likelihood loss $\mathcal{L}_T$ recovers exactly the penalized objective above. The source solution $\mathbf{w}_\text{old}$ is the prior mean; the penalty strength $\lambda$ encodes how confident we are that the source is a good prior for the target.
+
+The following implementation wraps scikit-learn logistic regression to incorporate an $\ell_2$ transfer penalty by shifting the penalty origin from zero to $\mathbf{w}_\text{old}$.
+
+```python
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+rng = np.random.default_rng(42)
+
+# Source domain: well-separated binary problem
+X_src, y_src = make_classification(
+    n_samples=400, n_features=20, n_informative=10,
+    random_state=0
+)
+# Target domain: same features, slight distribution shift (fewer samples)
+X_tgt, y_tgt = make_classification(
+    n_samples=60, n_features=20, n_informative=10,
+    random_state=7, flip_y=0.1
+)
+
+scaler = StandardScaler().fit(X_src)
+X_src_s = scaler.transform(X_src)
+X_tgt_s = scaler.transform(X_tgt)
+
+# Train source model
+src_model = LogisticRegression(C=1.0, max_iter=1000, random_state=0)
+src_model.fit(X_src_s, y_src)
+w_old = src_model.coef_[0]
+
+def transfer_logistic(X_tgt_train, y_tgt_train, w_old, lam=1.0, n_iter=500):
+    """Gradient descent minimizing CE + lambda * ||w - w_old||^2."""
+    w = w_old.copy()
+    b = 0.0
+    n = len(y_tgt_train)
+    lr = 0.05
+    for _ in range(n_iter):
+        logits = X_tgt_train @ w + b
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        err = probs - y_tgt_train
+        grad_w = X_tgt_train.T @ err / n + 2 * lam * (w - w_old)
+        grad_b = err.mean()
+        w -= lr * grad_w
+        b -= lr * grad_b
+    return w, b
+
+# Split target into train/test
+split = 40
+X_tt, y_tt = X_tgt_s[:split], y_tgt[:split]
+X_te, y_te = X_tgt_s[split:], y_tgt[split:]
+
+w_transfer, b_transfer = transfer_logistic(X_tt, y_tt, w_old, lam=0.5)
+
+logits_te = X_te @ w_transfer + b_transfer
+preds_transfer = (logits_te > 0).astype(int)
+acc_transfer = accuracy_score(y_te, preds_transfer)
+
+# Baseline: target-only logistic (no transfer)
+baseline = LogisticRegression(C=2.0, max_iter=1000, random_state=0)
+baseline.fit(X_tt, y_tt)
+acc_baseline = accuracy_score(y_te, baseline.predict(X_te))
+
+print(f"Transfer accuracy : {acc_transfer:.3f}")
+print(f"Baseline accuracy : {acc_baseline:.3f}")
+```
+
+On small target samples the transfer model typically outperforms the unconstrained baseline because the source prior prevents overfitting to the limited target labels.
+
+## 3. Strategy 2 — Heterogeneous Transfer: Shared Vocabulary and Representation Mapping
+
+When $\mathcal{X}_S \neq \mathcal{X}_T$, direct parameter reuse is impossible. The canonical example is cross-lingual transfer: source training data is annotated English clinical records; target data are Chinese-language records. The feature vectors occupy entirely different high-dimensional spaces.
+
+The standard remedy is to find a mapping $\phi_S : \mathcal{X}_S \to \mathcal{Z}$ and $\phi_T : \mathcal{X}_T \to \mathcal{Z}$ into a shared embedding space $\mathcal{Z}$ such that semantically equivalent items map to nearby points. For bilingual word embeddings the mapping is learned by aligning word vectors across languages using a small bilingual lexicon or even in a fully unsupervised manner (Lample et al. 2018 via adversarial alignment). The concept "cardiovascular disease" in English and "心血管疾病" in Chinese map to nearby vectors in $\mathcal{Z}$; a classifier trained in $\mathcal{Z}$ using English-labeled data then applies directly to Chinese input without any Chinese labels.
+
+Formally, the shared representation learning objective couples the source and target embedding networks:
+
+$$\min_{\phi_S, \phi_T, f} \; \mathbb{E}_{(x,y)\sim\mathcal{D}_S}\left[\ell(f(\phi_S(x)), y)\right] + \mu \cdot \Omega(\phi_S, \phi_T)$$
+
+where $\Omega$ is an alignment term enforcing that $\phi_S$ and $\phi_T$ map to a common geometry — for instance, encouraging the cosine similarity of cross-lingual synonym pairs to be high, or minimizing the Wasserstein distance between the marginal distributions $\phi_S(P_S)$ and $\phi_T(P_T)$.
+
+For tabular data with overlapping but not identical features, a softer version is instance weighting: re-weight source instances by $P_T(x) / P_S(x)$ (importance weighting) so that the source loss reflects the target distribution. This is equivalent to minimizing the target loss using only source labels, avoiding the need for any labeled target data.
+
+## 4. Strategy 3 — Deep Models: Feature Extraction and Fine-Tuning
+
+Deep neural networks learn hierarchical representations. For convolutional networks trained on ImageNet, early convolutional layers detect local edge orientations and color blobs — features that are useful across virtually all visual domains. Intermediate layers assemble textures and parts; final layers encode object-class specifics, which are heavily dataset-dependent. Yosinski et al. (2014) quantified this gradient of transferability empirically, showing that features from layers 1--3 of a network trained on one ImageNet split transfer almost perfectly to another split, while features from layers 6--7 become increasingly task-specific.
+
+This hierarchy motivates two operating modes:
+
+**Feature extraction.** Freeze all layers of the pretrained network up to (and including) some layer $k$; replace the final head with a new randomly initialized head suited to $\mathcal{T}_T$; train only the new head. The frozen layers act as a fixed feature extractor $\phi : \mathcal{X}_T \to \mathbb{R}^d$. With a linear head this collapses to kernel regression in the representation space — fast to train and resistant to overfitting when labeled target data is scarce.
+
+**Fine-tuning.** Initialize all layers from the pretrained weights; train the entire network (or selected layers) on the target task with a small learning rate. Fine-tuning allows the representation to adapt to target-specific statistics but risks **catastrophic forgetting** — overwriting source knowledge when the target dataset is small or the learning rate is large.
+
+```python
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as T
+from torchvision.datasets import CIFAR10
+from torch.utils.data import DataLoader, Subset
+
+torch.manual_seed(0)
+device = torch.device("cpu")
+
+transform = T.Compose([
+    T.Resize(224),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+# Small subset to keep runtime short on CPU
+train_ds = CIFAR10(root="/tmp/cifar", train=True, download=True, transform=transform)
+test_ds  = CIFAR10(root="/tmp/cifar", train=False, download=True, transform=transform)
+
+subset_idx_train = list(range(0, len(train_ds), 100))   # 500 samples
+subset_idx_test  = list(range(0, len(test_ds),  50))    # 200 samples
+train_loader = DataLoader(Subset(train_ds, subset_idx_train), batch_size=16, shuffle=True)
+test_loader  = DataLoader(Subset(test_ds,  subset_idx_test),  batch_size=32, shuffle=False)
+
+# Load pretrained ResNet-18; freeze everything except the final FC layer
+model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+for param in model.parameters():
+    param.requires_grad = False
+
+# Replace head: 512 -> 10 (CIFAR-10 classes)
+model.fc = nn.Linear(model.fc.in_features, 10)
+model = model.to(device)
+
+optimizer = torch.optim.Adam(model.fc.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
+
+def train_epoch(model, loader, optimizer):
+    model.train()
+    total_loss, correct, n = 0.0, 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * len(y)
+        correct += (logits.argmax(1) == y).sum().item()
+        n += len(y)
+    return total_loss / n, correct / n
+
+def evaluate(model, loader):
+    model.eval()
+    correct, n = 0, 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            correct += (model(x).argmax(1) == y).sum().item()
+            n += len(y)
+    return correct / n
+
+for epoch in range(3):
+    loss, tr_acc = train_epoch(model, train_loader, optimizer)
+    te_acc = evaluate(model, test_loader)
+    print(f"Epoch {epoch+1}  loss={loss:.3f}  train_acc={tr_acc:.3f}  test_acc={te_acc:.3f}")
+```
+
+With only 500 training examples and three epochs, the frozen ResNet-18 feature extractor achieves substantially higher accuracy than a randomly initialized network trained for the same number of steps, demonstrating that the ImageNet representation generalizes far beyond its source domain.
+
+## 5. Strategy 4 — Unsupervised Domain Adaptation
+
+A challenging but practically common setting is **unsupervised domain adaptation**: the source provides labeled pairs $\mathcal{D}_1 = \{(x_i, y_i)\}_{i=1}^{n_S}$ while the target provides only unlabeled instances $\mathcal{D}_2 = \{x_j\}_{j=1}^{n_T}$. The goal is to learn a classifier that performs well on target without any target labels.
+
+The dominant approach trains a shared feature extractor $\phi_\theta$ and classifier $f_\theta$ to minimize
+
+$$\min_{\theta} \; \underbrace{\frac{1}{n_S}\sum_{i=1}^{n_S} \ell(f_\theta(\phi_\theta(x_i)), y_i)}_{\text{source classification loss}} + \lambda \cdot \underbrace{\text{dist}\!\left(\{\phi_\theta(x_i)\}_{i \in S},\; \{\phi_\theta(x_j)\}_{j \in T}\right)}_{\text{domain discrepancy}}$$
+
+The discrepancy term pushes the extracted features to be **domain-invariant** — indistinguishable whether they came from source or target — while the classification term ensures that the features still carry label-predictive signal.
+
+Three popular discrepancy measures are:
+
+**Maximum Mean Discrepancy (MMD).** Let $\mathcal{H}$ be a reproducing kernel Hilbert space with kernel $k$. Then
+
+$$\text{MMD}^2(\mathcal{D}_1, \mathcal{D}_2; \phi) = \left\|\frac{1}{n_S}\sum_{i} \phi(x_i) - \frac{1}{n_T}\sum_{j} \phi(x_j)\right\|_\mathcal{H}^2$$
+
+Minimizing the squared MMD in the feature space $\phi_\theta$ encourages identical feature means across domains. Deep Adaptation Network (Long et al. 2015) applies MMD to multiple layers simultaneously.
+
+**Adversarial domain adaptation.** A binary domain discriminator $D_\psi$ is trained to distinguish source from target features, while $\phi_\theta$ is trained adversarially to fool it:
+
+$$\min_{\theta} \max_{\psi} \; \mathcal{L}_\text{cls}(\theta) - \lambda \, \mathcal{L}_\text{disc}(\theta, \psi)$$
+
+Gradient Reversal Layer (Ganin & Lempitsky 2015) implements this with a sign-flipped gradient during backpropagation through $\phi_\theta$ toward $D_\psi$, making the entire system end-to-end differentiable.
+
+**CORAL (Correlation Alignment).** Instead of aligning means, CORAL aligns second-order statistics (covariance matrices) of source and target features:
+
+$$\mathcal{L}_\text{CORAL} = \frac{1}{4d^2} \left\| C_S - C_T \right\|_F^2$$
+
+where $C_S, C_T \in \mathbb{R}^{d \times d}$ are the feature covariance matrices and $\|\cdot\|_F$ is the Frobenius norm. This is computationally inexpensive and requires no hyperparameter tuning beyond the weighting $\lambda$.
+
+## 6. Fine-Tuning Practical Guide
+
+**Layer-wise learning rate decay.** Because early layers need minimal adaptation, it is standard practice to assign progressively smaller learning rates to earlier layers:
+
+$$\eta_\ell = \eta_\text{top} \cdot \alpha^{L - \ell}, \quad \alpha \in (0.1, 0.5)$$
+
+where $L$ is the total number of layers and $\ell$ is the layer index from the input. The top layers (closest to output) receive the full learning rate $\eta_\text{top}$; each preceding group is reduced by factor $\alpha$. In PyTorch this is implemented by passing per-parameter-group learning rates to the optimizer:
+
+```python
+import torchvision.models as models
+import torch.optim as optim
+
+model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+layer_groups = [
+    ("layer1", model.layer1),
+    ("layer2", model.layer2),
+    ("layer3", model.layer3),
+    ("layer4", model.layer4),
+    ("fc",     model.fc),
+]
+base_lr = 1e-3
+decay   = 0.3
+n       = len(layer_groups)
+
+param_groups = [
+    {"params": group.parameters(), "lr": base_lr * (decay ** (n - 1 - i))}
+    for i, (_, group) in enumerate(layer_groups)
+]
+optimizer = optim.Adam(param_groups)
+
+for i, (name, _) in enumerate(layer_groups):
+    effective_lr = base_lr * (decay ** (n - 1 - i))
+    print(f"{name:10s}  lr = {effective_lr:.2e}")
+```
+
+**Catastrophic forgetting.** When a network is fine-tuned on a small target dataset with a large learning rate, the weights drift far from their pretrained values and the source representations are overwritten. Mitigation strategies include:
+
+- Elastic Weight Consolidation (EWC, Kirkpatrick et al. 2017): add an $\ell_2$ penalty toward pretrained weights, weighted by the Fisher information matrix diagonal, which selectively protects parameters that were most important for the source task.
+- Gradual unfreezing: start by training only the head for several epochs; then unfreeze the top block; then the next, and so on. This prevents gradients from early epochs destroying carefully tuned low-level features.
+- Label smoothing and dropout increase regularization and reduce overfitting on target.
+
+**Which layers to freeze.** The decision depends on the similarity between source and target. Ben-David et al. (2010) formalize this through $\mathcal{H}\Delta\mathcal{H}$-divergence: when source and target differ sharply (large divergence), deeper layers must adapt. Empirically, for natural image fine-tuning on small datasets, freezing layers 1--3 and fine-tuning layers 4--top is a reliable default. For highly dissimilar domains (medical images from photographic ImageNet pretraining), fine-tuning all layers with aggressive layer-wise decay often outperforms partial freezing.
+
+## 7. Theoretical Perspective
+
+Ben-David et al. (2010) prove a generalization bound for domain adaptation. Let $h^* = \arg\min_h \varepsilon_S(h) + \varepsilon_T(h)$ be the ideal joint hypothesis, $\lambda^* = \varepsilon_S(h^*) + \varepsilon_T(h^*)$ its combined error, and $d_{\mathcal{H}\Delta\mathcal{H}}(\mathcal{D}_S, \mathcal{D}_T)$ the domain divergence. Then for any $h$ in hypothesis class $\mathcal{H}$:
+
+$$\varepsilon_T(h) \leq \varepsilon_S(h) + d_{\mathcal{H}\Delta\mathcal{H}}(\mathcal{D}_S, \mathcal{D}_T) + \lambda^*$$
+
+This bound decomposes target error into three terms: how well $h$ classifies source data; the distributional divergence between domains; and an irreducible floor $\lambda^*$ representing how much the best shared classifier must sacrifice. Transfer learning is beneficial when the source error is low (strong source model), the divergence is small (related domains), and $\lambda^*$ is small (both tasks are jointly solvable). Negative transfer corresponds to large $d_{\mathcal{H}\Delta\mathcal{H}}$ that outweighs the first term's benefit.
+
+## References
+
+1. Pan, S. J., & Yang, Q. (2010). A Survey on Transfer Learning. *IEEE Transactions on Knowledge and Data Engineering*, 22(10), 1345--1359. https://doi.org/10.1109/TKDE.2009.191
+
+2. Yosinski, J., Clune, J., Bengio, Y., & Lipson, H. (2014). How transferable are features in deep neural networks? *Advances in Neural Information Processing Systems* 27. https://arxiv.org/abs/1411.1792
+
+3. Devlin, J., Chang, M.-W., Lee, K., & Toutanova, K. (2019). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. *NAACL-HLT 2019*. https://arxiv.org/abs/1810.04805
+
+4. Ben-David, S., Blitzer, J., Crammer, K., Kulesza, A., Pereira, F., & Vaughan, J. W. (2010). A theory of learning from different domains. *Machine Learning*, 79(1--2), 151--175. https://doi.org/10.1007/s10994-009-5152-4
+
+5. Ganin, Y., & Lempitsky, V. (2015). Unsupervised Domain Adaptation by Backpropagation. *ICML 2015*. https://arxiv.org/abs/1409.7495
+
+6. Kirkpatrick, J., Pascanu, R., Rabinowitz, N., et al. (2017). Overcoming catastrophic forgetting in neural networks. *PNAS*, 114(13), 3521--3526. https://doi.org/10.1073/pnas.1611835114
+
+7. Long, M., Cao, Y., Wang, J., & Jordan, M. I. (2015). Learning Transferable Features with Deep Adaptation Networks. *ICML 2015*. https://arxiv.org/abs/1502.02791

@@ -281,9 +281,89 @@ fn main() {
 
 :::
 
-## 8. Summary
+## 8. Integer Labels versus One-Hot Encoding: Sparse versus Dense Cross-Entropy
 
-Cross-entropy is the maximum likelihood objective for classification, and its two principal forms, softmax cross-entropy for multiclass problems and binary cross-entropy with logits for binary and multilabel problems, both produce the clean predicted-minus-target gradient that drives stable learning. The mathematical expressions hide numerical landmines that the shift trick for log-sum-exp and the absolute value form of softplus defuse, which is why fused logit-consuming loss functions are the norm. Label smoothing trades a small amount of confidence for better calibration and more regular representations, at the cost of fine grained inter-class information that some downstream uses still require. Understanding these objectives at the level of their gradients and their floating point behavior is what separates a model that trains from one that diverges.
+The multiclass cross-entropy derived in Section 2 assumes the target $y$ is represented as a one-hot vector of length $K$. In practice, label encoding is a choice with numerical and memory implications.
+
+### 8.1 The Two Representations
+
+A one-hot target stores class $c$ as a vector $e_c \in \{0,1\}^K$ with a single non-zero entry. An integer target stores only the index $c \in \{0, 1, \ldots, K-1\}$. For $K = 1000$ classes, one-hot uses 1000 floats per example; the integer uses one. For language modeling with a vocabulary of 50,000 tokens, the one-hot tensor across a batch of 512 sequences of length 256 would be 512 × 256 × 50,000 ≈ 6.5 billion entries, far beyond any practical memory budget.
+
+The loss formula is identical in both cases. For class $c$ and predicted distribution $\hat{p}$,
+
+$$
+\mathcal{L}_{\mathrm{CE}} = -\sum_{k=1}^{K} e_c(k)\, \log \hat{p}_k = -\log \hat{p}_c,
+$$
+
+because $e_c$ zeros out every term except $k = c$. The integer representation exploits this sparsity directly: it indexes into the log-probability vector rather than materializing the full one-hot and computing a dot product. The math is the same; only the implementation differs.
+
+### 8.2 Framework Implementations
+
+PyTorch separates the two cases explicitly:
+
+- `nn.CrossEntropyLoss` consumes **integer** labels of shape `(N,)` or `(N, d_1, ..., d_K)` for pixel-wise classification. It fuses softmax and NLL into one numerically stable operation.
+- `nn.NLLLoss` also consumes integer labels but expects **log-probabilities** as input (after `F.log_softmax`), giving manual control over the softmax.
+
+Keras similarly offers two variants:
+
+- `CategoricalCrossentropy` expects **one-hot** targets of shape `(N, K)`.
+- `SparseCategoricalCrossentropy` expects **integer** targets of shape `(N,)` and performs the same computation internally.
+
+The `from_logits` parameter controls whether the model output is treated as raw logits (apply softmax internally, numerically stable) or as probabilities (skip softmax). Setting `from_logits=True` is almost always preferable: it enables the fused log-sum-exp trick and avoids the redundant `softmax → log` round-trip.
+
+```{python}
+import numpy as np
+
+# Demonstrate SparseCategoricalCrossentropy vs CategoricalCrossentropy equivalence
+def softmax(z):
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+def sparse_ce(logits, labels):
+    probs = softmax(logits)
+    return -np.mean(np.log(probs[np.arange(len(labels)), labels] + 1e-12))
+
+def dense_ce(logits, one_hot):
+    probs = softmax(logits)
+    return -np.mean(np.sum(one_hot * np.log(probs + 1e-12), axis=-1))
+
+rng = np.random.default_rng(0)
+logits = rng.standard_normal((4, 5))   # batch=4, classes=5
+labels = np.array([2, 0, 4, 1])        # integer labels
+one_hot = np.eye(5)[labels]            # equivalent one-hot
+
+print(f"sparse CE:  {sparse_ce(logits, labels):.6f}")
+print(f"dense CE:   {dense_ce(logits, one_hot):.6f}")
+print(f"difference: {abs(sparse_ce(logits, labels) - dense_ce(logits, one_hot)):.2e}")
+```
+
+### 8.3 When to Use Each
+
+Use **integer labels** (sparse) when:
+- The label vocabulary is large (NLP token prediction, image segmentation with many classes).
+- Memory is a constraint.
+- You are using PyTorch's `CrossEntropyLoss` or Keras's `SparseCategoricalCrossentropy`.
+
+Use **one-hot labels** (dense) when:
+- Labels are soft (label smoothing, knowledge distillation), requiring a non-integer distribution over classes. You cannot express $[0.9, 0.05, 0.05]$ as a single integer.
+- The loss involves a sum over all classes, such as KL divergence between predicted and target distributions.
+- The framework or loss function requires it explicitly.
+
+Label smoothing, discussed in Section 7, requires one-hot (or equivalently soft) targets because smoothed labels are $\tilde{y}_k = (1-\epsilon)\,\delta_{k=c} + \epsilon/K$, which is not a valid integer encoding. Distillation losses similarly operate on soft teacher distributions and require the dense form.
+
+### 8.4 The `reduction` Parameter
+
+Both sparse and dense cross-entropy functions accept a `reduction` argument that controls how per-example losses are aggregated:
+
+- `'mean'` (default): divide the summed loss by the number of examples. Gradient scale is independent of batch size.
+- `'sum'`: sum all per-example losses. Gradient scale grows with batch size; requires compensating learning rate adjustment.
+- `'none'`: return the per-example loss vector. Useful for importance weighting: `loss = ce(logits, labels, reduction='none'); weighted = (loss * weights).mean()`.
+
+The choice of reduction is invisible in the forward pass output when batches are fixed size, but matters when batch sizes vary (variable-length sequences, online learning) or when sample-level weights are applied for class imbalance or curriculum learning.
+
+## 9. Summary
+
+Cross-entropy is the maximum likelihood objective for classification, and its two principal forms, softmax cross-entropy for multiclass problems and binary cross-entropy with logits for binary and multilabel problems, both produce the clean predicted-minus-target gradient that drives stable learning. The mathematical expressions hide numerical landmines that the shift trick for log-sum-exp and the absolute value form of softplus defuse, which is why fused logit-consuming loss functions are the norm. The sparse/dense distinction between integer and one-hot labels is purely an implementation concern with identical mathematics, but the choice matters practically: use integer labels for large vocabularies and dense one-hot labels when soft targets are needed for label smoothing or distillation. Label smoothing trades a small amount of confidence for better calibration and more regular representations, at the cost of fine grained inter-class information that some downstream uses still require. Understanding these objectives at the level of their gradients and their floating point behavior is what separates a model that trains from one that diverges.
 
 ## References
 

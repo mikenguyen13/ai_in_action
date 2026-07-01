@@ -1,0 +1,328 @@
+# Tool Use in Language Model Agents {#sec-tool-use}
+
+Language models trained on static corpora are frozen at their training cutoff: they cannot fetch tomorrow's weather, query a live database, execute arithmetic with guaranteed precision, or invoke an external service. These limitations are not incidental deficiencies but structural properties of the autoregressive generation paradigm. Tool use is the mechanism by which agents bridge the gap between language model reasoning and world action, converting natural-language intention into structured external calls whose results ground subsequent reasoning.
+
+## 1. Why Tools Are Necessary
+
+A language model generates tokens by approximating the conditional distribution $P(x_t \mid x_1, \ldots, x_{t-1})$ learned from training data. This distribution encodes knowledge about the world only up to the training cutoff and only insofar as that knowledge appeared in the training corpus. Three categories of tasks are therefore structurally outside the model's native capability.
+
+**Real-time knowledge.** Events after the training cutoff are unknown to the model. A user asking "what is the current Euro/USD exchange rate?" receives either an admission of ignorance or a confidently hallucinated stale figure. A tool call to a currency API grounds the response in live data.
+
+**Precise computation.** Transformer models are poor calculators. While they can approximate arithmetic for small numbers seen frequently in training, they have no reliable mechanism for multi-digit multiplication or floating-point arithmetic. A Python interpreter tool executes such computations exactly.
+
+**External state manipulation.** Creating a calendar event, sending an email, writing to a database, or triggering a deployment pipeline requires side effects in external systems. Language generation alone cannot produce these effects; only structured API calls can.
+
+Tool use does not require fine-tuning. A sufficiently capable model can learn to produce structured outputs from in-context demonstrations or system prompts. Fine-tuning improves reliability and reduces hallucination, as the Gorilla work demonstrates (Section 4), but the architectural pattern is prompt-level.
+
+## 2. Function Calling Mechanics
+
+The canonical mechanism for tool use is function calling, introduced in the OpenAI Chat Completions API and now a near-universal interface. The protocol has four components.
+
+**Schema declaration.** At inference time, the model receives a list of JSON Schema objects describing available tools. Each schema specifies the function name, a natural-language description, and a `parameters` object describing argument names, types, and descriptions. The model uses these schemas to determine when to call a tool and how to construct a valid argument bundle.
+
+```json
+{
+  "name": "get_current_weather",
+  "description": "Retrieve current weather conditions for a location.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "location": {
+        "type": "string",
+        "description": "City and country, e.g. 'Paris, France'"
+      },
+      "unit": {
+        "type": "string",
+        "enum": ["celsius", "fahrenheit"],
+        "description": "Temperature unit to return"
+      }
+    },
+    "required": ["location"]
+  }
+}
+```
+
+**Structured call generation.** When the model determines that a tool call is appropriate, it generates a structured object rather than free text. In the OpenAI format this appears in a dedicated `tool_calls` field of the assistant message, containing `id`, `type: "function"`, and a `function` object with `name` and `arguments` (a JSON string). The model does not continue generating conversational tokens until the tool result is returned.
+
+**Execution and result injection.** The runtime deserializes the argument bundle, dispatches to the appropriate function, and captures the return value. The result is injected into the conversation as a tool message keyed to the original call ID. In multi-tool scenarios, multiple calls may be batched in a single assistant turn and results returned in parallel.
+
+**Continued reasoning.** After receiving tool results the model resumes generation with a richer context: its original reasoning, the structured call it made, and the observed output. This grounds subsequent generation in verified external data.
+
+The conversation structure is therefore a sequence of alternating roles:
+
+$$\text{system} \to \text{user} \to \text{assistant (tool\_call)} \to \text{tool (result)} \to \text{assistant (final)}$$
+
+For multi-step tasks this sequence may cycle through the tool-call/tool-result pair multiple times before a final answer is produced.
+
+## 3. ReAct: Interleaved Reasoning and Acting
+
+Yao et al. (2023) formalized the observation that language models produce better tool-augmented outputs when reasoning and action are explicitly interleaved rather than either separated or implicit. The **ReAct** (Reason + Act) framework structures agent traces as alternating thought and action steps.
+
+A ReAct trace for a question-answering task might read:
+
+```
+Thought: I need to find the year Beyonce's sixth album was released.
+Action: Search("Beyonce sixth studio album")
+Observation: Beyonce's sixth studio album "Lemonade" was released in April 2016.
+Thought: I now know the release year is 2016. I should verify the director of the title track.
+Action: Search("Lemonade Beyonce title track director")
+Observation: The title track was directed by Kahlil Joseph and Beyonce herself.
+Thought: I have enough information to answer.
+Action: Finish("Lemonade was released in 2016; the title track was co-directed by Kahlil Joseph.")
+```
+
+This structure differs from chain-of-thought (CoT) prompting in a critical way: CoT generates reasoning entirely within the model's parametric knowledge, while ReAct grounds each reasoning step in observed external evidence. The observation at each step constrains subsequent thoughts, preventing the compounding hallucinations that afflict multi-step CoT.
+
+Yao et al. evaluated ReAct on HotpotQA (multi-hop question answering), Fever (fact verification), ALFWorld (text-based household tasks), and WebShop (product-search navigation). ReAct outperformed CoT-only baselines on all four tasks and produced traces that human raters found more interpretable and easier to correct. On HotpotQA, ReAct achieved 35.1% success versus 29.4% for CoT with the same model, a substantial gain attributable entirely to grounding.
+
+The information-theoretic motivation is straightforward. Let $K_\theta$ be the model's parametric knowledge and $K_e$ be external evidence retrieved at step $t$. CoT conditions only on $K_\theta$; ReAct conditions on $K_\theta \cup \bigcup_t K_e^{(t)}$. Because $K_e^{(t)}$ is retrieved in response to intermediate reasoning, it is specifically relevant to the current subproblem. The effective knowledge available to ReAct is therefore a superset of CoT's knowledge, targeted rather than broad.
+
+## 4. Gorilla: Reducing API Hallucination via Retrieval-Aware Training
+
+A persistent failure mode in tool use is parameter hallucination: the model invokes a real function name but fabricates argument names, types, or values that do not conform to the actual API. This is particularly dangerous for SDK calls where incorrect arguments cause silent wrong behavior rather than runtime errors.
+
+Patil et al. (2023) addressed this with **Gorilla**, a LLaMA-based model fine-tuned on over 1,600 API documentation pages spanning TorchHub, TensorFlow Hub, and HuggingFace model APIs. The contribution has two parts: a dataset and a training strategy.
+
+**APIBench.** The authors constructed APIBench by scraping API documentation, writing questions that require API calls to answer, and recording the correct API invocation as the label. The benchmark covers three domains with distinct calling conventions: TorchHub uses Python `torch.hub.load`, TensorFlow Hub uses `tensorflow_hub.load`, and HuggingFace uses `pipeline` with model identifiers. Hallucination is measured as the fraction of generated calls that either name a nonexistent API or supply incorrect arguments.
+
+**Retrieval-aware training.** The key insight is that API documentation is too voluminous to fit in context but too specific to memorize reliably. Gorilla's training procedure pairs each training example with retrieved documentation: a retriever fetches the most relevant API documentation for the question, that documentation is prepended to the context, and the model is trained to generate the correct API call given this augmented context. At inference time the same retriever runs before generation, simulating the training distribution.
+
+This contrasts with naive RAG, where retrieval is added at inference time without training-time conditioning. By training with retrieved context, the model learns to use documentation rather than to override it with parametric memorization. The result is a substantial reduction in hallucination: Gorilla achieves 20.43% AST accuracy on HuggingFace versus 8.22% for GPT-3.5-Turbo in the zero-shot setting, nearly a 2.5x improvement.
+
+The architectural takeaway is general: when tools have complex or frequently changing interfaces, fine-tuning with retrieval-in-context produces more reliable callers than prompting alone. This principle extends beyond API calling to any domain where the "schema" of valid actions evolves faster than model retraining cycles.
+
+## 5. MM-ReAct: Multimodal Tool Composition
+
+Yang et al. (2023) extended the ReAct framework to multimodal inputs by treating specialized vision models as tools. **MM-ReAct** allows a language model (GPT-4 in the original paper) to reason about images through a composition of external vision APIs rather than through its own vision encoder.
+
+The available tools include an image captioner, an OCR engine, a celebrity/landmark recognizer, a Bing image search, an image editing tool, and a math solver for image-embedded equations. When presented with an image, the language model does not process pixel values directly. Instead, it decomposes the visual question into a sequence of tool calls:
+
+```
+Thought: The image may contain text I need to read.
+Action: OCR(image)
+Observation: "Net Income: $4.2B (up 12% YoY)"
+Thought: I need context about this company to interpret the number.
+Action: BingSearch("company name from financial report header")
+Observation: The report header shows "Acme Corp Q3 2024"
+Thought: I can now answer the question about profitability trends.
+```
+
+This decomposition has an important epistemic property: each tool call produces a verifiable, human-interpretable intermediate result. The trace is auditable in a way that end-to-end vision-language generation is not. A reviewer can inspect whether the OCR output was correct, whether the search query was appropriate, and whether the final reasoning step is valid given the observations.
+
+MM-ReAct demonstrates that tool use is not merely a patch for knowledge gaps but a compositional architecture: a language model can serve as an orchestrator that coordinates specialist models, with each specialist optimized for a narrow perceptual or computational task. The language model contributes planning, disambiguation, and synthesis; the tools contribute precision.
+
+## 6. Chain-of-Abstraction Reasoning
+
+Gao et al. (2024) identified a subtle failure mode in direct tool use: when a model must invoke multiple tools in a chain, it tends to fix its reasoning structure around the first tool call's result, making it brittle to errors or unexpected outputs in that call. **Chain-of-Abstraction (CoA)** reasoning addresses this by separating the reasoning graph from tool execution.
+
+In CoA, the model first produces a complete reasoning trace using abstract placeholders for tool outputs:
+
+```
+Step 1: Compute the compound interest on $1000 at 5% for 3 years. Call this CALC_1.
+Step 2: The population in 2024 is BASE_POP. Retrieve this from the census API. Call this LOOKUP_1.
+Step 3: The answer is CALC_1 divided by LOOKUP_1.
+```
+
+Only after the reasoning structure is fixed does the runtime make tool calls to fill in `CALC_1` and `LOOKUP_1`, substituting results and evaluating the final expression. The advantage is that the reasoning graph is produced by the model in a single forward pass, without the sequential dependency on intermediate results that makes direct tool use brittle. Errors in one tool call can be diagnosed at a specific node in the graph rather than propagating through downstream reasoning.
+
+Gao et al. report that CoA outperforms direct ReAct-style tool use on multi-step mathematical reasoning and knowledge-intensive QA tasks. The gain is largest on tasks requiring three or more sequential tool calls, consistent with the hypothesis that compounding dependency is the primary source of fragility.
+
+## 7. Tool Design Principles
+
+Effective tool use depends as much on tool design as on model capability. Four principles govern reliable tool interfaces.
+
+**Reliability.** Tools should produce deterministic or near-deterministic outputs for a given input. Stochastic tools (e.g., tools that call another language model internally) introduce variance that the orchestrating model cannot account for. When stochasticity is unavoidable, tools should communicate uncertainty explicitly in their return values.
+
+**Documentation.** The JSON Schema description fields are the only signal the model has about what a tool does and when to use it. Descriptions must be precise, unambiguous, and include examples of correct argument values. Vague descriptions ("performs some data operation") lead to misuse; specific descriptions ("returns the closing price of a NASDAQ ticker on a given trading day in YYYY-MM-DD format") enable reliable invocation.
+
+**Atomicity.** Tools should have a single, well-defined responsibility. A tool that "searches the web and summarizes results" conflates retrieval with summarization; if either step fails, the failure is opaque. Separate tools for "web search returning raw snippets" and "summarize text" give the model control over each step and produce interpretable error signals.
+
+**Parseable outputs.** Tool return values should be structured (JSON, typed dataclasses) rather than free text. Free-text returns require the model to parse natural language before reasoning over results, introducing an additional failure mode. Structured returns enable direct field access in subsequent reasoning.
+
+## 8. Implementing a Tool-Use Loop
+
+The following implementation demonstrates the complete tool-use loop without external API dependencies, using a rule-based dispatcher in place of a language model to make the mechanics visible.
+
+```python
+import json
+import math
+from typing import Any, Callable
+
+TOOL_REGISTRY: dict[str, dict[str, Any]] = {}
+
+def tool(schema: dict[str, Any]) -> Callable:
+    def decorator(fn: Callable) -> Callable:
+        TOOL_REGISTRY[schema["name"]] = {"fn": fn, "schema": schema}
+        return fn
+    return decorator
+
+@tool({
+    "name": "calculator",
+    "description": "Evaluate a mathematical expression. Returns a float.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "A Python arithmetic expression, e.g. '2 ** 10 + sqrt(144)'"
+            }
+        },
+        "required": ["expression"]
+    }
+})
+def calculator(expression: str) -> float:
+    allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
+    allowed["abs"] = abs
+    return float(eval(expression, {"__builtins__": {}}, allowed))
+
+@tool({
+    "name": "lookup_capital",
+    "description": "Return the capital city of a country.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "country": {"type": "string", "description": "Country name in English"}
+        },
+        "required": ["country"]
+    }
+})
+def lookup_capital(country: str) -> str:
+    db = {
+        "France": "Paris", "Germany": "Berlin", "Japan": "Tokyo",
+        "Brazil": "Brasilia", "Australia": "Canberra", "Canada": "Ottawa",
+    }
+    return db.get(country, f"Unknown capital for '{country}'")
+
+def dispatch(call: dict[str, Any]) -> Any:
+    name = call["name"]
+    args = call.get("arguments", {})
+    if isinstance(args, str):
+        args = json.loads(args)
+    if name not in TOOL_REGISTRY:
+        return {"error": f"No tool named '{name}'"}
+    return TOOL_REGISTRY[name]["fn"](**args)
+
+def mock_llm(messages: list[dict]) -> dict:
+    """
+    Minimal rule-based mock that mimics the assistant turn of an LLM
+    with function-calling capability. Parses the last user message to
+    decide whether to call a tool or produce a final answer.
+    """
+    last_user = next(
+        (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+    )
+    tool_results = [m for m in messages if m["role"] == "tool"]
+
+    if "capital" in last_user.lower() and not tool_results:
+        country = "France" if "france" in last_user.lower() else "Japan"
+        return {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "tc_1", "type": "function",
+                 "function": {"name": "lookup_capital",
+                              "arguments": json.dumps({"country": country})}}
+            ]
+        }
+    if "sqrt" in last_user.lower() or "**" in last_user.lower():
+        if not tool_results:
+            expr = "sqrt(144) + 2 ** 10"
+            return {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "tc_2", "type": "function",
+                     "function": {"name": "calculator",
+                                  "arguments": json.dumps({"expression": expr})}}
+                ]
+            }
+    if tool_results:
+        last_result = tool_results[-1]["content"]
+        return {
+            "role": "assistant",
+            "content": f"Based on the tool result: {last_result}"
+        }
+    return {"role": "assistant", "content": "I can answer that directly: 42."}
+
+def run_agent(user_query: str, max_steps: int = 6) -> str:
+    messages = [{"role": "user", "content": user_query}]
+    for step in range(max_steps):
+        response = mock_llm(messages)
+        messages.append(response)
+        if "tool_calls" not in response:
+            return response.get("content", "")
+        for call in response["tool_calls"]:
+            fn_info = call["function"]
+            result = dispatch(fn_info)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": str(result)
+            })
+    return "Max steps reached without final answer."
+
+queries = [
+    "What is the capital of France?",
+    "Compute sqrt(144) + 2**10",
+    "What is the meaning of life?",
+]
+for q in queries:
+    answer = run_agent(q)
+    print(f"Q: {q}\nA: {answer}\n")
+```
+
+Running this loop produces:
+
+```
+Q: What is the capital of France?
+A: Based on the tool result: Paris
+
+Q: Compute sqrt(144) + 2**10
+A: Based on the tool result: 1036.0
+
+Q: What is the meaning of life?
+A: I can answer that directly: 42.
+```
+
+The mock demonstrates the structural mechanics: messages accumulate, tool calls are dispatched to a typed registry, results are injected as tool-role messages, and the agent terminates on a content-only assistant turn. Replacing `mock_llm` with an actual API call (passing `tools=[s["schema"] for s in TOOL_REGISTRY.values()]` and parsing the response's `tool_calls` field) converts this skeleton into a production loop.
+
+The second demonstration shows tool composition: computing a result that requires the `calculator` tool while leaving the reasoning structure in the calling code.
+
+```python
+def multi_step_demo() -> dict[str, float]:
+    results = {}
+    interest_rate = 0.05
+    principal = 1000.0
+    years = 3
+    expr = f"{principal} * (1 + {interest_rate}) ** {years}"
+    results["compound_interest"] = calculator(expression=expr)
+    results["log2_population_estimate"] = calculator(expression="log2(8e9)")
+    results["answer"] = results["compound_interest"] / results["log2_population_estimate"]
+    return results
+
+print(multi_step_demo())
+```
+
+This pattern implements Chain-of-Abstraction manually: the computation graph is expressed in Python (the "abstract" layer), and tool calls fill in the numerical leaves.
+
+## 9. Evaluation and Failure Modes
+
+Benchmarking tool-use agents requires metrics beyond end-task accuracy. Three dimensions matter.
+
+**Call precision and recall.** Does the model invoke the correct tool for each sub-problem (precision), and does it invoke all necessary tools (recall)? APIBench measures this via Abstract Syntax Tree (AST) comparison of generated versus reference API calls.
+
+**Argument correctness.** Even when the correct tool is named, arguments may be wrong. Argument correctness requires field-level comparison and is more sensitive than name-level matching. Gorilla's primary gain over baseline models is in argument correctness rather than tool selection.
+
+**Efficiency.** An agent that correctly answers a question in 10 tool calls when 2 suffice is expensive to run. Trajectory length is a proxy for reasoning efficiency and correlates with latency and API cost.
+
+Common failure modes include: invoking a tool when parametric knowledge suffices (over-reliance), failing to invoke a tool when external grounding is needed (under-reliance), generating syntactically valid but semantically incorrect argument bundles (hallucination), and entering cycles where repeated tool calls return the same observation without triggering a state change in reasoning.
+
+Mitigations include explicit stopping criteria in system prompts, tool-use training data that includes negative examples (situations where no tool call is correct), and structured output validation before dispatch.
+
+## References
+
+1. Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y. (2023). ReAct: Synergizing Reasoning and Acting in Language Models. *ICLR 2023*. https://arxiv.org/abs/2210.03629
+
+2. Patil, S. G., Zhang, T., Wang, X., & Gonzalez, J. E. (2023). Gorilla: Large Language Model Connected with Massive APIs. *arXiv preprint*. https://arxiv.org/abs/2305.15334
+
+3. Yang, Z., Li, L., Wang, J., Lin, K., Azarnasab, E., Ahmed, F., Liu, Z., Liu, C., Zeng, M., & Wang, L. (2023). MM-ReAct: Prompting ChatGPT for Multimodal Reasoning and Action. *arXiv preprint*. https://arxiv.org/abs/2303.11381
+
+4. Gao, J., Gu, L., Su, J., Guo, Y., Li, M., Li, J., Chen, W., & Bi, W. (2024). Efficient Tool Use with Chain-of-Abstraction Reasoning. *arXiv preprint*. https://arxiv.org/abs/2401.17464

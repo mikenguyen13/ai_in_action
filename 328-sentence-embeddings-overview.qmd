@@ -1,0 +1,355 @@
+# Sentence Embeddings: From BERT Pooling to SBERT {#sec-sentence-embeddings}
+
+Downstream applications in natural language processing -- semantic search, document clustering, paraphrase detection, and cross-lingual retrieval -- require a fixed-length vector that faithfully encodes the meaning of an entire sentence or paragraph. Token-level representations from transformer encoders do not satisfy this requirement directly: BERT produces a sequence of hidden states whose length equals the number of subword tokens, which varies from sentence to sentence. Constructing a sentence-level embedding therefore requires either an aggregation strategy over those token states or a purpose-designed training objective that shapes the embedding space. This chapter traces the line from naive BERT pooling strategies through the Sentence-BERT architecture, examines the theoretical reasons raw BERT fails at semantic similarity, surveys competing approaches, and demonstrates each technique with executable code.
+
+## 1. The Sentence Embedding Problem
+
+Given a sentence $s$ consisting of $n$ tokens, a BERT-style encoder produces a sequence of contextualised hidden states $\mathbf{H} = [\mathbf{h}_0, \mathbf{h}_1, \ldots, \mathbf{h}_n] \in \mathbb{R}^{(n+2) \times d}$ where $d$ is the hidden dimension (typically 768 for BERT-base) and the +2 accounts for the prepended [CLS] and appended [SEP] special tokens. A sentence embedding is a map $f: s \mapsto \mathbf{z} \in \mathbb{R}^d$ that is independent of sentence length. The vector $\mathbf{z}$ must encode enough semantic content that the cosine similarity $\text{cos}(\mathbf{z}_i, \mathbf{z}_j)$ reflects the semantic relatedness of sentences $s_i$ and $s_j$.
+
+This requirement connects to two practical concerns. First, semantic search over a corpus of $N$ documents requires computing $N$ embeddings offline and answering queries with a single matrix-vector product, giving $O(N)$ retrieval. An alternative -- the cross-encoder that feeds every (query, document) pair through a BERT model -- achieves higher accuracy but costs $O(N)$ forward passes at query time, which is infeasible for $N > 10^4$. Second, many evaluation protocols (Semantic Textual Similarity, STS) define a gold cosine score on sentence pairs; the embedding space must therefore be geometrically meaningful, not merely discriminative.
+
+## 2. Raw BERT Aggregation Strategies
+
+### 2.1 The [CLS] Token
+
+BERT prepends a special [CLS] symbol to every input. The original BERT paper (Devlin et al. 2019) uses the final-layer hidden state $\mathbf{h}_0^{(L)}$ as a summary representation for classification tasks, feeding it into a linear head. The intuition is that the transformer's self-attention can route global information into $\mathbf{h}_0$. For sentence embeddings the natural choice is therefore to extract $\mathbf{h}_0^{(L)}$ directly.
+
+However, Reimers and Gurevych (2019) showed empirically that this approach is catastrophic for semantic similarity. On the STS Benchmark, CLS-pooled BERT-base achieves a Spearman correlation of only 0.20, far below the 0.36 obtained by simply averaging static GloVe vectors over words. The explanation is that BERT's pretraining objectives (masked language modelling and next sentence prediction) never explicitly reward the [CLS] embedding for capturing sentential semantics. Its geometry is tuned for classification discrimination, not for metric learning.
+
+### 2.2 Mean Pooling
+
+A straightforward fix is to average all non-padding token embeddings from the final layer:
+
+$$\mathbf{z} = \frac{1}{n+2} \sum_{i=0}^{n+1} \mathbf{h}_i^{(L)}$$
+
+where the sum runs over [CLS], all content tokens, and [SEP]. This spreads semantic signal across all positions and avoids over-reliance on any single token. Reimers and Gurevych (2019) report that mean pooling outperforms CLS pooling on STS tasks by a substantial margin, though it still falls short of models fine-tuned for similarity.
+
+### 2.3 Multi-Layer Pooling
+
+BERT's later layers are more task-specific, while middle layers encode richer syntactic and lexical information. Averaging over the last two or four layers before pooling over positions can capture complementary signals:
+
+$$\mathbf{z} = \frac{1}{K} \sum_{l=L-K+1}^{L} \frac{1}{n+2} \sum_{i=0}^{n+1} \mathbf{h}_i^{(l)}$$
+
+for $K \in \{2, 4\}$. Jawahar et al. (2019) and others document that lower BERT layers capture syntax while upper layers specialise in semantics, so multi-layer pooling is a principled hedge.
+
+### 2.4 Max Pooling
+
+Element-wise maximum across the token dimension captures the most activated feature at each dimension:
+
+$$z_j = \max_{i \in \{0,\ldots,n+1\}} h_{ij}^{(L)}$$
+
+This pools the peak activation per feature regardless of where it occurs, analogous to max-over-time pooling in CNNs for text. In practice, mean pooling generally outperforms max pooling for semantic similarity but max pooling can be more robust to outlier token representations.
+
+The following code implements all four strategies using DistilBERT (a 66M-parameter distillation of BERT-base, fully CPU-feasible) and reports pairwise cosine similarities on a small set of example sentences.
+
+```python
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+model = AutoModel.from_pretrained("distilbert-base-uncased")
+model.eval()
+
+sentences = [
+    "The cat sat on the mat.",
+    "A feline rested on a rug.",
+    "The stock market closed higher today.",
+    "Investors were pleased with quarterly earnings.",
+]
+
+
+def encode(sentences, strategy="mean"):
+    encoded = tokenizer(
+        sentences, padding=True, truncation=True,
+        max_length=128, return_tensors="pt"
+    )
+    with torch.no_grad():
+        out = model(**encoded, output_hidden_states=True)
+
+    hidden_states = out.hidden_states  # tuple of (batch, seq_len, 768)
+    last = hidden_states[-1]
+    mask = encoded["attention_mask"].unsqueeze(-1).float()
+
+    if strategy == "cls":
+        return last[:, 0, :]
+
+    elif strategy == "mean":
+        return (last * mask).sum(1) / mask.sum(1)
+
+    elif strategy == "mean_last4":
+        stacked = torch.stack(hidden_states[-4:], dim=0).mean(0)
+        return (stacked * mask).sum(1) / mask.sum(1)
+
+    elif strategy == "max":
+        last_masked = last + (1 - mask) * (-1e9)
+        return last_masked.max(dim=1).values
+
+    raise ValueError(f"Unknown strategy: {strategy}")
+
+
+for strategy in ("cls", "mean", "mean_last4", "max"):
+    embs = encode(sentences, strategy=strategy)
+    embs = F.normalize(embs, dim=-1)
+    sim_cat_rug = (embs[0] * embs[1]).sum().item()
+    sim_cat_stock = (embs[0] * embs[2]).sum().item()
+    sim_stock_earnings = (embs[2] * embs[3]).sum().item()
+    print(
+        f"{strategy:12s} | cat/rug={sim_cat_rug:.3f}  "
+        f"cat/stock={sim_cat_stock:.3f}  "
+        f"stock/earnings={sim_stock_earnings:.3f}"
+    )
+```
+
+On a typical run the mean and mean_last4 strategies assign higher cosine scores to semantically similar pairs (cat/rug, stock/earnings) than to the cross-topic pair (cat/stock), while the CLS strategy produces near-uniform scores reflecting the collapsed geometry described next.
+
+## 3. The Anisotropy Problem
+
+Ethayarajh (2019) provides a theoretical and empirical account of why BERT embeddings perform poorly for cosine similarity. Define the anisotropy of a set of representations as the expected cosine similarity between two randomly drawn vectors:
+
+$$a = \mathbb{E}_{i \neq j}\left[\cos(\mathbf{h}_i, \mathbf{h}_j)\right]$$
+
+For an isotropic distribution (vectors spread uniformly over the unit sphere) $a \approx 0$. Ethayarajh measures $a > 0.99$ for the uppermost layers of GPT-2 and values approaching 1.0 for BERT's final layer. Nearly all token embeddings occupy a narrow cone in $\mathbb{R}^d$, so cosine similarities between any two vectors are uniformly high and carry no discriminative signal.
+
+The geometric cause is the softmax attention mechanism. During training, attention distributions concentrate on a small subset of tokens to minimise prediction loss, pulling their representations toward a dominant direction. Residual connections then propagate this bias through all layers. The result is a degenerate embedding space in which pairwise cosine similarity is essentially constant regardless of semantic content. Fine-tuning on a supervised similarity objective is necessary to expand the representations back toward isotropy.
+
+## 4. Sentence-BERT
+
+### 4.1 Architecture
+
+Reimers and Gurevych (2019) introduced Sentence-BERT (SBERT) to address this deficiency. SBERT wraps a BERT (or RoBERTa) encoder inside a siamese network: both sentences $s_i$ and $s_j$ are passed independently through the same shared encoder, a mean-pooling layer produces fixed-length vectors $\mathbf{u}, \mathbf{v} \in \mathbb{R}^d$, and a task-specific training objective shapes the resulting space.
+
+```{mermaid}
+graph TD
+    A["Sentence A"] --> B["BERT Encoder (shared weights)"]
+    C["Sentence B"] --> D["BERT Encoder (shared weights)"]
+    B --> E["Mean Pooling -> u"]
+    D --> F["Mean Pooling -> v"]
+    E --> G["Objective"]
+    F --> G
+```
+
+The siamese weight-sharing is crucial: it guarantees that two sentences which are semantically equivalent receive similar representations regardless of surface form, because the encoder must map both through the same parameter space.
+
+### 4.2 Training Objectives
+
+**NLI fine-tuning.** Using the Stanford NLI and MultiNLI corpora, SBERT trains a classifier on the concatenated vector $[\mathbf{u}; \mathbf{v}; |\mathbf{u} - \mathbf{v}|] \in \mathbb{R}^{3d}$ with a 3-class softmax predicting entailment, neutral, or contradiction:
+
+$$\mathcal{L}_\text{NLI} = -\sum_{k=1}^{3} y_k \log \hat{y}_k$$
+
+The element-wise difference $|\mathbf{u} - \mathbf{v}|$ provides a direct measure of component-wise discrepancy, which the model learns to associate with each relation class. By forcing the network to distinguish entailment from contradiction, training implicitly encourages semantically similar sentences to cluster together in embedding space.
+
+**STS fine-tuning.** For regression on gold similarity scores $g \in [0, 1]$, SBERT minimises the mean-squared error between the predicted cosine similarity and $g$:
+
+$$\mathcal{L}_\text{STS} = \left(\cos(\mathbf{u}, \mathbf{v}) - g\right)^2$$
+
+This objective directly aligns the geometric relationship between $\mathbf{u}$ and $\mathbf{v}$ with human-judged semantic relatedness.
+
+**Triplet loss.** For datasets with anchor $a$, positive $p$, and negative $n$, SBERT can also be trained with
+
+$$\mathcal{L}_\text{triplet} = \max\!\left(0,\ \|\mathbf{z}_a - \mathbf{z}_p\|_2 - \|\mathbf{z}_a - \mathbf{z}_n\|_2 + \epsilon\right)$$
+
+where $\epsilon > 0$ is a margin. This is standard metric learning and ensures the positive is closer to the anchor than the negative by at least $\epsilon$.
+
+### 4.3 Efficiency Advantage
+
+A cross-encoder that feeds $(s_i, s_j)$ as a single concatenated input through BERT computes attention across both sentences jointly and can in principle model complex cross-sentence interactions. However, pairwise similarity on $N$ sentences requires $\binom{N}{2}$ forward passes. For $N = 10\,000$ that is approximately $5 \times 10^7$ token pairs, which Reimers and Gurevych measure at 65 hours on a V100 GPU.
+
+SBERT instead pre-computes all $N$ embeddings in a single pass ($N$ forward passes of single sentences), then computes pairwise cosine similarities as a single matrix multiplication $\mathbf{Z}\mathbf{Z}^\top$ where $\mathbf{Z} \in \mathbb{R}^{N \times d}$. The same 10,000-sentence task takes approximately 5 seconds -- a speedup of roughly 65x -- with only modest accuracy degradation relative to the cross-encoder.
+
+## 5. The sentence-transformers Library
+
+The `sentence-transformers` library (UKPLab) provides a polished implementation of SBERT and dozens of pre-trained models. The following examples are CPU-runnable using `all-MiniLM-L6-v2`, a 22M-parameter model distilled to preserve SBERT quality at minimal compute cost.
+
+```python
+from sentence_transformers import SentenceTransformer, util
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+corpus = [
+    "A dog is playing fetch in the park.",
+    "A puppy chases a ball on the grass.",
+    "Scientists discover a new species of beetle.",
+    "Researchers identify previously unknown insect in Amazon.",
+    "The Federal Reserve raised interest rates by 25 basis points.",
+    "Central bank increases borrowing costs amid inflation concerns.",
+    "How do neural networks learn representations?",
+    "Deep learning models extract features through gradient descent.",
+    "The Eiffel Tower is located in Paris, France.",
+    "Paris is the capital and most populous city of France.",
+    "Photosynthesis converts sunlight into chemical energy in plants.",
+    "Chlorophyll in leaves absorbs light to produce glucose.",
+    "Electric vehicles are becoming more affordable each year.",
+    "Battery-powered cars gain market share as prices decline.",
+    "The Python programming language emphasises code readability.",
+    "Python syntax is designed to be clear and concise.",
+    "Climate change increases the frequency of extreme weather events.",
+    "Global warming intensifies hurricanes and droughts.",
+    "Mozart composed his first symphony at age eight.",
+    "The child prodigy wrote orchestral music before age ten.",
+]
+
+query = "How are machine learning models trained?"
+
+corpus_embeddings = model.encode(corpus, convert_to_tensor=True)
+query_embedding = model.encode(query, convert_to_tensor=True)
+
+hits = util.semantic_search(query_embedding, corpus_embeddings, top_k=3)[0]
+
+print(f"Query: {query}\n")
+for rank, hit in enumerate(hits, 1):
+    idx = hit["corpus_id"]
+    score = hit["score"]
+    print(f"  {rank}. (score={score:.4f}) {corpus[idx]}")
+```
+
+### 5.1 Paraphrase Mining
+
+A common production task is to identify near-duplicate or paraphrastic sentence pairs in a corpus. The `util.paraphrase_mining` function efficiently computes all pairwise similarities and returns pairs above a threshold:
+
+```python
+from sentence_transformers import SentenceTransformer, util
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+sentences = [
+    "How can I reset my password?",
+    "What is the procedure to change my login credentials?",
+    "I forgot my password, what do I do?",
+    "My account is locked, how do I unlock it?",
+    "How do I update my email address?",
+    "Can I change the email associated with my account?",
+    "What payment methods are accepted?",
+    "Which forms of payment do you support?",
+]
+
+paraphrases = util.paraphrase_mining(model, sentences, min_score=0.6)
+
+for score, i, j in paraphrases:
+    print(f"  score={score:.4f}  [{i}] {sentences[i]}")
+    print(f"             [{j}] {sentences[j]}")
+    print()
+```
+
+This detects that the password-reset variants and the payment-method variants are paraphrases, enabling deduplication or FAQ consolidation pipelines without any labelled data.
+
+## 6. Competing Sentence Embedding Methods
+
+### 6.1 Doc2Vec
+
+Le and Mikolov (2014) extended Word2Vec to learn paragraph vectors jointly with word vectors. Each document is assigned a unique id embedding that participates in the prediction of word context. Training is unsupervised and scales to large corpora, but the resulting embeddings are not optimised for semantic similarity and typically underperform SBERT by 5-15 Spearman points on STS benchmarks. Doc2Vec remains useful when labelled NLI or STS data is unavailable and computational resources preclude transformer inference.
+
+### 6.2 InferSent
+
+Conneau et al. (2017) trained a BiLSTM encoder on the Stanford NLI corpus using the same $[\mathbf{u}; \mathbf{v}; |\mathbf{u} - \mathbf{v}|; \mathbf{u} \odot \mathbf{v}]$ concatenation objective as SBERT's NLI variant. InferSent was the state of the art for English sentence embeddings at the time of release and demonstrated that NLI provides a strong transfer signal for semantic similarity. SBERT supersedes it by replacing the BiLSTM with a pretrained transformer encoder.
+
+### 6.3 Universal Sentence Encoder
+
+Cer et al. (2018) released the Universal Sentence Encoder (USE) in two variants: a deep averaging network (DAN) encoder for speed and a transformer encoder for accuracy. USE is trained on a diverse multi-task objective including SNLI, conversational input-response prediction, and supervised similarity data. It is distributed via TensorFlow Hub and supports easy deployment, though the transformer variant is closed-source. On STS-B, the transformer USE achieves competitive Spearman correlations but SBERT fine-tuned on STS data typically outperforms it.
+
+### 6.4 E5
+
+Wang et al. (2022) introduced E5 (EmbEddings from bidirEctional Encoder rEpresentations), trained via contrastive learning on a curated mixture of web data totalling over 1.3 billion sentence pairs. E5 adopts a prompting convention: queries are prefixed with "query: " and documents with "passage: " before encoding. This asymmetric prompting allows the model to learn distinct representations for retrieval-style short queries versus longer passage documents:
+
+$$\mathbf{z}_q = \text{MeanPool}\big(\text{BERT}(\text{"query: "} + s_q)\big)$$
+$$\mathbf{z}_d = \text{MeanPool}\big(\text{BERT}(\text{"passage: "} + s_d)\big)$$
+
+The contrastive loss is a standard in-batch negative InfoNCE objective:
+
+$$\mathcal{L}_\text{E5} = -\log \frac{\exp(\mathbf{z}_q^\top \mathbf{z}_{d^+} / \tau)}{\sum_{j} \exp(\mathbf{z}_q^\top \mathbf{z}_{d_j} / \tau)}$$
+
+where $d^+$ is the relevant document and $d_j$ ranges over all documents in the batch (including negatives). On MTEB, E5-large and its instruction-tuned successor E5-mistral rank at or near the top of the embedding leaderboard across retrieval tasks.
+
+## 7. MTEB: Massive Text Embedding Benchmark
+
+Muennighoff et al. (2022) introduced the Massive Text Embedding Benchmark (MTEB) to provide a comprehensive and reproducible evaluation framework for sentence embeddings. MTEB encompasses 58 datasets across 8 task categories:
+
+- **Classification**: sentence-level classification using a k-NN or logistic probe on embeddings.
+- **Clustering**: grouping sentences by topic using k-means, evaluated with V-measure.
+- **Pair classification**: binary or multi-class labelling of sentence pairs (paraphrase, duplicate detection).
+- **Reranking**: reranking a set of candidate documents for a query.
+- **Retrieval**: standard IR setting with corpus, queries, and relevance judgements (BEIR subset).
+- **Semantic Textual Similarity (STS)**: Spearman correlation with human similarity scores.
+- **Summarisation**: correlation between embedding-based similarity and human coherence judgements.
+- **Bitext mining**: cross-lingual alignment of parallel sentences across 112 languages.
+
+MTEB aggregates results into a single mean score over all tasks, which has become the standard for comparing sentence embedding models. The leaderboard (available at huggingface.co/spaces/mteb/leaderboard) shows that as of 2024-2025, instruction-tuned large models such as E5-mistral-7b-instruct and GTE-Qwen2-7B-instruct occupy the top positions, with scores exceeding 65 on the aggregate metric. Efficient small models such as all-MiniLM-L6-v2 score around 56, trading several points of accuracy for a 10-30x reduction in inference cost.
+
+MTEB also reveals task-specific performance patterns. Models trained heavily on NLI transfer well to STS but may underperform on retrieval tasks requiring asymmetric query-document matching. Conversely, models pre-trained with contrastive retrieval objectives (E5, BGE) excel at retrieval but can show lower STS scores. Practitioners should therefore select models based on their specific task distribution rather than relying on a single aggregate number.
+
+## 8. Full Semantic Search Demo
+
+The following self-contained demo encodes a 20-sentence corpus, indexes the embeddings, and answers two queries by returning the top-3 most similar documents.
+
+```python
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+corpus = [
+    "Transformers use self-attention to model long-range dependencies.",
+    "BERT is pretrained on masked language modelling and next sentence prediction.",
+    "GPT-2 generates text autoregressively using a causal language model.",
+    "Reinforcement learning from human feedback aligns language models with preferences.",
+    "Gradient descent updates parameters to minimise a loss function.",
+    "Backpropagation computes gradients via the chain rule of calculus.",
+    "Convolutional neural networks exploit spatial locality in images.",
+    "Recurrent neural networks process sequences with hidden state propagation.",
+    "Attention mechanisms let models focus on relevant parts of the input.",
+    "Dropout randomly zeroes activations during training to prevent overfitting.",
+    "Adam optimiser combines momentum and adaptive learning rates.",
+    "Batch normalisation stabilises training by normalising layer inputs.",
+    "Transfer learning uses pretrained weights as initialisation for new tasks.",
+    "Fine-tuning updates all model parameters on a downstream dataset.",
+    "Prompt engineering elicits desired behaviour from frozen language models.",
+    "Retrieval-augmented generation grounds model outputs in external documents.",
+    "Knowledge distillation trains a small student to mimic a large teacher.",
+    "Quantisation reduces model precision from 32-bit to 8-bit or lower.",
+    "Sparse attention reduces the quadratic cost of full self-attention.",
+    "Mixture of experts routes tokens to specialised subnetworks for efficiency.",
+]
+
+corpus_embeddings = model.encode(corpus, convert_to_tensor=True, show_progress_bar=False)
+corpus_embeddings = util.normalize_embeddings(corpus_embeddings)
+
+queries = [
+    "How does backpropagation work in neural networks?",
+    "What techniques make large language models smaller and faster?",
+]
+
+for query in queries:
+    query_embedding = model.encode(query, convert_to_tensor=True)
+    query_embedding = util.normalize_embeddings(query_embedding.unsqueeze(0)).squeeze(0)
+    hits = util.semantic_search(query_embedding, corpus_embeddings, top_k=3)[0]
+    print(f"Query: {query}")
+    for rank, hit in enumerate(hits, 1):
+        print(f"  {rank}. score={hit['score']:.4f} -- {corpus[hit['corpus_id']]}")
+    print()
+```
+
+This pipeline represents the minimal viable semantic search system: offline corpus encoding ($O(N)$ cost), followed by $O(Nd)$ dot-product retrieval at query time. For production deployments at scale, the dense embeddings are typically indexed in an approximate nearest-neighbour structure (FAISS, ScaNN, or HNSW via HNSWLIB) to reduce retrieval from $O(Nd)$ to sub-linear cost.
+
+## 9. Summary
+
+The progression from BERT pooling to SBERT illustrates a recurring theme in representation learning: architectural expressiveness is a necessary but not sufficient condition for a useful embedding space. Raw BERT embeddings collapse onto a narrow cone due to anisotropy induced by softmax attention, rendering cosine similarity uninformative regardless of pooling strategy. SBERT's siamese architecture with NLI or STS fine-tuning reshapes the space so that geometric proximity corresponds to semantic relatedness, enabling efficient bi-encoder retrieval at scale. Contemporary models such as E5 and GTE extend this approach by scaling contrastive pretraining to billion-pair web datasets and incorporating instruction tuning, pushing MTEB scores to new heights while preserving the efficiency advantage of the bi-encoder paradigm.
+
+## References
+
+1. Reimers, N. and Gurevych, I. (2019). Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks. *Proceedings of EMNLP 2019*. https://arxiv.org/abs/1908.10084
+
+2. Ethayarajh, K. (2019). How Contextual are Contextualized Word Representations? Comparing the Geometry of BERT, ELMo, and GPT-2 Embeddings. *Proceedings of EMNLP 2019*. https://arxiv.org/abs/1909.00512
+
+3. Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. (2019). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. *Proceedings of NAACL 2019*. https://arxiv.org/abs/1810.04805
+
+4. Cer, D., Yang, Y., Kong, S., Hua, N., Limtiaco, N., John, R. St., Constant, N., Guajardo-Cespedes, M., Yuan, S., Tar, C., Strope, B., and Kurzweil, R. (2018). Universal Sentence Encoder. https://arxiv.org/abs/1803.11175
+
+5. Wang, L., Yang, N., Huang, X., Jiao, B., Yang, L., Jiang, D., Majumder, R., and Wei, F. (2022). Text Embeddings by Weakly-Supervised Contrastive Pre-training. https://arxiv.org/abs/2212.03533
+
+6. Muennighoff, N., Tazi, N., Magne, L., and Reimers, N. (2022). MTEB: Massive Text Embedding Benchmark. https://arxiv.org/abs/2210.07316
+
+7. Le, Q. V. and Mikolov, T. (2014). Distributed Representations of Sentences and Documents. *Proceedings of ICML 2014*. https://arxiv.org/abs/1405.4053
+
+8. Conneau, A., Kiela, D., Schwenk, H., Barrault, L., and Bordes, A. (2017). Supervised Learning of Universal Sentence Representations from Natural Language Inference Data. *Proceedings of EMNLP 2017*. https://arxiv.org/abs/1705.02364
+
+9. Jawahar, G., Sagot, B., and Seddah, D. (2019). What Does BERT Learn about the Structure of Language? *Proceedings of ACL 2019*. https://aclanthology.org/P19-1356/

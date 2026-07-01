@@ -1,0 +1,315 @@
+# Multi-Agent LLM Systems {#sec-multi-agent-llm}
+
+A single large language model, no matter how capable, suffers a fundamental limitation: it produces one stream of reasoning from one implicit perspective. When a model writes code and then reviews it in the same forward pass, the review inherits all the biases and blind spots of the generation step. Multi-agent systems address this by distributing cognitive labor across several model instances, each constrained to a role, a perspective, or a stage of a pipeline. The resulting architecture enables specialization, parallelism, adversarial cross-checking, and iterative refinement that a monolithic model cannot replicate.
+
+## 1. Why Multiple Agents
+
+### 1.1 Division of Labor and Specialization
+
+Human organizations achieve reliability and quality through role differentiation. A software team separates product requirements, architecture, implementation, code review, and testing because each task demands different expertise and, critically, because the person writing code is ill-suited to evaluate whether requirements were met. The same logic applies to LLM systems. An agent whose system prompt constrains it to the role of security auditor will surface different vulnerabilities than the agent that wrote the code, even if both use the same underlying model weights.
+
+Specialization in multi-agent LLM systems is implemented by fixing a role-specific system prompt for each agent. The system prompt encodes constraints ("you only flag security issues, not style"), domain vocabulary ("assume OWASP Top 10 as your framework"), and output format ("respond with a numbered list of CVEs"). Because transformer models are highly sensitive to context, a well-crafted system prompt reliably shifts the model's distribution toward the desired behavior.
+
+### 1.2 Parallelism
+
+Tasks with independent subtasks are natural candidates for parallel agent execution. Generating multiple candidate solutions, searching several knowledge sources simultaneously, or producing first drafts of several document sections in parallel all benefit from concurrent agent invocation. The total wall-clock time for $N$ independent tasks with expected duration $\mu$ becomes $\mu$ rather than $N\mu$ when agents run in parallel, at the cost of $N$ times the token budget.
+
+### 1.3 Adversarial Checking and Debate
+
+Perhaps the most important motivation for multi-agent systems is adversarial verification. When one agent produces an answer and a second agent is explicitly prompted to find flaws, the second agent's critique is statistically independent of the first agent's generation, conditioned only on the text content of the answer. This independence breaks the autocorrelation that plagues single-model self-critique.
+
+Define the probability that a single agent makes an undetected error as $\epsilon$. If a second independent agent reviews the output and catches errors with probability $p_{\text{detect}}$, the residual error rate falls to $\epsilon(1 - p_{\text{detect}})$. With $k$ independent reviewers each catching errors independently, the residual error rate is $\epsilon \prod_{i=1}^{k}(1-p_{\text{detect},i})$. For $p_{\text{detect}} = 0.7$ and $k = 2$, this reduces $\epsilon$ by a factor of $0.09$, nearly an order of magnitude.
+
+## 2. ChatDev: Simulating a Software Company
+
+Qian et al. (2023) introduced ChatDev, a system that instantiates a virtual software company populated entirely by LLM agents. The company comprises roles including CEO, Chief Product Officer, Chief Technology Officer, Programmer, Code Reviewer, and Tester. Each agent is a separate LLM instance with a fixed role-defining system prompt.
+
+### 2.1 The Inception Prompting Technique
+
+The core challenge in multi-agent chat is maintaining role consistency while injecting task-relevant context. A naive approach would alter the system prompt for each task, but this creates prompt-injection risks and inconsistency. ChatDev instead uses what the authors call "Inception" prompting: the system prompt is frozen and defines role identity, while the task description and inter-agent messages are injected into the conversation history as user turns. The agent thus "learns" about the current task through the conversation, not through modification of its identity.
+
+Formally, let $s_r$ be the fixed system prompt for role $r$. The conversation history at step $t$ is $H_t = \{(u_1, a_1), \ldots, (u_t, a_t)\}$ where $u_i$ is a user-role message and $a_i$ is an assistant-role response. Each agent generates:
+
+$$a_{t+1} = \text{LLM}(s_r, H_t, u_{t+1})$$
+
+The role identity in $s_r$ remains fixed throughout the project, while the accumulating $H_t$ carries the full project context. This prevents role collapse while enabling contextual adaptation.
+
+### 2.2 Structured Communication Protocol
+
+Agents in ChatDev communicate through a structured phase-based protocol. The software development lifecycle is divided into phases: Designing (CEO and CPO produce requirements), Coding (CTO and Programmer implement), Code Review (Programmer and Reviewer iterate), and Testing (Programmer and Tester iterate on identified bugs). Each phase is a separate multi-turn dialogue between two designated agents. The output of each phase becomes input to the next, creating a waterfall-like pipeline with LLM-mediated handoffs.
+
+This phase structure prevents the combinatorial explosion of all-to-all communication and enforces a directed acyclic graph of information flow, reducing the risk of circular dependencies and echo chambers.
+
+## 3. AutoGen: Flexible Conversational Agents
+
+Wu et al. (2023) introduced AutoGen, a framework that generalizes multi-agent collaboration to arbitrary conversation topologies. Rather than prescribing a fixed organizational structure like ChatDev, AutoGen provides composable primitives that developers combine to build application-specific agent networks.
+
+### 3.1 Core Abstractions
+
+The fundamental unit in AutoGen is the `ConversableAgent`: an entity that can send messages, receive messages, and optionally execute code or call tools. Two specializations are particularly important. The `AssistantAgent` is an LLM-backed agent configured to write code, answer questions, and produce structured outputs. The `UserProxyAgent` acts as a proxy for human oversight, executing code in a sandbox, relaying results back to the assistant, and optionally soliciting human input at configurable checkpoints.
+
+The `UserProxyAgent` exposes a `human_input_mode` parameter with three values: `ALWAYS` (prompt a human on every turn), `NEVER` (fully autonomous), and `TERMINATE` (prompt only when the agent signals completion). This configurable human-in-the-loop mechanism allows the same agent architecture to be deployed across a spectrum from fully supervised to fully autonomous operation.
+
+### 3.2 Conversation Topologies
+
+AutoGen supports several topologies beyond the simple two-agent dialogue. In group chats, a `GroupChatManager` coordinates multiple agents by selecting the next speaker according to a policy (round-robin, LLM-selected, or custom). Sequential chats chain independent two-agent conversations, passing a summary of each conversation as context to the next. Nested chats allow one agent to spawn a sub-conversation with other agents as a subroutine, enabling hierarchical task decomposition.
+
+The group chat manager's speaker selection policy can itself be an LLM prompt, making the coordination logic adaptive. Given the current conversation history $H$ and the set of available agents $\mathcal{A}$, the manager solves:
+
+$$a^* = \arg\max_{a \in \mathcal{A}} \text{LLM}(\text{``Given the conversation, which agent should speak next?''}, H)$$
+
+This meta-level reasoning enables dynamic role assignment that responds to the evolving state of the task.
+
+## 4. MetaGPT: Standard Operating Procedures as Agent Programs
+
+Hong et al. (2023) observed that the primary failure mode of unconstrained multi-agent systems is information loss at handoff boundaries. When agents communicate in natural language, structured information degrades: an agent that produces a precise entity-relationship diagram in its reasoning may transmit only a prose summary to the next agent, losing the formal structure. MetaGPT addresses this by encoding software engineering Standard Operating Procedures (SOPs) into the agent workflow and requiring structured, typed outputs at each stage.
+
+### 4.1 Role-Structured Output Schema
+
+Each MetaGPT agent role produces a document defined by a schema rather than free text. The Product Manager produces a Product Requirements Document (PRD) with sections for goals, user stories, competitive analysis, and success metrics. The Architect produces a system design document with class diagrams, sequence diagrams, and file structure. The Engineer produces implementation code. The QA Engineer produces a test suite. These structured outputs are stored in a shared message pool.
+
+### 4.2 Publish-Subscribe Communication
+
+The shared message pool implements a publish-subscribe pattern. Each agent publishes its structured output to the pool tagged with its role and document type. Downstream agents subscribe to the document types they require: the Architect subscribes to PRDs, the Engineer subscribes to design documents, the QA Engineer subscribes to both design documents and code. This explicit subscription graph replaces the implicit assumption that all agents have access to all information, reducing context length and focusing each agent's attention on relevant inputs.
+
+Let $M_r$ be the set of message types produced by role $r$, and $S_r$ be the set of message types to which role $r$ subscribes. The information available to agent $r$ at step $t$ is:
+
+$$I_r^{(t)} = \bigcup_{r' : M_{r'} \cap S_r \neq \emptyset} \{m \in \text{Pool}_t : \text{type}(m) \in S_r\}$$
+
+This selective information access prevents context bloat while preserving the information dependency graph required for coherent collaboration. Hong et al. (2023) report that MetaGPT achieves 85.9% pass@1 on HumanEval when used for code generation tasks, attributed to the structured handoffs that preserve semantic content across role boundaries.
+
+## 5. Multi-Agent Debate
+
+Du et al. (2023) proposed a multi-agent debate protocol for improving factuality and reasoning. The protocol proceeds in rounds: in round $t=0$, each of $N$ agents independently generates an answer to a question. In subsequent rounds $t = 1, \ldots, T$, each agent reads all agents' answers from round $t-1$ and produces a revised answer. After $T$ rounds, the final answers are aggregated by majority vote or by a designated judge agent.
+
+### 5.1 Why Debate Improves Reasoning
+
+The information-theoretic motivation is that the initial answers form a sample from the LLM's output distribution. Different random seeds, sampling temperatures, or minor prompt variations produce diverse initial answers. When an agent reads answers that differ from its own, it is exposed to reasoning paths it did not generate, which can trigger recognition of its own errors. The debate process implements a form of iterated best-response:
+
+$$a_i^{(t)} = \text{LLM}\!\left(s_i,\; q,\; \{a_j^{(t-1)}\}_{j=1}^{N}\right)$$
+
+where $s_i$ is agent $i$'s system prompt, $q$ is the question, and $\{a_j^{(t-1)}\}$ is the set of all agents' previous answers. Over rounds, agents converge toward answers consistent with the majority reasoning chain, while agents with outlier positions must either articulate compelling arguments or update their position.
+
+### 5.2 Empirical Results
+
+Du et al. (2023) evaluate multi-agent debate on biography generation (factuality measured against Wikipedia), the MATH benchmark, and chess move prediction. With $N = 3$ agents and $T = 2$ debate rounds, factuality on biography generation improves by approximately 11 percentage points over a single-agent baseline. On MATH, accuracy improves from 51.3% to 60.4%. The improvements are largest on questions where agents initially disagree, confirming that debate is most valuable when the initial answer distribution is multimodal.
+
+### 5.3 Aggregation Strategies
+
+Simple majority voting over final-round answers is a strong baseline: if the probability of any single agent producing the correct answer is $p$ and agents are independent, the probability that a majority of $N$ agents is correct is $\sum_{k=\lceil N/2 \rceil}^{N} \binom{N}{k} p^k (1-p)^{N-k}$, which exceeds $p$ whenever $p > 0.5$. A judge agent that reads all final answers and selects the best-reasoned one can outperform majority vote when $p < 0.5$ for the majority of agents, since the judge can identify quality signals beyond mere agreement.
+
+## 6. Failure Modes
+
+### 6.1 Echo Chambers
+
+Multi-agent debate assumes diversity of initial answers. If agents share the same model, the same temperature, and receive the same prompt, their initial answers are nearly identical, and the debate degrades to a single-agent interaction with expensive overhead. Even with diverse agents, social pressure dynamics in the debate prompt can cause minority-correct agents to capitulate to a confident but wrong majority. Mitigation strategies include enforcing diverse system prompts, using distinct model versions, and requiring agents to explicitly state disagreements rather than silently updating.
+
+### 6.2 Role Collapse
+
+Agents with long conversation histories gradually lose fidelity to their assigned roles as the accumulating context dilutes the signal from the system prompt. A Programmer agent may begin offering product requirements opinions after dozens of turns of mixed-domain conversation. Role collapse can be detected by prompting the agent to state its role and responsibilities, and mitigated by periodic system prompt reinforcement or by resetting the conversation history to only the most relevant recent exchanges.
+
+### 6.3 Context Length Explosion
+
+In a group chat with $N$ agents exchanging $k$ messages each over $T$ rounds, the total context length grows as $O(NkT \cdot \bar{l})$ where $\bar{l}$ is the average message length. For $N = 5$, $k = 10$, $T = 5$, and $\bar{l} = 500$ tokens, the context already exceeds 125,000 tokens, at or beyond the limits of current models and expensive to process. Practical systems must implement context summarization, selective retention, or the publish-subscribe selective visibility pattern from MetaGPT to keep individual agent contexts manageable.
+
+### 6.4 Coordination Overhead
+
+Coordination messages (routing, acknowledgment, role assignment, format negotiation) consume tokens without advancing the task. In systems where the coordination protocol is itself LLM-generated (as in AutoGen's LLM-based speaker selection), coordination can consume a non-trivial fraction of total compute. Fixed-topology systems like ChatDev avoid this by hardcoding the coordination graph, trading flexibility for efficiency.
+
+## 7. Implementation: Two-Agent Debate in Python
+
+The following implementation demonstrates the multi-agent debate protocol with two agents alternating between answer generation and critique, converging on a consensus answer. The `MockLLM` class replaces actual model calls with deterministic responses to keep the demo CPU-runnable without API keys or GPU resources.
+
+```python
+from __future__ import annotations
+import textwrap
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+@dataclass
+class Message:
+    role: str
+    content: str
+
+
+@dataclass
+class Agent:
+    name: str
+    system_prompt: str
+    llm: Callable[[list[Message]], str]
+    history: list[Message] = field(default_factory=list)
+
+    def respond(self, user_message: str) -> str:
+        self.history.append(Message(role="user", content=user_message))
+        response = self.llm([Message(role="system", content=self.system_prompt)] + self.history)
+        self.history.append(Message(role="assistant", content=response))
+        return response
+
+    def reset(self) -> None:
+        self.history = []
+
+
+def make_mock_llm(responses: list[str]) -> Callable[[list[Message]], str]:
+    """Return an LLM stub that cycles through a fixed list of responses."""
+    state = {"idx": 0}
+
+    def llm(messages: list[Message]) -> str:
+        response = responses[state["idx"] % len(responses)]
+        state["idx"] += 1
+        return response
+
+    return llm
+
+
+def debate(question: str, agent_a: Agent, agent_b: Agent, rounds: int = 2) -> str:
+    """
+    Run a two-agent debate:
+      Round 0: both agents independently answer the question.
+      Rounds 1..T: each agent reads the other's previous answer and revises.
+      Final: agent_a proposes consensus; agent_b accepts or refines.
+    Returns the consensus answer string.
+    """
+    agent_a.reset()
+    agent_b.reset()
+
+    print(f"Question: {question}\n{'='*60}")
+
+    a_answer = agent_a.respond(f"Answer the following question:\n{question}")
+    b_answer = agent_b.respond(f"Answer the following question:\n{question}")
+
+    print(f"[Round 0] Agent A: {a_answer}")
+    print(f"[Round 0] Agent B: {b_answer}\n")
+
+    for r in range(1, rounds + 1):
+        critique_prompt_a = (
+            f"Your previous answer was:\n{a_answer}\n\n"
+            f"Agent B answered:\n{b_answer}\n\n"
+            "Identify any errors or improvements. Provide a revised answer."
+        )
+        critique_prompt_b = (
+            f"Your previous answer was:\n{b_answer}\n\n"
+            f"Agent A answered:\n{a_answer}\n\n"
+            "Identify any errors or improvements. Provide a revised answer."
+        )
+        a_answer = agent_a.respond(critique_prompt_a)
+        b_answer = agent_b.respond(critique_prompt_b)
+        print(f"[Round {r}] Agent A revised: {a_answer}")
+        print(f"[Round {r}] Agent B revised: {b_answer}\n")
+
+    consensus_prompt = (
+        f"Based on the debate, propose a single consensus answer to:\n{question}\n"
+        f"Your final position: {a_answer}\n"
+        f"Agent B's final position: {b_answer}"
+    )
+    consensus = agent_a.respond(consensus_prompt)
+    print(f"[Consensus] {consensus}")
+    return consensus
+
+
+agent_a_responses = [
+    "The capital of Australia is Sydney.",
+    "I reconsidered. Agent B correctly notes it is Canberra, not Sydney. My revised answer: Canberra.",
+    "Consensus: The capital of Australia is Canberra, established as a planned capital city in 1913.",
+]
+
+agent_b_responses = [
+    "The capital of Australia is Canberra.",
+    "My answer stands: Canberra. Agent A's initial claim of Sydney is a common misconception. Revised: Canberra.",
+]
+
+agent_a = Agent(
+    name="Agent A",
+    system_prompt="You are a careful reasoner. State your answer concisely and correct errors when challenged.",
+    llm=make_mock_llm(agent_a_responses),
+)
+
+agent_b = Agent(
+    name="Agent B",
+    system_prompt="You are a critical evaluator. Identify factual errors and provide accurate corrections.",
+    llm=make_mock_llm(agent_b_responses),
+)
+
+result = debate("What is the capital of Australia?", agent_a, agent_b, rounds=1)
+print(f"\nFinal answer: {result}")
+```
+
+The output shows Agent A initially producing the common misconception that Sydney is Australia's capital, Agent B immediately correcting it, and Agent A revising its position in the subsequent round. The consensus correctly identifies Canberra. In a production system, the `MockLLM` is replaced with calls to a real model API, and the system prompts are tuned to encourage genuine disagreement and evidence-based revision rather than social capitulation.
+
+The following example demonstrates a minimal group-chat coordinator that routes messages to agents by role:
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class SharedMessagePool:
+    """Central store with typed publish-subscribe routing."""
+    _store: list[dict[str, Any]] = field(default_factory=list)
+
+    def publish(self, role: str, doc_type: str, content: str) -> None:
+        self._store.append({"role": role, "doc_type": doc_type, "content": content})
+
+    def subscribe(self, doc_types: list[str]) -> list[dict[str, Any]]:
+        return [m for m in self._store if m["doc_type"] in doc_types]
+
+
+def run_pipeline(task: str) -> dict[str, str]:
+    pool = SharedMessagePool()
+
+    pool.publish(
+        role="product_manager",
+        doc_type="prd",
+        content=f"PRD for: {task}\nGoal: deliver a working implementation.\nAcceptance: all tests pass.",
+    )
+
+    prd_messages = pool.subscribe(["prd"])
+    prd_text = prd_messages[-1]["content"]
+    pool.publish(
+        role="architect",
+        doc_type="design",
+        content=f"Design derived from PRD:\n{prd_text}\nApproach: modular functions, typed interfaces.",
+    )
+
+    design_messages = pool.subscribe(["design"])
+    design_text = design_messages[-1]["content"]
+    pool.publish(
+        role="engineer",
+        doc_type="code",
+        content=f"# Implementation\n# Based on: {design_text[:60]}...\ndef solve(): return 42",
+    )
+
+    code_messages = pool.subscribe(["code"])
+    code_text = code_messages[-1]["content"]
+    pool.publish(
+        role="qa",
+        doc_type="tests",
+        content=f"# Tests for code\nassert solve() == 42  # from: {code_text[:40]}...",
+    )
+
+    return {
+        msg["role"]: msg["content"]
+        for msg in pool.subscribe(["prd", "design", "code", "tests"])
+    }
+
+
+artifacts = run_pipeline("implement a function that returns 42")
+for role, content in artifacts.items():
+    print(f"--- {role.upper()} ---")
+    print(content[:120])
+    print()
+```
+
+This second demo implements the MetaGPT publish-subscribe pattern. Each "agent" publishes a typed document to the shared pool; downstream agents subscribe only to the document types they need. The `subscribe` method enforces the information dependency graph without requiring all agents to process the entire conversation history.
+
+## References
+
+1. Qian, C., Cong, X., Yang, C., Chen, W., Su, Y., Xu, J., Liu, Z., and Sun, M. (2023). Communicative agents for software development. arXiv:2307.07924. https://arxiv.org/abs/2307.07924
+
+2. Wu, Q., Bansal, G., Zhang, J., Wu, Y., Li, B., Zhu, E., Jiang, L., Zhang, X., Zhang, S., Liu, J., Awadallah, A. H., White, R. W., Burger, D., and Wang, C. (2023). AutoGen: Enabling next-gen LLM applications via multi-agent conversation. arXiv:2308.08155. https://arxiv.org/abs/2308.08155
+
+3. Hong, S., Zheng, X., Chen, J., Cheng, Y., Wang, J., Zhang, C., Wang, Z., Yau, S. K. S., Lin, Z., Zhou, L., Ran, C., Xiao, L., and Wu, C. (2023). MetaGPT: Meta programming for a multi-agent collaborative framework. arXiv:2308.00352. https://arxiv.org/abs/2308.00352
+
+4. Du, Y., Li, S., Torralba, A., Tenenbaum, J. B., and Mordatch, I. (2023). Improving factuality and reasoning in language models through multiagent debate. arXiv:2305.14325. https://arxiv.org/abs/2305.14325

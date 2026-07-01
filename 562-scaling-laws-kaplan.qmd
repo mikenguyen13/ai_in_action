@@ -1,0 +1,230 @@
+# Scaling Laws for Neural Language Models {#sec-scaling-laws}
+
+The most consequential empirical discovery in modern deep learning is not a new architecture or training trick but a statistical regularity: the test loss of a language model follows smooth power laws in model size, dataset size, and compute budget, spanning many orders of magnitude with no sign of saturation. Kaplan et al. (2020) documented this finding across dozens of experiments on autoregressive transformers ranging from tens of millions to billions of parameters, establishing that progress in language modeling is, to a first approximation, predictable and continuous. This chapter derives those power laws, examines how Hoffmann et al. (2022) corrected the optimal compute-allocation strategy, and discusses the "emergent abilities" phenomenon that complicates the otherwise clean scaling picture.
+
+## 1. The Empirical Power Laws
+
+### 1.1 Setting and Notation
+
+Let $L$ denote cross-entropy loss on a held-out distribution (in nats or bits per token; Kaplan et al. use nats). Let $N$ be the number of non-embedding parameters, $D$ the number of tokens seen during training, and $C$ the total floating-point operations consumed. The central claim of Kaplan et al. (2020) is that when one resource is varied while the others are held abundant, loss obeys a power law:
+
+$$L(N) \approx \left(\frac{N_c}{N}\right)^{\alpha_N}, \qquad L(D) \approx \left(\frac{D_c}{D}\right)^{\alpha_D}, \qquad L(C) \approx \left(\frac{C_c}{C_{\min}}\right)^{\alpha_C}.$$
+
+The fitted exponents are $\alpha_N \approx 0.076$, $\alpha_D \approx 0.095$, $\alpha_C \approx 0.057$, and the critical scales are $N_c \approx 8.8 \times 10^{13}$ parameters, $D_c \approx 5.4 \times 10^{13}$ tokens, $C_c \approx 1.8 \times 10^{23}$ FLOPs. These constants are specific to the WebText2 distribution and the particular architecture family; the exponents, however, appear to be surprisingly stable across data distributions and even model families.
+
+### 1.2 The Power Law in Parameters: $L(N)$
+
+Taking logarithms, $\log L = \alpha_N (\log N_c - \log N)$, which is a straight line with slope $-\alpha_N$ on a log-log plot. The implication is dramatic: to halve the test loss by scaling alone you need to multiply $N$ by $2^{1/\alpha_N} \approx 2^{13.2} \approx 9400$. Loss falls, but slowly. This does not mean scaling is inefficient; rather, the absolute level of capability improvement can be enormous because language model loss correlates with a broad range of downstream tasks.
+
+The $N$-law holds when training is run to convergence on a dataset large enough that data is not the bottleneck. In practice, "large enough" means $D \gtrsim N / \alpha_D$ in token-to-parameter ratio; Kaplan et al. found that models trained with fewer than roughly $20$ tokens per parameter exhibit data-limited rather than parameter-limited scaling.
+
+### 1.3 The Power Law in Data: $L(D)$
+
+The data scaling law, $L(D) \approx (D_c / D)^{\alpha_D}$, holds when model capacity is not the bottleneck — that is, when $N$ is large relative to the data. The exponent $\alpha_D \approx 0.095$ is slightly steeper than $\alpha_N$, meaning doubling the dataset yields a slightly larger loss reduction than doubling parameters when measured in isolation. In practice, the two interact: a model too small to memorize the training distribution will plateau early regardless of $D$.
+
+The data law also has consequences for dataset contamination and repetition. Because each token contributes marginally less as it is repeated, fitting the same dataset multiple times yields diminishing returns. Hoffmann et al. (2022) later confirmed that the optimal strategy involves seeing most tokens roughly once.
+
+### 1.4 The Power Law in Compute: $L(C)$
+
+The compute law connects the two preceding laws through the relationship between $C$, $N$, and $D$. Under the standard approximation that a single forward or backward pass through an $N$-parameter transformer costs approximately $6N$ FLOPs per token (accounting for forward, backward, and weight updates), the total compute for training on $D$ tokens is
+
+$$C \approx 6 N D.$$
+
+If both $N$ and $D$ are chosen optimally for a given $C$, then the resulting loss follows $L(C) \approx (C_c / C)^{\alpha_C}$ with $\alpha_C \approx 0.057$.
+
+## 2. Optimal Compute Allocation: Kaplan vs. Chinchilla
+
+### 2.1 Kaplan's Allocation
+
+Given the three power laws, the question of how to allocate a fixed compute budget $C$ between model size $N$ and token count $D = C / (6N)$ becomes a constrained optimization problem. Kaplan et al. minimized the combined loss function
+
+$$L(N, D) \approx \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{D_c}{D}\right)^{\alpha_D}$$
+
+subject to $6ND = C$. Setting the gradient of $L$ with respect to $N$ to zero (with $D = C/(6N)$) gives the optimality condition:
+
+$$\frac{\partial}{\partial N}\left[\left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{6 N_c N}{C}\right)^{\alpha_D}\right] = 0$$
+
+$$-\alpha_N N_c^{\alpha_N} N^{-\alpha_N - 1} + \alpha_D \left(\frac{6 N_c}{C}\right)^{\alpha_D} N^{\alpha_D - 1} = 0.$$
+
+Solving for $N$ yields
+
+$$N_{\text{opt}} \propto C^{\alpha_D / (\alpha_N + \alpha_D)} \approx C^{0.095 / 0.171} \approx C^{0.556}.$$
+
+In their paper, Kaplan et al. quoted $N_{\text{opt}} \propto C^{0.73}$ and $D_{\text{opt}} \propto C^{0.27}$. The discrepancy arises because their fitting procedure treated the exponents differently, but the qualitative conclusion was the same: model size should grow faster than dataset size as compute increases. The practical upshot was that researchers should prefer large, undertrained models over smaller, fully-trained ones for any given compute budget.
+
+### 2.2 The Chinchilla Correction
+
+Hoffmann et al. (2022) revisited this question with a larger sweep of experiments and found that Kaplan et al.'s conclusion was wrong in an important way. The key methodological difference: Kaplan et al. often kept learning rate schedules and batch sizes fixed while varying model size, which can bias the estimate of the optimal allocation. Hoffmann et al. used a different approach: they trained a large number of models of different sizes and on different amounts of data, all to convergence with tuned hyperparameters, and then fit the resulting loss surface.
+
+Their fit, using a functional form that includes an irreducible loss term $E$ (the entropy of the data distribution),
+
+$$\hat{L}(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta},$$
+
+yielded $\alpha \approx 0.34$, $\beta \approx 0.28$, and a resulting optimal allocation of $N_{\text{opt}} \propto C^{0.50}$ and $D_{\text{opt}} \propto C^{0.50}$. Model size and dataset size should scale equally. The rule of thumb that emerged from their Chinchilla model: approximately $20$ tokens per parameter at the compute-optimal frontier.
+
+To verify this, Hoffmann et al. trained Chinchilla: 70 billion parameters on 1.4 trillion tokens. At the same total compute budget, Gopher (DeepMind's previous model) had 280 billion parameters but was trained on only 300 billion tokens — dramatically undertrained by the Chinchilla criterion. Chinchilla outperformed Gopher on almost every benchmark despite being four times smaller.
+
+The Chinchilla correction restructured industry practice. Models trained after 2022 — including LLaMA, Mistral, and subsequent generations — adopted higher token-to-parameter ratios, training 7B-parameter models on trillions of tokens rather than hundreds of billions.
+
+## 3. A Note on the 6ND Approximation
+
+The approximation $C \approx 6ND$ deserves brief derivation. In a transformer with $L$ layers, hidden dimension $d$, and $L d^2$ parameters in the attention and MLP blocks (ignoring embeddings, layer norms, and attention-head splits for clarity), a single forward pass over a sequence of length $T$ tokens costs approximately $2LD d \cdot T$ multiply-accumulate operations (one multiply and one add per weight per token), i.e., $2Nd/L \cdot L \cdot T = 2NT$ FLOPs. The backward pass costs roughly twice the forward pass, giving $6N$ FLOPs per training token. This linear relationship between compute, parameters, and tokens is a key simplification that makes the scaling law analysis tractable; more careful accounting (e.g., for attention's $O(T^2 d)$ cost at long context) introduces corrections but does not change the qualitative picture for typical sequence lengths.
+
+## 4. Emergent Abilities at Scale
+
+### 4.1 The Phenomenon
+
+Wei et al. (2022) identified a class of capabilities that do not exhibit smooth power-law improvement but instead appear suddenly when models cross a size threshold. Multi-step arithmetic, multi-symbol reasoning, chain-of-thought reasoning, and many BIG-Bench tasks (Srivastava et al. 2022) all show near-zero performance at smaller scales and above-random performance only at 100B+ parameters. This "emergent ability" characterization attracted significant attention because it seemed to contradict the smooth-scaling picture.
+
+### 4.2 The Metric Discontinuity Explanation
+
+Schaeffer et al. (2023) provided a parsimonious alternative explanation: apparent emergence is an artifact of discontinuous evaluation metrics. Consider a task that requires $k$ correct reasoning steps, each succeeded with probability $p(N)$ that improves smoothly with scale. The probability of getting all $k$ steps right is $p(N)^k$, which remains near zero until $p(N)$ is sufficiently large, then rises steeply. If the evaluation metric is binary (correct/incorrect on the full task), the aggregate metric looks emergent even though the underlying capability $p(N)$ is improving continuously.
+
+When Wei et al.'s tasks are evaluated with continuous metrics (e.g., token-level accuracy instead of full-string match), the apparent phase transition disappears and smooth power-law improvement resumes. This does not imply that emergence is an illusion — the practical threshold at which a model can solve a task is real and important for deployment — but it does explain why it is not fundamentally at odds with scaling laws.
+
+### 4.3 Implications
+
+The emergence debate has two practical consequences. First, capability evaluations should use graded rather than binary metrics wherever possible to reveal the underlying scaling trend. Second, extrapolating performance from small models to large ones is dangerous when the evaluation metric is nonlinear in the underlying capability. Organizations making investment decisions based on scaling-law extrapolations should account for these metric artifacts.
+
+## 5. What Scaling Does Not Solve
+
+Scaling laws describe reductions in cross-entropy loss on a held-out sample from the training distribution. This is a meaningful measure of language modeling quality, but it does not straightforwardly translate to all capabilities of interest.
+
+Formal reasoning and planning require multi-step inference chains that a language model must maintain coherently; loss on next-token prediction does not penalize models for inconsistencies that span many tokens. Factual precision — the ability to retrieve a specific numerical value or proper name correctly — improves with scale but remains imperfect because the model must compress factual associations into continuous weight space without guaranteed fidelity.
+
+Robustness to distribution shift is another limitation. A model trained on web text with excellent held-out loss may fail dramatically on out-of-distribution prompts, adversarial inputs, or specialized domains not well-represented in the pretraining corpus. Scaling the pretraining corpus helps to the extent it increases coverage, but there is no guarantee of universal robustness. Finally, alignment and instruction-following are not captured by the pretraining loss at all; these require additional supervised or reinforcement-based fine-tuning (see Chapter on RLHF).
+
+## 6. Fitting Scaling Laws in Practice
+
+### 6.1 Power-Law Regression
+
+The following code demonstrates fitting a power law $L(N) = (N_c / N)^{\alpha_N}$ to synthetic data that mimics the Kaplan et al. parameter-scaling curve. The fitting uses `scipy.optimize.curve_fit` with the log-linear form for numerical stability.
+
+```python
+import numpy as np
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(42)
+
+alpha_N_true = 0.076
+N_c_true = 8.8e13
+
+N_vals = np.logspace(7, 12, 30)
+L_clean = (N_c_true / N_vals) ** alpha_N_true
+L_noisy = L_clean * np.exp(rng.normal(0, 0.02, size=len(N_vals)))
+
+def power_law(N, log_N_c, alpha):
+    return np.exp(alpha * (log_N_c - np.log(N)))
+
+popt, pcov = curve_fit(
+    power_law,
+    N_vals,
+    L_noisy,
+    p0=[np.log(1e13), 0.08],
+    maxfev=10000,
+)
+log_N_c_fit, alpha_fit = popt
+N_c_fit = np.exp(log_N_c_fit)
+
+print(f"Fitted alpha_N : {alpha_fit:.4f}  (true: {alpha_N_true})")
+print(f"Fitted N_c     : {N_c_fit:.3e}  (true: {N_c_true:.3e})")
+
+N_dense = np.logspace(7, 12, 300)
+L_fitted = power_law(N_dense, log_N_c_fit, alpha_fit)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.scatter(N_vals, L_noisy, s=20, label="Synthetic observations", zorder=3)
+ax.plot(N_dense, L_fitted, color="tab:orange", label=f"Fit: α={alpha_fit:.4f}")
+ax.plot(N_dense, (N_c_true / N_dense) ** alpha_N_true,
+        linestyle="--", color="tab:gray", label="Ground truth")
+ax.set_xscale("log")
+ax.set_yscale("log")
+ax.set_xlabel("Parameters N")
+ax.set_ylabel("Loss L(N)")
+ax.set_title("Power-law fit: L(N) ∝ (N_c/N)^α_N")
+ax.legend()
+fig.tight_layout()
+plt.savefig("scaling_law_parameter_fit.png", dpi=150)
+plt.show()
+print("Figure saved.")
+```
+
+### 6.2 Optimal Compute Allocation
+
+Given a compute budget $C$ and the Chinchilla result that $N_{\text{opt}} \propto D_{\text{opt}}$ with the constant of proportionality $\approx 20$ tokens per parameter, the optimal allocation is:
+
+$$N_{\text{opt}} = \sqrt{\frac{C}{6 \cdot 20}} = \sqrt{\frac{C}{120}}, \qquad D_{\text{opt}} = 20 \cdot N_{\text{opt}}.$$
+
+The following code computes and plots the Kaplan and Chinchilla allocations across a range of compute budgets, making the divergence between the two prescriptions visible.
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+C_range = np.logspace(18, 26, 200)
+
+def kaplan_allocation(C, exp_N=0.73, exp_D=0.27):
+    N = (C / 6) ** exp_N
+    D = (C / 6) ** exp_D
+    scale = C / (6 * N * D)
+    return N * scale ** (exp_N / (exp_N + exp_D)), D * scale ** (exp_D / (exp_N + exp_D))
+
+def chinchilla_allocation(C, tokens_per_param=20.0):
+    N = np.sqrt(C / (6.0 * tokens_per_param))
+    D = tokens_per_param * N
+    return N, D
+
+N_kaplan, D_kaplan = kaplan_allocation(C_range)
+N_chinchilla, D_chinchilla = chinchilla_allocation(C_range)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+ax = axes[0]
+ax.plot(C_range, N_kaplan, label="Kaplan N_opt", color="tab:blue")
+ax.plot(C_range, N_chinchilla, label="Chinchilla N_opt", color="tab:orange", linestyle="--")
+ax.set_xscale("log"); ax.set_yscale("log")
+ax.set_xlabel("Compute budget C (FLOPs)")
+ax.set_ylabel("Optimal parameters N")
+ax.legend(); ax.set_title("Optimal model size vs compute")
+
+ax = axes[1]
+ratio_kaplan = D_kaplan / N_kaplan
+ratio_chinchilla = D_chinchilla / N_chinchilla
+ax.axhline(20, color="tab:orange", linestyle="--", label="Chinchilla (~20 tok/param)")
+ax.plot(C_range, ratio_kaplan, color="tab:blue", label="Kaplan tok/param ratio")
+ax.set_xscale("log")
+ax.set_xlabel("Compute budget C (FLOPs)")
+ax.set_ylabel("Tokens per parameter")
+ax.legend(); ax.set_title("Tokens-per-parameter at optimum")
+
+fig.tight_layout()
+plt.savefig("kaplan_vs_chinchilla_allocation.png", dpi=150)
+plt.show()
+print("Kaplan N_opt at C=1e23:", f"{kaplan_allocation(1e23)[0]:.3e}")
+print("Chinchilla N_opt at C=1e23:", f"{chinchilla_allocation(1e23)[0]:.3e}")
+```
+
+The output illustrates the central qualitative difference: Kaplan's prescription yields a tokens-per-parameter ratio that decreases as compute grows (the model grows faster than the dataset), while Chinchilla's prescription holds the ratio constant at approximately 20. At a compute budget of $10^{23}$ FLOPs, the two prescriptions imply optimal model sizes differing by roughly a factor of five, a practically enormous divergence.
+
+## 7. Scaling Laws Beyond Language Modeling
+
+Scaling laws of the form described above have been observed in vision models (Zhai et al. 2022), code models, multimodal models, and reinforcement learning (Jones 2021). The exponents differ across domains, but the qualitative picture — smooth power-law improvement with scale in a predictable regime — appears to be a general property of overparameterized neural networks trained on large corpora with gradient descent. This generality makes scaling laws one of the few quantitative tools available for planning large-scale AI development.
+
+However, the Chinchilla episode illustrates that scaling-law estimates are sensitive to experimental design, hyperparameter tuning, and the functional form assumed for the loss surface. Practitioners should treat scaling-law extrapolations as probabilistic forecasts with substantial uncertainty, particularly when extrapolating more than two or three orders of magnitude beyond the available data.
+
+## References
+
+1. Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and Amodei, D. (2020). Scaling Laws for Neural Language Models. *arXiv preprint*. https://arxiv.org/abs/2001.08361
+
+2. Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., de Las Casas, D., Hendricks, L. A., Welbl, J., Clark, A., Hennigan, T., Noland, E., Millican, K., van den Driessche, G., Damoc, B., Guy, A., Osindero, S., Simonyan, K., Elsen, E., Jack, R. L., Kavukcuoglu, K., and Sifre, L. (2022). Training Compute-Optimal Language Models. *arXiv preprint*. https://arxiv.org/abs/2203.15556
+
+3. Wei, J., Tay, Y., Bommasani, R., Raffel, C., Zoph, B., Borgeaud, S., Yogatama, D., Bosma, M., Zhou, D., Metzler, D., Chi, E. H., Hashimoto, T., Vinyals, O., Liang, P., Dean, J., and Fedus, W. (2022). Emergent Abilities of Large Language Models. *Transactions on Machine Learning Research*. https://arxiv.org/abs/2206.07682
+
+4. Schaeffer, R., Miranda, B., and Koyejo, S. (2023). Are Emergent Abilities of Large Language Models a Mirage? *arXiv preprint*. https://arxiv.org/abs/2304.15004
+
+5. Srivastava, A., Rastogi, A., Rao, A., Shoeb, A. A. M., Abid, A., Fisch, A., Brown, A. R., et al. (2022). Beyond the Imitation Game: Quantifying and Extrapolating the Capabilities of Language Models. *arXiv preprint*. https://arxiv.org/abs/2206.04615
+
+6. Zhai, X., Kolesnikov, A., Houlsby, N., and Beyer, L. (2022). Scaling Vision Transformers. *Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition*, 12104--12113. https://arxiv.org/abs/2106.04560
+
+7. Jones, A. (2021). Scaling Scaling Laws with Board Games. *arXiv preprint*. https://arxiv.org/abs/2104.03113

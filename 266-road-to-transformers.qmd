@@ -1,0 +1,304 @@
+# The Road to Transformers {#sec-road-to-transformers}
+
+The transformer architecture, introduced in 2017, did not emerge from a vacuum. It was the culmination of two decades of increasingly sophisticated neural sequence models, each generation exposing the limitations of its predecessor and pointing toward what the next would need to solve. Understanding this lineage is not merely historical: the problems that motivated each transition---vanishing gradients, sequential bottlenecks, fixed-length representation, quadratic attention cost---remain live engineering concerns in every deployment of modern language and vision systems.
+
+## 1. The CNN Era and Residual Connections
+
+Convolutional neural networks demonstrated that depth was the key ingredient for representational power in vision tasks. AlexNet (Krizhevsky et al., 2012) showed that a five-layer convolutional network trained on GPU hardware could dramatically outperform hand-engineered features on ImageNet, reducing top-5 error from roughly 26% to 15.3%. VGGNet (Simonyan and Zisserman, 2014) pushed this further by using very small $3 \times 3$ convolution kernels stacked in deep configurations of 16 to 19 layers, demonstrating that depth itself, rather than large receptive fields, drove performance.
+
+The natural question was: why not go deeper? The empirical answer was troubling. Networks deeper than about 20 layers trained worse than shallower ones---not because of overfitting, but because of the vanishing gradient problem. During backpropagation, gradients are multiplied layer by layer via the chain rule. If each multiplication attenuates the signal, the gradient reaching early layers is exponentially smaller than the loss gradient at the output, making early-layer weights nearly untrainable.
+
+He et al. (2016) solved this with the residual connection, a deceptively simple modification. Instead of learning a direct mapping $\mathcal{H}(x)$ from input to output, a residual block learns only the residual $\mathcal{F}(x) = \mathcal{H}(x) - x$, so the full transformation is
+
+$$\mathcal{H}(x) = \mathcal{F}(x) + x.$$
+
+The addition of the identity shortcut $x$ creates an alternative path for gradient flow. During backpropagation through a residual block, the gradient of the loss $\mathcal{L}$ with respect to the block input satisfies
+
+$$\frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial \mathcal{H}} \cdot \left(1 + \frac{\partial \mathcal{F}}{\partial x}\right).$$
+
+The additive $1$ in the gradient ensures that even if $\partial \mathcal{F}/\partial x$ vanishes, a unit-magnitude gradient flows unimpeded through the skip connection back to all earlier layers. This allowed He et al. to train networks of 152 layers---ResNet-152---achieving 3.57% top-5 error on ImageNet, surpassing human-level performance on that benchmark. The deeper architectural insight is that residual connections make the optimization landscape substantially easier to traverse, a property later confirmed by loss landscape visualization work.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + residual)
+
+torch.manual_seed(0)
+block = ResidualBlock(channels=16)
+x = torch.randn(2, 16, 8, 8)
+y = block(x)
+
+y.sum().backward()
+grad_norm = x.grad.norm().item() if x.requires_grad else None
+
+x_req = torch.randn(2, 16, 8, 8, requires_grad=True)
+y_req = block(x_req)
+y_req.sum().backward()
+print(f"Input shape: {x_req.shape}, Output shape: {y_req.shape}")
+print(f"Input gradient norm: {x_req.grad.norm().item():.4f}")
+```
+
+## 2. The RNN and LSTM Era
+
+While CNNs reshaped computer vision, sequence modeling required a different inductive bias: the ability to process variable-length inputs where the order of elements carried meaning. Recurrent neural networks (RNNs) addressed this by maintaining a hidden state that accumulated information across time steps. The vanilla RNN update at time step $t$ is
+
+$$h_t = \tanh(W_h h_{t-1} + W_x x_t + b),$$
+
+where $h_t \in \mathbb{R}^d$ is the hidden state, $x_t \in \mathbb{R}^m$ is the input, and $W_h$, $W_x$ are weight matrices. The same parameters are reused at every step, giving the model a compact representation of sequential inductive bias.
+
+The fundamental weakness of the vanilla RNN mirrors the deep CNN problem: vanishing gradients through time. The gradient of the loss with respect to an early hidden state $h_k$ involves the product
+
+$$\frac{\partial \mathcal{L}}{\partial h_k} = \frac{\partial \mathcal{L}}{\partial h_T} \prod_{t=k+1}^{T} \frac{\partial h_t}{\partial h_{t-1}}.$$
+
+Each factor $\partial h_t / \partial h_{t-1} = \text{diag}(\tanh'(\cdot)) W_h$ has singular values that, for most initializations, are less than one. Over a sequence of length $T$, the product decays exponentially and early-step gradients vanish, preventing the model from learning long-range dependencies. Additionally, vanilla RNNs are inherently sequential: computing $h_t$ requires $h_{t-1}$, preventing parallelization across time steps during training.
+
+### 2.1 Long Short-Term Memory
+
+Hochreiter and Schmidhuber (1997) proposed the Long Short-Term Memory (LSTM) to address the vanishing gradient problem through a gating mechanism that provides a nearly constant error carousel. The LSTM maintains two state vectors: a cell state $c_t \in \mathbb{R}^d$ that acts as a long-term memory, and a hidden state $h_t \in \mathbb{R}^d$ that serves as the working output. The update equations are
+
+$$f_t = \sigma(W_f [h_{t-1}, x_t] + b_f) \quad \text{(forget gate)},$$
+$$i_t = \sigma(W_i [h_{t-1}, x_t] + b_i) \quad \text{(input gate)},$$
+$$\tilde{c}_t = \tanh(W_c [h_{t-1}, x_t] + b_c) \quad \text{(candidate cell)},$$
+$$c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t \quad \text{(cell update)},$$
+$$o_t = \sigma(W_o [h_{t-1}, x_t] + b_o) \quad \text{(output gate)},$$
+$$h_t = o_t \odot \tanh(c_t).$$
+
+The crucial innovation is the cell state update $c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$. When the forget gate is close to one and the input gate is close to zero, $c_t \approx c_{t-1}$: information flows forward through time with gradient magnitude near one. This creates a highway for gradient flow analogous to the residual connection in ResNet, but adaptive: the gates themselves are learned from data, allowing the network to decide what to retain, update, or erase.
+
+Cho et al. (2014) introduced the Gated Recurrent Unit (GRU) as a streamlined variant that merges the forget and input gates into a single update gate $z_t$ and eliminates the separate cell state, reducing parameter count while retaining much of the LSTM's capacity for long-range memory.
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(42)
+
+vocab_size = 20
+embed_dim = 16
+hidden_dim = 32
+seq_len = 10
+batch_size = 8
+
+X = torch.randint(0, vocab_size, (batch_size, seq_len))
+y = (X.float().mean(dim=1) > vocab_size / 2).long()
+
+embedding = nn.Embedding(vocab_size, embed_dim)
+lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
+classifier_lstm = nn.Linear(hidden_dim, 2)
+classifier_avg = nn.Linear(embed_dim, 2)
+
+optimizer_lstm = torch.optim.Adam(
+    list(embedding.parameters()) + list(lstm.parameters()) + list(classifier_lstm.parameters()),
+    lr=1e-2
+)
+optimizer_avg = torch.optim.Adam(
+    list(embedding.parameters()) + list(classifier_avg.parameters()),
+    lr=1e-2
+)
+loss_fn = nn.CrossEntropyLoss()
+
+for step in range(200):
+    emb = embedding(X)
+
+    out, (h_n, _) = lstm(emb)
+    logits_lstm = classifier_lstm(h_n.squeeze(0))
+    loss_lstm = loss_fn(logits_lstm, y)
+    optimizer_lstm.zero_grad()
+    loss_lstm.backward()
+    optimizer_lstm.step()
+
+    logits_avg = classifier_avg(emb.mean(dim=1))
+    loss_avg = loss_fn(logits_avg, y)
+    optimizer_avg.zero_grad()
+    loss_avg.backward()
+    optimizer_avg.step()
+
+with torch.no_grad():
+    emb = embedding(X)
+    _, (h_n, _) = lstm(emb)
+    acc_lstm = (classifier_lstm(h_n.squeeze(0)).argmax(1) == y).float().mean().item()
+    acc_avg = (classifier_avg(emb.mean(dim=1)).argmax(1) == y).float().mean().item()
+
+print(f"LSTM accuracy: {acc_lstm:.2f}")
+print(f"Mean-pooling accuracy: {acc_avg:.2f}")
+```
+
+Despite LSTMs' success on tasks requiring hundreds of time steps of memory---machine translation, speech recognition, language modeling---the sequential computation bottleneck remained a fundamental architectural constraint. Training on long sequences required processing tokens one at a time, making parallelization across the sequence dimension impossible and keeping wall-clock training times high even with GPU hardware.
+
+## 3. The Attention Breakthrough
+
+The next architectural advance came not from a new recurrent cell design but from reconsidering how the encoder's information should be delivered to the decoder. In the standard seq2seq model (Sutskever et al., 2014), the encoder processes an input sequence and compresses it into a single fixed-length vector, which the decoder uses as its initial hidden state. This bottleneck forces the model to encode all information about an arbitrarily long source sentence into a vector of fixed dimensionality, a task that becomes increasingly difficult as sentence length grows.
+
+Bahdanau et al. (2015) introduced a soft attention mechanism that allowed the decoder to dynamically query the entire sequence of encoder hidden states at each decoding step. Let $h_j$ denote the $j$-th encoder hidden state and $s_{i-1}$ the decoder hidden state at step $i-1$. The alignment score
+
+$$e_{ij} = a(s_{i-1}, h_j)$$
+
+is computed by a small feedforward network $a$ that measures how well the input position $j$ matches the current decoding context. Normalizing these scores with softmax gives attention weights
+
+$$\alpha_{ij} = \frac{\exp(e_{ij})}{\sum_{k} \exp(e_{ik})},$$
+
+and the context vector
+
+$$c_i = \sum_j \alpha_{ij} h_j$$
+
+is a weighted combination of all encoder hidden states, with weights concentrated on the positions most relevant to predicting the next output token. The decoder then conditions on $c_i$ rather than a single fixed vector.
+
+This mechanism solved the bottleneck problem while introducing a useful side effect: the attention weights $\alpha_{ij}$ are interpretable as soft alignments between source and target positions, providing a window into what the model is attending to. Empirically, Bahdanau et al. showed that attention-equipped seq2seq models maintained translation quality on long sentences where fixed-vector seq2seq degraded sharply.
+
+The attention computation as formulated still required an underlying RNN to produce the encoder states $h_j$. The transformer would eliminate that dependency entirely.
+
+## 4. The Transformer
+
+Vaswani et al. (2017) made the decisive observation: if attention is powerful enough to replace the fixed-length bottleneck in seq2seq, it may be powerful enough to replace the recurrent computation entirely. Their architecture, presented in "Attention is All You Need," relies exclusively on attention and feedforward layers, achieving superior translation quality while being substantially more parallelizable.
+
+### 4.1 Scaled Dot-Product Attention
+
+The core operation packs queries $Q \in \mathbb{R}^{n \times d_k}$, keys $K \in \mathbb{R}^{m \times d_k}$, and values $V \in \mathbb{R}^{m \times d_v}$ into a single matrix computation:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V.$$
+
+In self-attention, queries, keys, and values are all derived from the same input sequence $X \in \mathbb{R}^{n \times d}$ via learned linear projections:
+
+$$Q = X W_Q, \quad K = X W_K, \quad V = X W_V,$$
+
+with $W_Q, W_K \in \mathbb{R}^{d \times d_k}$ and $W_V \in \mathbb{R}^{d \times d_v}$. The scaling factor $1/\sqrt{d_k}$ prevents dot products from growing large in magnitude as $d_k$ increases, which would push the softmax into regions with vanishingly small gradients.
+
+The key property of self-attention is that every position attends directly to every other position in a single layer, giving a path length of $\mathcal{O}(1)$ between any two positions in the sequence. By contrast, an RNN requires $\mathcal{O}(n)$ steps to propagate information from position 1 to position $n$. This $\mathcal{O}(1)$ path length is precisely what allows transformers to learn long-range dependencies that RNNs struggle with.
+
+The computational cost of self-attention is $\mathcal{O}(n^2 d)$ per layer, since the $n \times n$ attention matrix must be formed explicitly. This quadratic dependence on sequence length became a significant research focus as practitioners applied transformers to longer contexts, motivating efficient attention variants such as sparse attention, linear attention, and FlashAttention.
+
+### 4.2 Multi-Head Attention
+
+Rather than computing a single attention function, the transformer computes $h$ attention functions in parallel, each with its own projection matrices:
+
+$$\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h) W_O,$$
+
+where $\text{head}_i = \text{Attention}(Q W_{Q_i}, K W_{K_i}, V W_{V_i})$ and $W_O \in \mathbb{R}^{h d_v \times d}$ projects the concatenated outputs back to the model dimension. Multiple heads allow the model to simultaneously attend to information from different representation subspaces at different positions---one head might learn syntactic dependencies while another captures semantic similarity.
+
+### 4.3 Positional Encoding
+
+Because self-attention is permutation-equivariant (reordering the rows of $X$ permutes the rows of the output identically), the model has no built-in sense of position. Vaswani et al. inject positional information by adding sinusoidal encodings to the input embeddings:
+
+$$PE_{(pos, 2i)} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \quad PE_{(pos, 2i+1)} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right),$$
+
+where $pos$ is the sequence position and $i$ indexes the embedding dimension. Different dimensions oscillate at different frequencies, allowing the model to attend to absolute positions via individual dimensions and to relative positions through linear combinations, since $PE_{pos+k}$ can be expressed as a linear function of $PE_{pos}$.
+
+### 4.4 The Full Architecture
+
+The encoder consists of $N$ identical layers, each containing a multi-head self-attention sublayer followed by a position-wise feedforward network, with residual connections and layer normalization around each sublayer:
+
+$$\text{SubLayer}(x) = \text{LayerNorm}(x + \text{sublayer}(x)).$$
+
+The feedforward network applies two linear transformations with a ReLU activation:
+
+$$\text{FFN}(x) = \max(0, x W_1 + b_1) W_2 + b_2,$$
+
+with the inner dimension typically four times the model dimension. The decoder adds a cross-attention sublayer between the self-attention and feedforward sublayers, where queries come from the decoder and keys and values come from the encoder output.
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+class ScaledDotProductAttention(nn.Module):
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+                mask: torch.Tensor = None) -> torch.Tensor:
+        d_k = Q.size(-1)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        weights = torch.softmax(scores, dim=-1)
+        return torch.matmul(weights, V), weights
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_k = d_model // num_heads
+        self.num_heads = num_heads
+        self.W_Q = nn.Linear(d_model, d_model)
+        self.W_K = nn.Linear(d_model, d_model)
+        self.W_V = nn.Linear(d_model, d_model)
+        self.W_O = nn.Linear(d_model, d_model)
+        self.attention = ScaledDotProductAttention()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        B = Q.size(0)
+        def project(W, x):
+            return W(x).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
+        Q, K, V = project(self.W_Q, Q), project(self.W_K, K), project(self.W_V, V)
+        out, _ = self.attention(Q, K, V)
+        out = out.transpose(1, 2).contiguous().view(B, -1, self.num_heads * self.d_k)
+        return self.W_O(out)
+
+def sinusoidal_encoding(seq_len: int, d_model: int) -> torch.Tensor:
+    pe = torch.zeros(seq_len, d_model)
+    pos = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)
+    div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)
+    return pe
+
+torch.manual_seed(7)
+d_model, num_heads, seq_len, batch = 64, 4, 12, 3
+mha = MultiHeadAttention(d_model, num_heads)
+x = torch.randn(batch, seq_len, d_model)
+pe = sinusoidal_encoding(seq_len, d_model)
+x_pos = x + pe.unsqueeze(0)
+out = mha(x_pos, x_pos, x_pos)
+print(f"Input: {x_pos.shape}, Output: {out.shape}")
+print(f"Positional encoding range: [{pe.min():.3f}, {pe.max():.3f}]")
+print(f"Output norm: {out.norm(dim=-1).mean().item():.4f}")
+```
+
+## 5. The Transition: From LSTM to Transformer Dominance
+
+The period from 2015 to 2018 represents a transitional phase during which attention mechanisms were grafted onto recurrent architectures before eventually supplanting them. The shift can be traced through a sequence of landmark models.
+
+ELMo (Peters et al., 2018) produced contextualized word representations by running a deep bidirectional LSTM over text and extracting hidden states from each layer. Its key insight---that the same word token should have different representations depending on context---proved enormously influential. Yet ELMo still depended on sequential LSTM computation, limiting the parallelism available during training.
+
+BERT (Devlin et al., 2018) and GPT (Radford et al., 2018) both appeared in the same year and both adopted the transformer architecture exclusively, discarding the LSTM entirely. BERT used a bidirectional transformer encoder pretrained with masked language modeling and next sentence prediction, then fine-tuned on downstream tasks. GPT used a unidirectional transformer decoder pretrained with causal language modeling. Both achieved state-of-the-art results across a wide range of natural language benchmarks, definitively demonstrating that the recurrent inductive bias was not necessary for strong sequential performance and that the transformer's parallelism advantage during training enabled scaling to larger datasets than LSTM-based models could efficiently exploit.
+
+The retrospective explanation for why transformers superseded LSTMs combines several factors. First, full parallelism across sequence positions allows training throughput to scale with compute in a way sequential models cannot match. Second, the $\mathcal{O}(1)$ maximum path length between any two positions in a single transformer layer fundamentally changes the optimization difficulty of learning long-range dependencies: gradient flows directly between any two positions without multiplicative attenuation through intermediate steps. Third, the attention mechanism provides an explicit, learned routing mechanism for information across the sequence, whereas the LSTM must compress all relevant context into the fixed-dimensional hidden state through nonlinear gates. Fourth, transformers scale more predictably with model size and data volume, as documented by subsequent scaling law research (Kaplan et al., 2020), making investment in larger models reliably productive in a way that larger LSTM stacks were not.
+
+The CNN era established that depth and residual connectivity were key to learning hierarchical representations in vision. The RNN era demonstrated that sequential inductive bias could be encoded in learned gating mechanisms, but revealed the fundamental tension between expressiveness and training efficiency in sequential models. Attention resolved that tension by making the sequence-to-sequence routing function explicit, learnable, and fully parallelizable---and the transformer packaged these properties into an architecture that has dominated deep learning across modalities from 2018 to the present.
+
+## References
+
+1. Krizhevsky, A., Sutskever, I., and Hinton, G. E. (2012). ImageNet classification with deep convolutional neural networks. *Advances in Neural Information Processing Systems*, 25. https://proceedings.neurips.cc/paper/2012/hash/c399862d3b9d6b76c8436e924a68c45b-Abstract.html
+
+2. Simonyan, K. and Zisserman, A. (2014). Very deep convolutional networks for large-scale image recognition. arXiv:1409.1556. https://arxiv.org/abs/1409.1556
+
+3. He, K., Zhang, X., Ren, S., and Sun, J. (2016). Deep residual learning for image recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770--778. arXiv:1512.03385. https://arxiv.org/abs/1512.03385
+
+4. Hochreiter, S. and Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735--1780. https://doi.org/10.1162/neco.1997.9.8.1735
+
+5. Cho, K., van Merrienboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., and Bengio, Y. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation. arXiv:1406.1078. https://arxiv.org/abs/1406.1078
+
+6. Sutskever, I., Vinyals, O., and Le, Q. V. (2014). Sequence to sequence learning with neural networks. *Advances in Neural Information Processing Systems*, 27. https://arxiv.org/abs/1409.3215
+
+7. Bahdanau, D., Cho, K., and Bengio, Y. (2015). Neural machine translation by jointly learning to align and translate. *International Conference on Learning Representations*. arXiv:1409.0473. https://arxiv.org/abs/1409.0473
+
+8. Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., and Polosukhin, I. (2017). Attention is all you need. *Advances in Neural Information Processing Systems*, 30. arXiv:1706.03762. https://arxiv.org/abs/1706.03762
+
+9. Peters, M. E., Neumann, M., Iyyer, M., Gardner, M., Clark, C., Lee, K., and Zettlemoyer, L. (2018). Deep contextualized word representations. arXiv:1802.05365. https://arxiv.org/abs/1802.05365
+
+10. Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. (2018). BERT: Pre-training of deep bidirectional transformers for language understanding. arXiv:1810.04805. https://arxiv.org/abs/1810.04805
+
+11. Radford, A., Narasimhan, K., Salimans, T., and Sutskever, I. (2018). Improving language understanding by generative pre-training. OpenAI Technical Report. https://openai.com/research/language-unsupervised
+
+12. Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and Amodei, D. (2020). Scaling laws for neural language models. arXiv:2001.08361. https://arxiv.org/abs/2001.08361

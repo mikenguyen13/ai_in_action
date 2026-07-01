@@ -1,0 +1,268 @@
+# GPT-3: Few-Shot Learners at Scale {#sec-gpt3}
+
+## 1. The 175-Billion Parameter Landmark
+
+When Brown et al. released "Language Models are Few-Shot Learners" in May 2020, the field had grown accustomed to a particular rhythm: pretrain a large language model, then fine-tune it on a labeled dataset for each downstream task. GPT-3 broke that rhythm. At 175 billion parameters it was the largest language model published at the time, roughly two orders of magnitude larger than its predecessor GPT-2, and it demonstrated that scale alone could unlock a qualitatively new mode of operation: task performance from examples placed directly in the input, with no weight update whatsoever.
+
+The architectural choices were straightforward extensions of the transformer decoder established in GPT-2 (Radford et al., 2019). GPT-3 stacks 96 transformer layers, each with a hidden dimension of 12,288 and 96 attention heads, yielding a head dimension of 128. The feed-forward sublayers expand to $4 \times 12288 = 49152$ units before projecting back. The context window spans 2048 tokens, and positional information is encoded with learned absolute embeddings over those positions. The vocabulary follows the byte-pair encoding (BPE) scheme used in GPT-2 with 50,257 tokens.
+
+Parameter counting illustrates where the bulk of computation resides. Each attention sublayer contributes four projection matrices of shape $d_{\text{model}} \times d_{\text{model}}$, totaling $4 d^2$ per layer. Each feed-forward sublayer contributes two matrices of shapes $d \times 4d$ and $4d \times d$, totaling $8 d^2$. With 96 layers and $d = 12288$:
+
+$$N \approx 96 \times (4 + 8) \times 12288^2 \approx 175 \times 10^9$$
+
+The embedding matrix adds another $50257 \times 12288 \approx 617 \times 10^6$ parameters, a small fraction of the total.
+
+Training consumed approximately 300 billion tokens drawn from a weighted mixture of corpora. CommonCrawl (filtered) supplied the plurality; WebText2, Books1, Books2, and English Wikipedia provided higher-quality signal. Weighting was not proportional to corpus size: the Books and Wikipedia sources were upsampled relative to raw token counts, reflecting a judgment that denser factual prose deserved more influence. The model was trained with the standard autoregressive objective, maximizing $\sum_t \log p_\theta(x_t \mid x_{<t})$ across sequences.
+
+## 2. The Meta-Learning Hypothesis
+
+The conventional interpretation of supervised learning treats a model as mapping inputs to outputs after gradient descent on labeled pairs. GPT-3 operates differently at inference time. No gradient is computed; no weights move. Instead, the practitioner constructs a prompt that packages task description, optional examples, and a query, then conditions the model on that prompt to obtain a completion.
+
+Brown et al. (2020) framed this as meta-learning: during pretraining, the model implicitly learned not just facts and syntax but also how to learn from context. Each training document can be thought of as a short-lived "inner task" the model adapted to within a forward pass. By the time training is complete, the model has internalized so many task structures that it can recognize a new task's pattern from a handful of demonstrations placed in the context window.
+
+Formally, let $D = \{(x_1, y_1), \ldots, (x_k, y_k)\}$ denote $k$ labeled examples constituting the demonstration context, and let $T$ be a natural-language task description. The model computes
+
+$$p_\theta(\hat{y} \mid T, x_1, y_1, \ldots, x_k, y_k, x_{\text{query}})$$
+
+by a single forward pass. The key insight is that $\theta$ is fixed: in-context learning (ICL) is not optimization over $\theta$ but rather a conditioned sampling problem over the next tokens given an elaborately constructed prefix.
+
+This framing dissolves the boundary between "model weights" and "program." The prompt is a partial program; the model completes it. Garg et al. (2022) showed theoretically that transformers trained on function-class distributions can implement gradient descent in their forward pass, providing one mechanistic explanation for why ICL works. Empirically, the capability is strongly emergent: models below roughly one billion parameters show little ICL ability; it rises steeply between 1B and 175B.
+
+## 3. Zero-Shot, One-Shot, and Few-Shot Prompting
+
+GPT-3 crystallized a taxonomy that has since become standard in the field.
+
+**Zero-shot prompting** presents only a task description and the query, with no examples. The model must infer the desired output format entirely from the instruction.
+
+**One-shot prompting** augments the description with a single labeled example before the query. One demonstration is often enough to disambiguate the output format and the polarity or labeling convention expected.
+
+**Few-shot prompting** provides $k$ examples, where $k$ is bounded by the context window. In practice $k$ ranges from 2 to 50 depending on example length. More examples generally improve accuracy and consistency, up to a saturation point.
+
+The following templates illustrate all three modes for sentiment classification.
+
+```python
+def zero_shot_prompt(query: str) -> str:
+    return (
+        "Classify the sentiment of the following text as Positive or Negative.\n\n"
+        f"Text: {query}\n"
+        "Sentiment:"
+    )
+
+
+def one_shot_prompt(query: str) -> str:
+    return (
+        "Classify the sentiment of the following text as Positive or Negative.\n\n"
+        "Text: The product exceeded every expectation I had.\n"
+        "Sentiment: Positive\n\n"
+        f"Text: {query}\n"
+        "Sentiment:"
+    )
+
+
+def few_shot_prompt(examples: list[tuple[str, str]], query: str) -> str:
+    header = "Classify the sentiment of the following text as Positive or Negative.\n\n"
+    shots = "".join(
+        f"Text: {text}\nSentiment: {label}\n\n"
+        for text, label in examples
+    )
+    return header + shots + f"Text: {query}\nSentiment:"
+
+
+demonstrations = [
+    ("The product exceeded every expectation I had.", "Positive"),
+    ("Shipping was slow and the item arrived damaged.", "Negative"),
+    ("Absolutely brilliant performance from the entire cast.", "Positive"),
+    ("I would not recommend this to anyone.", "Negative"),
+]
+
+query = "The battery life is surprisingly good for the price."
+
+print("=== Zero-shot ===")
+print(zero_shot_prompt(query))
+print("\n=== One-shot ===")
+print(one_shot_prompt(query))
+print("\n=== Few-shot (k=4) ===")
+print(few_shot_prompt(demonstrations, query))
+```
+
+The output of these functions is the literal text sent to the language model. The model's completion of the truncated final line constitutes the prediction. No loss function is evaluated; no optimizer step occurs. The entire "training" for this task happened during pretraining, and the demonstrations merely orient the model's conditional distribution toward the desired output space.
+
+## 4. In-Context Learning: Why Scale Enables It
+
+ICL is not a property that can be engineered into a small model by clever prompting. It is empirically emergent. Brown et al. (2020) reported a consistent pattern across tasks: few-shot accuracy was nearly flat for models smaller than 1B parameters and rose sharply through the 6.7B, 13B, and 175B checkpoints. This is a hallmark of what Ganguli et al. and later Wei et al. (2022) called emergent abilities: capabilities that appear discontinuously as a function of scale.
+
+The theoretical picture remains active research, but several accounts have gained traction. One line of argument notes that large models trained on diverse corpora effectively memorize a compressed representation of every task structure that appears in natural text: translation instructions, arithmetic word problems, logical puzzles, code, and so on. When a prompt places the model in the vicinity of a known task structure, it can retrieve and execute the associated competency. A second account, motivated by the work of Akyurek et al. (2022), treats the transformer's attention mechanism as implementing an implicit optimization algorithm that can learn a linear model from the provided examples in a single pass.
+
+A crucial distinction: ICL does not modify $\theta$. It is therefore qualitatively different from fine-tuning, which computes gradients and updates weights. This distinction matters for deployment. A single frozen model checkpoint can be directed to perform thousands of distinct tasks by varying the prompt alone, eliminating the need to maintain separate fine-tuned models per task.
+
+## 5. Performance Across Benchmarks
+
+Brown et al. (2020) evaluated GPT-3 across a battery of natural language understanding, generation, translation, and reasoning benchmarks.
+
+On SuperGLUE, the suite of eight challenging NLU tasks used to benchmark fine-tuned models, few-shot GPT-3 reached an aggregate score of 71.8 compared to fine-tuned BERT-large at approximately 69.0 on comparable tasks. This was remarkable: a model that had never seen a single labeled SuperGLUE example at training time matched a model explicitly trained on thousands of them. Fine-tuned T5 still led at around 89, establishing that fine-tuning remains superior when labeled data is available, but the gap GPT-3 closed in zero-shot fashion was unprecedented.
+
+On arithmetic tasks such as two-digit addition and subtraction, three-digit multiplication, and digit decoding, GPT-3 in the few-shot regime solved between 50% and 100% of problems depending on task difficulty, tasks that smaller models effectively failed. On translation from English into French, German, and Romanian, few-shot GPT-3 approached or exceeded the best unsupervised baselines on three WMT benchmarks.
+
+Word unscrambling, anagram solving, and symbol manipulation tasks showed sharp scaling. Accuracy on five-letter anagrams jumped from near-chance at 1.3B parameters to over 40% at 175B parameters, an illustrative example of emergent capability.
+
+The pattern across tasks can be summarized conceptually as a sigmoid in log-parameter space: near-zero below a threshold, then rapid rise, then gradual saturation. The threshold varies by task difficulty, which is why the taxonomy of emergent abilities depends sensitively on what one is measuring.
+
+## 6. Limitations
+
+GPT-3's capabilities arrived alongside concrete limitations that reshaped the research agenda for the following years.
+
+**Variable binding and compositional generalization.** GPT-3 struggles with tasks that require tracking which entity takes which role across several reasoning steps. A prompt like "Alice gives Bob the ball. Bob gives Carol the ball. Who has the ball?" reliably elicits the correct answer, but deeper binding chains degrade accuracy rapidly. Compositional generalization, the ability to recombine known primitives in novel arrangements, remains weak relative to symbolic systems.
+
+**Logical inference.** On structured logical reasoning tasks requiring chained deduction over premises, few-shot GPT-3 performs substantially below specialized systems and even below human baselines on harder subsets.
+
+**Training data biases.** CommonCrawl, even after filtering, contains demographic stereotypes, factual errors, and toxic content. GPT-3 reproduces these biases in completions, a problem that motivates later work on reinforcement learning from human feedback (Ouyang et al., 2022) and constitutional AI.
+
+**No persistent memory.** The context window of 2048 tokens bounds the information available at inference time. The model has no mechanism to accumulate facts across separate API calls; each call starts from a blank context (aside from the system prompt). This is a fundamental architectural constraint at the time of GPT-3's release, though later work on retrieval-augmented generation partially addresses it.
+
+**Cost and latency.** At launch, GPT-3 access was priced at roughly \$12 per million tokens for the largest model, and inference latency for long contexts was high. This constrained deployment to use cases where the economics justified it, motivating subsequent work on model compression, distillation, and smaller instruction-tuned alternatives.
+
+## 7. Chain-of-Thought Prompting
+
+A consequential discovery that built directly on GPT-3's ICL capability was chain-of-thought (CoT) prompting, introduced by Wei et al. (2022). The observation was simple: if demonstrations in the few-shot context include not just input-output pairs but also intermediate reasoning steps, the model's accuracy on multi-step arithmetic, commonsense, and symbolic reasoning tasks improves dramatically.
+
+The simplest CoT variant appends the phrase "Let's think step by step" to the query, eliciting a self-generated chain of reasoning before the final answer. Wei et al. (2022) showed that on GSM8K (grade-school math word problems), CoT prompting with 540B PaLM reached over 56% accuracy compared to under 20% for standard few-shot prompting at the same scale. The effect was again emergent: CoT failed to help, and sometimes hurt, models smaller than roughly 10B parameters.
+
+The following code builds CoT prompts programmatically and demonstrates the format difference between direct and CoT few-shot templates.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class Example:
+    question: str
+    reasoning: str
+    answer: str
+
+
+def build_direct_prompt(examples: list[Example], query: str) -> str:
+    header = "Answer the following arithmetic question.\n\n"
+    shots = "".join(
+        f"Q: {ex.question}\nA: {ex.answer}\n\n"
+        for ex in examples
+    )
+    return header + shots + f"Q: {query}\nA:"
+
+
+def build_cot_prompt(examples: list[Example], query: str) -> str:
+    header = "Answer the following arithmetic question. Show your reasoning step by step.\n\n"
+    shots = "".join(
+        f"Q: {ex.question}\nA: {ex.reasoning} The answer is {ex.answer}.\n\n"
+        for ex in examples
+    )
+    return header + shots + f"Q: {query}\nA:"
+
+
+cot_examples = [
+    Example(
+        question="Roger has 5 tennis balls. He buys 2 more cans of 3 balls each. How many does he have?",
+        reasoning="Roger starts with 5 balls. 2 cans times 3 balls each is 6 balls. 5 + 6 = 11.",
+        answer="11",
+    ),
+    Example(
+        question="A juggler has 16 balls. Half are golf balls, and half of those are blue. How many blue golf balls?",
+        reasoning="Half of 16 is 8 golf balls. Half of 8 is 4 blue golf balls.",
+        answer="4",
+    ),
+]
+
+test_query = "Sara has 3 apples. She gets 2 more bags of 5 apples each. How many does she have?"
+
+print("=== Direct few-shot ===")
+print(build_direct_prompt(cot_examples, test_query))
+print("\n=== Chain-of-thought few-shot ===")
+print(build_cot_prompt(cot_examples, test_query))
+```
+
+The structural difference is visible at a glance: the CoT template inserts a natural-language derivation between question and answer in each demonstration. When the model completes the CoT prompt, it generates its own derivation before producing the final numeric answer. The derivation serves as working memory, allowing the model to track intermediate values across a computation that would otherwise exceed what the attention mechanism can implicitly store in its hidden states.
+
+A zero-shot CoT variant discovered by Kojima et al. (2022) requires no demonstrations at all: appending "Let's think step by step." to any question prompt triggers chain-of-thought reasoning without exemplars, though accuracy is generally lower than the few-shot version.
+
+## 8. The Prompting Template as a Software Primitive
+
+The GPT-3 release established something that persists to the present day: the prompt as a first-class software artifact. Before GPT-3, NLP engineering meant building pipelines of tokenizers, feature extractors, classifiers, and post-processors. After GPT-3, a large class of NLP tasks could be addressed by careful prompt construction and model conditioning.
+
+This created a new engineering discipline, later called prompt engineering, and eventually a formal field of study: prompt optimization, automatic prompt generation, and prompt robustness. The few-shot template builder above is a minimal instance of a prompt management system. Production systems added templating languages, dynamic example selection via semantic similarity, output parsers, and retry logic around the model API.
+
+```python
+import random
+
+
+def select_examples(
+    pool: list[Example],
+    query: str,
+    k: int = 4,
+    seed: int = 42,
+) -> list[Example]:
+    """Select k examples from pool. In production, replace random selection
+    with embedding-based nearest-neighbor retrieval for higher accuracy."""
+    rng = random.Random(seed)
+    return rng.sample(pool, min(k, len(pool)))
+
+
+def build_adaptive_cot_prompt(
+    pool: list[Example],
+    query: str,
+    k: int = 4,
+) -> str:
+    selected = select_examples(pool, query, k)
+    return build_cot_prompt(selected, query)
+
+
+large_pool = cot_examples + [
+    Example(
+        question="A farmer has 3 fields with 12 rows each, 8 plants per row. How many plants?",
+        reasoning="3 fields times 12 rows is 36 rows total. 36 rows times 8 plants is 288 plants.",
+        answer="288",
+    ),
+    Example(
+        question="Maria bakes 4 dozen cookies and gives away a quarter. How many remain?",
+        reasoning="4 dozen is 48. A quarter of 48 is 12. 48 minus 12 is 36.",
+        answer="36",
+    ),
+]
+
+prompt = build_adaptive_cot_prompt(large_pool, test_query, k=3)
+print(prompt)
+```
+
+The function `select_examples` uses random sampling for reproducibility in this illustration. In production deployments, the standard approach is to encode the query and the pool with a sentence embedding model, then retrieve the $k$ nearest neighbors by cosine similarity. This dynamic retrieval consistently outperforms random selection, especially when the pool is large and heterogeneous.
+
+## 9. The Legacy of GPT-3
+
+GPT-3 changed the commercial and research landscape of AI in ways that compound to the present.
+
+The API-access paradigm, where a single frontier model is served behind an HTTP endpoint and accessed by millions of downstream applications, originated with OpenAI's GPT-3 private and then public beta in 2020. This decoupled model development from application development, creating an ecosystem where startups, researchers, and enterprises could build AI-powered products without training any models themselves.
+
+The model directly motivated InstructGPT (Ouyang et al., 2022), which applied reinforcement learning from human feedback to make GPT-3 follow instructions more reliably and reduce harmful outputs, and ChatGPT, which brought the technology to over 100 million users within two months of its launch in late 2022. The architecture of the entire foundation model industry, including the notion of a base model refined by alignment techniques, traces to the lessons learned from GPT-3's deployment.
+
+On the research side, GPT-3 redirected the field's attention from task-specific supervised learning toward scaling laws, emergent capabilities, and the science of prompting. Kaplan et al. (2020) had already published scaling law results concurrent with GPT-3; the model provided empirical validation at a scale previously unseen. It also motivated competitors: PaLM (Chowdhery et al., 2022), Chinchilla (Hoffmann et al., 2022), LLaMA (Touvron et al., 2023), and dozens of other large language models followed directly in its wake, each testing hypotheses about data efficiency, architecture variation, and alignment that GPT-3's existence made concrete.
+
+The few-shot learning paradigm it established remains, half a decade later, the dominant mode of deploying large language models in production. The weights change; the paradigm endures.
+
+## References
+
+1. Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D. M., Wu, J., Winter, C., ... Amodei, D. (2020). Language models are few-shot learners. *Advances in Neural Information Processing Systems*, 33. https://arxiv.org/abs/2005.14165
+
+2. Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., & Zhou, D. (2022). Chain-of-thought prompting elicits reasoning in large language models. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2201.11903
+
+3. Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., & Sutskever, I. (2019). Language models are unsupervised multitask learners. *OpenAI Blog*, 1(8). https://openai.com/research/language-unsupervised
+
+4. Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., & Amodei, D. (2020). Scaling laws for neural language models. https://arxiv.org/abs/2001.08361
+
+5. Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C. L., Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A., Schulman, J., Hilton, J., Kelton, F., Miller, L., Simens, M., Askell, A., Welinder, P., Christiano, P., Leike, J., & Lowe, R. (2022). Training language models to follow instructions with human feedback. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2203.02155
+
+6. Garg, S., Tsipras, D., Liang, P., & Valiant, G. (2022). What can transformers learn in-context? A case study of simple function classes. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2208.01066
+
+7. Akyurek, E., Schuurmans, D., Andreas, J., Ma, T., & Zhou, D. (2022). What learning algorithm is in-context learning? Investigations with linear models. *International Conference on Learning Representations*. https://arxiv.org/abs/2211.15661
+
+8. Kojima, T., Gu, S. S., Reid, M., Matsuo, Y., & Iwasawa, Y. (2022). Large language models are zero-shot reasoners. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2205.11916
+
+9. Wei, J., Tay, Y., Bommasani, R., Raffel, C., Zoph, B., Borgeaud, S., Yogatama, D., Bosma, M., Zhou, D., Metzler, D., Chi, E. H., Hashimoto, T., Vinyals, O., Liang, P., Dean, J., & Fedus, W. (2022). Emergent abilities of large language models. *Transactions on Machine Learning Research*. https://arxiv.org/abs/2206.07682
+
+10. Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., de las Casas, D., Hendricks, L. A., Welbl, J., Clark, A., Hennigan, T., Noland, E., Millican, K., van den Driessche, G., Damoc, B., Guy, A., Osindero, S., Simonyan, K., Elsen, E., ... Sifre, L. (2022). Training compute-optimal large language models. https://arxiv.org/abs/2203.15556

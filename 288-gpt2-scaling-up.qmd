@@ -1,0 +1,239 @@
+# GPT-2: Language Models as Unsupervised Multitask Learners {#sec-gpt2}
+
+## 1. From GPT-1 to the Multitask Hypothesis
+
+The transformer architecture introduced by Vaswani et al. (2017) was originally framed as a sequence-to-sequence model for machine translation. Radford et al. (2018) asked whether a decoder-only variant, pretrained purely on unlabeled text via a causal language modeling objective, could serve as a universal representation learner for downstream natural language tasks. The answer was GPT-1, a 117-million-parameter model that demonstrated substantial zero-shot and few-shot capabilities when fine-tuned with lightweight task-specific heads.
+
+The GPT-1 pretraining objective is the autoregressive negative log-likelihood over a corpus of tokens $\mathcal{U} = \{u_1, u_2, \ldots, u_n\}$:
+
+$$L_1(\mathcal{U}) = \sum_{i} \log P(u_i \mid u_{i-k}, \ldots, u_{i-1};\, \Theta)$$
+
+where $k$ is the context window size and $\Theta$ are the transformer parameters. The causal mask ensures that position $i$ attends only to positions $j < i$, preserving the autoregressive factorization of the joint distribution $P(u_1, \ldots, u_n) = \prod_i P(u_i \mid u_{<i})$.
+
+Fine-tuning in GPT-1 added a supervised objective over labeled pairs $(x, y)$:
+
+$$L_2(\mathcal{C}) = \sum_{(x,y)} \log P(y \mid x^1, \ldots, x^m)$$
+
+with the final hidden state $h_m^l$ passed through a linear output head. Radford et al. (2018) found that auxiliary language modeling during fine-tuning improved generalization, yielding a combined objective $L_3 = L_2 + \lambda L_1$. Task identity was encoded by inserting special delimiter tokens into the input sequence, letting a single pretrained backbone handle classification, entailment, similarity, and multiple-choice tasks via light restructuring of the input format.
+
+GPT-1's results were compelling but still required labeled supervision for each downstream task. The central question posed by GPT-2 (Radford et al., 2019) was more radical: can a language model learn to perform tasks without any labeled data, relying solely on scale and the diversity of its pretraining corpus?
+
+## 2. The Multitask Framing
+
+Radford et al. (2019) argue that a sufficiently expressive language model trained on a sufficiently diverse corpus implicitly learns to condition on task descriptions embedded in natural language context. Their formulation reframes supervised learning as a special case of language modeling. Any supervised task can be expressed as estimating $P(\text{output} \mid \text{input})$. A general-purpose learner, however, should be able to handle multiple tasks from the same parameters by learning $P(\text{output} \mid \text{input}, \text{task})$.
+
+Crucially, in a natural language setting, "task" need not be an explicit discrete label. It can be expressed as a natural language prefix. A translation task becomes predicting the English continuation of "Translate from French to English: [French sentence]". A question-answering task becomes predicting the answer following "Q: [question] A:". The hypothesis is that natural text on the internet already contains implicit demonstrations of these mappings in sufficient variety and quantity that a large language model will internalize them.
+
+This framing has a clean probabilistic justification. McCann et al. (2018) introduced the decaNLP benchmark, which posed all NLP tasks as question answering. GPT-2 goes further: rather than designing a meta-architecture to route between tasks, it proposes that the language modeling objective itself, when applied at sufficient scale over sufficiently diverse data, produces a model that routes implicitly via context. This is sometimes called the "task in the prompt" hypothesis, and GPT-2's empirical results provided its first large-scale validation.
+
+## 3. WebText and the Data Flywheel
+
+Model scale alone does not explain GPT-2's capabilities. The training corpus, WebText, was constructed by scraping all outbound links from Reddit posts that received at least three karma points. The karma filter acts as a rough proxy for human curation: content that at least three people found interesting enough to upvote. After deduplication and quality filtering, WebText contains approximately 40 GB of text spanning 8 million documents.
+
+This design choice reflects an important lesson from GPT-1: common crawl data, though enormous, contains substantial low-quality content that degrades model capabilities. WebText sacrifices raw token count for diversity and quality. The corpus spans news articles, forum discussions, academic preprints, fiction, code, and technical documentation, providing the breadth of domains that the multitask hypothesis requires.
+
+The vocabulary uses byte-pair encoding (BPE) with a vocabulary of 50,257 tokens. GPT-2's BPE operates at the byte level rather than the character level, which avoids out-of-vocabulary issues for arbitrary Unicode text without resorting to character-level models. The tokenizer can encode any string losslessly.
+
+## 4. Architecture: Scale and Refinements
+
+GPT-2 retains the decoder-only transformer structure of GPT-1 but makes several targeted architectural modifications.
+
+### 4.1 Pre-Layer Normalization
+
+In the original transformer (Vaswani et al., 2017) and GPT-1, layer normalization is applied after the residual connection (post-LN):
+
+$$\text{output} = \text{LayerNorm}(x + \text{Sublayer}(x))$$
+
+GPT-2 moves layer normalization to the input of each sub-block (pre-LN):
+
+$$\text{output} = x + \text{Sublayer}(\text{LayerNorm}(x))$$
+
+Pre-LN stabilizes training at large depth by ensuring that the gradient signal at each layer is normalized before entering the sublayer. Empirically, pre-LN models train faster and require less careful learning rate warmup. An additional layer normalization is placed after the final self-attention block before the vocabulary projection, providing further gradient stability at the output.
+
+### 4.2 Initialization Scaling
+
+The weight matrices in residual paths are scaled by $1/\sqrt{N}$ where $N$ is the number of residual layers, following a strategy analogous to the Fixup initialization (Zhang et al., 2019). This prevents the residual stream variance from growing with depth.
+
+### 4.3 Model Sizes
+
+GPT-2 was released in four sizes:
+
+| Model | Parameters | Layers | Hidden dim | Attention heads | Context |
+|-------|-----------|--------|------------|----------------|---------|
+| GPT-2 small | 117M | 12 | 768 | 12 | 1024 |
+| GPT-2 medium | 345M | 24 | 1024 | 16 | 1024 |
+| GPT-2 large | 762M | 36 | 1280 | 20 | 1024 |
+| GPT-2 XL | 1542M | 48 | 1600 | 25 | 1024 |
+
+The context window of 1024 tokens doubles GPT-1's 512-token window, allowing the model to condition on longer contexts. The XL model's 48-layer, 1600-dimensional architecture represents a roughly 13x parameter increase over GPT-1.
+
+The self-attention computation in each layer follows the scaled dot-product attention with causal masking. For queries $Q$, keys $K$, and values $V$ derived from the input via learned projections:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + M\right) V$$
+
+where $M$ is a mask matrix with $M_{ij} = -\infty$ for $j > i$ and $0$ otherwise. Multi-head attention concatenates $h$ such attention outputs computed with distinct projection matrices:
+
+$$\text{MultiHead}(X) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h)\, W^O$$
+
+$$\text{head}_r = \text{Attention}(XW^Q_r,\, XW^K_r,\, XW^V_r)$$
+
+Each head operates in dimension $d_k = d_{\text{model}} / h$, so the total parameter count for attention projections scales as $4 d_{\text{model}}^2$ per layer. For GPT-2 XL: $4 \times 1600^2 \times 48 \approx 491\text{M}$ parameters in attention alone, with the remaining parameters in feed-forward layers ($8 d_{\text{model}}^2$ per layer for a 4x expansion FFN).
+
+## 5. Zero-Shot Transfer Results
+
+GPT-2 was evaluated in a zero-shot setting: no gradient updates, no task-specific examples, only a natural-language prompt prefix drawn from each task's standard format. The results were striking.
+
+On eight language modeling benchmarks spanning different domains (PTB, WikiText-2, WikiText-103, 1 Billion Word, enwiki8, text8, lambada, CBT-CN, CBT-NE), GPT-2 achieved state-of-the-art perplexity on seven of them despite never being explicitly trained or fine-tuned on any of them. The Penn Treebank result was the exception, likely because PTB's distribution (newswire from 1989) diverges substantially from WebText.
+
+Zero-shot reading comprehension on CoQA (Reddy et al., 2019), a conversational question answering benchmark, yielded an F1 score of 55, outperforming three of four domain-specific baselines that had been fully supervised on CoQA's training set. The model was prompted with the passage followed by a question-answer dialogue prefix.
+
+Zero-shot summarization was evaluated by prompting the model with an article from CNN/DailyMail followed by the text "TL;DR:" and sampling from the model. The resulting summaries were evaluated with ROUGE scores. While they lagged behind supervised extractive systems, they demonstrated that the model had internalized the concept of summarization from its pretraining data.
+
+Zero-shot translation was evaluated by prompting with the pattern "[English sentence] = [French sentence]\n[New English sentence] =" and observing the French continuation. On WMT-14 English-to-French, GPT-2 achieved 5 BLEU, competitive with early unsupervised neural machine translation systems despite having no explicit translation objective.
+
+## 6. The Staged Release and AI Safety Questions
+
+OpenAI's February 2019 announcement included an unusual decision: they would not release the full 1.5B-parameter model, releasing instead progressively larger versions over nine months (117M in February, 345M in May, 762M in August, 1542M in November 2019).
+
+The stated rationale was concern about malicious use: high-quality text generation could be used for disinformation, spam, phishing, and propaganda at scale. This was the first prominent instance of a major AI laboratory explicitly staging a model release on dual-use grounds.
+
+The decision generated significant debate. Critics argued that the delay was primarily a publicity strategy, that the capability gap between 117M and 1.5B was modest, and that withholding models hindered safety research by limiting reproducibility. Proponents argued that establishing norms of caution was valuable even if this specific delay was of limited practical effect.
+
+In retrospect, GPT-2's text generation capabilities were substantially weaker than those of models released in the following two years. The staged release did not prevent any documented misuse. The more lasting contribution was forcing a public conversation about release norms that prefigured debates around GPT-3, LLaMA, and subsequent frontier models. The episode established that model release is a policy decision, not merely a technical one, and that AI laboratories bear some responsibility for anticipating downstream misuse.
+
+## 7. Text Generation with GPT-2
+
+The following demonstration uses the DistilGPT-2 model (Sanh et al., 2019), a 82-million-parameter distilled version of GPT-2 small, which runs efficiently on CPU and captures the essential generation behavior of the full model.
+
+```python
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import torch
+
+tokenizer = GPT2Tokenizer.from_pretrained("distilgpt2")
+model = GPT2LMHeadModel.from_pretrained("distilgpt2")
+model.eval()
+
+prompt = "In a distant future where machines have learned to speak,"
+inputs = tokenizer(prompt, return_tensors="pt")
+
+with torch.no_grad():
+    output_ids = model.generate(
+        inputs["input_ids"],
+        max_new_tokens=80,
+        do_sample=True,
+        top_k=50,
+        top_p=0.92,
+        temperature=0.85,
+        repetition_penalty=1.3,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+print(generated)
+```
+
+The `top_k=50` parameter restricts sampling to the 50 highest-probability tokens at each step, truncating the long tail of improbable continuations. Nucleus sampling (`top_p=0.92`) further restricts to the smallest set of tokens whose cumulative probability exceeds 0.92, adapting the effective vocabulary dynamically based on the model's confidence. Temperature scaling by $0.85$ sharpens the distribution slightly, reducing incoherence without making the output repetitive. The `repetition_penalty` parameter multiplicatively penalizes logits of tokens already present in the output, mitigating the repetition problem discussed in Section 8.
+
+The following cell demonstrates token probability inspection, which reveals the model's internal distribution over continuations:
+
+```python
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import torch
+import torch.nn.functional as F
+
+tokenizer = GPT2Tokenizer.from_pretrained("distilgpt2")
+model = GPT2LMHeadModel.from_pretrained("distilgpt2")
+model.eval()
+
+prefix = "The capital of France is"
+inputs = tokenizer(prefix, return_tensors="pt")
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+next_token_logits = logits[0, -1, :]
+probs = F.softmax(next_token_logits, dim=-1)
+top_probs, top_ids = torch.topk(probs, 10)
+
+print(f"Top continuations for: '{prefix}'")
+for prob, token_id in zip(top_probs.tolist(), top_ids.tolist()):
+    token_str = tokenizer.decode([token_id])
+    print(f"  {repr(token_str):20s}  {prob:.4f}")
+```
+
+This exposes the raw probability distribution that text generation samples from. For factual prompts like the one above, the model concentrates high probability mass on the correct answer, reflecting knowledge absorbed from WebText.
+
+The full GPT-2 XL model requires a GPU for practical inference. The following block illustrates the standard usage pattern:
+
+```python
+# GPU required -- shown for reference
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import torch
+
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2-xl")
+model = GPT2LMHeadModel.from_pretrained("gpt2-xl").to("cuda")
+model.eval()
+
+prompt = "The implications of large-scale language models for scientific research are"
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+with torch.no_grad():
+    output_ids = model.generate(
+        inputs["input_ids"],
+        max_new_tokens=200,
+        do_sample=True,
+        top_k=40,
+        top_p=0.95,
+        temperature=0.9,
+        repetition_penalty=1.2,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+```
+
+## 8. Failure Modes and the Road to GPT-3
+
+GPT-2's capabilities were real but bounded in ways that motivated the design choices of GPT-3 (Brown et al., 2020).
+
+### 8.1 Repetition and Degeneration
+
+Autoregressive models trained with teacher-forcing (maximum likelihood on gold continuations) are prone to degeneration: in the absence of diverse training signal at inference time, the model can enter probability loops where it assigns highest probability to repetitions of recent context. This manifests as repeated phrases, sentences, or even paragraphs in longer generations. The repetition penalty heuristic applied above is a post-hoc fix; later work such as contrastive search (Su et al., 2022) and exposure bias correction address this at the training level.
+
+The theoretical reason for repetition is a mismatch between training and inference distributions. During training, the model always conditions on ground-truth previous tokens. During inference, it conditions on its own (potentially imperfect) previous outputs, accumulating errors. This covariate shift compounds over long sequences.
+
+### 8.2 Calibration and Factual Hallucination
+
+GPT-2 generates plausible-sounding text that is frequently factually wrong. On the TriviaQA benchmark in a zero-shot setting, the model achieved 4.1% exact match, far below supervised systems. The model has no mechanism to distinguish confidently held facts from confabulations: it assigns high probability to false statements that superficially resemble true ones in its training distribution.
+
+The calibration problem can be quantified by measuring expected calibration error (ECE): $\text{ECE} = \sum_{b=1}^{B} \frac{|B_b|}{n} |\text{acc}(B_b) - \text{conf}(B_b)|$, where bins $B_b$ group predictions by confidence. Language model confidence (measured as the probability assigned to the generated continuation) does not reliably predict correctness for factual assertions. This problem is not resolved by scale alone and persists in much larger models; GPT-3 improves accuracy substantially but retains overconfident hallucination.
+
+### 8.3 What GPT-2 Proved and Did Not Prove
+
+GPT-2 established that zero-shot language modeling capabilities improve reliably with scale when training data quality is controlled. It proved the viability of the "task in the prompt" hypothesis for a range of NLP benchmarks. It did not prove that scaling alone would eventually produce general-purpose language understanding at human level; that claim required GPT-3's in-context learning results and subsequent work on instruction tuning.
+
+The model's failure on the 1 Billion Word benchmark (where its perplexity was notably higher than some smaller models) reflected a known limitation: the benchmark's held-out test set contains news text from a similar period as much of GPT-2's training data, but GPT-2's broader data distribution diluted its specialization on that domain. This illustrates the trade-off between breadth and depth that large pretraining corpora impose.
+
+GPT-2's limitations set the agenda for GPT-3 (Brown et al., 2020): a 175-billion-parameter model trained on a filtered version of Common Crawl plus WebText2, demonstrating that in-context learning (few-shot prompting with examples in the context window) could match fine-tuned models on many benchmarks. The progression from GPT-1 to GPT-2 to GPT-3 is a case study in what scaling laws (Kaplan et al., 2020) predict: loss decreases as a power law in model size, dataset size, and compute, with no evidence of a plateau at GPT-2 scale.
+
+## References
+
+1. Radford, A., Narasimhan, K., Salimans, T., and Sutskever, I. (2018). Improving Language Understanding by Generative Pre-Training. OpenAI Blog. https://openai.com/research/language-unsupervised
+
+2. Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and Sutskever, I. (2019). Language Models are Unsupervised Multitask Learners. OpenAI Blog. https://openai.com/research/better-language-models
+
+3. Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D. M., Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E., Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C., McCandlish, S., Radford, A., Sutskever, I., and Amodei, D. (2020). Language Models are Few-Shot Learners. arXiv:2005.14165. https://arxiv.org/abs/2005.14165
+
+4. Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., and Polosukhin, I. (2017). Attention Is All You Need. Advances in Neural Information Processing Systems, 30. https://arxiv.org/abs/1706.03762
+
+5. Sanh, V., Debut, L., Chaumond, J., and Wolf, T. (2019). DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter. arXiv:1910.01108. https://arxiv.org/abs/1910.01108
+
+6. McCann, B., Keskar, N. S., Xiong, C., and Socher, R. (2018). The Natural Language Decathlon: Multitask Learning as Question Answering. arXiv:1806.08730. https://arxiv.org/abs/1806.08730
+
+7. Reddy, S., Chen, D., and Manning, C. D. (2019). CoQA: A Conversational Question Answering Challenge. Transactions of the Association for Computational Linguistics, 7, 249-266. https://doi.org/10.1162/tacl_a_00266
+
+8. Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and Amodei, D. (2020). Scaling Laws for Neural Language Models. arXiv:2001.08361. https://arxiv.org/abs/2001.08361
+
+9. Su, Y., Lan, T., Wang, Y., Yogatama, D., Kong, L., and Collier, N. (2022). A Contrastive Framework for Neural Text Generation. Advances in Neural Information Processing Systems, 35. https://arxiv.org/abs/2202.06417
+
+10. Zhang, H., Dauphin, Y. N., and Ma, T. (2019). Fixup Initialization: Residual Learning Without Normalization. International Conference on Learning Representations. https://arxiv.org/abs/1901.09321

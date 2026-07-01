@@ -1,0 +1,259 @@
+# Covariate Shift: Detection and Correction {#sec-covariate-shift}
+
+Statistical learning theory rests on an assumption so fundamental that it rarely appears in textbook problem statements: the training and test distributions are identical. In practice this assumption fails constantly. A spam filter trained on corporate email encounters personal messages; a medical classifier trained in one hospital is deployed in another; a speech recogniser trained on studio recordings meets background noise. The mismatch between the distribution that generated training labels and the distribution encountered at inference time is called *dataset shift*, and its most tractable special case is *covariate shift*.
+
+## 1. Formal Definition and Key Assumption
+
+Let $\mathcal{X}$ be the input space and $\mathcal{Y}$ the label space. Suppose training data are drawn i.i.d. from a *source* joint distribution $p(x, y)$ and test data from a *target* joint distribution $q(x, y)$. Covariate shift is the condition
+
+$$q(x, y) = q(x) \cdot p(y \mid x),$$
+
+meaning the marginal over inputs has changed --- $q(x) \neq p(x)$ --- but the conditional label distribution remains the same: $q(y \mid x) = p(y \mid x)$ for all $x$ in the support of both distributions. The inputs are the covariates, hence the name.
+
+This factorisation carries a crucial consequence. The Bayes optimal classifier
+
+$$f^*(x) = \arg\max_{y \in \mathcal{Y}} p(y \mid x)$$
+
+is *identical* under both distributions because $p(y \mid x) = q(y \mid x)$. The target we are trying to learn has not moved; only the density of inputs over which we must perform well has shifted. Contrast this with *label shift* ($p(y)$ changes, $p(x \mid y)$ stays fixed) or full *dataset shift* where $q(y \mid x) \neq p(y \mid x)$; those settings are strictly harder because the optimal predictor itself changes.
+
+Covariate shift arises naturally in several ways. Selection bias occurs when training subjects are not a random sample of the target population: clinical trial participants differ systematically from the broader patient pool. Temporal drift pushes feature distributions forward in time while task semantics stay constant. Domain adaptation problems share the same labelling function across languages or imaging modalities while inputs live in different regions of feature space.
+
+## 2. Why Empirical Risk Minimisation Fails Under Covariate Shift
+
+Standard ERM minimises the training-set average loss
+
+$$\hat{R}_{\text{ERM}}(f) = \frac{1}{n} \sum_{i=1}^{n} L(f(x_i), y_i), \quad (x_i, y_i) \sim p(x, y).$$
+
+By the law of large numbers this converges, as $n \to \infty$, to the *source* expected risk
+
+$$R_p(f) = \mathbb{E}_{p(x,y)}\bigl[L(f(x), y)\bigr] = \int_{\mathcal{X}} \mathbb{E}_{p(y \mid x)}\bigl[L(f(x), y)\bigr] \, p(x) \, dx.$$
+
+The quantity we actually care about at deployment is the *target* expected risk
+
+$$R_q(f) = \int_{\mathcal{X}} \mathbb{E}_{p(y \mid x)}\bigl[L(f(x), y)\bigr] \, q(x) \, dx.$$
+
+Because $p(x) \neq q(x)$, the loss surface being optimised during training is a biased proxy for the loss surface that governs test performance. Concretely, if $q(x)$ places high probability on a region $\mathcal{A} \subset \mathcal{X}$ where $p(x) \approx 0$, training provides almost no gradient signal for $\mathcal{A}$, yet the model is evaluated heavily there. The estimator $\hat{R}_{\text{ERM}}$ can be arbitrarily far from $R_q$ depending on the divergence between $p$ and $q$.
+
+Shimodaira (2000) formalised this failure mode and proposed the correction strategy that grounds all subsequent work in this area.
+
+## 3. Importance Weighting: The Fundamental Correction
+
+The bridge between source and target risks is the *importance weight*
+
+$$w(x) = \frac{q(x)}{p(x)}.$$
+
+A change-of-measure argument shows that the target risk can be expressed as a source expectation:
+
+$$R_q(f) = \int_{\mathcal{X}} \mathbb{E}_{p(y \mid x)}\bigl[L(f(x), y)\bigr] q(x) \, dx = \int_{\mathcal{X}} \mathbb{E}_{p(y \mid x)}\bigl[L(f(x), y)\bigr] w(x) \, p(x) \, dx$$
+
+$$= \mathbb{E}_{p(x,y)}\bigl[w(x) \cdot L(f(x), y)\bigr].$$
+
+This is simply importance sampling: a sample from $p$ can estimate an expectation under $q$ by reweighting each observation by $w(x_i)$. The corresponding *weighted ERM* objective is
+
+$$\hat{R}_{\text{WERM}}(f) = \frac{1}{n} \sum_{i=1}^{n} w(x_i) \cdot L(f(x_i), y_i).$$
+
+Minimising $\hat{R}_{\text{WERM}}$ over a hypothesis class yields a consistent estimator of $R_q(f)$ under mild regularity conditions, provided $w(x)$ is known or can be estimated. The weights act as a form of soft resampling: observations from low-density source regions that happen to be high-density target regions receive amplified loss, forcing the optimiser to attend to them.
+
+The difficulty is that $w(x) = q(x)/p(x)$ requires estimating two densities in high-dimensional spaces, a problem that is notoriously ill-conditioned. Two families of algorithms sidestep density estimation by directly estimating the ratio $w(x)$.
+
+## 4. KLIEP: Kullback-Leibler Importance Estimation
+
+Sugiyama et al. (2008) proposed KLIEP (Kullback-Leibler Importance Estimation Procedure), which estimates $w(x)$ by minimising a KL divergence between $q(x)$ and the fitted importance-weighted source $\hat{w}(x) p(x)$.
+
+Parameterise the weight function as a log-linear model in kernel features:
+
+$$\hat{w}(x;\theta) = \exp\!\left(\sum_{l=1}^{b} \theta_l \phi_l(x)\right),$$
+
+where $\phi_l(x) = k(x, c_l)$ for kernel $k$ and basis centres $c_l$ sampled from the target distribution. The objective is
+
+$$\min_{\theta} \; \text{KL}\bigl(q \;\|\; \hat{w}(\cdot;\theta) p\bigr) = -\mathbb{E}_{q}\bigl[\log \hat{w}(x;\theta)\bigr] + \log \mathbb{E}_{p}\bigl[\hat{w}(x;\theta)\bigr],$$
+
+subject to the normalisation constraint $\mathbb{E}_p[\hat{w}(x;\theta)] = 1$. The critical observation is that both expectations can be approximated from finite samples: the first from target samples $\{x_j^q\}_{j=1}^m$ and the second from source samples $\{x_i^p\}_{i=1}^n$. No density estimation is required. The objective is convex in $\theta$, and projected gradient ascent converges to the global optimum. Cross-validation over the parameter $b$ (number of basis functions) provides model selection.
+
+## 5. uLSIF: Least-Squares Importance Fitting
+
+Kanamori et al. (2009) observed that the KL divergence objective is sensitive to small estimated weights (near zero) because the log makes it unbounded. They proposed *unconstrained Least Squares Importance Fitting* (uLSIF), which instead minimises the squared error between $\hat{w}(x)$ and the true ratio:
+
+$$J(\hat{w}) = \frac{1}{2}\mathbb{E}_{p}\bigl[(\hat{w}(x) - w(x))^2\bigr].$$
+
+Expanding and dropping terms that do not depend on $\hat{w}$:
+
+$$J(\hat{w}) = \frac{1}{2}\mathbb{E}_{p}\bigl[\hat{w}(x)^2\bigr] - \mathbb{E}_{q}\bigl[\hat{w}(x)\bigr] + \text{const}.$$
+
+Parameterising $\hat{w}(x; \alpha) = \sum_{l=1}^b \alpha_l \phi_l(x)$ with the same kernel basis, the empirical approximation of $J$ yields a quadratic objective in $\alpha$:
+
+$$\hat{J}(\alpha) = \frac{1}{2}\alpha^\top \hat{H} \alpha - \hat{h}^\top \alpha,$$
+
+where
+
+$$\hat{H}_{ll'} = \frac{1}{n}\sum_{i=1}^n \phi_l(x_i^p)\phi_{l'}(x_i^p), \qquad \hat{h}_l = \frac{1}{m}\sum_{j=1}^m \phi_l(x_j^q).$$
+
+Adding an $\ell_2$ regulariser $\frac{\lambda}{2}\|\alpha\|^2$ converts the problem to a kernel ridge regression:
+
+$$\hat{\alpha} = (\hat{H} + \lambda I)^{-1} \hat{h}.$$
+
+This closed-form solution makes uLSIF faster and more numerically stable than iterative methods like KLIEP. The non-negativity constraint $\alpha_l \geq 0$ can be enforced by clipping. Kanamori et al. (2009) prove that the uLSIF estimator achieves the optimal $O(n^{-1/2})$ convergence rate for importance weight estimation.
+
+## 6. Classifier-Based Detection and Weight Estimation
+
+An intuitive alternative that does not require kernel density machinery is to train a *discriminative* classifier to distinguish source samples (class 0) from target samples (class 1), pooling both sets without labels. If the classifier cannot separate them, the AUC is near 0.5 and the shift is negligible. If the AUC is substantially above 0.5, a detectable shift is present.
+
+More precisely, let $P(\text{test} \mid x)$ denote the posterior probability assigned by the discriminator. By Bayes' theorem:
+
+$$\frac{q(x)}{p(x)} = \frac{P(\text{test} \mid x)}{P(\text{train} \mid x)} \cdot \frac{P(\text{train})}{P(\text{test})}.$$
+
+If source and target sets have equal size, $P(\text{train}) = P(\text{test}) = 1/2$ and the ratio simplifies to
+
+$$w(x) = \frac{q(x)}{p(x)} = \frac{P(\text{test} \mid x)}{P(\text{train} \mid x)} = \frac{P(\text{test} \mid x)}{1 - P(\text{test} \mid x)}.$$
+
+This is the odds ratio of the discriminator's output, directly providing per-sample importance weights from a single binary classification. The approach scales naturally to high-dimensional, structured inputs because any off-the-shelf classifier can serve as the discriminator. Gradient boosted trees are a common choice in tabular settings; convolutional classifiers work for image shift detection.
+
+The classifier-based approach also yields a straightforward shift audit: run a gradient-attributions pass on the discriminator to identify which features are most responsible for the high AUC, surfacing precisely which dimensions of input space have drifted.
+
+## 7. Monitoring and Detecting Shift in Deployment
+
+Production ML systems require continuous monitoring for covariate shift because distributions evolve over time. Several complementary strategies are in common use.
+
+*Univariate statistics* track population-level summaries of each feature separately: mean, variance, and quantiles are compared between a reference window (often the training set) and a rolling test window. The Kolmogorov-Smirnov (KS) statistic is a non-parametric two-sample test that flags features whose empirical CDFs diverge significantly. For categorical features, a chi-squared test on frequency tables plays the analogous role.
+
+*Multivariate methods* capture joint feature interactions that univariate statistics miss. The classifier-based AUC method operates on the full feature vector and therefore detects shift in joint distributions. Maximum Mean Discrepancy (MMD) provides a kernel-based two-sample statistic with known asymptotic distribution under the null hypothesis of no shift:
+
+$$\text{MMD}^2(\mathcal{H}; p, q) = \left\|\mathbb{E}_{p}[\phi(x)] - \mathbb{E}_{q}[\phi(x)]\right\|_{\mathcal{H}}^2,$$
+
+where $\phi$ maps to a reproducing kernel Hilbert space. An unbiased estimate of MMD from finite samples permits hypothesis testing.
+
+*Operational guards* complement statistical tests: monitoring prediction confidence distributions, tracking label acquisition latency (labels arriving from downstream systems reveal drift in the target variable), and flagging inputs in low-density training regions using isolation forests or local outlier factor scores.
+
+### 7.1 The Adversarial Case
+
+The covariate shift assumption $q(y \mid x) = p(y \mid x)$ holds for *natural* distribution shift but fails under adversarial perturbations. An adversary who computes an $\ell_\infty$-bounded perturbation $\delta$ such that $f(x + \delta) \neq y$ has changed $x$ to a point where $p(y \mid x + \delta)$ assigns low probability to the true label. This is fundamentally different from covariate shift because the optimal classifier changes: $f^*(x + \delta) \neq f^*(x)$ in the adversarial sense.
+
+Detecting whether a deployment shift is natural or adversarial matters operationally. One approach is to fit an importance-weighted model on the shifted data and evaluate whether calibrated confidence improves (natural shift, correctable) or remains poor despite reweighting (adversarial, requires adversarial training or certified defences). Population-level monitoring alone cannot catch per-instance adversarial inputs; per-instance detectors such as feature squeezing or input complexity measures are necessary complements.
+
+## 8. Implementation: Importance-Weighted Logistic Regression
+
+The following demonstration generates a synthetic covariate shift scenario: training inputs from $p(x) \sim \mathcal{N}(0, 1)$ and test inputs from $q(x) \sim \mathcal{N}(2, 1)$, with a shared conditional $p(y \mid x) = \sigma(1.5x - 1)$. A logistic regression trained without correction will underperform on the test distribution; importance weighting recovers the target risk.
+
+```python
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from scipy.special import expit
+
+rng = np.random.default_rng(42)
+
+def sample_data(n, mu, rng):
+    x = rng.normal(loc=mu, scale=1.0, size=n)
+    logit = 1.5 * x - 1.0
+    y = (rng.random(n) < expit(logit)).astype(int)
+    return x.reshape(-1, 1), y
+
+n_train, n_test = 2000, 1000
+X_train, y_train = sample_data(n_train, mu=0.0, rng=rng)
+X_test,  y_test  = sample_data(n_test,  mu=2.0, rng=rng)
+
+# Unweighted logistic regression
+clf_plain = LogisticRegression(C=1.0, solver="lbfgs", max_iter=500)
+clf_plain.fit(X_train, y_train)
+acc_plain = clf_plain.score(X_test, y_test)
+
+# Classifier-based importance weights
+# Pool train (label 0) and test (label 1) by their INPUTS only
+X_pool = np.vstack([X_train, X_test])
+d_labels = np.array([0]*n_train + [1]*n_test)
+
+disc = LogisticRegression(C=1.0, solver="lbfgs", max_iter=500)
+disc.fit(X_pool, d_labels)
+
+# Shift detection: AUC of discriminator
+disc_proba = disc.predict_proba(X_pool)[:, 1]
+auc = roc_auc_score(d_labels, disc_proba)
+
+# Importance weights for training samples: w(x) = P(test|x) / P(train|x)
+p_test_given_x = disc.predict_proba(X_train)[:, 1]
+p_train_given_x = 1.0 - p_test_given_x
+weights = np.clip(p_test_given_x / (p_train_given_x + 1e-9), 0.0, 20.0)
+
+# Importance-weighted logistic regression
+clf_iw = LogisticRegression(C=1.0, solver="lbfgs", max_iter=500)
+clf_iw.fit(X_train, y_train, sample_weight=weights)
+acc_iw = clf_iw.score(X_test, y_test)
+
+print(f"Discriminator AUC (shift detection): {auc:.3f}")
+print(f"Unweighted test accuracy:            {acc_plain:.3f}")
+print(f"Importance-weighted test accuracy:   {acc_iw:.3f}")
+```
+
+```python
+import numpy as np
+from scipy.special import expit
+
+# Analytic baseline: Bayes optimal accuracy under q(x) ~ N(2,1)
+rng2 = np.random.default_rng(0)
+x_oracle = rng2.normal(2.0, 1.0, 50_000)
+y_oracle_prob = expit(1.5 * x_oracle - 1.0)
+y_oracle_pred = (y_oracle_prob >= 0.5).astype(int)
+y_oracle_true = (rng2.random(50_000) < y_oracle_prob).astype(int)
+bayes_acc = np.mean(y_oracle_pred == y_oracle_true)
+print(f"Bayes optimal accuracy under q(x):   {bayes_acc:.3f}")
+
+# Demonstrate uLSIF weights manually (Gaussian kernel, closed form)
+rng3 = np.random.default_rng(7)
+X_src = rng3.normal(0.0, 1.0, (2000, 1))
+X_tgt = rng3.normal(2.0, 1.0, (1000, 1))
+
+sigma = 1.0
+b = 50
+centres = X_tgt[rng3.choice(len(X_tgt), b, replace=False)]
+
+def rbf(X, C, sigma):
+    diff = X[:, None, :] - C[None, :, :]        # (n, b, d)
+    return np.exp(-np.sum(diff**2, axis=2) / (2 * sigma**2))
+
+Phi_src = rbf(X_src, centres, sigma)             # (n_src, b)
+Phi_tgt = rbf(X_tgt, centres, sigma)             # (n_tgt, b)
+
+lam = 0.01
+H_hat = Phi_src.T @ Phi_src / len(X_src)        # (b, b)
+h_hat = Phi_tgt.mean(axis=0)                     # (b,)
+
+alpha = np.linalg.solve(H_hat + lam * np.eye(b), h_hat)
+alpha = np.clip(alpha, 0.0, None)
+
+w_ulsif = Phi_src @ alpha
+print(f"uLSIF weight stats — mean: {w_ulsif.mean():.3f}, std: {w_ulsif.std():.3f}, min: {w_ulsif.min():.3f}, max: {w_ulsif.max():.3f}")
+```
+
+The first block shows that the discriminator AUC far exceeds 0.5 (confirming detectable shift) and that importance weighting closes a meaningful fraction of the accuracy gap relative to the unweighted baseline. The second block implements the closed-form uLSIF estimator with a Gaussian kernel, illustrating that it requires only matrix operations on the kernel feature matrices and produces non-negative weights by construction after clipping.
+
+## 9. Variance and Effective Sample Size
+
+Importance weighting is unbiased but can have very high variance when $q$ and $p$ are far apart. The *effective sample size* (ESS) quantifies how much information the weighted sample actually contains:
+
+$$\text{ESS} = \frac{\left(\sum_{i=1}^n w(x_i)\right)^2}{\sum_{i=1}^n w(x_i)^2}.$$
+
+When $q$ and $p$ have little overlap, a small number of training points carry nearly all the weight, ESS $\ll n$, and the variance of any importance-weighted estimator is correspondingly inflated. Practical guidelines include clipping weights at a maximum value (at the cost of introducing a small bias), or truncating the ratio using $\tilde{w}(x) = \min(w(x), c)$ for a threshold $c$ chosen by cross-validation. Self-normalised importance sampling replaces weights $w(x_i)$ with $w(x_i) / \sum_j w(x_j)$, which reduces variance and removes the need for the normalisation constraint in KLIEP at the cost of introducing a $O(n^{-1})$ bias.
+
+The bias-variance trade-off in importance weighting mirrors the broader trade-off in domain adaptation: when source and target are very different, any correction method based solely on source-labelled data will struggle, and collecting even a small amount of target-labelled data typically dominates pure unsupervised reweighting.
+
+## 10. Connections to Domain Adaptation and Transfer Learning
+
+Covariate shift correction occupies a specific position in the taxonomy of distribution shift methods. *Unsupervised domain adaptation* addresses the same problem with no target labels and often employs domain-adversarial training (Ganin et al., 2016) to learn a feature representation that is invariant to the source/target discriminator. This can be viewed as learning a feature mapping $\phi$ such that the importance ratio $q(\phi(x))/p(\phi(x)) \approx 1$, i.e., driving the ESS up by projection into a subspace of matched marginals.
+
+*Semi-supervised domain adaptation* augments unlabelled target data with small amounts of target labels, improving weight estimation and enabling direct fine-tuning of the final layers. Pretrained large models used in transfer learning have already seen diverse data, implicitly matching many natural covariate shift scenarios, which is one practical explanation for their strong out-of-distribution generalisation.
+
+Understanding covariate shift as a specific structural assumption --- unchanged conditional, changed marginal --- keeps the problem tractable: the Bayes optimal classifier is the same target under both distributions, so the challenge is purely one of estimation, not of a moving target.
+
+## References
+
+1. Shimodaira, H. (2000). Improving predictive inference under covariate shift by weighting the log-likelihood function. *Journal of Statistical Planning and Inference*, 90(2), 227-244. https://doi.org/10.1016/S0378-3758(00)00115-4
+
+2. Sugiyama, M., Nakajima, S., Kashima, H., von Bunau, P., and Kawanabe, M. (2008). Direct importance estimation with model selection and its application to covariate shift adaptation. *Journal of Machine Learning Research*, 9, 1433-1481. https://dl.acm.org/doi/10.5555/1390681.1442799
+
+3. Kanamori, T., Hido, S., and Sugiyama, M. (2009). A least-squares approach to direct importance estimation. *Journal of Machine Learning Research*, 10, 1391-1445. https://dl.acm.org/doi/10.5555/1577069.1755874
+
+4. Bickel, S., Bruckner, M., and Scheffer, T. (2009). Discriminative learning under covariate shift. *Journal of Machine Learning Research*, 10, 2137-2155. https://dl.acm.org/doi/10.5555/1577069.1755878
+
+5. Ganin, Y., Ustinova, E., Ajakan, H., Germain, P., Larochelle, H., Laviolette, F., Marchand, M., and Lempitsky, V. (2016). Domain-adversarial training of neural networks. *Journal of Machine Learning Research*, 17(1), 2096-2030. https://arxiv.org/abs/1505.07818
+
+6. Gretton, A., Borgwardt, K. M., Rasch, M. J., Scholkopf, B., and Smola, A. (2012). A kernel two-sample test. *Journal of Machine Learning Research*, 13, 723-773. https://dl.acm.org/doi/10.5555/2503308.2188410

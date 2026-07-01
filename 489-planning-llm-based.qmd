@@ -1,0 +1,295 @@
+# LLM-Based Planning and Task Decomposition {#sec-llm-planning}
+
+## 1. The Planning Problem
+
+Complex real-world tasks decompose into sequences of interdependent steps, each of which may require distinct resources, produce intermediate artifacts consumed by later steps, and fail in ways that cascade through the plan. Classical AI planning formalizes this structure precisely: given a world state $s_0$, a goal condition $g$, and a set of actions $\mathcal{A}$ each specified by preconditions and effects, find a sequence $\langle a_1, a_2, \ldots, a_n \rangle$ that transitions $s_0$ to some $s_n \models g$.
+
+STRIPS (Stanford Research Institute Problem Solver) introduced this representation in the 1970s. Each action $a \in \mathcal{A}$ carries a precondition list $\text{pre}(a)$, an add list $\text{add}(a)$, and a delete list $\text{del}(a)$. Applying $a$ to state $s$ yields $(s \setminus \text{del}(a)) \cup \text{add}(a)$ whenever $\text{pre}(a) \subseteq s$. Planning Domain Definition Language (PDDL) extended this formalism with typed objects, numeric fluents, temporal constraints, and probabilistic effects, enabling solvers such as Fast Downward and LAMA to tackle industrial logistics, robotic manipulation, and scheduling problems.
+
+The limitation of classical planning is the **world model bottleneck**: every predicate, every object, and every action schema must be hand-specified in the formal language. For open-domain tasks expressed in natural language — "book me the cheapest flight to Paris that still lets me attend Tuesday's 3 p.m. standup, then draft an itinerary" — no PDDL representation exists. The set of relevant predicates is not known in advance; the effects of tool invocations are complex and context-dependent; and goal specifications are ambiguous in ways only resolvable through pragmatic inference.
+
+Large language models offer a different regime: they encode vast amounts of commonsense and procedural knowledge from pre-training and can generate plans expressed in the same natural language as the task specification. The LLM functions as an approximate world model, predicting plausible next actions, their likely outcomes, and when re-planning is needed. Execution uses external tools — code interpreters, web search APIs, database queries — that ground the model's reasoning in real computation. This section traces the progression from chain-of-thought prompting through structured plan-and-execute systems and tree-search methods.
+
+## 2. Chain-of-Thought Prompting
+
+### 2.1 From Direct Prediction to Intermediate Reasoning
+
+Standard few-shot prompting conditions a language model to produce an answer $y$ given a question $x$ by maximizing:
+
+$$P(y \mid x) = \prod_{t} P(y_t \mid x, y_{<t})$$
+
+For arithmetic or multi-step reasoning tasks, the optimal $y$ is a final answer that depends on intermediate computations not expressed in $x$. When the model must compress the full reasoning chain into a single token prediction, it can only succeed if the mapping from $x$ to $y$ can be captured by a shallow pattern in the training distribution. For problems requiring five or more compositional steps, this fails systematically.
+
+Wei et al. (2022) proposed **chain-of-thought prompting**: augment each few-shot exemplar with an explicit intermediate reasoning chain $c$ so the model learns to generate:
+
+$$P(c, y \mid x) = P(c \mid x) \cdot P(y \mid x, c)$$
+
+The chain $c$ contains natural-language computations (arithmetic steps, logic deductions, sub-goal states) that serve as intermediate variables. Because the model generates $c$ before $y$, the conditional $P(y \mid x, c)$ is evaluated at a context that already contains the resolved sub-computations, dramatically reducing the complexity of the remaining prediction. Empirically, this can be decomposed as:
+
+$$\log P(y \mid x, c) \approx \log P(y \mid x) + \sum_{i} \Delta_i$$
+
+where each $\Delta_i$ is the log-odds contribution of sub-result $r_i \in c$ to the final answer. When sub-results are individually easy to verify and the model assigns high probability to correct intermediates, the chain provides strong guidance.
+
+Wei et al. (2022) showed that chain-of-thought prompting produces substantial gains on the GSM8K math benchmark, SVAMP, and BIG-Bench hard tasks — but only for models with approximately 100 billion parameters or more. Smaller models generate incoherent chains that do not improve, and sometimes hurt, final accuracy. This **emergence at scale** suggests the capability requires sufficient representational capacity to maintain a coherent reasoning trace over dozens of tokens.
+
+The zero-shot variant ("Let's think step by step") introduced by Kojima et al. (2022) demonstrates that the reasoning scaffold is partially encoded during pre-training: merely eliciting deliberate sequential reasoning improves performance without any exemplars.
+
+### 2.2 Limitations of Linear Chains
+
+Chain-of-thought reasoning is strictly linear: a single path from question to answer. If the model takes a wrong turn at step $k$, all subsequent steps build on a flawed premise and the error propagates irreversibly. The model has no mechanism to backtrack, evaluate alternative paths, or select among competing hypotheses. Tasks that require **exploration** — where the correct reasoning path is not obvious a priori — expose this limitation.
+
+## 3. Plan-and-Execute Architectures
+
+### 3.1 Separating Planning from Execution
+
+Wang et al. (2023) formalized the **plan-and-execute** paradigm, which decouples the cognitive tasks of planning and execution into separate agents. A planner agent $\pi_P$ takes the high-level task $T$ and produces a structured plan:
+
+$$\text{plan} = \pi_P(T) = \langle s_1, s_2, \ldots, s_n \rangle$$
+
+where each step $s_i$ specifies an action type, its arguments, and optionally which prior steps it depends on. An executor agent $\pi_E$ then carries out each step sequentially or in parallel according to the dependency graph, invoking tools and accumulating results:
+
+$$r_i = \pi_E(s_i, \{r_j : j \prec i\})$$
+
+where $j \prec i$ denotes step $j$ precedes step $i$ in the dependency order. The final response is synthesized from $\{r_i\}$.
+
+This separation offers several advantages over interleaved agent loops such as ReAct (Yao et al., 2022). First, the planner can reason about the full task structure without being distracted by execution details. Second, the executor can focus on reliable tool invocation without maintaining global task context. Third, plan-level re-planning — triggered when $r_i$ indicates failure — can update $\langle s_{i+1}, \ldots, s_n \rangle$ globally rather than greedily patching one step at a time. Wang et al. (2023) showed plan-and-execute outperforms ReAct on long-horizon tasks across several benchmarks, with the gap widening as the number of required steps increases.
+
+### 3.2 Re-planning Under Failure
+
+When executor step $i$ fails or returns an unexpected result, naive continuation compounds errors. A re-planner receives the original task $T$, the partial execution history $\langle (s_1, r_1), \ldots, (s_i, r_i) \rangle$, and generates a revised plan for the remaining steps:
+
+$$\text{plan}' = \pi_P(T, \text{history})$$
+
+This mirrors closed-loop control: the plan is a hypothesis about action sequences, updated in light of observed outcomes. In practice, re-planning frequency trades off accuracy against API cost; architectures typically trigger re-planning only on explicit failure signals rather than after every step.
+
+## 4. HuggingGPT: Orchestrating Specialized Models
+
+Shen et al. (2023) demonstrated that an LLM can serve as a **controller** that dynamically selects and orchestrates specialized models rather than executing tasks itself. HuggingGPT uses ChatGPT as a central planner with access to a catalog of HuggingFace models, each with a natural-language description of its input/output types and capabilities.
+
+The system operates in four phases. In **Task Planning**, the controller parses the user request into a dependency graph of sub-tasks, each tagged with a task type (image classification, text generation, object detection, etc.) and the data flow between them. In **Model Selection**, for each sub-task the controller queries the model catalog and selects the best-matching model based on capability description and user context — for example, routing an image captioning sub-task to BLIP-2 and a subsequent question-answering sub-task to a reading-comprehension model conditioned on that caption.
+
+In **Task Execution**, the selected models are invoked via HuggingFace's inference API, and outputs are cached. Finally, in **Response Generation**, the controller synthesizes a natural-language response by integrating model outputs, handling cases where intermediate results must be passed as inputs to downstream models.
+
+The key insight is that model capability descriptions serve as an informal type system: the controller matches task requirements to model affordances through natural-language reasoning rather than explicit type checking. This allows the system to compose models it has never seen composed before, generalizing to novel multi-modal task combinations at inference time. Failure modes include incorrect model selection when capability descriptions are ambiguous and error propagation when an upstream model's output is malformed for a downstream model's expected input format.
+
+## 5. A Taxonomy of LLM Planning Methods
+
+Huang et al. (2024) surveyed the landscape of LLM planning and proposed a taxonomy with four primary strategies.
+
+**Subgoal decomposition** recursively breaks a task into sub-goals until each is directly executable. Hierarchical task networks in classical planning instantiate this structure formally; in LLM systems it arises naturally from prompts such as "Break this task into smaller steps." The key challenge is decomposition granularity: too coarse and steps are themselves complex planning problems; too fine and the plan is verbose and fragile to minor phrasing variations.
+
+**Multi-plan selection** generates a population of candidate plans and selects among them using an evaluator — a separate model, a heuristic scorer, or majority vote. Self-consistency (Wang et al., 2022) applies this idea to reasoning: sample $k$ chains of thought, aggregate answers by majority vote, and return the plurality result. The population of plans trades off computational cost against robustness to individual plan failures.
+
+**External planner guidance** uses classical planners to verify or extend LLM-generated plans. An LLM translates the natural-language task into a PDDL problem file; a sound planner (Fast Downward, LAMA) finds a provably correct plan if one exists; the LLM translates the plan back into natural-language instructions. This hybrid approach inherits formal correctness guarantees for the structured component while using the LLM for the grounding step that classical planners cannot perform.
+
+**Reflection and refinement** closes the loop between execution and planning by having the LLM critique its own outputs and iteratively revise. Reflexion (Shinn et al., 2023) stores execution feedback in a verbal memory buffer and conditions the next plan attempt on both the original task and accumulated failure descriptions. This is analogous to policy gradient methods in reinforcement learning, with the LLM's self-critique playing the role of the reward signal.
+
+### 5.1 Key Failure Modes
+
+Huang et al. (2024) identify three systematic failure modes that cut across all paradigms. **Overconfident incorrect plans**: LLMs assign high probability to plausible-sounding plans that violate physical or logical constraints — for example, a cooking plan that uses a cooking step before a step that produces the ingredient. The model has no explicit constraint checker, so precondition violations go undetected. **Inability to detect plan failures**: even when an executor returns an error, the LLM may not recognize it as a failure signal requiring re-planning, particularly when error messages are terse or ambiguous. **Hallucinated preconditions**: the model assumes the existence of resources, APIs, or world states that do not exist, generating plans that cannot be executed by any executor.
+
+## 6. Tree of Thoughts
+
+### 6.1 Search Over Reasoning States
+
+Yao et al. (2023b) generalized chain-of-thought reasoning from a linear path to a **tree of thoughts** (ToT), enabling systematic search over the space of possible reasoning trajectories. Define a reasoning state $s^{(d)}$ at depth $d$ as a partial problem-solving context consisting of the problem statement and $d$ reasoning steps. A thought generator $G(s^{(d)})$ samples $k$ candidate next thoughts $\{t_1^{(d+1)}, \ldots, t_k^{(d+1)}\}$ from the LLM, producing $k$ successor states $\{s_1^{(d+1)}, \ldots, s_k^{(d+1)}\}$.
+
+A state evaluator $V(s^{(d)})$ assigns a score to each state — either by prompting the LLM to estimate likelihood of success from that state, or via a simple heuristic. The search algorithm (BFS, DFS, or beam search) then traverses the tree, expanding high-value states and pruning low-value ones. The full algorithm is:
+
+$$\text{ToT}(x) = \arg\max_{y \in \text{leaves}} \text{score}(y)$$
+
+where leaves are terminal reasoning states and score aggregates evaluator values along the path. With beam width $b$ and maximum depth $D$, the computational cost is $O(k \cdot b \cdot D)$ model calls versus $O(D)$ for chain-of-thought — a multiplicative overhead that is justified when the task requires genuine exploration.
+
+On the Game of 24 (produce the number 24 from four given numbers using arithmetic operations), chain-of-thought achieves approximately 4% success rate while ToT with BFS achieves 74%. The task requires backtracking — some arithmetic subexpressions are dead ends — which is impossible in a linear chain but natural in tree search. Creative writing tasks with multiple structural constraints and crossword puzzle solving show similar gains.
+
+### 6.2 Relationship to Classical Search
+
+Tree of Thoughts is a learned heuristic search: the generator plays the role of a successor function and the evaluator plays the role of a heuristic function $h(n)$ in A* or beam search. Classical heuristics are hand-designed to be admissible (never overestimate cost to goal); LLM evaluators are approximate and may be miscalibrated, but generalize to arbitrary domains without domain-specific engineering. The resulting algorithm has the flavor of Monte Carlo Tree Search with a learned policy and value function, analogous to AlphaGo's dual-network architecture but operating in the space of natural-language reasoning steps.
+
+## 7. Implementation: A Minimal Plan-and-Execute System
+
+The following implementation demonstrates plan-and-execute with a mock planner that templates plans from recognized task patterns. No LLM API is required; the planner uses rule-based templates to generate JSON plans, and the executor processes each step using pure Python tools.
+
+```python
+import json
+import re
+from typing import Any
+
+TOOL_REGISTRY: dict[str, Any] = {}
+
+def tool(name: str):
+    def decorator(fn):
+        TOOL_REGISTRY[name] = fn
+        return fn
+    return decorator
+
+@tool("search")
+def search(query: str, **_) -> str:
+    results = {
+        "population of France": "67.4 million (2023 estimate)",
+        "capital of France": "Paris",
+        "Eiffel Tower height": "330 metres including antenna",
+    }
+    for key, val in results.items():
+        if key.lower() in query.lower():
+            return val
+    return f"[mock result for: {query}]"
+
+@tool("calculate")
+def calculate(expression: str, **_) -> str:
+    allowed = set("0123456789 +-*/().,")
+    sanitized = "".join(c for c in expression if c in allowed)
+    try:
+        result = eval(sanitized, {"__builtins__": {}})  # noqa: S307
+        return str(result)
+    except Exception as exc:
+        return f"error: {exc}"
+
+@tool("summarize")
+def summarize(text: str, **_) -> str:
+    sentences = re.split(r"(?<=[.!?]) +", text.strip())
+    return sentences[0] if sentences else text[:80]
+
+def mock_planner(task: str) -> list[dict[str, Any]]:
+    """Rule-based planner that templates plans for recognized task patterns."""
+    task_lower = task.lower()
+
+    if "population" in task_lower and "capital" in task_lower:
+        return [
+            {"id": 1, "tool": "search", "args": {"query": "capital of France"}, "depends_on": []},
+            {"id": 2, "tool": "search", "args": {"query": "population of France"}, "depends_on": []},
+            {"id": 3, "tool": "summarize", "args": {"text": "RESULT_1 | RESULT_2"}, "depends_on": [1, 2]},
+        ]
+
+    if "calculate" in task_lower or any(op in task else "" for op in ["+", "-", "*", "/"]):
+        expr = re.search(r"[\d\s\+\-\*/\(\)\.]+", task)
+        expression = expr.group(0).strip() if expr else "0"
+        return [
+            {"id": 1, "tool": "calculate", "args": {"expression": expression}, "depends_on": []},
+        ]
+
+    return [
+        {"id": 1, "tool": "search", "args": {"query": task}, "depends_on": []},
+        {"id": 2, "tool": "summarize", "args": {"text": "RESULT_1"}, "depends_on": [1]},
+    ]
+
+def resolve_args(args: dict[str, Any], results: dict[int, str]) -> dict[str, Any]:
+    """Substitute RESULT_N placeholders with actual execution results."""
+    resolved = {}
+    for key, val in args.items():
+        if isinstance(val, str):
+            for step_id, result in results.items():
+                val = val.replace(f"RESULT_{step_id}", result)
+        resolved[key] = val
+    return resolved
+
+def execute_plan(plan: list[dict[str, Any]]) -> dict[int, str]:
+    results: dict[int, str] = {}
+    remaining = list(plan)
+
+    while remaining:
+        ready = [
+            step for step in remaining
+            if all(dep in results for dep in step["depends_on"])
+        ]
+        if not ready:
+            raise RuntimeError("Dependency cycle detected in plan")
+
+        for step in ready:
+            step_id = step["id"]
+            tool_name = step["tool"]
+            resolved = resolve_args(step["args"], results)
+
+            if tool_name not in TOOL_REGISTRY:
+                results[step_id] = f"[unknown tool: {tool_name}]"
+            else:
+                results[step_id] = TOOL_REGISTRY[tool_name](**resolved)
+
+            remaining.remove(step)
+
+    return results
+
+def plan_and_execute(task: str) -> None:
+    print(f"Task: {task}")
+    plan = mock_planner(task)
+    print(f"\nGenerated plan ({len(plan)} steps):")
+    print(json.dumps(plan, indent=2))
+
+    print("\nExecution:")
+    results = execute_plan(plan)
+    for step_id, result in sorted(results.items()):
+        print(f"  Step {step_id}: {result}")
+
+    final_step = max(results)
+    print(f"\nFinal output: {results[final_step]}")
+
+plan_and_execute("What is the capital and population of France?")
+print()
+plan_and_execute("calculate 330 * 1000 / 67.4")
+```
+
+The executor respects the dependency graph by processing steps in topological order: a step becomes ready only once all its declared dependencies have produced results. The `resolve_args` function substitutes `RESULT_N` placeholders so downstream steps can consume upstream outputs without the planner explicitly passing result objects.
+
+```python
+def demo_replanning() -> None:
+    """Demonstrate re-planning when a step returns an error."""
+
+    def flaky_search(query: str, **_) -> str:
+        if "population" in query:
+            raise ValueError("API rate limit exceeded")
+        return f"[result for: {query}]"
+
+    def replan(task: str, history: list[tuple[int, str, str]]) -> list[dict]:
+        print(f"  Re-planning after {len(history)} executed steps...")
+        failed_tools = {tool for _, tool, result in history if result.startswith("error")}
+        return [
+            {"id": len(history) + 1, "tool": "search",
+             "args": {"query": task + " (fallback)"}, "depends_on": []}
+        ]
+
+    task = "Find the population of France"
+    plan = [{"id": 1, "tool": "search", "args": {"query": "population of France"}, "depends_on": []}]
+    history: list[tuple[int, str, str]] = []
+
+    for step in plan:
+        try:
+            result = flaky_search(**step["args"])
+            history.append((step["id"], step["tool"], result))
+        except ValueError as exc:
+            error_result = f"error: {exc}"
+            history.append((step["id"], step["tool"], error_result))
+            print(f"  Step {step['id']} failed: {exc}")
+            fallback_plan = replan(task, history)
+            for fb_step in fallback_plan:
+                result = TOOL_REGISTRY["search"](**fb_step["args"])
+                print(f"  Fallback step {fb_step['id']}: {result}")
+            break
+
+demo_replanning()
+```
+
+This second block illustrates graceful degradation: when a step raises an exception, the system captures the error in the history and invokes the re-planner, which generates a fallback plan using the accumulated context. In production systems, the re-planner would be an LLM call conditioned on the task description and the full execution history.
+
+## 8. Synthesis and Practical Considerations
+
+The progression from chain-of-thought to plan-and-execute to Tree of Thoughts reflects increasing formalization of the search structure latent in complex task solving. Chain-of-thought makes reasoning explicit but commits to a single linear path. Plan-and-execute separates the planning and execution concerns and enables structured re-planning. Tree of Thoughts makes the branching and evaluation structure explicit, enabling near-optimal search at the cost of multiplicative compute.
+
+In practice, system designers choose among these based on task properties. For tasks with clear sequential dependencies and low ambiguity, plan-and-execute with deterministic re-planning suffices. For tasks requiring genuine exploration — where the optimal path is not identifiable without partial execution — Tree of Thoughts or Monte Carlo sampling with self-consistency scoring is more appropriate. For tasks requiring specialized models (vision, audio, structured prediction), the HuggingGPT paradigm of LLM-as-controller with a model catalog provides compositional generalization to novel multi-modal combinations.
+
+The fundamental limitation across all paradigms is the **grounding gap**: the LLM's internal representation of world state is statistical and approximate. Plans generated without access to real-time information may contain hallucinated preconditions or invalid action sequences. Closing this gap requires tight coupling between planning and execution, with real observations fed back into the planning context after each action — the core insight behind closed-loop agent architectures discussed in subsequent chapters.
+
+## References
+
+1. Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., and Zhou, D. (2022). Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2201.11903
+
+2. Wang, L., Xu, W., Lan, Y., Hu, Z., Lan, Y., Lee, R. K.-W., and Lim, E.-P. (2023). Plan-and-Solve Prompting: Improving Zero-Shot Chain-of-Thought Reasoning by Large Language Models. *Proceedings of ACL 2023*. https://arxiv.org/abs/2305.04091
+
+3. Shen, Y., Song, K., Tan, X., Li, D., Lu, W., and Zhuang, Y. (2023). HuggingGPT: Solving AI Tasks with ChatGPT and Its Friends in HuggingFace. *Advances in Neural Information Processing Systems*, 36. https://arxiv.org/abs/2303.17580
+
+4. Huang, L., Yu, W., Ma, W., Zhong, W., Feng, Z., Wang, H., Chen, Q., Peng, W., Feng, X., Qin, B., and Liu, T. (2024). A Survey on Hallucination in Large Language Models: Principles, Taxonomy, Challenges, and Open Questions. https://arxiv.org/abs/2402.02716
+
+5. Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T. L., Cao, Y., and Narasimhan, K. (2023). Tree of Thoughts: Deliberate Problem Solving with Large Language Models. *Advances in Neural Information Processing Systems*, 36. https://arxiv.org/abs/2305.10601
+
+6. Kojima, T., Gu, S. S., Reid, M., Matsuo, Y., and Iwasawa, Y. (2022). Large Language Models are Zero-Shot Reasoners. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2205.11916
+
+7. Shinn, N., Cassano, F., Berman, E., Gopinath, A., Narasimhan, K., and Yao, S. (2023). Reflexion: Language Agents with Verbal Reinforcement Learning. *Advances in Neural Information Processing Systems*, 36. https://arxiv.org/abs/2303.11366

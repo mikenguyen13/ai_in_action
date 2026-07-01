@@ -1,0 +1,346 @@
+# Data Drift Detection Methods {#sec-drift-detection}
+
+Deployed machine learning models operate under a fundamental assumption that the distribution of incoming data resembles the distribution on which the model was trained. When this assumption fails, prediction quality degrades silently. The model continues to return outputs, but those outputs grow increasingly unreliable as the real world evolves away from the training snapshot. This phenomenon is called **data drift** or **covariate shift**, and detecting it promptly is one of the central operational challenges in production machine learning.
+
+The detection problem is formally a **two-sample test**: given a reference dataset $X_\text{ref}$ drawn from distribution $P$ and a current window $X_\text{curr}$ drawn from distribution $Q$, decide at some significance level whether $P = Q$. The reference dataset is typically the training set or a held-out slice from a period of known good behavior. The current window is a rolling buffer of recent production inputs. Every statistical method in this chapter is, at its core, a way to operationalize this test.
+
+## 1. The Kolmogorov-Smirnov Test
+
+For continuous univariate features, the Kolmogorov-Smirnov (KS) test is the most widely deployed drift detector. Let $F_n$ be the empirical cumulative distribution function (CDF) of the reference sample of size $n$ and $G_m$ be the empirical CDF of the current sample of size $m$:
+
+$$F_n(x) = \frac{1}{n} \sum_{i=1}^{n} \mathbf{1}[X_i \le x], \qquad G_m(x) = \frac{1}{m} \sum_{j=1}^{m} \mathbf{1}[Y_j \le x].$$
+
+The KS statistic is the supremum of the absolute difference between these two step functions:
+
+$$D_{n,m} = \sup_{x \in \mathbb{R}} \left| F_n(x) - G_m(x) \right|.$$
+
+Under $H_0: P = Q$, the statistic $D_{n,m} \sqrt{nm/(n+m)}$ converges in distribution to the Kolmogorov distribution, enabling exact p-value computation. A p-value below a chosen significance level $\alpha$ (commonly 0.05) causes rejection of $H_0$ and signals drift.
+
+The KS test is sensitive to both location shifts (changes in mean) and scale changes (changes in variance or tails). Its geometric interpretation is appealing: $D_{n,m}$ measures the largest vertical gap between the two empirical CDFs, which a practitioner can visualize directly.
+
+```python
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(42)
+
+n_ref = 2000
+n_curr = 500
+
+x_ref = rng.normal(loc=0.0, scale=1.0, size=n_ref)
+x_curr = rng.normal(loc=0.4, scale=1.2, size=n_curr)
+
+result = stats.ks_2samp(x_ref, x_curr)
+print(f"KS statistic: {result.statistic:.4f}")
+print(f"p-value:      {result.pvalue:.4f}")
+print(f"Drift detected: {result.pvalue < 0.05}")
+
+x_sorted = np.linspace(min(x_ref.min(), x_curr.min()),
+                       max(x_ref.max(), x_curr.max()), 500)
+cdf_ref  = np.mean(x_ref[:, None] <= x_sorted, axis=0)
+cdf_curr = np.mean(x_curr[:, None] <= x_sorted, axis=0)
+
+plt.figure(figsize=(7, 4))
+plt.plot(x_sorted, cdf_ref,  label="Reference CDF")
+plt.plot(x_sorted, cdf_curr, label="Current CDF", linestyle="--")
+gap_idx = np.argmax(np.abs(cdf_ref - cdf_curr))
+plt.annotate("", xy=(x_sorted[gap_idx], cdf_curr[gap_idx]),
+             xytext=(x_sorted[gap_idx], cdf_ref[gap_idx]),
+             arrowprops=dict(arrowstyle="<->", color="red"))
+plt.text(x_sorted[gap_idx] + 0.05,
+         (cdf_ref[gap_idx] + cdf_curr[gap_idx]) / 2,
+         f"D = {result.statistic:.3f}", color="red")
+plt.xlabel("Feature value")
+plt.ylabel("CDF")
+plt.legend()
+plt.tight_layout()
+plt.savefig("ks_cdf_demo.png", dpi=120)
+plt.close()
+```
+
+One limitation of the KS test is that it applies only to continuous features. Categorical columns require a different approach.
+
+## 2. Chi-Squared Test for Categorical Features
+
+For a categorical feature with $k$ distinct values, the chi-squared goodness-of-fit test compares observed counts in the current window against expected counts derived from the reference distribution. Let $p_i^\text{ref}$ be the proportion of reference samples falling into category $i$. Given a current window of total size $N_\text{curr}$, the expected count for category $i$ is $E_i = N_\text{curr} \cdot p_i^\text{ref}$ and the observed count is $O_i$. The test statistic is:
+
+$$\chi^2 = \sum_{i=1}^{k} \frac{(O_i - E_i)^2}{E_i}.$$
+
+Under $H_0$, this follows a chi-squared distribution with $k - 1$ degrees of freedom (when the reference proportions are treated as known). The rule of thumb requiring $E_i \ge 5$ for each bin guards against poor chi-squared approximation; cells with sparse expected counts are typically merged before applying the test.
+
+```python
+from scipy.stats import chisquare
+
+rng = np.random.default_rng(0)
+categories = ["A", "B", "C", "D", "E"]
+
+ref_probs  = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
+n_ref_cat  = 5000
+ref_counts = rng.multinomial(n_ref_cat, ref_probs)
+
+curr_probs = np.array([0.20, 0.25, 0.25, 0.20, 0.10])
+n_curr_cat = 600
+curr_counts = rng.multinomial(n_curr_cat, curr_probs)
+
+expected = ref_probs * n_curr_cat
+
+chi2, p_value = chisquare(f_obs=curr_counts, f_exp=expected)
+print(f"Chi-squared: {chi2:.3f}")
+print(f"p-value:     {p_value:.4f}")
+print(f"Drift detected: {p_value < 0.05}")
+for cat, obs, exp in zip(categories, curr_counts, expected):
+    print(f"  {cat}: obs={obs:4d}  exp={exp:6.1f}  diff={obs-exp:+.1f}")
+```
+
+## 3. Population Stability Index
+
+The Population Stability Index (PSI) originated in consumer credit scoring and is entrenched in banking regulation. It quantifies how much the distribution of a scored variable has shifted relative to a development sample. For a feature discretized into $B$ bins, let $p_i^\text{ref}$ and $p_i^\text{curr}$ be the fractions of reference and current samples in bin $i$:
+
+$$\text{PSI} = \sum_{i=1}^{B} \left( p_i^\text{curr} - p_i^\text{ref} \right) \ln \frac{p_i^\text{curr}}{p_i^\text{ref}}.$$
+
+The conventional binning strategy uses 10 or 20 equal-frequency bins defined on the reference distribution. The interpretation thresholds are widely standardized in practice: PSI $< 0.10$ indicates no meaningful shift; $0.10 \le \text{PSI} < 0.20$ signals moderate drift warranting investigation; PSI $\ge 0.20$ indicates severe drift requiring model revalidation or retraining.
+
+PSI is asymmetric and not a true divergence in the information-theoretic sense, but its asymmetry is deliberate: the reference distribution anchors the bins and the expected proportions, mirroring how a model is anchored to its training sample. To avoid taking the logarithm of zero, bins with zero observed or expected counts are typically assigned a small floor probability $\epsilon = 0.0001$ before computing the sum.
+
+Note the structural similarity to the Kullback-Leibler divergence $\text{KL}(Q \| P) = \sum_i p_i^\text{curr} \ln (p_i^\text{curr} / p_i^\text{ref})$. PSI is in fact the sum $\text{KL}(Q \| P) + \text{KL}(P \| Q)$, making it a symmetrized KL divergence (Kullback and Leibler 1951; Jeffreys 1946).
+
+```python
+def compute_psi(reference, current, n_bins=10, epsilon=1e-4):
+    breakpoints = np.percentile(reference, np.linspace(0, 100, n_bins + 1))
+    breakpoints[0]  = -np.inf
+    breakpoints[-1] =  np.inf
+
+    ref_counts  = np.histogram(reference, bins=breakpoints)[0]
+    curr_counts = np.histogram(current,   bins=breakpoints)[0]
+
+    ref_pct  = ref_counts  / len(reference)
+    curr_pct = curr_counts / len(current)
+
+    ref_pct  = np.clip(ref_pct,  epsilon, None)
+    curr_pct = np.clip(curr_pct, epsilon, None)
+
+    psi_bins = (curr_pct - ref_pct) * np.log(curr_pct / ref_pct)
+    return psi_bins.sum(), psi_bins
+
+rng = np.random.default_rng(7)
+x_ref_psi  = rng.normal(0, 1, 10000)
+x_curr_psi = rng.normal(0.6, 1.1, 2000)
+
+psi_total, psi_per_bin = compute_psi(x_ref_psi, x_curr_psi, n_bins=10)
+print(f"PSI = {psi_total:.4f}")
+if psi_total < 0.10:
+    print("Verdict: no significant drift")
+elif psi_total < 0.20:
+    print("Verdict: moderate drift -- investigate")
+else:
+    print("Verdict: severe drift -- model revalidation required")
+```
+
+## 4. Jensen-Shannon Divergence
+
+The KL divergence $\text{KL}(P \| Q) = \sum_i p_i \ln(p_i / q_i)$ is undefined when $q_i = 0$ for some $i$ where $p_i > 0$, and it is asymmetric. The **Jensen-Shannon divergence** (JSD) addresses both issues. Define the mixture $M = (P + Q)/2$. Then:
+
+$$\text{JSD}(P \| Q) = \frac{1}{2} \text{KL}(P \| M) + \frac{1}{2} \text{KL}(Q \| M).$$
+
+Because $M$ always has positive probability wherever either $P$ or $Q$ does, the KL terms are always finite. JSD is symmetric and bounded: $\text{JSD}(P \| Q) \in [0, \ln 2]$ (nats) or $[0, 1]$ (bits). Its square root $\sqrt{\text{JSD}}$ is a proper metric on the space of probability distributions (Endres and Schindelin 2003).
+
+For drift monitoring, JSD is useful when feature histograms are compared across many features simultaneously: the common $[0, \ln 2]$ scale makes cross-feature comparison natural, unlike the KS statistic whose range depends on sample sizes.
+
+```python
+from scipy.spatial.distance import jensenshannon
+
+def jsd_from_samples(reference, current, n_bins=50):
+    lo = min(reference.min(), current.min())
+    hi = max(reference.max(), current.max())
+    bins = np.linspace(lo, hi, n_bins + 1)
+    p, _ = np.histogram(reference, bins=bins, density=True)
+    q, _ = np.histogram(current,   bins=bins, density=True)
+    p = p + 1e-10
+    q = q + 1e-10
+    p /= p.sum()
+    q /= q.sum()
+    return jensenshannon(p, q)
+
+jsd_val = jsd_from_samples(x_ref_psi, x_curr_psi)
+print(f"JSD = {jsd_val:.4f}  (max possible = {np.log(2):.4f} nats)")
+```
+
+## 5. Wasserstein Distance
+
+The **Wasserstein distance** (also called the Earth Mover's Distance, EMD) has a beautifully physical interpretation: it is the minimum amount of work required to transport the probability mass of distribution $P$ into the shape of distribution $Q$, where work is mass times distance moved. Formally, let $\Gamma(P, Q)$ be the set of all joint distributions $\gamma$ on $\mathcal{X} \times \mathcal{X}$ with marginals $P$ and $Q$:
+
+$$W_1(P, Q) = \inf_{\gamma \in \Gamma(P,Q)} \mathbb{E}_{(x,y) \sim \gamma} \left[ \|x - y\| \right].$$
+
+For one-dimensional distributions, this reduces elegantly to the $L^1$ distance between CDFs:
+
+$$W_1(P, Q) = \int_{-\infty}^{\infty} \left| F_P(x) - F_Q(x) \right| dx,$$
+
+which can be computed in $O(n \log n)$ time by sorting both samples. Unlike JSD, the Wasserstein distance is sensitive to the geometry of the sample space: moving mass across a large gap costs more than moving it across a small gap. This makes it well-suited for detecting gradual distributional shifts where the two distributions partially overlap.
+
+```python
+from scipy.stats import wasserstein_distance
+
+w1 = wasserstein_distance(x_ref_psi, x_curr_psi)
+print(f"W1 (Wasserstein-1) = {w1:.4f}")
+
+for shift in [0.0, 0.2, 0.5, 1.0, 2.0]:
+    x_shifted = rng.normal(shift, 1, 3000)
+    w = wasserstein_distance(x_ref_psi, x_shifted)
+    ks_stat, _ = stats.ks_2samp(x_ref_psi, x_shifted)
+    print(f"  shift={shift:.1f}  W1={w:.4f}  KS={ks_stat:.4f}")
+```
+
+The output of this snippet shows that Wasserstein distance grows roughly linearly with the shift magnitude, while the KS statistic saturates near 1 for large shifts. This linear scaling makes Wasserstein distance more informative as a continuous severity metric.
+
+## 6. Evidently for Production Monitoring
+
+Individual statistical tests are powerful but require assembly into a monitoring pipeline. The **Evidently** library provides an open-source framework that wraps these tests, adds model quality metrics, and renders interactive HTML reports (Evidently AI 2023).
+
+The core abstraction is the `Report`, which accepts a list of `Metric` objects. The `DataDriftTable` metric runs per-column drift tests automatically, choosing KS for continuous features and chi-squared for categorical ones, and aggregating a dataset-level drift flag based on how many features exceed threshold.
+
+```python
+import pandas as pd
+import numpy as np
+from evidently import Report
+from evidently.metrics import DataDriftTable, DatasetDriftMetric
+
+rng = np.random.default_rng(99)
+n_ref = 2000
+n_curr = 500
+
+reference_df = pd.DataFrame({
+    "income":    rng.normal(55000, 12000, n_ref),
+    "age":       rng.normal(42, 10, n_ref),
+    "loan_term": rng.integers(12, 60, n_ref),
+    "purpose":   rng.choice(["auto", "home", "personal", "edu"], n_ref,
+                            p=[0.35, 0.30, 0.25, 0.10]),
+})
+
+current_df = pd.DataFrame({
+    "income":    rng.normal(52000, 14000, n_curr),
+    "age":       rng.normal(38, 11, n_curr),
+    "loan_term": rng.integers(24, 72, n_curr),
+    "purpose":   rng.choice(["auto", "home", "personal", "edu"], n_curr,
+                            p=[0.25, 0.25, 0.35, 0.15]),
+})
+
+report = Report(metrics=[
+    DatasetDriftMetric(),
+    DataDriftTable(),
+])
+
+report.run(reference_data=reference_df, current_data=current_df)
+report.save_html("drift_report.html")
+print("Report written to drift_report.html")
+
+result_dict = report.as_dict()
+summary = result_dict["metrics"][0]["result"]
+print(f"Dataset drift detected: {summary['dataset_drift']}")
+print(f"Drifted features: {summary['number_of_drifted_columns']} / "
+      f"{summary['number_of_columns']}")
+```
+
+The HTML report embeds interactive Plotly charts showing per-feature distributions, drift scores, and a summary table. In production, the `report.as_dict()` output can be serialized to JSON and ingested into a monitoring database or alerting system.
+
+## 7. Multivariate Drift Detection
+
+Monitoring features individually is not sufficient when drift manifests as a change in the **joint** distribution of correlated features. A feature vector may remain marginally stable while its covariance structure shifts dramatically, as when two previously independent sensors become correlated due to a hardware fault.
+
+### 7.1 Maximum Mean Discrepancy
+
+The **Maximum Mean Discrepancy** (MMD) is the most theoretically principled multivariate two-sample test for high-dimensional data (Gretton et al. 2012). For a reproducing kernel Hilbert space $\mathcal{H}$ with kernel $k$:
+
+$$\text{MMD}^2(\mathcal{H}, P, Q) = \left\| \mu_P - \mu_Q \right\|_\mathcal{H}^2,$$
+
+where $\mu_P = \mathbb{E}_{x \sim P}[k(x, \cdot)]$ is the kernel mean embedding of $P$. The empirical estimator is:
+
+$$\widehat{\text{MMD}}^2 = \frac{1}{n^2}\sum_{i,j} k(x_i, x_j) - \frac{2}{nm}\sum_{i,j}k(x_i, y_j) + \frac{1}{m^2}\sum_{i,j}k(y_i, y_j).$$
+
+With a Gaussian radial basis function kernel $k(x,y) = \exp(-\|x-y\|^2 / 2\sigma^2)$, MMD captures arbitrary distributional differences including changes in higher-order moments and correlations.
+
+```python
+def mmd_rbf(X, Y, sigma=1.0):
+    n, m = len(X), len(Y)
+    def rbf(A, B):
+        diff = A[:, None, :] - B[None, :, :]
+        return np.exp(-np.sum(diff**2, axis=-1) / (2 * sigma**2))
+    kxx = rbf(X, X)
+    kyy = rbf(Y, Y)
+    kxy = rbf(X, Y)
+    return kxx.mean() - 2 * kxy.mean() + kyy.mean()
+
+rng = np.random.default_rng(3)
+X_ref_mv  = rng.multivariate_normal([0, 0], [[1, 0.5], [0.5, 1]], size=400)
+X_curr_mv = rng.multivariate_normal([0, 0], [[1, -0.3], [-0.3, 1]], size=200)
+
+mmd_val = mmd_rbf(X_ref_mv, X_curr_mv, sigma=1.0)
+print(f"MMD^2 (correlation shift) = {mmd_val:.5f}")
+
+X_curr_same = rng.multivariate_normal([0, 0], [[1, 0.5], [0.5, 1]], size=200)
+mmd_null = mmd_rbf(X_ref_mv, X_curr_same, sigma=1.0)
+print(f"MMD^2 (no shift)           = {mmd_null:.5f}")
+```
+
+### 7.2 Classifier-Based Two-Sample Test
+
+A flexible and intuitive multivariate drift detector trains a binary classifier to distinguish reference samples (label 0) from current samples (label 1). If the two datasets come from the same distribution, a classifier should achieve AUC close to 0.5 (chance performance). An AUC significantly above 0.5 indicates that the classifier can separate the two populations, implying distributional shift.
+
+This approach is distribution-free and automatically captures multivariate interactions. The classifier's feature importances also reveal which features drive the detected shift.
+
+$$\text{AUC} > 0.5 + \delta \quad \Rightarrow \quad \text{drift detected}$$
+
+where $\delta$ is a chosen sensitivity threshold (commonly 0.05 to 0.10). Permutation testing (shuffling labels and recomputing AUC) provides exact p-values when sample sizes are limited (Rabanser et al. 2019).
+
+```python
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import cross_val_score
+
+n_ref_cls  = 600
+n_curr_cls = 300
+
+X_ref_cls  = rng.normal([0, 0, 0], 1, size=(n_ref_cls, 3))
+X_curr_cls = rng.normal([0.5, 0, -0.3], 1, size=(n_curr_cls, 3))
+
+X_combined = np.vstack([X_ref_cls, X_curr_cls])
+y_combined = np.array([0] * n_ref_cls + [1] * n_curr_cls)
+
+clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=0)
+auc_scores = cross_val_score(clf, X_combined, y_combined,
+                             cv=5, scoring="roc_auc")
+mean_auc = auc_scores.mean()
+print(f"Classifier AUC: {mean_auc:.4f}")
+print(f"Drift detected: {mean_auc > 0.55}")
+```
+
+## 8. Choosing the Right Method
+
+The selection among these methods depends on feature type, sample size, regulatory context, and whether interpretability or sensitivity is the primary concern.
+
+The **KS test** and **chi-squared test** are appropriate for per-feature univariate monitoring when interpretable p-values are required. They are the natural choice when downstream stakeholders need to understand which specific features have drifted and by how much.
+
+The **PSI** is the standard in financial services and consumer lending. Regulatory guidance from agencies such as the OCC and Basel Committee on Banking Supervision frequently mandates PSI-based stability reports for credit risk models. Its familiar thresholds (0.1/0.2) are embedded in model risk management policy documents at major banks worldwide.
+
+The **Jensen-Shannon divergence** and **Wasserstein distance** are preferable when drift metrics feed into differentiable optimization objectives, gradient-based active learning, or domain adaptation algorithms. Their smooth behavior as a function of distributional shift makes them more informative than p-values for this purpose.
+
+**MMD** and the **classifier-based test** are necessary when covariate shift affects the joint distribution in ways that univariate tests cannot detect. They are computationally heavier but provide substantially greater statistical power against multivariate shift patterns.
+
+**Evidently** provides a production-ready integration layer that applies these tests at scale across hundreds of features, renders results in dashboards, and integrates with MLflow, Grafana, and data platform APIs. It is the appropriate starting point for any team building a model monitoring system from scratch.
+
+A complete production monitoring pipeline combines all three layers: univariate tests (KS/chi-sq/PSI) for interpretable per-feature alerting, a multivariate test (MMD or classifier AUC) for catching correlated shifts, and a reporting framework (Evidently) for stakeholder communication and audit trails. Alerts should trigger model revalidation workflows, not automatic retraining, since drift in inputs does not always degrade output quality if the learned function is robust.
+
+## References
+
+1. Rabanser, S., Günnemann, S., and Lipton, Z. C. (2019). Failing loudly: An empirical study of methods for detecting dataset shift. *Advances in Neural Information Processing Systems*, 32. https://arxiv.org/abs/1810.11953
+
+2. Gretton, A., Borgwardt, K. M., Rasch, M. J., Scholkopf, B., and Smola, A. (2012). A kernel two-sample test. *Journal of Machine Learning Research*, 13(25), 723-773. https://jmlr.org/papers/v13/gretton12a.html
+
+3. Kullback, S. and Leibler, R. A. (1951). On information and sufficiency. *Annals of Mathematical Statistics*, 22(1), 79-86. https://doi.org/10.1214/aoms/1177729694
+
+4. Jeffreys, H. (1946). An invariant form for the prior probability in estimation problems. *Proceedings of the Royal Society of London A*, 186(1007), 453-461. https://doi.org/10.1098/rspa.1946.0056
+
+5. Endres, D. M. and Schindelin, J. E. (2003). A new metric for probability distributions. *IEEE Transactions on Information Theory*, 49(7), 1858-1860. https://doi.org/10.1109/TIT.2003.813506
+
+6. Evidently AI (2023). Evidently: ML monitoring and observability. https://www.evidentlyai.com
+
+7. Villani, C. (2009). *Optimal Transport: Old and New*. Springer. https://doi.org/10.1007/978-3-540-71050-9

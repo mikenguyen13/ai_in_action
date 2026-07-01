@@ -1,0 +1,270 @@
+# Concept Drift: Detection, Types, and Adaptation {#sec-concept-drift}
+
+A deployed machine learning model implicitly encodes a fixed joint distribution over inputs and outputs. When the world changes, that distribution shifts, and the model's predictions degrade even though the model itself has not changed. This phenomenon is called **concept drift**: the conditional distribution $p_t(y \mid x)$ at time $t$ differs from the conditional distribution $p_{t+1}(y \mid x)$ at some later time $t+1$. The name descends from machine learning theory, where the target function a learner tries to approximate is called the *concept* [Widmer & Kubat (1996)]. When the concept itself evolves, the learned approximation becomes stale.
+
+Concept drift is fundamentally distinct from **covariate shift**, in which the marginal distribution $p(x)$ changes while the conditional $p(y \mid x)$ remains constant. Under covariate shift a model calibrated for the new input distribution may still make correct predictions; the labeling rule has not changed. Under concept drift the labeling rule itself has changed, and no amount of importance-weighting the old data recovers a correct model. Both phenomena can occur simultaneously, but their remedies differ sharply. This chapter focuses exclusively on concept drift.
+
+## 1. Formal Definition
+
+Let $\{(x_t, y_t)\}_{t=1}^{\infty}$ be a stream of labeled examples drawn from a sequence of joint distributions. Define the concept at time $t$ as the conditional distribution $\mathcal{C}_t = p_t(y \mid x)$. Concept drift between times $t_0$ and $t_1$ exists if and only if
+
+$$\exists\, x \in \mathcal{X} : p_{t_0}(y \mid x) \neq p_{t_1}(y \mid x).$$
+
+In the supervised learning setting, a model $f : \mathcal{X} \to \mathcal{Y}$ trained under $p_{t_0}(y \mid x)$ will incur non-zero irreducible error under $p_{t_1}(y \mid x)$ even if the sample size is infinite, unless $f$ has somehow also learned the new concept. Practical detection therefore monitors the error rate of a fixed model on a stream of incoming labeled examples; a sustained rise in that rate signals that the concept has drifted.
+
+Two related but distinct notions appear in the literature. **Real drift** refers to a change in $p(y \mid x)$ that is genuinely caused by a change in the underlying process. **Virtual drift** (Salganicoff 1997) refers to a change in $p(x)$ that affects which regions of input space matter most, without altering $p(y \mid x)$. Virtual drift can masquerade as real drift if the model was never trained on the newly popular region of $\mathcal{X}$.
+
+## 2. Taxonomy of Drift Patterns
+
+Gama et al. (2004) introduced an influential taxonomy of four drift patterns based on the temporal profile of $p_t(y \mid x)$.
+
+```{mermaid}
+graph TD
+  A["Sudden drift"] --> B["Sharp step at t*"]
+  C["Gradual drift"] --> D["Smooth transition over window"]
+  E["Incremental drift"] --> F["Step-by-step small shifts"]
+  G["Recurring drift"] --> H["Cyclic return of past concepts"]
+```
+
+### 2.1 Sudden Drift
+
+In sudden drift the concept switches abruptly at a single time point $t^*$:
+
+$$p_t(y \mid x) = \begin{cases} \mathcal{C}_0 & t < t^* \\ \mathcal{C}_1 & t \geq t^* \end{cases}$$
+
+This is the easiest pattern to detect because the error rate exhibits a sharp step change. Real-world examples include a sensor calibration reset, a policy change that takes effect on a fixed date, or a sudden change in the definition of a target label due to regulatory requirements.
+
+### 2.2 Gradual Drift
+
+In gradual drift the process transitions smoothly over a window $[t^*, t^* + w]$. One common model draws example $(x_t, y_t)$ from $\mathcal{C}_0$ with probability $1 - \alpha(t)$ and from $\mathcal{C}_1$ with probability $\alpha(t)$, where $\alpha(t)$ increases monotonically from 0 to 1 over the window. In the logistic version:
+
+$$\alpha(t) = \frac{1}{1 + \exp\!\left(-\kappa(t - t^*)\right)},$$
+
+with $\kappa$ controlling the transition speed. Language models experience gradual drift as vocabulary and usage norms evolve over years; recommender systems experience it as audience demographics shift.
+
+### 2.3 Incremental Drift
+
+Incremental drift is a sequence of small but persistent shifts, each individually below the detection threshold. Unlike gradual drift, where there is a well-defined old concept and new concept, incremental drift may trace a continuous path through concept space. Data collection protocols that evolve as operators gain experience exhibit this pattern, as do time-series problems where the underlying physics evolves continuously (e.g., equipment wear).
+
+### 2.4 Recurring Drift
+
+Recurring drift describes concepts that reappear cyclically. The process alternates among a finite set $\{\mathcal{C}_0, \mathcal{C}_1, \ldots, \mathcal{C}_k\}$ with a temporal period. Seasonal retail demand is the canonical example: buying behavior in December differs from July, but December behavior recurs annually. Ensemble methods that retain archived models for past concepts and reactivate them when the corresponding concept recurs are particularly effective for this pattern.
+
+## 3. Statistical Detection Methods
+
+Detection methods can be divided into error-rate monitoring methods, which require ground-truth labels, and distribution-based methods, which monitor the distribution of model inputs or outputs without labels. We cover the three most influential error-rate methods.
+
+### 3.1 DDM: Drift Detection Method
+
+Gama et al. (2004) derived DDM from the statistics of Bernoulli trials. Let $p_i$ be the observed error rate after seeing $i$ examples, and define the standard deviation
+
+$$s_i = \sqrt{\frac{p_i(1 - p_i)}{i}}.$$
+
+By the Chebyshev inequality, the true error rate $p$ lies within $p_i \pm k\, s_i$ with high probability for any fixed $k$. DDM tracks the minimum values $p_{\min}$ and $s_{\min}$ seen so far and raises two thresholds:
+
+- **Warning level:** $p_i + s_i \geq p_{\min} + 2\, s_{\min}$
+- **Drift level:** $p_i + s_i \geq p_{\min} + 3\, s_{\min}$
+
+When the warning level is triggered, the algorithm retains all examples observed since the warning began. When the drift level is triggered, the stored examples become the new training set and $p_{\min}$, $s_{\min}$ are reset. The factors 2 and 3 correspond roughly to 95% and 99.7% confidence intervals under normality, though the Bernoulli error rate is only asymptotically normal.
+
+The running minimum update rule is:
+
+$$p_{\min} \leftarrow p_i, \quad s_{\min} \leftarrow s_i \quad \text{whenever } p_i + s_i < p_{\min} + s_{\min}.$$
+
+### 3.2 EDDM: Early Drift Detection Method
+
+Baena-Garcia et al. (2006) modified DDM to be more sensitive to gradual drift by switching from cumulative error rate to the distance between consecutive errors. Define $d_i$ as the number of examples between the $(i-1)$-th and $i$-th error, with mean $\mu_i$ and standard deviation $\sigma_i$ estimated online using Welford's method. The detection statistic is
+
+$$T_i = \mu_i + k\, \sigma_i,$$
+
+and drift is signaled when $T_i$ falls significantly below its maximum $T_{\max}$. Gradual drift reduces the inter-error distance gradually, whereas sudden drift reduces it sharply; EDDM detects gradual changes earlier than DDM because the inter-error distance is more informative than the running average error rate under a slow-moving concept.
+
+### 3.3 ADWIN: Adaptive Windowing
+
+Bifet and Gavalda (2007) proposed ADWIN, which maintains a window of recent observations and automatically adjusts the window length to reflect the most recent stable concept. At each time step the algorithm considers all possible splits of the current window $W$ into a left sub-window $W_0$ and a right sub-window $W_1$. Let $n_0 = |W_0|$, $n_1 = |W_1|$, $n = n_0 + n_1$, and define the harmonic mean $n^* = n_0 n_1 / n$. Drift is detected when
+
+$$\left|\hat{\mu}_0 - \hat{\mu}_1\right| \geq \varepsilon_{\text{cut}} = \sqrt{\frac{1}{2n^*} \ln \frac{4n}{\delta}},$$
+
+where $\hat{\mu}_0$ and $\hat{\mu}_1$ are the empirical means over the two sub-windows and $\delta$ is the desired false-positive rate. When drift is detected, all elements of $W_0$ are discarded and the window shrinks to $W_1$, which is the most recently stable segment.
+
+The bound $\varepsilon_{\text{cut}}$ follows from Hoeffding's inequality applied to bounded random variables. For a variable taking values in $[0,1]$, the probability that the true mean difference between two independent samples of sizes $n_0$ and $n_1$ is as large as $|\hat{\mu}_0 - \hat{\mu}_1|$ by chance is at most
+
+$$2\exp\!\left(-2\varepsilon^2 n^*\right) \leq \delta,$$
+
+which gives $\varepsilon_{\text{cut}}$ above after solving for $\varepsilon$ and applying a union bound over $O(n)$ possible cut points (the $4n$ factor inside the logarithm).
+
+ADWIN has time complexity $O(n)$ per step in the worst case but $O(\log n)$ amortized when using the compressed representation. Its key advantage over DDM and EDDM is that it does not require the user to specify a window size; the window length adapts to the rate of change of the underlying concept.
+
+## 4. Adaptation Strategies
+
+Detecting drift is only half the problem. Once drift is confirmed, the model must be updated. Four main strategies exist, which differ in how aggressively they discard old information.
+
+### 4.1 Full Retraining on a Sliding Window
+
+The simplest strategy discards all examples older than a window $w$ and retrains a fresh model on the $w$ most recent labeled examples. This requires only a fixed memory budget and is appropriate when drift is sudden and the new concept is stable. The optimal $w$ balances bias (small $w$ ignores useful older data) against variance (large $w$ contaminates the training set with outdated examples). Drift detectors like ADWIN implicitly choose $w$ adaptively.
+
+### 4.2 Weighted Retraining
+
+Rather than discarding examples abruptly, weighted retraining assigns exponentially decaying importance weights:
+
+$$\omega_t = \lambda^{T - t}, \quad \lambda \in (0, 1),$$
+
+where $T$ is the current time. A weighted empirical risk minimizer then solves
+
+$$\hat{f} = \arg\min_f \sum_{t=1}^{T} \lambda^{T-t} \ell(f(x_t), y_t).$$
+
+For exponential families and generalized linear models this leads to closed-form solutions. For neural networks, stochastic gradient descent with per-example weights is straightforward. The half-life of the weights is $\tau_{1/2} = -\ln 2 / \ln \lambda$.
+
+### 4.3 Ensemble Update
+
+Ensemble methods maintain a pool of models trained on different time windows. Upon drift detection, the weakest-performing member of the ensemble (measured on recent examples) is replaced with a freshly trained model. Strategies include SEA (Streaming Ensemble Algorithm, Street and Kim 2001), which trains a new classifier on each chunk and retains the best $k$ classifiers. Recurring drift is handled naturally by maintaining archived classifiers and reactivating them when their associated concept reappears; the Dynse framework (de Barros et al. 2018) formalizes this.
+
+### 4.4 Online and Incremental Learning
+
+Truly online algorithms update the model after each example without storing the full training set. Perceptron-style updates, stochastic gradient descent, and online versions of decision trees (Hoeffding trees, Domingos and Hulten 2000) fall in this category. These methods adapt continuously rather than in response to discrete drift events, which is appropriate when concept evolution is incremental. The learning rate acts as a forgetting factor: a higher learning rate makes the model more responsive to recent examples but increases variance.
+
+## 5. Simulation and Detection in Python
+
+The following code simulates a binary classification stream with a sudden concept drift at $t = 500$. Before the drift, the positive class is determined by $x_1 > 0$; after the drift, the rule flips to $x_1 < 0$. A logistic regression model is trained on an initial window, then predictions are made on the stream. DDM monitors the online error rate to detect the drift.
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(42)
+n_total = 1000
+drift_point = 500
+
+X = rng.standard_normal((n_total, 2))
+y_pre  = (X[:drift_point,  0] > 0).astype(int)
+y_post = (X[drift_point:,  0] < 0).astype(int)   # rule flips
+y = np.concatenate([y_pre, y_post])
+
+# Train on first 200 examples (pre-drift concept)
+clf = LogisticRegression()
+clf.fit(X[:200], y[:200])
+
+# DDM state
+p_min, s_min = 1.0, 1.0
+p_i = 0.0
+n_errors = 0
+warning_flags, drift_flags = [], []
+
+error_rates = []
+for i, (xi, yi) in enumerate(zip(X[200:], y[200:]), start=1):
+    pred = clf.predict(xi.reshape(1, -1))[0]
+    error = int(pred != yi)
+    n_errors += error
+    p_i = n_errors / i
+    s_i = np.sqrt(p_i * (1 - p_i) / i) if p_i > 0 and p_i < 1 else 0.0
+    error_rates.append(p_i)
+
+    if p_i + s_i < p_min + s_min:
+        p_min, s_min = p_i, s_i
+
+    if p_i + s_i >= p_min + 3 * s_min and i > 30:
+        drift_flags.append(i + 200)
+        # Reset DDM state after drift detected
+        p_min, s_min = 1.0, 1.0
+        n_errors = 0
+        p_i = 0.0
+    elif p_i + s_i >= p_min + 2 * s_min and i > 30:
+        warning_flags.append(i + 200)
+
+t_axis = np.arange(200, n_total)
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(t_axis, error_rates, color="steelblue", lw=1.2, label="Cumulative error rate")
+for wf in warning_flags[:5]:
+    ax.axvline(wf, color="orange", lw=0.8, alpha=0.6, label="Warning" if wf == warning_flags[0] else "")
+for df in drift_flags[:3]:
+    ax.axvline(df, color="red", lw=1.2, linestyle="--", label="Drift detected" if df == drift_flags[0] else "")
+ax.axvline(drift_point, color="black", lw=1.5, linestyle=":", label="True drift point")
+ax.set_xlabel("Time step")
+ax.set_ylabel("Cumulative error rate")
+ax.set_title("DDM on a sudden-drift stream (drift at t=500)")
+ax.legend()
+plt.tight_layout()
+plt.savefig("ddm_drift_detection.png", dpi=120)
+plt.show()
+print(f"DDM drift flags at steps: {drift_flags}")
+```
+
+The second code block implements a lightweight ADWIN check on a scalar stream of losses to confirm drift.
+
+```python
+import numpy as np
+
+def adwin_check(stream, delta=0.002):
+    """
+    Minimal ADWIN implementation for a stream of values in [0,1].
+    Returns indices where drift was detected.
+    """
+    window = []
+    drift_points = []
+
+    for t, val in enumerate(stream):
+        window.append(val)
+        n = len(window)
+        arr = np.array(window)
+        detected = False
+        for cut in range(1, n - 1):
+            n0, n1 = cut, n - cut
+            n_star = (n0 * n1) / n
+            if n_star < 1:
+                continue
+            mu0 = arr[:cut].mean()
+            mu1 = arr[cut:].mean()
+            eps_cut = np.sqrt((1 / (2 * n_star)) * np.log(4 * n / delta))
+            if abs(mu0 - mu1) >= eps_cut:
+                drift_points.append(t)
+                window = list(arr[cut:])   # drop old sub-window
+                detected = True
+                break
+        if detected:
+            break  # restart from new window
+
+    return drift_points
+
+rng = np.random.default_rng(0)
+losses_pre  = rng.beta(2, 8, 400)       # low loss, mean ~0.2
+losses_post = rng.beta(6, 4, 400)       # high loss, mean ~0.6
+stream = np.concatenate([losses_pre, losses_post])
+
+detected = adwin_check(stream, delta=0.002)
+print(f"ADWIN detected drift near index: {detected}")
+```
+
+## 6. Practical Considerations
+
+### 6.1 Label Latency
+
+Most drift detection methods require ground-truth labels to compute prediction errors. In practice, labels arrive with delay: a fraud label may take days, a medical outcome months. During the latency period the model continues to serve predictions on a concept it may no longer understand. Strategies to handle label latency include:
+
+- **Prediction confidence monitoring:** large drops in average posterior entropy or calibrated probability can signal distribution shift without labels.
+- **Input distribution monitoring:** multivariate tests (e.g., Maximum Mean Discrepancy, two-sample energy distance) on the input distribution $p(x)$ can detect covariate shift that often co-occurs with concept drift.
+- **Synthetic labels via proxy tasks:** when the primary label is delayed, a related label that arrives sooner can serve as a canary.
+
+### 6.2 False-Positive Rate Control
+
+All threshold-based detectors face the multiple-comparison problem: running a test at every time step inflates the false-positive rate. DDM and ADWIN control this through their respective statistical bounds, but in practice the analyst should calibrate thresholds on held-out data from a period of known stability and choose $\delta$ to give an acceptable expected detection delay under the alternative.
+
+### 6.3 Computational Budget
+
+Re-training a large model after every detected drift event may be prohibitively expensive. Lightweight fine-tuning, adapter layers (for neural networks), or updating only the final layer of a deep feature extractor are practical alternatives. When drift is expected to be gradual and incremental, online updates with per-sample gradients may be sufficient without any explicit detection step.
+
+## References
+
+1. Gama, J., Medas, P., Castillo, G., & Rodrigues, P. (2004). Learning with drift detection. In *Advances in Artificial Intelligence (SBIA 2004)*, Lecture Notes in Computer Science, vol. 3171, pp. 286-295. Springer. https://doi.org/10.1007/978-3-540-28645-5_29
+
+2. Bifet, A., & Gavalda, R. (2007). Learning from time-changing data with adaptive windowing. In *Proceedings of the 2007 SIAM International Conference on Data Mining (SDM)*, pp. 443-448. SIAM. https://doi.org/10.1137/1.9781611972771.42
+
+3. Lu, J., Liu, A., Dong, F., Gu, F., Gama, J., & Zhang, G. (2018). Learning under concept drift: A review. *ACM Computing Surveys*, 51(6), 1-29. https://doi.org/10.1145/3236009
+
+4. Baena-Garcia, M., del Campo-Avila, J., Fidalgo, R., Bifet, A., Gavalda, R., & Morales-Bueno, R. (2006). Early drift detection method. In *Proceedings of the 4th ECML PKDD International Workshop on Knowledge Discovery from Data Streams*, pp. 77-86.
+
+5. Widmer, G., & Kubat, M. (1996). Learning in the presence of concept drift and hidden contexts. *Machine Learning*, 23(1), 69-101. https://doi.org/10.1007/BF00116900
+
+6. Domingos, P., & Hulten, G. (2000). Mining high-speed data streams. In *Proceedings of the 6th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, pp. 71-80. https://doi.org/10.1145/347090.347107
+
+7. Street, W. N., & Kim, Y. (2001). A streaming ensemble algorithm (SEA) for large-scale classification. In *Proceedings of the 7th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, pp. 377-382. https://doi.org/10.1145/502512.502568

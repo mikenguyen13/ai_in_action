@@ -1,0 +1,218 @@
+# o1: Reasoning Models and Test-Time Compute {#sec-o1-reasoning}
+
+The dominant narrative in deep learning has been that scale drives capability: more parameters, more data, more training compute yield better models. This train-time scaling hypothesis has held across two orders of magnitude of model size and underpins every frontier system deployed today. In September 2024, OpenAI released o1, a model that opens a complementary axis of capability: rather than increasing parameters or training FLOPs, o1 spends more compute at *inference time*, generating extended internal reasoning before committing to an answer. The empirical gains are dramatic -- on problems that stymied every prior model, o1 approaches the performance of domain experts -- and the underlying principle, that reasoning can be made into a learnable, scalable process, represents a structural shift in how AI systems handle hard cognitive work.
+
+## 1. The Test-Time Compute Paradigm
+
+### 1.1 Two Axes of Scaling
+
+Let $C_{\text{train}}$ denote the total floating-point operations expended during model training and $C_{\text{infer}}$ the compute consumed per query at inference time. Classical scaling laws (Kaplan et al. 2020; Hoffmann et al. 2022) describe how loss decreases as $C_{\text{train}}$ grows, holding $C_{\text{infer}}$ fixed -- specifically, for a given compute budget $C$, the optimal loss follows
+
+$$L(C) \propto C^{-\alpha}$$
+
+for an empirically measured exponent $\alpha \approx 0.05$-$0.10$ depending on the benchmark. The insight motivating o1 is that $C_{\text{infer}}$ is an independent variable that has been largely held at its minimum. A standard autoregressive model generates one token per forward pass; for a 1B-token answer that is 1B forward passes regardless of how hard the question is. There is no mechanism by which the model can allocate more computation to harder instances.
+
+Test-time compute methods break this constraint. By generating a chain of intermediate reasoning steps before the final answer, the model effectively "thinks longer" about hard problems. Snell et al. (2024) show empirically that accuracy on mathematical benchmarks scales log-linearly with the number of reasoning tokens consumed, up to a saturation point that is itself benchmark-dependent. The practical implication is that for a fixed model size, investing inference compute beats increasing model size when the bottleneck is multi-step reasoning rather than knowledge retrieval.
+
+### 1.2 Why Inference Compute Helps Reasoning
+
+Reasoning problems share a structural property that distinguishes them from retrieval problems: the answer depends on a sequence of interdependent inferential steps, each of which must be correct for the final answer to be correct. Given $n$ steps each with independent success probability $p$, the chain-level success probability is $p^n$, which collapses rapidly for even moderate $n$ unless $p \approx 1$. A model that generates the answer in a single forward pass provides exactly one attempt at the entire chain.
+
+By contrast, a model that generates an explicit reasoning trace can (a) verify each step against prior steps, (b) detect contradictions and backtrack, and (c) explore multiple candidate solution paths before selecting the best. These are forms of *search over reasoning space*, and they require compute proportional to the depth and breadth of search. This is why test-time compute scaling is not uniformly beneficial: on problems with $n = 1$ (simple lookup), there is nothing to search over and extended reasoning provides no benefit. On problems with large $n$ (olympiad mathematics, multi-step code synthesis), the benefit is substantial.
+
+## 2. Chain-of-Thought Reasoning as a Trained Capability
+
+### 2.1 From Prompting to Learning
+
+Chain-of-thought prompting, introduced by Wei et al. (2022), demonstrates that standard language models can be coaxed into generating intermediate reasoning steps by providing few-shot examples that include worked solutions. This is a prompting technique applied to a model not specifically trained for it. The accuracy gains are real but modest and inconsistent across domains.
+
+o1 differs fundamentally: the chain-of-thought is *trained*, not prompted. The model is optimized end-to-end to produce reasoning traces that lead to correct final answers. The internal trace, referred to in OpenAI's documentation as "thinking tokens", is generated autoregressively but does not appear in the user-facing output. The model learns that the hidden scratch space is available for exploration, that it may write partial attempts, cross them out, and restart, and that the quality of the final answer is the objective, not the quality of any individual reasoning step.
+
+### 2.2 Process Reward Modeling
+
+The training signal for o1 is believed to involve *process-level reward modeling* (Lightman et al. 2023), in which a separate reward model scores intermediate reasoning steps rather than only the final answer. Let the reasoning trace be a sequence of steps $r_1, r_2, \ldots, r_T$ followed by a final answer $a$. An outcome reward model (ORM) provides a binary signal $R_{\text{ORM}} \in \{0, 1\}$ based solely on whether $a$ is correct. A process reward model (PRM) provides a per-step signal $R_{\text{PRM}}(r_t) \in [0, 1]$ measuring whether step $r_t$ is a valid inferential move given $r_1, \ldots, r_{t-1}$.
+
+Training with PRM signals has two advantages over ORM alone. First, it provides a denser learning signal: a 20-step reasoning trace with a wrong final answer yields one bit of gradient under ORM but 20 bits of gradient under PRM. Second, it identifies *where* reasoning fails, enabling targeted correction. The total reward used during RL training combines both:
+
+$$R = \lambda_{\text{ORM}} R_{\text{ORM}}(a) + \lambda_{\text{PRM}} \sum_{t=1}^{T} R_{\text{PRM}}(r_t)$$
+
+The model is then trained via a policy gradient method -- the specific algorithm is not disclosed by OpenAI, but the approach is consistent with REINFORCE with baseline or proximal policy optimization (PPO).
+
+### 2.3 MCTS-Like Exploration During Training
+
+Generating diverse, high-quality reasoning traces for training requires exploration. Random sampling from the model produces traces that are correlated and predominantly wrong for hard problems. Several public research directions (Hao et al. 2023; Zhang et al. 2024) investigate Monte Carlo Tree Search (MCTS) over reasoning steps during the data generation phase of training. In this framework, each node in the tree represents a partial reasoning trace $r_1, \ldots, r_t$, and MCTS uses a value function (implemented as a PRM) to select which nodes to expand. The tree search discovers solution paths that random sampling would rarely find, and these successful traces become the training data for the next policy iteration.
+
+The resulting training loop is a form of self-play: the current policy generates candidates, MCTS filters and extends the best ones, and the policy is fine-tuned on the winners. Over successive iterations, the policy learns to produce reasoning traces that are structurally similar to the successful MCTS-found solutions without requiring MCTS at inference time -- the search is *distilled* into the model weights.
+
+## 3. Empirical Performance
+
+### 3.1 Mathematical Reasoning
+
+On AIME 2024, a competition intended for the top few hundred high-school students in the United States, o1 achieves 74.4% accuracy (pass@1), compared to 9.3% for GPT-4o. The gap is not a marginal improvement but a qualitative shift: GPT-4o essentially cannot solve these problems reliably, while o1 solves three-quarters of them. On the MATH benchmark (Hendrycks et al. 2021), which covers five difficulty levels of competition mathematics, o1 reaches 83.3% versus GPT-4o's 76.6%, a smaller gap that reflects the easier problems in MATH being solvable by good knowledge retrieval without deep reasoning.
+
+### 3.2 Scientific and Programming Benchmarks
+
+On GPQA Diamond, a benchmark of PhD-level questions in biology, chemistry, and physics curated to be beyond the knowledge of non-experts, o1 achieves 78.3%, above the average performance of human PhD students (73.0%) in the respective fields. This is the first language model to exceed expert-human performance on this benchmark. On Codeforces competitive programming problems, o1 reaches the 89th percentile of human competitors, demonstrating that the reasoning capability transfers across domains.
+
+### 3.3 The Compute-Accuracy Tradeoff Within o1
+
+OpenAI releases two variants: o1 and o1-mini. The full o1 model uses a larger base and longer reasoning budgets; o1-mini is a distilled version optimized for speed and cost. Empirically, o1 outperforms o1-mini on multi-step mathematical reasoning by approximately 10-15 percentage points on AIME, while o1-mini is 3-5x faster and substantially cheaper per token. The architectural details are not disclosed, but the pattern is consistent with o1-mini having a smaller reasoning budget (fewer thinking tokens) rather than a smaller parameter count alone.
+
+## 4. Self-Consistency: Simulating Test-Time Compute
+
+Self-consistency (Wang et al. 2022) is the best-understood open method for implementing test-time compute scaling. Rather than generating one chain-of-thought and accepting its answer, the method generates $k$ independent chains-of-thought and takes the majority-vote answer. The underlying theoretical argument is that if each chain has probability $p > 0.5$ of reaching the correct answer, then the majority-vote answer has probability
+
+$$P(\text{majority correct}) = \sum_{j > k/2} \binom{k}{j} p^j (1-p)^{k-j}$$
+
+which converges to 1 as $k \to \infty$. For $p = 0.6$ and $k = 10$, this gives approximately 0.83; for $k = 40$, approximately 0.97. The method is model-agnostic and requires no training change.
+
+The following implementation simulates self-consistency on arithmetic word problems using a rule-based solver as a stand-in for a language model reasoning trace. Each "chain" introduces random error to model the imperfect per-chain accuracy of a real LLM, and the majority vote aggregates across chains.
+
+```python
+import random
+import re
+from collections import Counter
+from typing import Callable
+
+def evaluate_arithmetic(expression: str) -> float:
+    """Evaluate a simple arithmetic expression safely."""
+    expression = re.sub(r'[^0-9+\-*/().\s]', '', expression)
+    return eval(compile(expression, '<string>', 'eval'))
+
+def noisy_solver(problem: str, true_answer: float, p_correct: float = 0.65) -> float:
+    """Simulate a chain-of-thought solver with per-chain accuracy p_correct."""
+    if random.random() < p_correct:
+        return true_answer
+    # Return a plausible but wrong nearby answer
+    noise = random.choice([-2, -1, 1, 2, 3, -3, 5, -5])
+    return true_answer + noise
+
+def self_consistency(
+    problem: str,
+    true_answer: float,
+    k: int = 10,
+    p_correct: float = 0.65,
+    rng_seed: int = 42,
+) -> dict:
+    """
+    Run self-consistency with k independent reasoning chains.
+    Returns the majority-vote answer and per-run statistics.
+    """
+    random.seed(rng_seed)
+    answers = [noisy_solver(problem, true_answer, p_correct) for _ in range(k)]
+    vote_counts = Counter(answers)
+    majority_answer = vote_counts.most_common(1)[0][0]
+    return {
+        "answers": answers,
+        "vote_counts": dict(vote_counts),
+        "majority_answer": majority_answer,
+        "is_correct": majority_answer == true_answer,
+    }
+
+problems = [
+    ("What is 15 * 8 + 32?", 152.0),
+    ("What is 144 / 12 - 7?", 5.0),
+    ("What is 23 + 47 * 2?", 117.0),
+    ("What is (100 - 37) * 3?", 189.0),
+    ("What is 256 / 4 + 19?", 83.0),
+]
+
+p_correct = 0.60  # per-chain accuracy
+
+print(f"Single-chain accuracy (p={p_correct}): {p_correct:.0%}")
+print(f"\n{'Problem':<35} {'k=1':>6} {'k=5':>6} {'k=15':>7} {'k=40':>7}")
+print("-" * 60)
+
+for problem_text, true_ans in problems:
+    results = {}
+    for k in [1, 5, 15, 40]:
+        res = self_consistency(problem_text, true_ans, k=k, p_correct=p_correct)
+        results[k] = res["is_correct"]
+    row = (
+        f"{problem_text[:34]:<35}"
+        + "".join(f"{'OK' if results[k] else 'FAIL':>6}" for k in [1, 5, 15, 40])
+    )
+    print(row)
+```
+
+```python
+import math
+from collections import Counter
+
+def theoretical_majority_accuracy(p: float, k: int) -> float:
+    """Probability that majority vote is correct given per-chain accuracy p."""
+    total = 0.0
+    for j in range(k // 2 + 1, k + 1):
+        binom = math.comb(k, j)
+        total += binom * (p ** j) * ((1 - p) ** (k - j))
+    if k % 2 == 0:
+        # Tie-breaking: assume 50% chance tie resolves correctly
+        tie_prob = math.comb(k, k // 2) * (p ** (k // 2)) * ((1 - p) ** (k // 2))
+        total += 0.5 * tie_prob
+    return total
+
+print("Majority-vote accuracy vs number of chains (p_correct = 0.60)")
+print(f"{'k':>6}  {'P(majority correct)':>22}")
+print("-" * 32)
+for k in [1, 3, 5, 10, 20, 40, 100]:
+    acc = theoretical_majority_accuracy(0.60, k)
+    print(f"{k:>6}  {acc:>22.4f}")
+
+print()
+print("Majority-vote accuracy vs per-chain accuracy (k = 15)")
+print(f"{'p':>6}  {'P(majority correct)':>22}")
+print("-" * 32)
+for p in [0.50, 0.55, 0.60, 0.65, 0.70, 0.80, 0.90]:
+    acc = theoretical_majority_accuracy(p, 15)
+    print(f"{p:>6.2f}  {acc:>22.4f}")
+```
+
+The second block shows that for per-chain accuracy above 0.5, majority vote with $k = 40$ chains recovers accuracy above 0.95 even when individual chains are only 60% reliable. This is the mechanism behind o1's gains: more "thinking" corresponds to more chains explored internally, with the model acting as its own verifier.
+
+## 5. Scaling Laws for Test-Time Compute
+
+Snell et al. (2024) characterize how accuracy scales with inference compute for a fixed model. Their central finding is that for hard mathematical problems, accuracy follows
+
+$$\text{Acc}(C_{\text{infer}}) \approx A - B \cdot e^{-\beta C_{\text{infer}}}$$
+
+where $A$ is the asymptotic accuracy (ceiling set by the model's knowledge), $B$ is the gap between baseline and ceiling, and $\beta$ governs the rate of improvement. Crucially, $\beta$ is much larger for hard problems than easy ones: easy problems saturate quickly (small benefit to more thinking), while hard problems continue improving over a wide range of inference compute. This justifies the adaptive allocation strategy in o1: the model generates more thinking tokens for harder queries, as detected by the model's own uncertainty during reasoning.
+
+The practical implication for deployment is that cost and latency scale with problem difficulty. A simple algebra question may require 200 thinking tokens; an AIME problem may require 20,000. This non-uniform cost structure is novel: traditional LLM inference has roughly uniform cost per query, enabling straightforward capacity planning. Test-time compute models require either user-facing latency variance or dynamic batching infrastructure that can accommodate variable reasoning budgets.
+
+## 6. The o1 Model Family and Capability Trajectory
+
+OpenAI has released several variants in the o1 family. o1-preview was the initial September 2024 release, a larger model with a longer reasoning budget. o1-mini, released simultaneously, sacrifices some accuracy on knowledge-intensive questions (where retrieval from weights matters) while retaining most of the mathematical reasoning gains, reflecting that the reasoning capability generalizes from a smaller model efficiently. o1 (the production release, December 2024) further refines the base model and training pipeline.
+
+o3, announced in late 2024, extends the paradigm with a larger reasoning budget and improved PRM, reaching 96.7% on AIME 2024 (25/25 problems correct) and 88% on ARC-AGI, a benchmark specifically designed to be hard for narrow-memorization systems. The ARC-AGI result is notable because the benchmark rewards abstract pattern recognition under novel configurations, a setting where knowledge retrieval is by construction unavailable. The gains on ARC-AGI suggest that the extended reasoning capability in o3 is not simply better interpolation over training data but involves some form of genuine in-context search.
+
+o3-mini follows the same distillation strategy as o1-mini, offering configurable reasoning effort levels (low, medium, high) that trade cost for accuracy. This per-query configurability is architecturally important: it allows downstream applications to set a reasoning budget per query based on stakes and latency constraints.
+
+## 7. Limitations
+
+Despite impressive benchmark results, o1-class models have documented failure modes. First, *overthinking on simple problems*: the model may generate long reasoning traces for questions that require only one inferential step, introducing both latency and opportunities for self-contradiction within the trace. Empirically, o1 performs similarly to or occasionally worse than GPT-4o on simple factual queries where rapid retrieval is sufficient.
+
+Second, *hallucination within reasoning chains*: the model can introduce false intermediate steps that are internally consistent with prior steps but factually wrong. The extended reasoning trace provides no guarantee of factual grounding; each step is still a next-token prediction, susceptible to the same distributional biases as any autoregressive model. Because thinking tokens are hidden from the user, these errors are invisible and may be harder to audit than errors in a visible chain-of-thought response.
+
+Third, *opacity*: the inability to inspect thinking tokens means that users and safety evaluators cannot verify the reasoning process. This has prompted ongoing debate about interpretability obligations for deployed reasoning models, particularly in high-stakes domains such as medicine and law.
+
+Fourth, *benchmark saturation*: AIME and MATH are now close to solved. As o3 approaches ceiling performance, meaningful evaluation of further progress will require harder benchmarks, which in turn may be generated by o3-class models -- creating a circularity in the capability evaluation ecosystem.
+
+## References
+
+1. OpenAI. (2024). OpenAI o1 System Card. https://openai.com/index/openai-o1-system-card/
+
+2. Wang, X., Wei, J., Schuurmans, D., Le, Q., Chi, E., Narang, S., Chowdhery, A., & Zhou, D. (2022). Self-Consistency Improves Chain of Thought Reasoning in Language Models. arXiv:2203.11171. https://arxiv.org/abs/2203.11171
+
+3. Snell, C., Lee, J., Xu, K., & Kumar, A. (2024). Scaling LLM Test-Time Compute Optimally Can be More Effective than Scaling Model Parameters. arXiv:2408.03314. https://arxiv.org/abs/2408.03314
+
+4. Lightman, H., Kosaraju, V., Burda, Y., Edwards, H., Baker, B., Lee, T., Leike, J., Schulman, J., Sutskever, I., & Cobbe, K. (2023). Let's Verify Step by Step. arXiv:2305.20050. https://arxiv.org/abs/2305.20050
+
+5. Wei, J., Wang, X., Schuurmans, D., Bosma, M., Chi, E., Le, Q., & Zhou, D. (2022). Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. arXiv:2201.11903. https://arxiv.org/abs/2201.11903
+
+6. Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart, S., Tang, E., Song, D., & Steinhardt, J. (2021). Measuring Mathematical Problem Solving With the MATH Dataset. arXiv:2103.03874. https://arxiv.org/abs/2103.03874
+
+7. Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., & Amodei, D. (2020). Scaling Laws for Neural Language Models. arXiv:2001.08361. https://arxiv.org/abs/2001.08361
+
+8. Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., Casas, D. de L., Hendricks, L. A., Welbl, J., Clark, A., Hennigan, T., Noland, E., Millican, K., van den Driessche, G., Damoc, B., Guy, A., Osindero, S., Simonyan, K., Elsen, E., Jack, R. A., Kavukcuoglu, K., & Sifre, L. (2022). Training Compute-Optimal Large Language Models. arXiv:2203.15556. https://arxiv.org/abs/2203.15556
+
+9. Hao, S., Gu, Y., Ma, H., Hong, J. J., Wang, Z., Wang, D. Z., & Hu, Z. (2023). Reasoning with Language Model is Planning with World Model. arXiv:2305.14992. https://arxiv.org/abs/2305.14992

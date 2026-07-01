@@ -1,0 +1,329 @@
+# Adversarial Domain Adaptation {#sec-adversarial-da}
+
+## 1. The Adversarial Perspective on Domain Shift
+
+Domain adaptation seeks a representation of the input space that retains discriminative information for the label prediction task while discarding the spurious signals that distinguish one domain from another. The fundamental difficulty is that these two objectives pull in opposite directions: a maximally discriminative feature space preserves every bit of domain-specific signal, while a maximally domain-invariant feature space destroys all structure that varies across domains, including potentially class-relevant variation.
+
+Adversarial training offers a principled resolution. Rather than specifying by hand which features to suppress, an adversarial procedure discovers the minimal transformation that satisfies both constraints simultaneously. A feature extractor competes against a domain classifier in a minimax game: the feature extractor is rewarded for confusing the domain classifier while remaining useful for label prediction, and the domain classifier is rewarded for discriminating which domain a sample came from. The Nash equilibrium of this game, when it exists, is a feature distribution that is as class-discriminative as possible subject to being domain-indistinguishable.
+
+The formal connection to generalization theory makes the adversarial approach more than a heuristic. Ben-David et al. (2010) bound the target error $\epsilon_T$ of a hypothesis $h$ in terms of its source error $\epsilon_S$, the $\mathcal{H}$-divergence between source and target marginal feature distributions, and the ideal joint error:
+
+$$\epsilon_T(h) \leq \epsilon_S(h) + d_{\mathcal{H}}(\mathcal{D}_S, \mathcal{D}_T) + \lambda^*$$
+
+where $\lambda^* = \min_{h \in \mathcal{H}} [\epsilon_S(h) + \epsilon_T(h)]$ is the irreducible error of the best shared hypothesis. The $\mathcal{H}$-divergence term $d_{\mathcal{H}}$ measures how well a classifier from the hypothesis class $\mathcal{H}$ can distinguish source from target samples in feature space. Adversarial domain adaptation directly minimizes an empirical proxy for this term: by training a domain discriminator to full capacity and then forcing the feature extractor to defeat it, the method minimizes the empirical $\mathcal{H}$-divergence, tightening the generalization bound from the inside.
+
+## 2. Domain-Adversarial Neural Networks
+
+### 2.1 Architecture
+
+Ganin et al. (2016) instantiate the adversarial framework as a unified neural network with three components operating on a shared intermediate representation. Let $x \in \mathcal{X}$ denote an input and $z = G_f(x; \theta_f)$ the feature vector produced by a feature extractor $G_f$ with parameters $\theta_f$. Two shallow heads operate on $z$:
+
+- **Label predictor** $G_y(z; \theta_y)$: predicts the class label $y \in \mathcal{Y}$, trained only on labeled source samples.
+- **Domain classifier** $G_d(z; \theta_d)$: predicts the domain label $d \in \{0, 1\}$ (0 = source, 1 = target), trained on all samples from both domains.
+
+The training objective couples these components through a minimax game. Let $\mathcal{D}_S = \{(x_i^s, y_i)\}_{i=1}^{n_S}$ denote the labeled source set and $\mathcal{D}_T = \{x_j^t\}_{j=1}^{n_T}$ the unlabeled target set. Define $L_y$ as the cross-entropy classification loss and $L_d$ as the binary cross-entropy domain loss. The DANN objective is:
+
+$$\min_{\theta_f, \theta_y} \max_{\theta_d} \; \mathbb{E}_{(x,y) \sim \mathcal{D}_S}\left[L_y\!\left(G_y(G_f(x; \theta_f); \theta_y),\, y\right)\right] - \lambda \cdot \mathbb{E}_{x \sim \mathcal{D}_S \cup \mathcal{D}_T}\left[L_d\!\left(G_d(G_f(x; \theta_f); \theta_d),\, d\right)\right]$$
+
+The minimax structure deserves careful reading. The domain classifier $G_d$ maximizes $L_d$ (it becomes a better domain discriminator), while the feature extractor $G_f$ minimizes $L_d$ (it becomes a better domain confuser). The label predictor $G_y$ and feature extractor jointly minimize $L_y$ in the usual supervised manner. The hyperparameter $\lambda \geq 0$ controls the relative weight of domain confusion against task accuracy.
+
+At convergence, the feature extractor produces embeddings from which the domain of origin cannot be determined better than chance, while still encoding the information needed for accurate label prediction on the source domain. If the assumption of covariate shift holds and the optimal joint hypothesis has low error on both domains, this convergence implies low target error.
+
+### 2.2 Gradient Reversal Layer
+
+Implementing the minimax objective naively requires alternating between two distinct optimizers with conflicting goals for $\theta_f$. Ganin et al. (2015) introduce a remarkably elegant device that collapses this into a single forward-backward pass: the **Gradient Reversal Layer** (GRL).
+
+The GRL acts as the identity function during the forward pass:
+
+$$\text{GRL}(x) = x$$
+
+During backpropagation, it reverses the sign of the gradient and scales by $\lambda$:
+
+$$\frac{\partial \, \text{GRL}(x)}{\partial x} = -\lambda \mathbf{I}$$
+
+Concretely, the network architecture is: $x \to G_f \to \text{GRL} \to G_d$. When a gradient from the domain classifier loss flows back through the GRL, it arrives at $\theta_f$ with its sign reversed. Standard gradient descent on $\theta_f$ therefore performs gradient ascent with respect to $L_d$, maximizing domain classifier loss, while simultaneously performing gradient descent on $L_y$ through the direct path $x \to G_f \to G_y$.
+
+This construction is not merely a trick of implementation. The GRL defines a pseudo-function whose gradient is well-defined in the sense of the theory of distributions, and the fixed-point analysis of gradient descent with the GRL can be shown to correspond to the Nash equilibrium of the minimax game under mild regularity conditions. The GRL transforms a constrained bilevel optimization problem into an unconstrained single-level problem solvable with standard stochastic gradient methods.
+
+In PyTorch, the GRL is implemented as a custom autograd function:
+
+```python
+import torch
+import torch.nn as nn
+from torch.autograd import Function
+
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_val):
+        ctx.save_for_backward(torch.tensor(lambda_val))
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (lambda_val,) = ctx.saved_tensors
+        return -lambda_val * grad_output, None
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambda_val=1.0):
+        super().__init__()
+        self.lambda_val = lambda_val
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_val)
+```
+
+### 2.3 The $\lambda$ Schedule
+
+A subtlety of DANN training is the scheduling of $\lambda$. If $\lambda$ is set large from the start, the domain adversarial signal overwhelms the task supervision before the feature extractor has learned a useful representation, leading to mode collapse or slow convergence. Ganin et al. (2016) propose an annealing schedule that starts domain adaptation only after task learning is established. Let $p \in [0, 1]$ denote the fraction of training completed. The schedule is:
+
+$$\lambda_p = \frac{2}{1 + \exp(-10 \cdot p)} - 1$$
+
+At $p = 0$, $\lambda_0 = 0$ (pure task learning). At $p = 1$, $\lambda_1 \approx 1$ (full adversarial adaptation). The sigmoid-like shape ensures a smooth transition, with the steepest increase occurring around $p = 0.5$. This schedule also stabilizes training by preventing large gradient reversals from disrupting task performance early in training.
+
+## 3. Conditional Adversarial Domain Adaptation
+
+A limitation of DANN is that it aligns only the marginal feature distributions $p_S(z)$ and $p_T(z)$. Two distributions can have identical marginals while having very different class-conditional distributions $p_S(z | y)$ and $p_T(z | y)$. If source class 1 maps to the same region of $z$-space as target class 2, marginal alignment produces a useless representation for label prediction.
+
+Long et al. (2018) address this with **Conditional Domain Adversarial Networks** (CDAN). The domain classifier is conditioned on the classifier's own output distribution $\hat{y} = G_y(z)$, aligning the joint distributions of features and predictions rather than the marginal feature distributions. The domain discriminator takes as input the outer product $z \otimes \hat{y}$, a vector in $\mathbb{R}^{d \cdot K}$ where $d$ is the feature dimension and $K$ is the number of classes. The outer product encodes which part of feature space is relevant to each class.
+
+The CDAN objective is:
+
+$$\min_{\theta_f, \theta_y} \max_{\theta_d} \; \mathbb{E}_S[L_y(G_y(z), y)] - \lambda \cdot \mathbb{E}_{S \cup T}\left[L_d\!\left(G_d(z \otimes G_y(z); \theta_d),\, d\right)\right]$$
+
+The conditioning on $G_y(z)$ introduces a coupling between the task prediction and domain alignment. If the label predictor is confident that a target sample belongs to class $k$, the domain discriminator must align source and target features specifically within the subspace relevant to class $k$. This prevents the pathological case where the feature extractor achieves apparent domain confusion by mixing class identities across domains rather than achieving genuine class-conditional alignment.
+
+CDAN optionally includes an entropy conditioning mechanism: samples with low-entropy (high-confidence) predictions are given higher weight in the domain adversarial loss, since these are the samples where the feature extractor's alignment is most reliable and class-discriminative.
+
+## 4. Full DANN Implementation
+
+The following implementation demonstrates DANN on a toy 2D domain adaptation problem. The source domain consists of two interleaved rings in the positive quadrant; the target domain is the same rings shifted by a fixed offset. A multi-layer perceptron serves as the feature extractor, with GRL enabling single-pass training.
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.autograd import Function
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_val):
+        ctx.save_for_backward(torch.tensor(float(lambda_val)))
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (lam,) = ctx.saved_tensors
+        return -lam * grad_output, None
+
+
+class GRL(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lambda_val = 0.0
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_val)
+
+
+def make_rings(n, shift=(0.0, 0.0), noise=0.05):
+    angles = np.random.uniform(0, 2 * np.pi, n)
+    radii = np.where(np.arange(n) < n // 2, 1.0, 2.0)
+    labels = (np.arange(n) >= n // 2).astype(int)
+    x = radii * np.cos(angles) + shift[0] + np.random.randn(n) * noise
+    y = radii * np.sin(angles) + shift[1] + np.random.randn(n) * noise
+    pts = np.stack([x, y], axis=1).astype(np.float32)
+    return pts, labels.astype(np.int64)
+
+
+n_samples = 400
+X_src, y_src = make_rings(n_samples, shift=(0.0, 0.0))
+X_tgt, y_tgt = make_rings(n_samples, shift=(1.5, 1.5))
+
+Xs = torch.from_numpy(X_src)
+ys = torch.from_numpy(y_src)
+Xt = torch.from_numpy(X_tgt)
+yt = torch.from_numpy(y_tgt)
+
+
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LabelPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(32, 16), nn.ReLU(), nn.Linear(16, 2))
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class DomainClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.grl = GRL()
+        self.net = nn.Sequential(nn.Linear(32, 16), nn.ReLU(), nn.Linear(16, 2))
+
+    def forward(self, z):
+        return self.net(self.grl(z))
+
+
+feat_ext = FeatureExtractor()
+label_pred = LabelPredictor()
+domain_clf = DomainClassifier()
+
+params = list(feat_ext.parameters()) + list(label_pred.parameters()) + list(domain_clf.parameters())
+optimizer = optim.Adam(params, lr=1e-3)
+task_loss_fn = nn.CrossEntropyLoss()
+domain_loss_fn = nn.CrossEntropyLoss()
+
+n_epochs = 300
+domain_labels_src = torch.zeros(n_samples, dtype=torch.long)
+domain_labels_tgt = torch.ones(n_samples, dtype=torch.long)
+
+task_losses, domain_accs, target_accs = [], [], []
+
+for epoch in range(n_epochs):
+    p = epoch / n_epochs
+    lam = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
+    domain_clf.grl.lambda_val = lam
+
+    z_src = feat_ext(Xs)
+    task_logits = label_pred(z_src)
+    task_loss = task_loss_fn(task_logits, ys)
+
+    z_tgt = feat_ext(Xt)
+    z_all = torch.cat([z_src, z_tgt], dim=0)
+    d_labels = torch.cat([domain_labels_src, domain_labels_tgt], dim=0)
+    domain_logits = domain_clf(z_all)
+    domain_loss = domain_loss_fn(domain_logits, d_labels)
+
+    total_loss = task_loss + domain_loss
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    if (epoch + 1) % 50 == 0:
+        with torch.no_grad():
+            tgt_logits = label_pred(feat_ext(Xt))
+            tgt_acc = (tgt_logits.argmax(1) == yt).float().mean().item()
+            d_acc = (domain_logits.argmax(1) == d_labels).float().mean().item()
+        task_losses.append(task_loss.item())
+        domain_accs.append(d_acc)
+        target_accs.append(tgt_acc)
+        print(f"Epoch {epoch+1:3d} | lambda={lam:.3f} | task_loss={task_loss.item():.4f} "
+              f"| domain_acc={d_acc:.3f} | target_acc={tgt_acc:.3f}")
+```
+
+```python
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+with torch.no_grad():
+    z_src_np = feat_ext(Xs).numpy()
+    z_tgt_np = feat_ext(Xt).numpy()
+
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=2)
+pca.fit(np.concatenate([z_src_np, z_tgt_np]))
+z_src_2d = pca.transform(z_src_np)
+z_tgt_2d = pca.transform(z_tgt_np)
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+ax = axes[0]
+ax.scatter(X_src[:200, 0], X_src[:200, 1], c="steelblue", s=8, alpha=0.6, label="Src cls 0")
+ax.scatter(X_src[200:, 0], X_src[200:, 1], c="orange", s=8, alpha=0.6, label="Src cls 1")
+ax.scatter(X_tgt[:200, 0], X_tgt[:200, 1], c="steelblue", s=8, alpha=0.6, marker="x", label="Tgt cls 0")
+ax.scatter(X_tgt[200:, 0], X_tgt[200:, 1], c="orange", s=8, alpha=0.6, marker="x", label="Tgt cls 1")
+ax.set_title("Input space: source (circles) vs target (x)")
+ax.legend(fontsize=7)
+
+ax = axes[1]
+ax.scatter(z_src_2d[:200, 0], z_src_2d[:200, 1], c="steelblue", s=8, alpha=0.6, label="Src cls 0")
+ax.scatter(z_src_2d[200:, 0], z_src_2d[200:, 1], c="orange", s=8, alpha=0.6, label="Src cls 1")
+ax.scatter(z_tgt_2d[:200, 0], z_tgt_2d[:200, 1], c="steelblue", s=8, alpha=0.6, marker="x", label="Tgt cls 0")
+ax.scatter(z_tgt_2d[200:, 0], z_tgt_2d[200:, 1], c="orange", s=8, alpha=0.6, marker="x", label="Tgt cls 1")
+ax.set_title("DANN feature space (PCA): domains aligned by class")
+ax.legend(fontsize=7)
+
+plt.tight_layout()
+plt.savefig("dann_features.png", dpi=120)
+plt.close()
+print("Saved dann_features.png")
+```
+
+The first plot shows the raw input space: source samples (circles) and target samples (crosses) are clearly separated spatially. After DANN training, the PCA projection of the learned feature space shows source and target samples of the same class overlapping, while classes remain separated. The domain classifier cannot exceed chance accuracy on the aligned features, confirming that the GRL has successfully minimized the $\mathcal{H}$-divergence.
+
+## 5. Theoretical Depth and Practical Considerations
+
+### 5.1 Connection to GANs and $f$-Divergences
+
+The domain adversarial framework is structurally identical to a Generative Adversarial Network (Goodfellow et al., 2014) where the generator is replaced by the feature extractor. The domain classifier plays the role of the discriminator. When the domain classifier has sufficient capacity and is trained to optimality at each step, maximizing the classifier's loss is equivalent to minimizing the Jensen-Shannon divergence between the source and target feature distributions:
+
+$$d_{\text{JS}}(p_S(z), p_T(z)) = \frac{1}{2} \text{KL}(p_S \| m) + \frac{1}{2} \text{KL}(p_T \| m), \quad m = \frac{p_S + p_T}{2}$$
+
+This connection suggests that the same mode-collapse pathologies observed in GAN training can affect DANN. If the feature extractor finds a degenerate mapping that collapses all features to a single point, the domain classifier is defeated trivially while the task loss becomes useless. The $\lambda$ schedule is partly designed to prevent this collapse by ensuring task discrimination is established before domain confusion is encouraged.
+
+Alternative divergence measures have been proposed. Wasserstein distance (Villani, 2008) has better theoretical properties (continuity everywhere, no saturation of gradients), motivating Wasserstein domain adaptation variants. The $f$-divergence framework (Nowozin et al., 2016) subsumes both Jensen-Shannon and Wasserstein as special cases and provides a principled basis for choosing the divergence measure.
+
+### 5.2 Limitations of Marginal Alignment
+
+The central limitation of standard DANN is that it aligns marginal feature distributions without regard to class structure. Formally, if the source feature distribution is:
+
+$$p_S(z) = \sum_{k=1}^{K} p_S(y=k) \, p_S(z | y=k)$$
+
+then perfect marginal alignment $p_S(z) = p_T(z)$ is compatible with the class-conditional distributions being completely misaligned, as long as the class priors differ appropriately to cancel the misalignment in the mixture. CDAN addresses this by conditioning the adversarial signal on the classifier output, but the conditioning is only as good as the classifier itself. If the classifier is wrong about target class membership (which it will be early in training since it is never trained on target labels), the conditioning signal is noisy and may reinforce errors.
+
+Pseudo-labeling strategies (Lee, 2013) partially address this by assigning high-confidence target predictions as provisional labels and including them in the task loss, forming a self-training loop around the adversarial alignment. The combination of adversarial alignment and pseudo-labeling is used in several state-of-the-art systems.
+
+### 5.3 Multi-Source and Partial Adaptation
+
+Real deployments often involve multiple source domains $\{\mathcal{D}_{S_1}, \ldots, \mathcal{D}_{S_M}\}$ rather than a single source. Multi-source DANN introduces a separate domain classifier for each pair of adjacent domains, or a single $M$-class domain classifier. The theoretical analysis extends directly: minimizing the pairwise $\mathcal{H}$-divergences bounds the target error in terms of a combination of source errors and inter-source divergences.
+
+Partial domain adaptation, where $\mathcal{Y}_T \subset \mathcal{Y}_S$ (the target contains only a subset of source classes), requires modified objectives that down-weight source samples from classes absent in the target. Standard DANN will misalign these irrelevant source classes onto target features, corrupting the representation. Class-conditional reweighting methods (Cao et al., 2018) address this by estimating source class relevance from domain discriminator outputs.
+
+### 5.4 Open Questions
+
+Several open questions remain in adversarial domain adaptation. First, the theory assumes the existence of a good joint hypothesis with low error on both domains; when this assumption is violated (when source and target tasks genuinely differ), adversarial alignment can degrade performance below the no-adaptation baseline. Detecting this failure mode without target labels is an unsolved problem in practice.
+
+Second, the connection between adversarial domain adaptation and invariant risk minimization (Arjovsky et al., 2019) is unresolved. Both methods seek representations that generalize across environments, but they optimize different objectives and have different failure modes.
+
+Third, most analysis considers two-domain adaptation; the general multi-target or continual domain adaptation setting, where the target distribution shifts continuously over time, is an active research direction with connections to online learning and meta-learning.
+
+## References
+
+1. Ganin, Y., Ustinova, E., Ajakan, H., Germain, P., Larochelle, H., Laviolette, F., Marchand, M., & Lempitsky, V. (2016). Domain-adversarial training of neural networks. *Journal of Machine Learning Research*, 17(59), 1--35. https://arxiv.org/abs/1505.07818
+
+2. Ganin, Y., & Lempitsky, V. (2015). Unsupervised domain adaptation by backpropagation. *Proceedings of the 32nd International Conference on Machine Learning (ICML)*, 1180--1189. https://arxiv.org/abs/1409.7495
+
+3. Long, M., Cao, Z., Wang, J., & Jordan, M. I. (2018). Conditional adversarial domain adaptation. *Advances in Neural Information Processing Systems (NeurIPS)*, 31. https://arxiv.org/abs/1705.10667
+
+4. Ben-David, S., Blitzer, J., Crammer, K., Kulesza, A., Pereira, F., & Vaughan, J. W. (2010). A theory of learning from different domains. *Machine Learning*, 79(1--2), 151--175. https://doi.org/10.1007/s10994-009-5152-4
+
+5. Goodfellow, I., Pouget-Abadie, J., Mirza, M., Xu, B., Warde-Farley, D., Ozair, S., Courville, A., & Bengio, Y. (2014). Generative adversarial nets. *Advances in Neural Information Processing Systems (NeurIPS)*, 27. https://arxiv.org/abs/1406.2661
+
+6. Nowozin, S., Cseke, B., & Tomioka, R. (2016). f-GAN: Training generative neural samplers using variational divergence minimization. *Advances in Neural Information Processing Systems (NeurIPS)*, 29. https://arxiv.org/abs/1606.00709
+
+7. Cao, Z., Ma, L., Long, M., & Wang, J. (2018). Partial adversarial domain adaptation. *Proceedings of the European Conference on Computer Vision (ECCV)*, 135--150. https://arxiv.org/abs/1808.04205
+
+8. Arjovsky, M., Bottou, L., Gulrajani, I., & Lopez-Paz, D. (2019). Invariant risk minimization. https://arxiv.org/abs/1907.02893
+
+9. Lee, D.-H. (2013). Pseudo-label: The simple and efficient semi-supervised learning method for deep neural networks. *ICML Workshop on Challenges in Representation Learning*, 3(2).

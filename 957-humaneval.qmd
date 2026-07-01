@@ -1,0 +1,226 @@
+# HumanEval: Coding Benchmarks and Code Generation Agents {#sec-humaneval}
+
+Measuring the ability of language models to generate correct, executable code requires benchmarks that go beyond surface-level text similarity. HumanEval, introduced by Chen et al. (2021) alongside the Codex model, established the standard methodology: present a model with a Python function signature and docstring, collect multiple code completions, and evaluate each against hidden unit tests. The years following its release saw pass rates climb from below 30 percent to above 96 percent, driven not by larger models alone but by increasingly sophisticated inference-time strategies that treat code generation as a search problem. Understanding this trajectory illuminates a general principle now pervasive in AI systems: more compute spent at inference time, structured as deliberate exploration, can substitute for and often exceed the gains from additional pretraining.
+
+## 1. The HumanEval Benchmark
+
+### 1.1 Problem Structure
+
+HumanEval consists of 164 hand-crafted Python programming problems. Each problem supplies a function signature, a detailed docstring specifying the expected behavior, and between one and thirteen unit tests not visible to the model during generation. Problems span sorting, string manipulation, arithmetic reasoning, list operations, and simple algorithmic tasks. The deliberate restriction to function-level tasks with clear input-output contracts makes evaluation deterministic: a generated function either passes all unit tests or it does not. There is no partial credit and no ambiguity about correctness.
+
+A representative problem takes the following form:
+
+```python
+from typing import List
+
+def has_close_elements(numbers: List[float], threshold: float) -> bool:
+    """Check if in given list of numbers, are any two numbers closer to each
+    other than given threshold.
+    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)
+    False
+    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)
+    True
+    """
+    # model must complete this function
+```
+
+The docstring examples are visible to the model; the full test suite (which may include edge cases such as empty lists, negative thresholds, and floating-point boundary values) is used only for evaluation. This separation prevents naive template-matching strategies from succeeding.
+
+### 1.2 The pass@k Metric
+
+A single-sample pass rate is a poor estimator of a model's capability distribution, because code generation is stochastic and a capable model may generate a correct solution 30 percent of the time. Chen et al. (2021) therefore define $\text{pass}@k$: the probability that at least one of $k$ independently drawn samples passes all unit tests.
+
+Direct computation of pass@k by sampling $k$ solutions and checking whether any pass is unbiased but high-variance when $k$ is small relative to the model's true success rate. Chen et al. propose drawing $n \geq k$ samples per problem, counting the number of correct samples $c$, and computing:
+
+$$\text{pass}@k = 1 - \frac{\binom{n - c}{k}}{\binom{n}{k}}$$
+
+This estimator is unbiased and has lower variance than the naive estimator, because it uses all $n$ samples. The combinatorial fraction $\binom{n-c}{k} / \binom{n}{k}$ is the probability that all $k$ chosen samples are drawn from the $n - c$ incorrect ones, so its complement is the probability that at least one correct sample is selected.
+
+To compute this stably for large $n$ without integer overflow, the binomial coefficient ratio can be simplified:
+
+$$\frac{\binom{n-c}{k}}{\binom{n}{k}} = \prod_{i=0}^{k-1} \frac{n - c - i}{n - i}$$
+
+This product form involves only floating-point arithmetic and avoids computing large factorials.
+
+```python
+import numpy as np
+from typing import Union
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator from Chen et al. (2021).
+
+    Parameters
+    ----------
+    n : total number of samples generated per problem
+    c : number of those samples that pass all unit tests
+    k : the k in pass@k (number of allowed attempts)
+
+    Returns
+    -------
+    Estimated probability that at least one of k samples is correct.
+    """
+    if n - c < k:
+        return 1.0
+    return 1.0 - np.prod(
+        1.0 - k / np.arange(n - c + 1, n + 1)
+    )
+
+
+def mean_pass_at_k(results: list[tuple[int, int]], k: int) -> float:
+    """Average pass@k over a set of problems.
+
+    Parameters
+    ----------
+    results : list of (n_samples, n_correct) tuples, one per problem
+    k       : number of allowed attempts
+    """
+    return float(np.mean([pass_at_k(n, c, k) for n, c in results]))
+
+
+# Reproduce the intuition from Chen et al. (2021) Table 1
+# Suppose 164 problems, each sampled n=200 times at various accuracy levels
+rng = np.random.default_rng(42)
+
+def simulate_results(true_prob: float, n_problems: int = 164, n_samples: int = 200):
+    """Simulate (n, c) pairs when each sample independently passes with true_prob."""
+    return [
+        (n_samples, int(rng.binomial(n_samples, true_prob)))
+        for _ in range(n_problems)
+    ]
+
+print(f"{'true_prob':>10} {'pass@1':>10} {'pass@10':>10} {'pass@100':>10}")
+for p in [0.10, 0.20, 0.30, 0.50, 0.70]:
+    results = simulate_results(p)
+    row = [mean_pass_at_k(results, k) for k in [1, 10, 100]]
+    print(f"{p:>10.2f} {row[0]:>10.4f} {row[1]:>10.4f} {row[2]:>10.4f}")
+```
+
+The output illustrates the leverage effect: a model with only 10 percent per-sample accuracy achieves pass@100 well above 50 percent, because 100 independent draws give many chances to find a correct solution. This separates raw per-sample quality from the exploration benefit of sampling.
+
+```python
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+ks = [1, 5, 10, 25, 50, 100]
+true_probs = np.linspace(0.05, 0.95, 50)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+for k in ks:
+    pass_k_vals = []
+    for p in true_probs:
+        results = simulate_results(p, n_problems=500, n_samples=200)
+        pass_k_vals.append(mean_pass_at_k(results, k))
+    ax.plot(true_probs, pass_k_vals, label=f"pass@{k}")
+
+ax.set_xlabel("Per-sample probability of correct solution")
+ax.set_ylabel("pass@k")
+ax.set_title("pass@k as a function of per-sample accuracy")
+ax.legend(loc="lower right", fontsize=8)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("pass_at_k_curves.png", dpi=120)
+print("Saved pass_at_k_curves.png")
+```
+
+## 2. Baseline Performance and the Rise of Code Generation Models
+
+### 2.1 Codex and GPT-3
+
+The original HumanEval paper evaluated GPT-3 at 28.8 percent pass@1, the same figure as Codex (12B) at the time of publication. The Codex model family was fine-tuned on code from GitHub, demonstrating that domain-specific pretraining on source repositories substantially improves functional correctness despite identical architecture and parameter count. At pass@100, Codex reached 72.3 percent, showing that correct solutions existed in the model's output distribution even when they were infrequent. The gap between pass@1 and pass@100 quantified exactly how much opportunity remained for inference-time search strategies to exploit.
+
+GPT-4, evaluated in zero-shot mode without chain-of-thought or multi-sample strategies, achieved approximately 67 percent pass@1, a 38-point improvement over Codex achieved primarily through scale, instruction tuning, and RLHF alignment. This ceiling proved temporary; the subsequent agent-based approaches would exceed it substantially within two years.
+
+### 2.2 CodeT: Dual Execution Agreement
+
+Chen et al. (2022) introduced CodeT, which addresses a fundamental asymmetry in HumanEval: the unit tests used for final evaluation are hidden, but the model can generate its own tests. CodeT generates both candidate solutions and candidate test cases for each problem. It then scores each (solution, test) pair by dual execution agreement: run each generated solution against each generated test case, and form consensus clusters of solutions that agree on all test outputs. The highest-scoring cluster, defined as the one containing the most solutions whose outputs are mutually consistent across the largest number of tests, is selected as the final answer.
+
+This approach does not require access to ground-truth tests during generation. It reaches 65.8 percent pass@1 on HumanEval with Codex as the backbone, surpassing the naive pass@1 of the same model substantially. The key insight is that while individual test cases generated by the model may be incorrect, a large population of (solution, test) pairs can be cross-validated: a correct solution tends to produce consistent outputs across many different test inputs, whereas buggy solutions tend to produce idiosyncratic outputs that disagree with the majority.
+
+## 3. Self-Debugging and Verbal Feedback
+
+### 3.1 Reflexion
+
+Shinn et al. (2023) introduced Reflexion, a framework in which an agent generates an initial solution, executes it against available tests, receives execution feedback (error traces, failed assertions, incorrect outputs), and then generates a verbal reflection on what went wrong. This reflection is stored in the agent's context and used to condition the next generation attempt. The cycle repeats for a fixed number of iterations or until all tests pass.
+
+Reflexion achieved approximately 88 percent pass@1 on HumanEval, using GPT-4 as the generation backbone. The mechanism is qualitatively different from simply sampling more solutions: rather than drawing independent samples, Reflexion uses test execution as a gradient signal, directing the model's next attempt toward fixing specific identified failures. The verbal reflection step converts runtime error messages into natural language diagnoses, which the model can reason about in its next attempt.
+
+The effectiveness of Reflexion depends critically on the quality of the feedback signal. HumanEval's docstring examples often serve as proxy tests during generation, and the framework exploits any tests visible in the prompt. On problems where execution feedback is informative, performance is substantially better than on problems where all tests pass by accident due to shallow implementations.
+
+## 4. Tree Search Over Solution Spaces
+
+### 4.1 Language Agent Tree Search (LATS)
+
+Zhou et al. (2023) formalized inference-time search over code generation as Monte Carlo Tree Search (MCTS), yielding Language Agent Tree Search (LATS). In LATS, a node represents a state: a partial or complete code solution together with any execution feedback received so far. An edge represents an action: generate a new solution, apply a specific edit (fix the identified bug, rewrite the loop logic), run the current solution and observe the output, or produce an explanation of the current state.
+
+The value function is implemented via self-evaluation: the model rates its own current solution on a scalar scale, guided by execution feedback and the problem description. MCTS expands nodes preferentially based on upper confidence bounds that balance exploitation of high-value states against exploration of less-visited states. After a fixed compute budget, the solution at the highest-value leaf node is returned.
+
+LATS reached 94.4 percent pass@1 on HumanEval, establishing that systematic tree search over the solution space substantially outperforms both greedy decoding and flat sampling. The compute cost is substantially higher than a single forward pass, but the return on that compute is superlinear for difficult problems where the correct solution is rare under the base distribution.
+
+The MCTS formulation provides a principled account of why inference-time search works: the model's output distribution contains correct solutions for most HumanEval problems at some non-trivial probability, and tree search efficiently finds them by using execution feedback as a local value signal rather than sampling uniformly from the full distribution.
+
+### 4.2 AgentCoder
+
+Huang et al. (2023) extended the multi-sample paradigm with AgentCoder, which separates the generation, testing, and revision roles into distinct specialized prompts. A programmer agent generates initial solutions, a test designer agent generates comprehensive test cases specifically targeting boundary conditions and edge cases, and an executor agent iterates on the code using both the generated tests and any available examples. AgentCoder reached 96.3 percent pass@1 on HumanEval, the highest reported figure in the literature at the time of writing, demonstrating that role specialization within a single-model multi-agent framework provides additional gains over undifferentiated iteration.
+
+## 5. Multi-Agent Software Simulation
+
+### 5.1 MetaGPT
+
+Hong et al. (2023) took a different architectural approach with MetaGPT, simulating the structure of a software company. Distinct agent roles, each instantiated as separate LLM calls with role-specific system prompts, correspond to Product Manager, Architect, Senior Engineer, and QA Engineer. The Product Manager agent converts the problem description into a structured requirements document. The Architect agent produces a high-level design. The Engineer agents implement individual components. The QA Engineer agent generates test cases and reviews the implementation.
+
+Agents communicate through structured artifacts, specifically product requirement documents, API specifications, and code modules, rather than free-form conversation. This structured handoff prevents the context drift that afflicts long single-agent conversations and ensures that each agent operates on a well-defined input artifact. MetaGPT achieved approximately 85.9 percent pass@1 on HumanEval with GPT-4.
+
+The performance of MetaGPT on HumanEval is lower than LATS or AgentCoder, which is unsurprising given that HumanEval problems are function-level tasks that do not require architectural decomposition. The framework's strengths emerge more clearly on complex multi-file software generation tasks where the overhead of structured coordination pays dividends.
+
+The progression from CodeT to Reflexion to LATS to AgentCoder illustrates a general scaling law for inference-time compute: each successive approach spends more compute per problem but achieves substantially higher pass rates. The relationship is not linear; tree search in LATS provides a qualitative jump over linear self-debugging chains in Reflexion, suggesting that the structure of the search procedure matters, not just the total compute budget.
+
+## 6. Limitations of HumanEval as a Benchmark
+
+### 6.1 Training Data Contamination
+
+The most significant methodological concern for HumanEval is contamination: many of the 164 problems may appear verbatim or in close paraphrase in the training corpora of large language models, particularly those trained on GitHub code repositories. A model that has memorized the correct answer to a problem achieves high pass@1 without demonstrating genuine generalization. The contamination problem worsens as models grow larger and training datasets expand, making it difficult to attribute performance improvements to improved reasoning rather than increased memorization.
+
+Several mitigation strategies have been proposed, including evaluating on hold-out variants where variable names and problem framing are perturbed, or using temporally separated benchmarks where evaluation problems postdate the training cutoff. None of these fully resolve the concern because the distribution of problem structures, even with surface perturbations, may remain close to training examples.
+
+### 6.2 Function-Level vs. Repository-Level Complexity
+
+HumanEval problems are isolated function implementations averaging fewer than 20 lines of correct code. Real software engineering tasks involve understanding and modifying large codebases with complex inter-module dependencies, inferring implicit specifications from usage patterns, and making changes that do not introduce regressions in unrelated components. A model that achieves 96 percent pass@1 on HumanEval may still fail on tasks requiring multi-file reasoning, dependency management, or incremental modification of existing code.
+
+### 6.3 Goodhart's Law and Benchmark Gaming
+
+As pass rates on HumanEval approached the ceiling of the benchmark, the community has recognized that optimizing specifically for HumanEval has led to methods that exploit the benchmark's specific structure. Test-driven generation methods, for example, benefit from the fact that HumanEval's docstrings often contain example input-output pairs that serve as implicit tests. Methods that would not generalize to problems without such examples achieve inflated HumanEval numbers. The benchmark has in this sense been "solved" in the Goodhart's Law sense: pass rate on HumanEval is no longer a reliable indicator of general code generation capability.
+
+## 7. SWE-bench: Repository-Level Code Editing
+
+### 7.1 Benchmark Design
+
+Jimenez et al. (2024) introduced SWE-bench to address HumanEval's limitations. SWE-bench consists of 2,294 real GitHub issues from popular Python repositories such as Django, scikit-learn, and sympy, paired with the corresponding pull requests that resolve them. The task is to generate a patch that resolves the issue and passes the associated regression tests. Unlike HumanEval, the model must understand a large existing codebase, identify which files and functions are relevant to the bug report, and produce a minimal, targeted fix.
+
+Performance on SWE-bench is dramatically lower than on HumanEval. State-of-the-art systems in 2024 achieved 4 to 13 percent resolution rates on the full benchmark, rising to approximately 20 percent on the curated SWE-bench Verified subset (500 human-verified problems). These numbers reflect the genuine difficulty of repository-level software engineering: even systems that achieve near-perfect scores on HumanEval struggle to navigate large codebases and reason about implicit invariants maintained across many interacting components.
+
+### 7.2 Implications for Agent Design
+
+The contrast between HumanEval and SWE-bench pass rates reveals that the inference-time strategies that work well for function generation, iterative self-debugging of isolated units, do not straightforwardly transfer to repository-level editing. SWE-bench requires effective file retrieval from large repositories, accurate localization of the relevant code region among thousands of candidates, and conservative edits that preserve existing behavior. Multi-agent systems designed for SWE-bench, such as AutoCodeRover and Agentless, invest heavily in the retrieval and localization stages that HumanEval does not require, because there is no codebase to navigate.
+
+This suggests that HumanEval and SWE-bench measure partially overlapping but distinct capabilities: single-function code synthesis versus program comprehension and targeted modification. Both are necessary for practical code generation systems, and neither benchmark alone provides a sufficient evaluation.
+
+## 8. Summary
+
+HumanEval established a rigorous, executable evaluation protocol for code generation and the pass@k metric remains the standard approach for comparing models across multiple samples. The trajectory from 28.8 percent pass@1 with Codex to 96.3 percent with AgentCoder is not primarily a story of model scale but of inference-time architecture: self-generated tests, execution feedback loops, verbal self-reflection, Monte Carlo tree search, and role-differentiated multi-agent collaboration each contributed measurable gains beyond what larger models alone provided. The benchmark's limitations, particularly training contamination and its restriction to isolated function synthesis, motivated SWE-bench and subsequent repository-level evaluations that better reflect real engineering tasks. The field's current challenge is designing inference-time agent architectures that achieve the same quality of search and feedback on repository-scale problems that LATS achieved on the 164 HumanEval functions.
+
+## References
+
+1. Chen, M., Tworek, J., Jun, H., Yuan, Q., Ponde de Oliveira Pinto, H., Kaplan, J., ... & Zaremba, W. (2021). Evaluating large language models trained on code. arXiv:2107.03374. https://arxiv.org/abs/2107.03374
+
+2. Chen, B., Zhang, F., Nguyen, A., Zan, D., Lin, Z., Lou, J. G., & Chen, W. (2022). CodeT: Code generation with generated tests. arXiv:2207.10397. https://arxiv.org/abs/2207.10397
+
+3. Shinn, N., Cassano, F., Gopinath, A., Narasimhan, K., & Yao, S. (2023). Reflexion: Language agents with verbal reinforcement learning. arXiv:2303.11366. https://arxiv.org/abs/2303.11366
+
+4. Zhou, A., Yan, K., Shlapentokh-Rothman, M., Wang, H., & Wang, Y. X. (2023). Language agent tree search unifies reasoning, acting, and planning in language models. arXiv:2310.04406. https://arxiv.org/abs/2310.04406
+
+5. Hong, S., Zhuge, M., Chen, J., Zheng, X., Cheng, Y., Zhang, C., ... & Wu, C. (2023). MetaGPT: Meta programming for a multi-agent collaborative framework. arXiv:2308.00352. https://arxiv.org/abs/2308.00352
+
+6. Huang, D., Bu, Q., Zhang, J. M., Luck, M., & Cui, H. (2023). AgentCoder: Multi-agent-based code generation with iterative testing and optimisation. arXiv:2312.13010. https://arxiv.org/abs/2312.13010
+
+7. Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., & Narasimhan, K. (2024). SWE-bench: Can language models resolve real-world GitHub issues? arXiv:2310.06770. https://arxiv.org/abs/2310.06770

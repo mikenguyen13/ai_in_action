@@ -1,0 +1,265 @@
+# Model Monitoring in Production {#sec-model-monitoring}
+
+Every deployed machine learning model is a hypothesis about the future: that the statistical regularities observed in training data will persist in the live environment. This hypothesis is almost always wrong to some degree. The train-test distribution gap is never zero, and the gap between training time and deployment time is wider still. Even a model with excellent held-out evaluation metrics will degrade as the world changes around it. Model monitoring is the discipline of detecting this degradation before it causes harm, diagnosing its source, and triggering corrective action.
+
+## 1. Why Models Degrade
+
+The fundamental issue is one of distributional mismatch. A supervised model learns a function $f: \mathcal{X} \to \mathcal{Y}$ that minimizes expected loss under the training distribution $p_{\text{train}}(x, y)$. At inference time, inputs are drawn from a deployment distribution $p_{\text{deploy}}(x, y)$. If $p_{\text{deploy}} \neq p_{\text{train}}$, the guarantee from empirical risk minimization breaks down. The expected loss under deployment is
+
+$$\mathbb{E}_{p_{\text{deploy}}}[\ell(f(x), y)] = \mathbb{E}_{p_{\text{train}}}[\ell(f(x), y)] + \underbrace{\int \ell(f(x), y)\,(p_{\text{deploy}}(x,y) - p_{\text{train}}(x,y))\,dx\,dy}_{\text{distributional shift penalty}},$$
+
+and the shift penalty can be large even when the first term is small.
+
+Sources of shift accumulate over the deployment lifetime. Data pipelines are refactored, sensor calibrations drift, upstream schema changes silently alter feature semantics. User populations evolve: a fraud detection model trained on 2022 transaction patterns confronts novel schemes in 2024. Seasonal patterns that were absent from a short training window appear in production. In some domains, notably finance and epidemiology, the very act of deploying a model changes the phenomenon it models, a reflexive feedback loop that canonical i.i.d. theory does not capture.
+
+Beyond organic drift, adversarial actors deliberately craft inputs to exploit blind spots in the learned function. A model deployed at scale becomes a target, and the distribution of adversarial queries can depart dramatically from the benign training population.
+
+## 2. Taxonomy of Deployment Failures
+
+### 2.1 Data Quality Issues
+
+The most immediately visible failure mode is broken data: null values in fields that training assumed were always populated, type mismatches from schema evolution, encoding changes that turn a categorical feature from integer-coded to string-coded. These failures corrupt individual predictions rather than shifting the population and often produce dramatically out-of-range feature values that can be caught with simple bounds checks. Schema validation at the feature ingestion boundary is a prerequisite for higher-level monitoring.
+
+### 2.2 Covariate Shift
+
+Covariate shift occurs when the marginal input distribution changes, $p_{\text{deploy}}(x) \neq p_{\text{train}}(x)$, while the conditional $p(y \mid x)$ remains the same. The model's learned mapping is still correct in principle; it simply encounters input regions that were sparsely or unrepresented at training time, where its predictions are extrapolations rather than interpolations. Accuracy degrades in proportion to how heavily those drifted regions are weighted in the new query distribution. Standard detection methods compare the empirical distribution of production feature values against a reference dataset drawn from training.
+
+### 2.3 Concept Drift
+
+Concept drift is more insidious: the conditional distribution $p(y \mid x)$ changes. The world itself has changed. A credit model calibrated before an economic shock finds that the same income-to-debt ratio that predicted repayment in 2019 predicts default in 2020. No amount of feature monitoring will reveal this directly; it requires observing ground truth labels and comparing model predictions against them. Because labels arrive late (see Section 3), concept drift is often detected only after it has already caused material harm.
+
+### 2.4 Prediction Drift
+
+Prediction drift refers to a change in the model's output distribution without a corresponding change in inputs. This is a signature of model or code changes: a dependency upgrade altered numerical precision, a feature preprocessing step was inadvertently changed, or a model version was deployed without going through the standard evaluation gate. Monitoring the output score histogram against the reference period catches these regressions early.
+
+### 2.5 Infrastructure Failures
+
+Latency spikes, memory leaks, GPU out-of-memory errors, and service timeouts are not model quality issues but they degrade the user experience and can mask model failures. A service that returns stale cached predictions due to a backend timeout looks correct at the feature level but is effectively offline. Infrastructure metrics, latency percentiles, error rates, and resource utilization must be co-monitored with model quality metrics.
+
+### 2.6 Adversarial Inputs
+
+Adversarial inputs are crafted to cause specific misbehavior: misclassification, extraction of training data, or triggering sensitive output. They often lie outside the natural data manifold and can be detected by out-of-distribution (OOD) detectors that measure distance from the training distribution. However, adaptive adversaries who know the OOD detector can construct inputs that evade it while still causing model failures, making this an arms race.
+
+## 3. The Feedback Delay Problem
+
+A central challenge in production monitoring is that ground truth labels are often unavailable at prediction time and may not arrive for days, weeks, or months. A loan default model scores applications in real time but learns the true outcome only after the repayment window closes, which may be 12 to 24 months. A medical diagnosis model may await biopsy results. A churn prediction model must wait to see whether a customer actually churned.
+
+During this delay, the only observable signal is the input data itself and, sometimes, the model's outputs. This makes covariate shift monitoring the primary proxy for model health. The reasoning is: if the feature distribution has drifted significantly from training, then even if the conditional $p(y \mid x)$ has not changed, the model is operating in a regime where its empirical error guarantees no longer apply. Drift detection is a leading indicator; label-based performance monitoring is the lagging ground truth.
+
+Proxy labels can partially bridge the gap in some domains. Click-through rates, user corrections, and escalation rates are weak but fast signals of model output quality. A well-designed monitoring system layers these proxies together with distributional checks and deferred ground truth evaluation.
+
+## 4. Population-Level Monitoring Architecture
+
+The following diagram illustrates the standard architecture for batch-mode monitoring, which is appropriate for most production deployments.
+
+```{mermaid}
+flowchart LR
+    A["Incoming requests"] --> B["Prediction service"]
+    B --> C["Feature log store"]
+    B --> D["Prediction log store"]
+    C --> E["Batch monitor job"]
+    D --> E
+    E --> F["Drift statistics"]
+    F --> G{"Threshold exceeded?"}
+    G -- "Yes" --> H["Alert and page"]
+    G -- "No" --> I["Update dashboard"]
+    H --> J["Human review"]
+    J --> K{"Root cause"}
+    K -- "Data issue" --> L["Fix pipeline"]
+    K -- "Model drift" --> M["Retrain trigger"]
+```
+
+Each prediction is logged with its full feature vector and output score. A batch monitoring job runs on a schedule, typically every hour for high-stakes systems or every 24 hours for lower-frequency deployments. The job compares the distribution of features and predictions in the current window against a reference dataset, computes drift statistics, and fires alerts when thresholds are exceeded.
+
+The reference dataset is critical. It should represent the distribution the model was trained and validated on, covering the range of inputs the model is expected to handle correctly. The first 30 days after a model is deployed in production, assuming they are representative, make a practical reference window.
+
+## 5. What to Monitor
+
+### 5.1 Feature Statistics
+
+For each input feature, track summary statistics over sliding windows:
+
+- **Null rate**: fraction of missing values. A sudden increase often indicates an upstream pipeline failure.
+- **Mean and standard deviation**: sensitive to distributional shift in continuous features.
+- **Min and max**: catches encoding errors and sensor malfunctions that produce out-of-range values.
+- **Cardinality** (for categoricals): new categories appearing in production that were absent at training are a strong signal.
+
+### 5.2 Feature Distribution Statistics
+
+Summary statistics can miss distributional changes that leave the mean unchanged. Two full-distribution statistics are standard:
+
+**Kolmogorov-Smirnov statistic.** For continuous feature $j$, let $F_{\text{ref}}$ and $F_{\text{prod}}$ be the empirical CDFs of the reference and production windows. The KS statistic is
+
+$$D_j = \sup_x |F_{\text{ref},j}(x) - F_{\text{prod},j}(x)|.$$
+
+Under the null hypothesis that both samples are drawn from the same distribution, the asymptotic distribution of $\sqrt{n} D_j$ is the Kolmogorov distribution, giving a $p$-value. With $p$ features, apply a Bonferroni correction and alert when the corrected $p$-value falls below 0.05.
+
+**Population Stability Index.** PSI was developed in credit scoring and is widely used because it provides an interpretable magnitude rather than just a $p$-value. Bin the feature into $B$ buckets using the reference distribution to define bucket boundaries. Let $r_b$ and $q_b$ be the fraction of reference and production samples falling in bucket $b$. Then
+
+$$\text{PSI} = \sum_{b=1}^{B} (q_b - r_b) \ln\!\frac{q_b}{r_b}.$$
+
+The conventional thresholds are: PSI $< 0.1$ indicates stable distribution, $0.1 \le \text{PSI} < 0.2$ moderate drift requiring attention, and PSI $\ge 0.2$ severe drift requiring action. PSI is a symmetrized KL divergence, specifically $\text{PSI} = \text{KL}(q \| r) + \text{KL}(r \| q)$, which makes it sensitive to shifts in both directions.
+
+### 5.3 Prediction Distribution
+
+Monitor the output score histogram over time. For classifiers, track the mean predicted probability and its standard deviation. A sudden shift in the score distribution may indicate a model version change, a covariate shift, or a code regression, and often appears before any label-based signal.
+
+### 5.4 Model Performance (when labels are available)
+
+When delayed labels arrive, compute rolling accuracy, AUC-ROC, F1, or domain-specific metrics over a sliding window. Calibration, the alignment between predicted probabilities and empirical frequencies, is particularly important to monitor for models whose outputs are used as risk scores in downstream decision systems.
+
+### 5.5 Infrastructure Metrics
+
+Track request latency at the p50, p95, and p99 percentiles, error rates by error type (timeout, OOM, schema validation failure), and resource utilization (CPU, memory, GPU memory). These should be part of a unified monitoring dashboard alongside model quality metrics so that correlations between infrastructure anomalies and quality degradation are immediately visible.
+
+## 6. Alert Threshold Strategy
+
+Setting alert thresholds requires balancing sensitivity against alert fatigue. Too many false positives and practitioners stop responding to alerts; too few and real degradation goes undetected.
+
+A principled approach uses the reference period itself to calibrate thresholds. Compute the PSI and KS statistics on held-out batches drawn from the reference distribution. The resulting empirical null distribution gives natural thresholds at desired false positive rates. For PSI, the canonical thresholds (0.1 and 0.2) are empirically validated across many credit and insurance applications and are a safe starting point. For the KS test, the Bonferroni correction for $p$ features is
+
+$$\alpha_{\text{corrected}} = \frac{0.05}{p}.$$
+
+Alert severity can be tiered: a page to on-call engineers for PSI $\ge 0.2$ on a high-importance feature, a Slack notification for PSI $\in [0.1, 0.2)$, and a logged entry for lower-level anomalies. Not all features are equally important, and feature importance scores from the model can be used to weight alert severity accordingly.
+
+## 7. Retraining Strategies
+
+When monitoring detects degradation, the corrective action is typically retraining on more recent data. Three strategies exist along a spectrum of complexity.
+
+**Scheduled retraining** triggers a new training run on a fixed cadence regardless of detected drift. It is simple to implement, predictable, and avoids the complexity of designing reliable drift-triggered pipelines. Its drawback is inefficiency: it retrains even when the model is performing well, and it may not retrain quickly enough during sudden shifts.
+
+**Triggered retraining** fires a new training run when a drift or performance metric crosses a threshold. It is more efficient and responsive but requires high confidence in the monitoring signal. A false positive from the drift detector wastes training compute and may introduce instability from retraining on too little new data. A false negative fails to retrain when needed.
+
+**Continuous learning** updates the model parameters incrementally as new labeled data arrives, using online learning algorithms or mini-batch gradient descent. It is most responsive to gradual drift but introduces stability challenges: the model can catastrophically forget earlier patterns, and online updates are harder to validate before deployment.
+
+In practice, most production systems use scheduled retraining with a monitoring layer that can shrink the retrain interval or trigger an out-of-cycle run when severe drift is detected. This hybrid approach captures most of the efficiency of triggered retraining while preserving operational simplicity.
+
+## 8. Implementation: A Minimal Monitoring Pipeline
+
+The following Python implementation builds a complete monitoring pipeline from scratch. It generates a reference dataset, simulates production batches with gradual covariate drift, computes PSI for each feature per batch, and visualizes the drift trajectory over time.
+
+```python
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+
+rng = np.random.default_rng(42)
+
+def generate_reference(n=5000):
+    age = rng.normal(40, 10, n)
+    income = rng.lognormal(10.5, 0.6, n)
+    credit_score = rng.normal(680, 80, n)
+    debt_ratio = rng.beta(2, 5, n)
+    df = pd.DataFrame({
+        "age": age,
+        "income": income,
+        "credit_score": credit_score,
+        "debt_ratio": debt_ratio,
+    })
+    return df
+
+def generate_production_batch(n=500, drift_factor=0.0):
+    age = rng.normal(40 + drift_factor * 5, 10 + drift_factor * 2, n)
+    income = rng.lognormal(10.5 - drift_factor * 0.2, 0.6 + drift_factor * 0.1, n)
+    credit_score = rng.normal(680 - drift_factor * 30, 80 + drift_factor * 10, n)
+    debt_ratio = rng.beta(2 + drift_factor, 5 - drift_factor * 0.5, n)
+    return pd.DataFrame({
+        "age": age,
+        "income": income,
+        "credit_score": credit_score,
+        "debt_ratio": debt_ratio,
+    })
+
+def compute_psi(ref_series, prod_series, n_bins=10):
+    breakpoints = np.percentile(ref_series, np.linspace(0, 100, n_bins + 1))
+    breakpoints[0] = -np.inf
+    breakpoints[-1] = np.inf
+    ref_counts = np.histogram(ref_series, bins=breakpoints)[0]
+    prod_counts = np.histogram(prod_series, bins=breakpoints)[0]
+    eps = 1e-8
+    ref_pct = ref_counts / ref_counts.sum() + eps
+    prod_pct = prod_counts / prod_counts.sum() + eps
+    psi = np.sum((prod_pct - ref_pct) * np.log(prod_pct / ref_pct))
+    return psi
+
+def compute_ks(ref_series, prod_series):
+    stat, pvalue = stats.ks_2samp(ref_series, prod_series)
+    return stat, pvalue
+
+reference = generate_reference(n=5000)
+features = reference.columns.tolist()
+
+n_batches = 20
+drift_schedule = np.linspace(0, 2.0, n_batches)
+
+psi_records = []
+ks_records = []
+
+for batch_idx, drift in enumerate(drift_schedule):
+    batch = generate_production_batch(n=500, drift_factor=drift)
+    psi_row = {"batch": batch_idx}
+    ks_row = {"batch": batch_idx}
+    for feat in features:
+        psi_row[feat] = compute_psi(reference[feat], batch[feat])
+        ks_stat, ks_pval = compute_ks(reference[feat], batch[feat])
+        ks_row[f"{feat}_stat"] = ks_stat
+        ks_row[f"{feat}_pval"] = ks_pval
+    psi_records.append(psi_row)
+    ks_records.append(ks_row)
+
+psi_df = pd.DataFrame(psi_records).set_index("batch")
+ks_df = pd.DataFrame(ks_records).set_index("batch")
+
+fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True)
+axes = axes.flatten()
+colors = ["#2196F3", "#E91E63", "#4CAF50", "#FF9800"]
+
+for i, feat in enumerate(features):
+    ax = axes[i]
+    ax.plot(psi_df.index, psi_df[feat], color=colors[i], linewidth=2, label="PSI")
+    ax.axhline(0.1, color="orange", linestyle="--", linewidth=1, label="PSI=0.10 (moderate)")
+    ax.axhline(0.2, color="red", linestyle="--", linewidth=1, label="PSI=0.20 (severe)")
+    ax.set_title(feat)
+    ax.set_ylabel("PSI")
+    ax.set_xlabel("Production batch")
+    ax.legend(fontsize=7)
+    ax.set_ylim(bottom=0)
+
+fig.suptitle("Feature drift over production batches (PSI)", fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.savefig("psi_drift.png", dpi=120, bbox_inches="tight")
+plt.show()
+
+bonferroni_alpha = 0.05 / len(features)
+print(f"Bonferroni-corrected alpha: {bonferroni_alpha:.4f}\n")
+print("Final batch drift summary:")
+print(psi_df.iloc[-1].round(3))
+print("\nKS p-values (final batch):")
+for feat in features:
+    pval = ks_df[f"{feat}_pval"].iloc[-1]
+    flag = " ** ALERT **" if pval < bonferroni_alpha else ""
+    print(f"  {feat}: p={pval:.4e}{flag}")
+```
+
+Running this code simulates 20 production batches in which features drift progressively from the reference distribution. Early batches show PSI below 0.1 for all features, confirming stability. By batch 10, features begin crossing the moderate threshold. The final batches exceed the severe threshold on all features, and the KS test after Bonferroni correction flags statistically significant drift. This is the signal that would trigger a human review and potential retrain.
+
+A production monitoring system extends this skeleton with database backends for the reference and production samples, a scheduler (Airflow, Prefect, or a simple cron job) to run the monitoring job, a metrics store (Prometheus, DataDog, or a time-series database) to record PSI and KS values over time, and an alerting layer (PagerDuty, OpsGenie) wired to the threshold logic.
+
+## 9. Connecting Monitoring to the ML Lifecycle
+
+Model monitoring is not a postdeployment afterthought but a first-class component of the ML lifecycle. The reference dataset, threshold calibration, and alert routing should be designed alongside the model itself, before deployment, and reviewed as part of the model release process.
+
+Monitoring data feeds back into the training pipeline through two channels. First, logged production features accumulate a dataset of real-world inputs that can augment or replace the training data at retrain time, closing the distributional gap. Second, delayed labels, once they arrive, form a ground truth evaluation set that provides the only honest estimate of production performance. Coupling the monitoring infrastructure to the data labeling and training pipelines creates a closed loop that keeps the model aligned with the evolving world.
+
+## References
+
+1. Klaise, J., Van Looveren, A., Vacanti, G., and Coca, A. (2022). "Alibi Detect: Algorithms for outlier, adversarial and drift detection." *Journal of Machine Learning Research*, 23(147), 1-6. https://jmlr.org/papers/v23/21-1011.html
+
+2. Rabanser, S., Günnemann, S., and Lipton, Z. C. (2019). "Failing Loudly: An Empirical Study of Methods for Detecting Dataset Shift." *Advances in Neural Information Processing Systems (NeurIPS)*, 32. https://arxiv.org/abs/1810.11953
+
+3. Moreno-Torres, J. G., Raeder, T., Alaiz-Rodríguez, R., Chawla, N. V., and Herrera, F. (2012). "A unifying view on dataset shift in classification." *Pattern Recognition*, 45(1), 521-530. https://doi.org/10.1016/j.patcog.2011.06.019
+
+4. Gama, J., Zliobaite, I., Bifet, A., Pechenizkiy, M., and Bouchachia, A. (2014). "A survey on concept drift adaptation." *ACM Computing Surveys*, 46(4), 1-37. https://doi.org/10.1145/2523813
+
+5. Sculley, D., Holt, G., Golovin, D., Davydov, E., Phillips, T., Ebner, D., Chaudhary, V., Young, M., Crespo, J. F., and Dennison, D. (2015). "Hidden technical debt in machine learning systems." *Advances in Neural Information Processing Systems (NeurIPS)*, 28. https://proceedings.neurips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html
