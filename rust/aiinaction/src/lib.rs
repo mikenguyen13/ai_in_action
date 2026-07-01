@@ -121,6 +121,7 @@ pub mod ch200_weight_init;
 pub mod ch201_batch_norm;
 pub mod ch202_layer_norm;
 pub mod ch204_dropout;
+pub mod ch207_densenet;
 
 #[cfg(test)]
 mod tests {

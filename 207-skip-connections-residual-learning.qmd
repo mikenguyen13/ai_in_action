@@ -168,19 +168,155 @@ $$
 x_\ell = H_\ell\!\left( [\, x_0, x_1, \ldots, x_{\ell-1} \,] \right),
 $$
 
-where $[\cdot]$ denotes concatenation along the channel axis and $H_\ell$ is a composite function, typically batch normalization, a nonlinearity, and a convolution. A block of $L$ layers therefore contains $\frac{L(L+1)}{2}$ direct connections rather than the $L$ connections of a plain stack.
+where $[\cdot]$ denotes concatenation along the channel axis and $H_\ell$ is a composite function, typically batch normalization, a ReLU nonlinearity, and a convolution. A block of $L$ layers therefore contains $\frac{L(L+1)}{2}$ direct connections rather than the $L$ connections of a plain stack: layer $\ell$ alone contributes $\ell$ incoming edges (one from each earlier layer, including the block input), and summing $\ell$ from $0$ to $L-1$ gives $\binom{L}{2} + L = \frac{L(L+1)}{2}$.
+
+```{mermaid}
+flowchart LR
+  X0["x0"] --> H1["H1"]
+  X0 -.-> C1(("concat"))
+  H1 --> C1
+  C1 --> X1["x1"]
+  X0 -.-> C2(("concat"))
+  X1 -.-> C2
+  X1 --> H2["H2"]
+  H2 --> C2
+  C2 --> X2["x2"]
+  X0 -.-> C3(("concat"))
+  X1 -.-> C3
+  X2 -.-> C3
+  X2 --> H3["H3"]
+  H3 --> C3
+  C3 --> X3["x3"]
+```
+
+Each dotted edge is a piece of the growing concatenation: layer $\ell$'s composite function $H_\ell$ reads every feature map produced so far, and its output is appended rather than added, so nothing already computed is ever overwritten.
 
 ### 4.2 Growth Rate and Parameter Efficiency
 
-Because inputs accumulate through concatenation, each layer needs to produce only a small number of new feature maps. This number is the **growth rate** $k$: if the input to the block has $k_0$ channels, then layer $\ell$ sees $k_0 + k(\ell - 1)$ channels. A small growth rate, often a few dozen channels, keeps the network narrow while still giving later layers access to all earlier features. Dense connectivity is strikingly parameter efficient for this reason. Each layer adds only its own thin slice of new features, and because every layer can read the collective knowledge of the block, the network avoids relearning redundant representations. Reported results showed dense networks matching or exceeding the accuracy of residual networks with substantially fewer parameters [@huang2017densely].
+Because inputs accumulate through concatenation, each layer needs to produce only a small number of new feature maps. This number is the **growth rate** $k$: if the input to the block has $k_0$ channels, then layer $\ell$ (0-indexed) sees $k_0 + k\ell$ channels, and the block's final output width after $L$ layers is $k_0 + kL$. A small growth rate, often a few dozen channels, keeps the network narrow while still giving later layers access to all earlier features.
+
+To control the cost of the $3 \times 3$ convolution inside $H_\ell$ as the input width grows with $\ell$, the DenseNet-B (bottleneck) variant inserts a $1 \times 1$ convolution first, mapping the accumulated $c_\ell = k_0 + k\ell$ input channels down to $b k$ channels (with bottleneck multiplier $b$, typically $4$), before the $3 \times 3$ convolution produces the $k$ new features:
+
+$$
+\text{params}_\ell \;=\; \underbrace{c_\ell \cdot (bk)}_{1\times 1 \text{ bottleneck}} \;+\; \underbrace{(bk) \cdot k \cdot 9}_{3\times 3 \text{ conv}}.
+$$
+
+Summing over $\ell = 0, \ldots, L-1$ gives the dense block's total parameter count. This is strikingly parameter efficient compared with a plain stack of $L$ ordinary $3\times 3$ convolutions matched to the same final width $w = k_0 + kL$, whose parameter count is $c_0 w \cdot 9 + (L-1)w^2 \cdot 9$: the plain stack pays the full $w^2$ cost at every layer, while the dense block pays only for the thin $k$-wide slice each layer actually produces. Reported results showed dense networks matching or exceeding the accuracy of residual networks with substantially fewer parameters [@huang2017densely]. Transitions between dense blocks apply a $1 \times 1$ convolution with a **compression factor** $\theta \in (0, 1]$, shrinking $c$ input channels down to $\lfloor \theta c \rfloor$ channels before average pooling halves the spatial resolution, which is what keeps the concatenated width from growing without bound across the full network.
+
+The table below applies this arithmetic to the four ImageNet-scale DenseNet-BC variants from @huang2017densely (growth rate $k=32$, stem width $k_0=64$, compression $\theta=0.5$, bottleneck $b=4$), summing only the dense blocks and inter-block transitions (excluding the stem convolution, final batch norm, and classifier head, which is why these figures run a bit below the paper's full reported totals):
+
+| Variant | Block config (layers per block) | Dense + transition params |
+|---|---|---|
+| DenseNet-121 | 6, 12, 24, 16 | 6.86M |
+| DenseNet-169 | 6, 12, 32, 32 | 12.32M |
+| DenseNet-201 | 6, 12, 48, 32 | 17.85M |
+| DenseNet-264 | 6, 12, 64, 48 | 30.24M |
 
 ### 4.3 Gradient Flow in Dense Networks
 
-The gradient argument carries over with a concatenative twist. Every layer has a direct path to the loss through the layers it feeds, and because connections are formed by concatenation rather than summation, the signal from each source layer remains identifiable rather than blended. Each layer thus receives gradients along many short paths, and the implicit deep supervision this creates is part of why dense networks train well. Transitions between dense blocks use pooling and $1 \times 1$ convolutions to reduce the channel count, preventing the concatenated width from growing without bound across the full network.
+The gradient argument carries over with a concatenative twist. Every layer has a direct path to the loss through the layers it feeds, and because connections are formed by concatenation rather than summation, the signal from each source layer remains identifiable rather than blended: unrolling the concatenation, $x_L$ contains $x_0$ verbatim as a slice of its channels, so $\partial x_L / \partial x_0$ includes a literal identity block rather than a sum of Jacobian products. Each layer thus receives gradients along many short paths, and the implicit deep supervision this creates is part of why dense networks train well.
 
 ### 4.4 Choosing Between Additive and Concatenative Connectivity
 
 Additive and concatenative shortcuts embody different trade-offs. Addition preserves a fixed channel width, costs nothing in extra memory at the join, and biases each block toward small perturbations of its input, which suits the iterative-refinement reading. Concatenation preserves earlier features verbatim and lets later layers select among them, at the cost of growing channel counts and higher activation memory. In practice residual addition dominates very large models, where its constant width and clean identity path scale gracefully, while dense concatenation remains attractive when parameter and feature efficiency are the priority. Both descend from the same insight: give the optimizer a direct, low-resistance route between distant layers, and depth becomes an asset rather than a liability.
+
+### 4.5 Reference Implementation
+
+The shared library `aiinaction` ships a from-scratch implementation of the dense-block arithmetic above, plus a toy forward pass that makes the concatenation mechanic concrete. Each layer's composite $H_\ell$ is stood in for by a single seeded linear-plus-ReLU map (rather than a full batch-norm/conv stack), so the forward pass stays honest about *how features accumulate through concatenation* without requiring a tensor/convolution implementation. Weights are drawn from the same 64-bit linear congruential generator (LCG) used elsewhere in this book, so the Python, Julia, and Rust implementations produce bit-identical layers given the same seed, and the parity tests assert this on shared fixtures.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+from aiinaction.ch207_densenet import (
+    dense_block_channel_sizes,
+    dense_block_param_count,
+    plain_block_param_count,
+    dense_block_forward,
+    densenet_dense_param_total,
+)
+
+# Channel growth: layer l sees k0 + k*l channels; growth rate k=3, k0=4.
+sizes = dense_block_channel_sizes(c0=4, growth_rate=3, num_layers=3)
+print("channel sizes (input to each layer, then block output):", sizes)
+
+# Run the toy dense block forward pass and confirm the observed feature
+# width matches the theoretical channel-size trace at every step.
+x0 = [1.0, 0.6, -0.3, 0.9]
+out, sizes_trace = dense_block_forward(x0, growth_rate=3, num_layers=3, seed=2)
+print("final concatenated features:", [round(v, 4) for v in out.tolist()])
+assert sizes_trace == sizes
+
+# Parameter efficiency: a dense block vs. a plain stack of matched output width.
+dense_params = dense_block_param_count(c0=16, growth_rate=12, num_layers=8, bn_size=4)
+plain_params = plain_block_param_count(c0=16, width=16 + 12 * 8, num_layers=8)
+print(f"dense block:  {dense_params:,} params")
+print(f"plain stack:  {plain_params:,} params (same final width {16 + 12 * 8})")
+print(f"ratio: plain uses {plain_params / dense_params:.1f}x more parameters")
+
+# DenseNet-BC variant totals (dense blocks + transitions only).
+for variant in ("121", "169", "201", "264"):
+    total = densenet_dense_param_total(variant)
+    print(f"DenseNet-{variant}: {total / 1e6:.2f}M dense+transition params")
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch207Densenet
+
+sizes = dense_block_channel_sizes(4, 3, 3)
+println("channel sizes: ", sizes)
+
+x0 = [1.0, 0.6, -0.3, 0.9]
+out, sizes_trace = dense_block_forward(x0, 3, 3, 2)
+println("final concatenated features: ", round.(out; digits=4))
+@assert sizes_trace == sizes
+
+dense_params = dense_block_param_count(16, 12, 8, 4)
+plain_params = plain_block_param_count(16, 16 + 12 * 8, 8)
+println("dense block:  $dense_params params")
+println("plain stack:  $plain_params params (same final width $(16 + 12 * 8))")
+println("ratio: plain uses $(round(plain_params / dense_params; digits=1))x more parameters")
+
+for variant in ("121", "169", "201", "264")
+    total = densenet_dense_param_total(variant)
+    println("DenseNet-$variant: $(round(total / 1e6; digits=2))M dense+transition params")
+end
+```
+
+## Rust
+
+```rust
+use aiinaction::ch207_densenet::{
+    dense_block_channel_sizes, dense_block_param_count, plain_block_param_count,
+    dense_block_forward, densenet_dense_param_total,
+};
+
+fn main() {
+    let sizes = dense_block_channel_sizes(4, 3, 3).unwrap();
+    println!("channel sizes: {:?}", sizes);
+
+    let x0 = [1.0, 0.6, -0.3, 0.9];
+    let (out, sizes_trace) = dense_block_forward(&x0, 3, 3, 2).unwrap();
+    println!("final concatenated features: {:?}", out);
+    assert_eq!(sizes_trace, sizes);
+
+    let dense_params = dense_block_param_count(16, 12, 8, 4).unwrap();
+    let plain_params = plain_block_param_count(16, 16 + 12 * 8, 8).unwrap();
+    println!("dense block:  {} params", dense_params);
+    println!("plain stack:  {} params (same final width {})", plain_params, 16 + 12 * 8);
+    println!("ratio: plain uses {:.1}x more parameters", plain_params as f64 / dense_params as f64);
+
+    for variant in ["121", "169", "201", "264"] {
+        let total = densenet_dense_param_total(variant, 32, 64, 0.5, 4).unwrap();
+        println!("DenseNet-{}: {:.2}M dense+transition params", variant, total as f64 / 1e6);
+    }
+}
+```
+
+:::
 
 ## 5. When to Use Skip Connections, and Pitfalls
 
