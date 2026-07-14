@@ -102,9 +102,39 @@ Two further production techniques round out the picture.
 
 **Sliding-window attention** bounds the cache instead of managing it. Models such as Mistral 7B restrict each token to attend only to the previous $w$ tokens (a window), so the KV-cache never exceeds $w$ positions regardless of total sequence length. Information still propagates beyond the window because stacked layers compose their receptive fields: after $L$ layers the effective context reaches roughly $L \times w$ tokens. This trades a bounded, constant memory footprint for a controlled loss of exact long-range access, and it composes cleanly with GQA and paged attention.
 
-## 7. Production Code
+## 7. Learned Sparse Attention for Long Context
 
-### 7.1 A From-Scratch KV-Cache, Executed on CPU
+Sliding-window attention (Section 6) buys a bounded cache by giving up exact long-range access: anything older than $w$ tokens is unreachable within a layer. For the tasks that most need long context, retrieval, multi-document reasoning, following a reference introduced thousands of tokens ago, that is exactly the information thrown away. The question is whether attention can stay **sparse**, so cost remains far below the $O(n^2)$ of Section 2, yet still reach the *right* distant tokens, chosen per query instead of fixed by a window. Chunk-wise sparse attention answers yes; the difficulty has always been that heuristic chunk selection is inaccurate, leaving a persistent quality gap to full attention. Hu et al. (2026) close that gap with **Hierarchical Landmark Sparse (HiLS) attention**, whose chunk selection is learned end-to-end under the language-modeling loss.
+
+**Chunks and landmarks.** Partition the past into non-overlapping chunks of size $S$. A query at position $i$ always attends to a local sliding window, plus the top-$K$ *distant chunks* it selects. To decide which, each chunk $c$ is summarized by a **landmark**: a compressed key $\mathbf{k}'_c$ formed by attention-weighted pooling of the chunk's own keys, together with a scalar bias $b'_c$,
+
+$$
+\mathbf{k}'_c = \sum_{j \in c} p_j\, \mathbf{k}_j, \qquad p = \operatorname{softmax}\!\big(\mathbf{q}'_c \mathbf{K}_c^\top\big),
+$$
+
+where $\mathbf{q}'_c$ is the landmark's proxy query and $\mathbf{K}_c$ stacks the chunk's keys. A single vector $\mathbf{k}'_c$ now stands in for the whole chunk.
+
+**Retrieval score.** A calibrated query $\hat{\mathbf{q}}_i$ (a low-rank adjustment bridges token-level and chunk-level attention statistics) scores chunk $c$ by
+
+$$
+\hat s_{i,c} = \frac{\hat{\mathbf{q}}_i^\top \mathbf{k}'_c}{\sqrt{d}} + b'_c ,
+$$
+
+and retains the top-$K$ chunks. Only those chunks' tokens enter the fine-grained attention, so per-query cost is $O\big((w + KS)\,d\big)$, independent of total sequence length once $w$, $K$, and $S$ are fixed, the property that makes it "sparse."
+
+**Hierarchical factorization, and why it trains.** Selecting the top-$K$ chunks is discrete and therefore not differentiable. HiLS sidesteps this by factorizing the attention weight on token $j$ in chunk $c$ into an intra-chunk term and an inter-chunk term:
+
+$$
+w_{i,j} \;\approx\; \underbrace{\frac{\exp(s_{i,j})}{Z_{i,c}}}_{\text{within chunk } c} \;\times\; \underbrace{\frac{\hat Z_{i,c}}{\hat{\mathcal Z}_i}}_{\text{across chunks}},
+$$
+
+where $Z_{i,c}$ is the ordinary softmax normalizer *within* chunk $c$, and $\hat Z_{i,c}$ is a learned surrogate mass for the chunk as a whole, built from the retrieval score $\hat s_{i,c}$ and normalized across the selected chunks by $\hat{\mathcal Z}_i$. Because the surrogate masses sit *inside* the forward attention weights, the plain next-token loss backpropagates into the landmark keys $\mathbf{k}'_c$, the biases $b'_c$, and the calibrated queries: chunk retrieval is trained by language modeling itself, with no auxiliary retrieval objective and no non-differentiable top-$K$ in the gradient path. The authors call this native sparse training, and it is what lets learned selection match full attention where heuristic selection could not.
+
+**What it buys.** Trained at a modest context length, HiLS extrapolates far beyond it, reported at over $64\times$ the training length while sustaining roughly $90\%$ needle-in-a-haystack retrieval accuracy, a regime where full attention's length generalization collapses. Because the factorization has the same intra-/inter-chunk form at any length, an existing full-attention model can be *converted* to HiLS with lightweight continued pretraining, keeping in-domain quality while gaining ultra-long-context reach. It also composes with the rest of this chapter: the KV of unselected chunks need not stay resident in fast memory, so HiLS cuts KV *traffic* (Section 3) the way GQA cuts KV *size* (Section 4), and the two are orthogonal.
+
+## 8. Production Code
+
+### 8.1 A From-Scratch KV-Cache, Executed on CPU
 
 The following cell implements single-head causal self attention two ways: the **naive** decoder that recomputes attention over the full prefix at every step, and the **cached** decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder's superlinear growth against the cache's near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.
 
@@ -224,7 +254,7 @@ for t in [128, 256, 512, 1024]:
 
 The naive column grows faster than the cached column as the prefix doubles, the empirical signature of $O(t^2)$ versus $O(t)$ per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.
 
-### 7.2 Grouped-Query and Multi-Query Attention, Executed on CPU
+### 8.2 Grouped-Query and Multi-Query Attention, Executed on CPU
 
 This cell implements one attention layer parameterized by the number of KV groups $g$. Setting $g = h$ gives multi-head attention, $g = 1$ gives multi-query attention, and $1 < g < h$ gives grouped-query attention. We repeat each KV head across its query group with `repeat_interleave`, run a forward pass for several values of $g$, and report the resulting KV-cache size so the $h/g$ reduction is explicit.
 
@@ -301,7 +331,7 @@ print("GQA with g = n_heads is structurally identical to MHA (per-head KV, no sh
 
 The KV bytes fall exactly by the factor $h/g$: halving the number of KV groups halves the cache. MQA ($g = 1$) is eight times smaller than MHA here, and GQA at $g = 4$ or $g = 2$ gives an intermediate footprint, the trade space real models tune for quality versus memory.
 
-### 7.3 FlashAttention (requires GPU)
+### 8.3 FlashAttention (requires GPU)
 
 FlashAttention ships as a fused CUDA kernel. The cleanest way to use it in practice is through PyTorch's `scaled_dot_product_attention`, which dispatches to a FlashAttention backend on supported GPUs, or through the `flash-attn` package directly. The code below is the real invocation; it is not executed here because the speedup depends on the GPU SRAM-versus-HBM gap.
 
@@ -330,7 +360,7 @@ from flash_attn import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True)
 ```
 
-### 7.4 Paged Attention with vLLM (requires GPU)
+### 8.4 Paged Attention with vLLM (requires GPU)
 
 vLLM implements paged attention and continuous batching behind a simple serving API. The KV-cache management, block tables, and prefix sharing are internal; the user just gets high throughput. Shown, not executed, because it loads a multi-billion-parameter model onto a GPU.
 
@@ -349,7 +379,7 @@ for output in llm.generate(prompts, params):
     print(output.outputs[0].text)
 ```
 
-### 7.5 Sliding-Window Attention on GPU
+### 8.5 Sliding-Window Attention on GPU
 
 Sliding-window attention is a property of the model architecture and is applied by the serving stack. With FlashAttention the window is passed as a kernel argument so the bounded attention is computed fused, and the KV-cache is capped at the window size. Shown, not executed, because it needs the GPU kernel.
 
@@ -361,7 +391,7 @@ from flash_attn import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True, window_size=(4096, 0))
 ```
 
-### 7.6 Running it on a GPU (executed)
+### 8.6 Running it on a GPU (executed)
 
 The CPU cells above show the asymptotics on small tensors. To see the KV-cache pay off on a real model and real hardware, the cell below loads a small open-weights instruct model (Qwen2.5-0.5B-Instruct, with a gpt2 fallback) onto the GPU and times autoregressive generation twice: once with `use_cache=True`, which keeps the running keys and values exactly as in Section 3, and once with `use_cache=False`, which forces the model to recompute attention over the whole growing prefix at every step. Both decode the same fixed number of new tokens from the same prompt under identical greedy settings, so the only difference is whether the cache is reused.
 
@@ -457,7 +487,7 @@ else:
 
 The `use_cache=True` path is the production default and decodes each token in roughly constant time, because every step attends one new query against the stored cache. The `use_cache=False` path recomputes keys and values for the whole prefix at every step, so its per-token cost climbs with position and its total time is several times larger even for this short generation. The peak-memory line shows the other side of the trade from Section 3: the cache that buys the speedup is itself resident memory, modest here but the quantity that, at production context lengths, dominates the serving budget.
 
-## 8. Pitfalls and When to Use
+## 9. Pitfalls and When to Use
 
 **The KV-cache is almost always the right default for decoding, but it is not free.** It trades recomputation for memory, and at long context the cache can exceed the model weights in size. Budget for it explicitly using the formula in Section 3 before assuming a context length fits. If memory is the binding constraint, the levers in order of disruption are GQA or MQA (architectural, set at training time), KV-cache quantization to int8 or fp8 (cheap, small quality cost), and sliding-window or other sparse attention (changes the model's reach).
 
@@ -481,3 +511,4 @@ The `use_cache=True` path is the production default and decodes each token in ro
 8. Jiang, A. Q. et al. "Mistral 7B" (sliding-window attention). 2023. https://arxiv.org/abs/2310.06825
 9. Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867
 10. Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288
+11. Hu, X. et al. "Hierarchical Sparse Attention Done Right: Toward Infinite Context Modeling" (HiLS attention). 2026. https://arxiv.org/abs/2607.02980

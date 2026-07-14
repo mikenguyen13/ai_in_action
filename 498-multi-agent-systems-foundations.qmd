@@ -98,6 +98,115 @@ Du et al. (2023) evaluate multi-agent debate on biography generation (factuality
 
 Simple majority voting over final-round answers is a strong baseline: if the probability of any single agent producing the correct answer is $p$ and agents are independent, the probability that a majority of $N$ agents is correct is $\sum_{k=\lceil N/2 \rceil}^{N} \binom{N}{k} p^k (1-p)^{N-k}$, which exceeds $p$ whenever $p > 0.5$. A judge agent that reads all final answers and selects the best-reasoned one can outperform majority vote when $p < 0.5$ for the majority of agents, since the judge can identify quality signals beyond mere agreement.
 
+### 5.4 Why Voting Converges: The Hive-Mind Equivalence {#sec-hive-mind}
+
+Section 5.1 to 5.3 describe *what* debate-and-vote does; a striking theoretical result explains *why* it should converge on the best answer at all, even though no individual agent is ever told which answer is correct. Soma et al. (2024) study an unrelated-looking system, honey bee swarms choosing a new nest site, and show that its imitation dynamics are exactly a reinforcement-learning algorithm. The mapping onto multi-agent debate is direct once stated: a candidate final answer plays the role of a *nest site* (an action $a$ among $n$ options), an agent's current answer is its *type*, and "broadcasting a nest site more enthusiastically the better it seems" is exactly what a debating agent does when it argues for its own answer with more or less conviction.
+
+**The weighted voter model.** Let $\pi = (\pi_1, \dots, \pi_n)$ be the population vector, the fraction of the $N$ agents currently holding each of the $n$ candidate answers, $\sum_a \pi_a = 1$. An agent holding answer $a$ draws a noisy quality estimate $r_a \sim r(a, \pi) \in [0,1]$ (in the debate setting: how convincing its own reasoning for $a$ seems on reflection) and broadcasts $a$ at a rate proportional to $r_a$. An agent that encounters a neighbor holding answer $b$ switches to $b$ with probability proportional to $b$'s broadcast strength, i.e. proportional to $\mathbb{E}[r_b]$ weighted by how many neighbors hold $b$. This is a purely *imitative* rule: no agent ever compares options directly, it only ever reacts to what it overhears, exactly as a debating agent only ever reads other agents' stated answers, never a ground truth.
+
+**The single-agent bandit view.** Soma et al. define the update rule an *equivalent single reinforcement-learning agent* would use, $\alpha$-**Maynard-Cross Learning (MCL)**: draw one action $k$, observe its reward sample $r_k$, and update the policy $\pi$ by
+
+$$
+\pi_a \;\leftarrow\; \pi_a + \alpha\,\frac{r_k}{v^\pi}
+\begin{cases}
+1 - \pi_a & a = k \\
+-\,\pi_a & a \ne k,
+\end{cases}
+\qquad v^\pi = \sum_b \pi_b\, \mathbb{E}[r_b],
+$$
+
+where $v^\pi$ is the current policy's expected value and $\alpha = 1/N$ plays the role of a learning rate. Averaged over the randomness in $k$ and $r_k$, this update has expectation
+
+$$
+\mathbb{E}[d\pi_a] \;=\; \frac{\pi_a}{v^\pi}\big(q_a^\pi - v^\pi\big), \qquad q_a^\pi = \mathbb{E}[r_a],
+$$ {#eq-498-drift}
+
+which is the **replicator dynamic** of evolutionary game theory: an option's share of the population grows exactly in proportion to how much its quality $q_a^\pi$ exceeds the population's current average $v^\pi$, and shrinks otherwise. This is intuitive for debate: an answer's support grows only while it is doing better than the group's current average conviction.
+
+**Proposition 2 (Soma et al. 2024).** A population of $N$ agents independently following the local, purely imitative weighted-voter rule is, at the population level, *exactly* a single reinforcement-learning agent executing $\alpha$-MCL with $\alpha = 1/N$, where each agent supplies one parallel action sample $a^{(i)} \sim \pi$ tested against its own private copy of the reward distribution. In other words: **the swarm is not merely analogous to a bandit learner, it is one, with the population size setting the learning rate.**
+
+The following simulation makes the equivalence concrete: it runs the $N$-agent weighted-voter swarm and the single-agent $\alpha$-MCL bandit side by side on the same $n$-option quality landscape, and checks that their policy trajectories coincide up to Monte Carlo noise.
+
+```{python}
+#| label: code-498-hive-mind
+#| code-fold: false
+import numpy as np
+
+rng = np.random.default_rng(0)
+
+
+def sample_reward(true_quality, rng):
+    """A noisy per-draw quality estimate r_a in [0, 1], mean true_quality[a]."""
+    return np.clip(rng.normal(true_quality, 0.05), 0.0, 1.0)
+
+
+def swarm_async_step(pi, true_quality, N, rng):
+    """One elementary imitation event, implementing Definition 3's switching
+    rule directly: a single focal agent, currently of type a, tunes into the
+    population's total broadcast and re-settles on type b with probability
+    proportional to b's population share times b's broadcast strength (its
+    quality estimate), pi_b * r_b / sum_l(pi_l * r_l) -- a full resample, not
+    a pairwise duel, since the focal agent hears *every* type's broadcast at
+    once. This single-event timescale is what corresponds to exactly one
+    alpha-MCL update below, alpha = 1/N being the size of a one-agent shift.
+    """
+    a = rng.choice(len(pi), p=pi)               # focal agent's current type
+    r = sample_reward(true_quality, rng)         # a fresh quality draw per type
+    weight = pi * r
+    b = rng.choice(len(pi), p=weight / weight.sum())  # type it resettles on
+    if a != b:
+        pi = pi.copy()
+        pi[a] -= 1.0 / N
+        pi[b] += 1.0 / N
+        pi = np.clip(pi, 0.0, None)  # guard against float underflow below zero
+        pi /= pi.sum()
+    return pi
+
+
+def mcl_step(pi, true_quality, alpha, rng):
+    """One alpha-MCL update: a single RL agent samples one action and updates pi."""
+    k = rng.choice(len(pi), p=pi)
+    r_k = sample_reward(true_quality[k], rng)
+    v_pi = float(np.dot(pi, true_quality))  # E[r_b] = true_quality[b] in expectation
+    delta = np.where(np.arange(len(pi)) == k, 1 - pi, -pi)
+    return np.clip(pi + alpha * (r_k / v_pi) * delta, 0.0, None)
+
+
+n_options = 4
+true_quality = np.array([0.30, 0.55, 0.40, 0.70])  # option 3 (index 3) is best
+N = 200  # swarm size == 1/alpha for the equivalent single agent
+alpha = 1.0 / N
+rounds = 3000  # elementary events; ~O(N) events are needed for the swarm to move
+n_replicates = 150  # average many independent runs to isolate the *expected* update
+
+best = int(true_quality.argmax())
+swarm_traj = np.zeros(rounds)
+mcl_traj = np.zeros(rounds)
+
+for _ in range(n_replicates):
+    pi_s = np.full(n_options, 1.0 / n_options)
+    pi_m = np.full(n_options, 1.0 / n_options)
+    for t in range(rounds):
+        pi_s = swarm_async_step(pi_s, true_quality, N, rng)
+        pi_m = mcl_step(pi_m, true_quality, alpha, rng)
+        pi_m = pi_m / pi_m.sum()
+        swarm_traj[t] += pi_s[best]
+        mcl_traj[t] += pi_m[best]
+
+swarm_traj /= n_replicates
+mcl_traj /= n_replicates
+
+print(f"true qualities: {true_quality}, best option = {best}, replicates = {n_replicates}")
+print(f"{'round':>6}{'E[swarm share of best]':>24}{'E[MCL share of best]':>22}")
+for t in [0, 99, 499, 999, 1999, rounds - 1]:
+    print(f"{t + 1:>6}{swarm_traj[t]:>24.3f}{mcl_traj[t]:>22.3f}")
+print(f"\nmax gap between the two mean trajectories: {np.abs(swarm_traj - mcl_traj).max():.3f}")
+```
+
+Averaged over many replicate runs, the two processes' *mean* trajectories track each other closely at every round, which is exactly what Proposition 2 predicts: it is a statement about the expected update, the drift of Equation @eq-498-drift, not about any single finite-$N$ sample path. A single realization of the discrete swarm, by contrast, is a literal absorbing Markov chain: a finite voter model *must* eventually reach unanimous consensus on one option (this is the classical voter-model fixation result), so one run of the swarm typically lands on a hard $[0,\dots,1,\dots,0]$ well before the smoother single-agent MCL policy gets that close, a real difference in variance and absorption behavior, not a bug in the equivalence. Averaging over replicates is what recovers the shared mean-field dynamics both processes obey.
+
+The practical reading for multi-agent debate carries over directly: **debate-and-vote is a bandit algorithm running on the space of candidate answers**, and it converges on the best answer precisely because, and only because, each agent's broadcast strength (how convincingly it argues) tracks that answer's true quality. This is also a precise diagnosis of the echo-chamber failure mode of section 6.1: if every agent's quality estimate $r_a$ is drawn from the same biased source (identical model, identical prompt, correlated errors), the "bandit" is not exploring $n$ independent noisy estimates at all, it is running $N$ correlated copies of one estimate, and the replicator dynamic above amplifies whatever that shared estimate says, right or wrong, rather than discovering the true best answer.
+
 ## 6. Failure Modes
 
 ### 6.1 Echo Chambers
@@ -313,3 +422,5 @@ This second demo implements the MetaGPT publish-subscribe pattern. Each "agent" 
 3. Hong, S., Zheng, X., Chen, J., Cheng, Y., Wang, J., Zhang, C., Wang, Z., Yau, S. K. S., Lin, Z., Zhou, L., Ran, C., Xiao, L., and Wu, C. (2023). MetaGPT: Meta programming for a multi-agent collaborative framework. arXiv:2308.00352. https://arxiv.org/abs/2308.00352
 
 4. Du, Y., Li, S., Torralba, A., Tenenbaum, J. B., and Mordatch, I. (2023). Improving factuality and reasoning in language models through multiagent debate. arXiv:2305.14325. https://arxiv.org/abs/2305.14325
+
+5. Soma, K., Bouteiller, Y., Hamann, H., and Beltrame, G. (2024). The hive mind is a single reinforcement learning agent. arXiv:2410.17517 (preprint, revised through 2026). https://arxiv.org/abs/2410.17517

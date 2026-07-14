@@ -81,6 +81,30 @@ $$ {#eq-700-cot}
 
 and the value of depth is that intermediate steps can be *conditioned on and corrected*: a later step can detect that an earlier one was wrong and override it, something a single forward answer cannot do. This is the behaviour that outcome-reward reinforcement learning incentivizes directly (the subject of the reinforcement-learning chapter). The research consensus through 2025 is that breadth and depth **compose**, and the optimal split depends on the problem: easy problems waste compute under heavy search, while the hardest benefit from both.
 
+### 3.6 Verification as its own scaling axis {#sec-700-verification-axis}
+
+Section @sec-700-imperfect left a sharp practical conclusion: on best-of-N, *the verifier, not the sampler, sets the ceiling*, because selection accuracy is governed by the verifier's noise scale $\sigma$ in @sec-700-imperfect. That reframes the question. If more samples are wasted compute once the verifier saturates, can we instead spend compute on *the verifier* to shrink $\sigma$? Kwok et al. (2026) argue yes, and treat **verification** as a third scaling axis alongside pre-training scale and generation-time sampling.
+
+The starting move is to stop asking the verifier for a discrete label. A standard LM judge prompts a model to emit a score token (say an integer in $\{0,\dots,G\}$) and reads the single sampled token, discarding everything the model knew about its own uncertainty. Instead, read the verifier's next-token *distribution* over a fixed set of scoring tokens $\{v_1,\dots,v_G\}$ and take its expectation. With a monotone map $\phi(v_g)\in[0,1]$ from each scoring token to a scalar, the continuous score of a candidate trace $\tau$ for prompt $x$ is
+
+$$
+s(x,\tau) \;=\; \mathbb{E}_{v \sim p_\theta(\cdot\mid x,\tau)}\big[\phi(v)\big] \;=\; \sum_{g=1}^{G} p_\theta\big(v_g \mid x, \tau\big)\,\phi(v_g).
+$$ {#eq-700-verifier-score}
+
+This is free: the logits at the scoring position are already computed in the forward pass that would have produced the discrete label, so @eq-700-verifier-score costs one verifier call and turns a one-bit judgment into a calibrated real number. Its value is that it *scales* along three independent directions, each of which reduces the effective noise $\sigma$ that @sec-700-imperfect identified as the binding constraint:
+
+- **Score granularity $G$.** More scoring tokens give a finer partition of $[0,1]$, so genuinely-better traces separate from worse ones instead of colliding on the same coarse bucket. Empirically the signal-to-noise ratio of the score rises with $G$ (the paper reports SNR climbing from $0.775$ at $G{=}1$ toward $0.799$ at $G{=}20$).
+- **Repeated evaluation $K$.** Averaging $K$ independent reads of @eq-700-verifier-score is ordinary variance reduction, cutting the estimator's variance like $1/K$; verification accuracy rises from $74.7\%$ at $K{=}1$ to $77.5\%$ at $K{=}16$ on their agentic benchmark.
+- **Criteria decomposition $C$.** Rather than score "is this good?" in one shot, score $C$ narrower sub-criteria and average, which lowers per-judgment complexity; the $C$-criterion ensemble reaches $78.3\%$ versus $75.2\text{–}76.4\%$ for any single criterion.
+
+Combining all three, the aggregate reward is the mean over criteria and repeats of the expected score,
+
+$$
+R(x,\tau) \;=\; \frac{1}{C\,K}\sum_{c=1}^{C}\sum_{k=1}^{K}\sum_{g=1}^{G} p_\theta\big(v_g \mid x, c, \tau\big)\,\phi(v_g),
+$$ {#eq-700-verifier-reward}
+
+and because $K$ and $C$ are literal averages, each added read or criterion shrinks $\sigma$ in the model of @sec-700-imperfect, lifting the best-of-N ceiling that plain resampling cannot move. To turn scores into a choice without the $O(N^2)$ cost of all-pairs comparison, the continuous scores feed a pivot-tournament ranker that runs in $O(Nk)$: a randomized ring pass cancels positional bias, the top-$k$ candidates become pivots, and the rest are compared only against the pivot set. Requiring no verifier training, this reaches state of the art on agentic selection, $86.5\%$ on Terminal-Bench V2 and $78.2\%$ on SWE-Bench Verified. The same continuous signal doubles as a *dense* reward for reinforcement learning, improving the sample efficiency of GRPO (the algorithm behind R1 in section @sec-700-r1) where a sparse outcome reward gives the policy almost nothing to learn from on long trajectories.
+
 ## 4. The o-Series: Reasoning as a Product {#sec-700-o-series}
 
 OpenAI's **o1**, released September 12, 2024, was the first widely deployed reasoning model. It was trained to think before answering, hid its raw chain of thought behind a summarized version, and demonstrated the inference-scaling curve on competition mathematics, coding, and science.
@@ -118,6 +142,85 @@ flowchart TD
     C --> G["Long chain of thought"]
     C --> H["Self critique and revision"]
 ```
+
+### 6.1 Fixing PRM's Reward-Hacking Problem: Hierarchical Reward Models {#sec-700-hrm}
+
+Section @sec-700-imperfect showed that best-of-N is only as good as its verifier, and process reward models (PRMs) are the workhorse step-level verifier used in the "tree search with process reward model" branch of Figure @fig-700-methods. Wang et al. (2026) identify a specific, structural failure mode in that verifier, distinct from the Gaussian noise of section @sec-700-imperfect: a PRM is trained on *isolated* steps, so it has no way to know that a mistake at step $i$ can be repaired by step $i+2$. It penalizes the flawed step and never observes the recovery, so a policy trajectory that catches and fixes its own error scores no better than one that simply gets the step wrong and never recovers. Table @tbl-700-orm-prm-hrm summarizes how this differs from the two established reward designs.
+
+| Feature | ORM | PRM | HRM |
+|---|---|---|---|
+| Scoring method | Rule-based or RM | RM only | RM only |
+| Granularity (training data) | Whole trajectory | Single step | Single step + consecutive pairs |
+| Step-wise feedback | No | Yes | Yes |
+| Rewards error correction | Yes (only via the final answer) | No | Yes |
+
+: ORM, PRM, and HRM compared, after Wang et al. (2026, Table 1). {#tbl-700-orm-prm-hrm}
+
+**Hierarchical supervision.** Let a reasoning trajectory have $N$ steps $s_1, \dots, s_N$ and let $R(\cdot)$ be a step-level reward function trained to classify a step as correct. PRM's training set has one row per step:
+
+$$
+D_{\text{PRM}} = \{(s_i,\, R(s_i)) \mid 1 \le i \le N\}.
+$$ {#eq-700-dprm}
+
+The **Hierarchical Reward Model (HRM)** augments this with one extra row per pair of *consecutive* steps, merged into a single training example:
+
+$$
+D_{\text{HRM}} = D_{\text{PRM}} \,\cup\, \{(s_i \,\Vert\, s_{i+1},\; R(s_i \,\Vert\, s_{i+1})) \mid 1 \le i < N\},
+$$ {#eq-700-dhrm}
+
+where $\Vert$ denotes concatenation. $D_{\text{HRM}}$ is a strict superset of $D_{\text{PRM}}$: every single-step example survives untouched, and the model additionally sees each two-step span labeled as a coherent unit. Crucially, HRM changes only the *training data*, not the *inference interface*: at test time it still scores one step at a time, $R(s_i)$, exactly like PRM. It is therefore a drop-in replacement in a best-of-N or beam-search pipeline, with zero extra latency or serving cost.
+
+The label attached to a merged span is not "correct if both steps are correct." PRM800K's manual annotations carry three classes, positive, negative, and neutral; Wang et al. define the merged label by the rule in Table @tbl-700-hrm-labels, with consecutive neutral/negative steps deliberately labeled negative to penalize non-progressive reasoning.
+
+| Previous step | Current step | Merged label |
+|---|---|---|
+| Positive | Positive | Positive |
+| Positive | Neutral / Negative | Negative |
+| Neutral / Negative | Positive | Positive |
+| Neutral / Negative | Neutral / Negative | Negative |
+
+: HRM's merged-step labeling rule (Wang et al. 2026, Table 6). Read closely, the merged label depends only on the *current* step's bucket (positive vs. not) — the "previous step" column never changes the outcome. Section @sec-700-hrm-code verifies this reduction over all label combinations and works a trajectory where a negative step 2 is redeemed by a positive step 3, exactly Figure 1's worked example in the source paper. {#tbl-700-hrm-labels}
+
+**Does it work?** Fine-tuning Qwen2.5-1.5B-Math as the reward model on PRM800K's manual annotations and scoring a Qwen2.5-72B-Math-Instruct policy with best-of-N, PRM's accuracy *degrades* as the sample budget $N$ grows, the reward-hacking signature: more candidates give the flawed verifier more chances to be fooled. HRM instead stabilizes (Table @tbl-700-hrm-bestofn).
+
+| $N$ | 2 | 4 | 8 | 16 | 24 |
+|---|---|---|---|---|---|
+| ORM | 0.622 | 0.677 | 0.655 | 0.655 | 0.633 |
+| PRM | 0.700 | 0.644 | 0.611 | 0.588 | 0.577 |
+| HRM | 0.722 | 0.711 | 0.744 | **0.800** | **0.800** |
+
+: Best-of-N accuracy on the PRM800K test set, Qwen2.5-72B-Math-Instruct as policy (Wang et al. 2026, Table 2). {#tbl-700-hrm-bestofn}
+
+Trained only on PRM800K and evaluated out-of-domain on GSM8K and MATH500 with a Qwen2.5-7B-Math-Instruct policy, HRM's edge widens on the harder benchmark and narrows on the easier one, consistent with the mechanism: MATH500 problems need several reasoning steps where self-correction matters, while most GSM8K problems are solved in two or three steps with little room for a PRM's blind spot to bite.
+
+| $N$ | 2 | 8 | 32 | 128 | 512 |
+|---|---|---|---|---|---|
+| GSM8K, PRM | 0.784 | 0.858 | 0.893 | 0.917 | 0.918 |
+| GSM8K, HRM | 0.784 | 0.846 | 0.902 | 0.914 | 0.926 |
+| MATH500, PRM | 0.468 | 0.598 | 0.658 | 0.662 | 0.688 |
+| MATH500, HRM | **0.490** | **0.612** | **0.692** | **0.740** | **0.736** |
+
+: Out-of-domain generalization, best-of-N with Qwen2.5-7B-Math-Instruct (Wang et al. 2026, Table 5, selected columns). {#tbl-700-hrm-generalization}
+
+**Hierarchical Node Compression (HNC): making the annotation cheaper, not just better.** Manually labeling PRM800K-scale data is expensive, which is why section @sec-700-methods and the show-only block in section @sec-700-show-only use Monte Carlo Tree Search (MCTS) to auto-annotate steps instead: each node in the search tree is a partial reasoning step, and its score is the fraction of its child subtrees that reach a correct final answer. Wang et al. augment this auto-labeled data with **Hierarchical Node Compression (HNC)**: merge two consecutive tree nodes into one, at essentially no extra rollout cost, to manufacture additional two-step HRM training examples from the same MCTS tree.
+
+HNC's justification is a short, exact argument about sample means. Model an MCTS node's $N$ child branches as i.i.d. Bernoulli($\theta$) correctness indicators $X_1, \dots, X_N$, where $\theta$ is the (unknown) true probability that a branch's subtree is judged correct. MCTS estimates the parent's score by the child sample mean,
+
+$$
+\hat\theta_N = \frac{1}{N}\sum_{j=1}^{N} X_j, \qquad \mathbb{E}[\hat\theta_N] = \theta, \qquad \operatorname{Var}(\hat\theta_N) = \frac{\theta(1-\theta)}{N} \equiv \frac{\sigma^2}{N},
+$$ {#eq-700-hnc-before}
+
+the standard mean and variance of a Bernoulli sample mean. HNC drops one child chosen uniformly at random, *independent of its value*, and renormalizes over the remaining $N-1$. Because the $N$ children are i.i.d., discarding one of them uniformly at random leaves an i.i.d. sample of size $N-1$ drawn from the same Bernoulli($\theta$) distribution, so the renormalized estimator is nothing more than the sample mean of that smaller i.i.d. sample:
+
+$$
+\hat\theta_{N-1} = \frac{1}{N-1}\sum_{j \ne k} X_j, \qquad \mathbb{E}[\hat\theta_{N-1}] = \theta, \qquad \operatorname{Var}(\hat\theta_{N-1}) = \frac{\theta(1-\theta)}{N-1} \equiv \frac{\sigma^2}{N-1}.
+$$ {#eq-700-hnc-after}
+
+The estimator stays **unbiased** (both @eq-700-hnc-before and @eq-700-hnc-after average to $\theta$), which is what makes HNC safe to use as data augmentation rather than a source of systematic label error. But because $N - 1 < N$, the variance strictly *increases*, $\sigma^2/(N-1) > \sigma^2/N$: HNC deliberately injects controlled noise, which is exactly what makes the merged example a distinct, useful training point rather than a duplicate. The inflation factor is $\frac{\sigma^2/(N-1)}{\sigma^2/N} = \frac{N}{N-1}$, which is large only for small $N$ and tends to $1$ as $N$ grows, so for the tree widths the paper actually uses (5 to 6 children per node), the added noise is real but bounded, roughly a 20 to 25% variance increase. Section @sec-700-hrm-code verifies both the unbiasedness and the variance formulas by direct Monte Carlo simulation and a symbolic check.
+
+On PRM800K, applying HNC to MCTS-generated trajectories (using Qwen2.5-7B-Math-Instruct as the rollout policy, no manual labels at all) and fine-tuning Qwen2.5-1.5B-Math as before, HRM again outperforms PRM in best-of-N accuracy across three different policy models (DeepSeek-Math-7B, Qwen2.5-7B-Math-Instruct, and Qwen2.5-72B-Math-Instruct), and the added training cost is small: roughly 30% more training examples but only 120 versus 84 A100 GPU-hours to fine-tune the 1.5B reward model, against the 2,457 GPU-hours the MCTS rollouts themselves consume. The paper also uses the auto-labeled data to fine-tune the policy model itself (self-training) on high-confidence trajectories, with a KL-regularized objective $\mathcal{L} = \mathcal{L}_{\text{LM}} + \lambda \log D_{\text{KL}}(P \Vert Q)$ against a frozen reference model; the log inside the KL term is necessary in practice because raw KL divergence (range 0 to 20,000) otherwise swamps the causal language-modeling loss (range 0 to 12) and the optimizer collapses onto matching the reference distribution instead of learning to reason.
+
+**The pattern generalizes past text.** Zhang et al. (2025) apply the same hierarchical-supervision idea outside mathematical text entirely, to *symbolic computer vision*: parsing a diagram (a geometry figure or chart) into geometric primitives, points, lines, shapes, and the relations between them, rather than into pixels. Their **Symbolic Hierarchical Process Reward Model** rewards a self-supervised symbolic auto-encoder at multiple levels of a parsing hierarchy, point-on-line consistency, line-on-shape consistency, and shape-on-relation consistency, exactly mirroring HRM's single-step versus multi-step split but with "step" now meaning one level of geometric structure instead of one line of arithmetic. The reward hacking problem is the same one section @sec-700-hrm diagnoses (a flat, single-level reward is easy to satisfy locally while getting the overall structure wrong) and the fix is the same shape (supervise coherence across levels, not just within one). On diagram-heavy benchmarks the reported gains are large: a 98.2% reduction in geometric reconstruction error, and double-digit accuracy improvements on MathGlance, MathVerse, and GeoQA over pixel-only baselines. The result worth taking away is architectural, not domain-specific: hierarchical process supervision is a general recipe for any reward model whose target has natural multi-level structure, text reasoning steps, geometric primitives, or otherwise, wherever a flat, single-level reward would be exploitable.
 
 ## 7. Reasoning Distillation {#sec-700-distillation}
 
@@ -530,6 +633,315 @@ high_effort = SamplingParams(temperature=0.6, max_tokens=8192)  # think long
 # Route per query: cheap path for easy prompts, high_effort only when needed.
 ```
 
+### 9.7 Reproducing the HRM Mechanism (executed) {#sec-700-hrm-code}
+
+Training an actual reward model exceeds a laptop, so the two mechanisms behind HRM in section @sec-700-hrm are reproduced directly: the merge-labeling rule of Table @tbl-700-hrm-labels (a pure function, no model needed) and the HNC variance argument of @eq-700-hnc-before to @eq-700-hnc-after (a Monte Carlo simulation, no model needed). Both are exact, runnable demonstrations of the paper's mechanism, not a re-run of its GPU experiments.
+
+**Merge-labeling rule and the self-correction example.** First confirm the reduction claimed under Table @tbl-700-hrm-labels, that the merged label depends only on the current step's bucket, by exhaustively checking all label combinations. Then build $D_{\text{PRM}}$ and $D_{\text{HRM}}$ from a toy trajectory that mirrors the paper's own worked example (Figure 1): step 2 makes an arithmetic slip, step 3 catches and fixes it.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| label: code-700-hrm-labels
+#| code-fold: false
+from itertools import product
+
+POSITIVE, NEGATIVE, NEUTRAL = "positive", "negative", "neutral"
+
+
+def _bucket(label):
+    """Collapse PRM800K's three labels into HRM's two merge buckets."""
+    return POSITIVE if label == POSITIVE else "non_positive"
+
+
+def merge_step_labels(prev_label, curr_label):
+    """HRM's merge rule for two consecutive steps (Wang et al. 2026, Table 6)."""
+    return POSITIVE if _bucket(curr_label) == POSITIVE else NEGATIVE
+
+
+# The "previous step" column in Table 6 never changes the outcome: verify
+# the merged label depends only on curr_label, over all 3x3 combinations.
+all_labels = [POSITIVE, NEGATIVE, NEUTRAL]
+for prev, curr in product(all_labels, all_labels):
+    expected = POSITIVE if curr == POSITIVE else NEGATIVE
+    assert merge_step_labels(prev, curr) == expected
+print("merged label depends only on the *current* step's label (verified over all 9 combinations)")
+
+
+def build_prm_hrm_datasets(steps):
+    """steps: list of (text, label). Returns (D_PRM, D_HRM) per Eq. 700-dprm/dhrm."""
+    d_prm = list(steps)
+    d_hrm = list(d_prm)
+    for i in range(len(steps) - 1):
+        (s_i, lbl_i), (s_ip1, lbl_ip1) = steps[i], steps[i + 1]
+        d_hrm.append((f"{s_i} {s_ip1}", merge_step_labels(lbl_i, lbl_ip1)))
+    return d_prm, d_hrm
+
+
+# Figure 1's worked example: a self-corrected arithmetic slip.
+trajectory = [
+    ("Step 1: 1+2=3", POSITIVE),
+    ("Step 2: 3+3=7", NEGATIVE),                  # arithmetic slip
+    ("Step 3: Oops, it should be 6, not 7.", POSITIVE),  # self-correction
+    ("Step 4: 6+4=10", POSITIVE),
+    ("Step 5: 10+5=15", POSITIVE),
+]
+
+d_prm, d_hrm = build_prm_hrm_datasets(trajectory)
+print(f"|D_PRM| = {len(d_prm)}  (one row per step)")
+print(f"|D_HRM| = {len(d_hrm)}  (D_PRM plus {len(trajectory) - 1} merged-pair rows)")
+print("\nmerged rows added by HRM:")
+for text, label in d_hrm[len(d_prm):]:
+    print(f"  {label:>8}  <-  {text!r}")
+```
+
+## Julia
+
+```julia
+@enum StepLabel Positive Negative Neutral
+
+bucket(label::StepLabel) = label == Positive ? Positive : Negative
+
+"""HRM's merge rule for two consecutive steps (Wang et al. 2026, Table 6)."""
+merge_step_labels(prev::StepLabel, curr::StepLabel) =
+    bucket(curr) == Positive ? Positive : Negative
+
+function build_prm_hrm_datasets(steps::Vector{Tuple{String,StepLabel}})
+    d_prm = steps
+    merged = [(steps[i][1] * " " * steps[i + 1][1],
+               merge_step_labels(steps[i][2], steps[i + 1][2]))
+              for i in 1:length(steps) - 1]
+    return d_prm, vcat(d_prm, merged)
+end
+
+trajectory = [
+    ("Step 1: 1+2=3", Positive),
+    ("Step 2: 3+3=7", Negative),
+    ("Step 3: Oops, it should be 6, not 7.", Positive),
+    ("Step 4: 6+4=10", Positive),
+    ("Step 5: 10+5=15", Positive),
+]
+
+d_prm, d_hrm = build_prm_hrm_datasets(trajectory)
+println("|D_PRM| = ", length(d_prm), "  |D_HRM| = ", length(d_hrm))
+for (text, label) in d_hrm[length(d_prm) + 1:end]
+    println("  ", label, "  <-  ", text)
+end
+```
+
+## Rust
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StepLabel { Positive, Negative, Neutral }
+
+fn bucket(label: StepLabel) -> StepLabel {
+    if label == StepLabel::Positive { StepLabel::Positive } else { StepLabel::Negative }
+}
+
+/// HRM's merge rule for two consecutive steps (Wang et al. 2026, Table 6).
+fn merge_step_labels(_prev: StepLabel, curr: StepLabel) -> StepLabel {
+    if bucket(curr) == StepLabel::Positive { StepLabel::Positive } else { StepLabel::Negative }
+}
+
+fn build_prm_hrm_datasets(
+    steps: &[(String, StepLabel)],
+) -> (Vec<(String, StepLabel)>, Vec<(String, StepLabel)>) {
+    let d_prm: Vec<_> = steps.to_vec();
+    let mut d_hrm = d_prm.clone();
+    for w in steps.windows(2) {
+        let (s_i, lbl_i) = &w[0];
+        let (s_ip1, lbl_ip1) = &w[1];
+        d_hrm.push((format!("{} {}", s_i, s_ip1), merge_step_labels(*lbl_i, *lbl_ip1)));
+    }
+    (d_prm, d_hrm)
+}
+
+fn main() {
+    use StepLabel::*;
+    let trajectory = vec![
+        ("Step 1: 1+2=3".to_string(), Positive),
+        ("Step 2: 3+3=7".to_string(), Negative),
+        ("Step 3: Oops, it should be 6, not 7.".to_string(), Positive),
+        ("Step 4: 6+4=10".to_string(), Positive),
+        ("Step 5: 10+5=15".to_string(), Positive),
+    ];
+
+    let (d_prm, d_hrm) = build_prm_hrm_datasets(&trajectory);
+    println!("|D_PRM| = {}  |D_HRM| = {}", d_prm.len(), d_hrm.len());
+    for (text, label) in &d_hrm[d_prm.len()..] {
+        println!("  {:?}  <-  {:?}", label, text);
+    }
+}
+```
+
+:::
+
+Step 2 alone is labeled negative, exactly what a PRM would penalize with no way to recover. But the merged span (step 2 + step 3) is labeled **positive**, because the current step (step 3) is positive: HRM's training data teaches the reward model that this two-step span is fine, giving credit for the self-correction that PRM structurally cannot see.
+
+**HNC's variance claim, verified by simulation and symbolically.** Equations @eq-700-hnc-before and @eq-700-hnc-after claim the child-dropping estimator stays unbiased while its variance rises from $\sigma^2/N$ to $\sigma^2/(N-1)$. Simulate an MCTS node with $N$ i.i.d. Bernoulli($\theta$) children many times, compare the empirical mean and variance of the estimator before and after dropping one random child, and check both against the closed forms.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| label: code-700-hnc-mc
+#| code-fold: false
+import numpy as np
+
+rng = np.random.default_rng(42)
+
+
+def simulate_hnc_variance(theta, n_children, n_trials, rng):
+    """Empirical mean/variance of the parent-node score estimator, before and
+    after HNC drops one uniformly-random child (Wang et al. 2026, Sec. 3.2)."""
+    full = np.empty(n_trials)
+    reduced = np.empty(n_trials)
+    for t in range(n_trials):
+        children = rng.random(n_children) < theta
+        full[t] = children.mean()
+        drop = rng.integers(n_children)
+        reduced[t] = np.delete(children, drop).mean()
+    return full, reduced
+
+
+theta, N, n_trials = 0.7, 6, 200_000
+full, reduced = simulate_hnc_variance(theta, N, n_trials, rng)
+sigma2 = theta * (1 - theta)
+
+print(f"true theta = {theta}, N = {N} children, trials = {n_trials:,}\n")
+print(f"{'estimator':<26}{'mean':>8}{'empirical var':>16}{'closed form':>14}")
+print(f"{'before HNC (N)':<26}{full.mean():>8.4f}{full.var():>16.6f}{sigma2 / N:>14.6f}")
+print(f"{'after HNC (N-1)':<26}{reduced.mean():>8.4f}{reduced.var():>16.6f}{sigma2 / (N - 1):>14.6f}")
+print(f"\nvariance inflation N/(N-1) = {N / (N - 1):.3f}")
+```
+
+## Julia
+
+```julia
+using Random, Statistics
+
+function simulate_hnc_variance(theta, n_children, n_trials; seed=42)
+    rng = MersenneTwister(seed)
+    full = Vector{Float64}(undef, n_trials)
+    reduced = Vector{Float64}(undef, n_trials)
+    for t in 1:n_trials
+        children = rand(rng, n_children) .< theta
+        full[t] = mean(children)
+        drop = rand(rng, 1:n_children)
+        reduced[t] = mean(children[1:end .!= drop])
+    end
+    return full, reduced
+end
+
+theta, N, n_trials = 0.7, 6, 200_000
+full, reduced = simulate_hnc_variance(theta, N, n_trials)
+sigma2 = theta * (1 - theta)
+
+println("before HNC: mean=", round(mean(full), digits=4),
+        " var=", round(var(full), digits=6),
+        " closed_form=", round(sigma2 / N, digits=6))
+println("after HNC:  mean=", round(mean(reduced), digits=4),
+        " var=", round(var(reduced), digits=6),
+        " closed_form=", round(sigma2 / (N - 1), digits=6))
+```
+
+## Rust
+
+```rust
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+
+fn simulate_hnc_variance(theta: f64, n: usize, n_trials: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut full = Vec::with_capacity(n_trials);
+    let mut reduced = Vec::with_capacity(n_trials);
+    for _ in 0..n_trials {
+        let children: Vec<bool> = (0..n).map(|_| rng.gen::<f64>() < theta).collect();
+        full.push(children.iter().filter(|&&x| x).count() as f64 / n as f64);
+        let drop = rng.gen_range(0..n);
+        let kept = children.iter().enumerate()
+            .filter(|(i, _)| *i != drop)
+            .filter(|(_, &x)| x)
+            .count();
+        reduced.push(kept as f64 / (n - 1) as f64);
+    }
+    (full, reduced)
+}
+
+fn mean(v: &[f64]) -> f64 { v.iter().sum::<f64>() / v.len() as f64 }
+fn variance(v: &[f64]) -> f64 {
+    let m = mean(v);
+    v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64
+}
+
+fn main() {
+    let (theta, n, n_trials) = (0.7, 6usize, 200_000usize);
+    let (full, reduced) = simulate_hnc_variance(theta, n, n_trials, 42);
+    let sigma2 = theta * (1.0 - theta);
+    println!("before HNC: mean={:.4} var={:.6} closed_form={:.6}",
+        mean(&full), variance(&full), sigma2 / n as f64);
+    println!("after HNC:  mean={:.4} var={:.6} closed_form={:.6}",
+        mean(&reduced), variance(&reduced), sigma2 / (n as f64 - 1.0));
+}
+```
+
+:::
+
+Both estimators' empirical means land on $\theta$ to three decimal places, and both empirical variances track their closed forms: HNC does not bias the label, it only adds bounded, quantified noise. A symbolic check confirms the unbiasedness algebraically rather than just numerically:
+
+```{python}
+#| label: code-700-hnc-sympy
+#| code-fold: false
+import sympy as sp
+
+N_sym, theta_sym = sp.symbols("N theta", positive=True)
+S_mean = N_sym * theta_sym  # E[sum of N i.i.d. Bernoulli(theta)] = N*theta
+
+full_mean = S_mean / N_sym
+# Dropping one child uniformly at random, independent of its value, removes
+# a term with the same marginal E[X_k] = theta regardless of which index k is.
+reduced_mean = (S_mean - theta_sym) / (N_sym - 1)
+
+print("E[full estimator]    =", sp.simplify(full_mean))
+print("E[reduced estimator] =", sp.simplify(reduced_mean))
+assert sp.simplify(full_mean - theta_sym) == 0
+assert sp.simplify(reduced_mean - theta_sym) == 0
+print("both are unbiased for theta (symbolically confirmed)")
+```
+
+Finally, the variance-inflation curve across tree widths, showing why the paper's choice of 5 to 6 children per node keeps HNC's injected noise modest:
+
+```{python}
+#| label: fig-700-hnc-variance
+#| code-fold: false
+#| fig-cap: "HNC's variance inflation shrinks quickly as the tree gets wider: dropping a child from a 6-wide node costs about 20% more variance, but from a 20-wide node costs about 5%."
+import matplotlib.pyplot as plt
+
+Ns = np.arange(2, 21)
+sigma2 = theta * (1 - theta)
+var_before = sigma2 / Ns
+var_after = sigma2 / (Ns - 1)
+
+fig, ax = plt.subplots(figsize=(6.5, 4))
+ax.plot(Ns, var_before, "o-", label=r"before HNC: $\sigma^2/N$")
+ax.plot(Ns, var_after, "s-", label=r"after HNC: $\sigma^2/(N-1)$")
+ax.set_xlabel("number of child nodes N")
+ax.set_ylabel("variance of the parent-node score estimate")
+ax.set_title(rf"HNC variance inflation ($\theta$={theta})")
+ax.legend()
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+plt.show()
+
+print("variance inflation N/(N-1) by tree width:")
+for n in [2, 4, 6, 10, 20]:
+    print(f"  N={n:>3}: {n / (n - 1):.3f}x")
+```
+
 ## 10. Pitfalls and When to Use {#sec-700-pitfalls}
 
 **When reasoning helps.** Reasoning models shine on problems with **verifiable structure and multiple steps**: competition mathematics, algorithmic coding, formal logic, and scientific problems where intermediate work can be checked. The capability is sharpest exactly where answers are checkable, because reinforcement learning with verifiable rewards (the reinforcement-learning chapter) requires a checkable answer.
@@ -540,6 +952,7 @@ high_effort = SamplingParams(temperature=0.6, max_tokens=8192)  # think long
 
 - **Majority voting below the plurality threshold.** Equation @eq-700-hoeffding is a warning: if the model is below the plurality threshold on a problem, self-consistency drives accuracy *down*. Verify the model is better than the threshold before voting.
 - **Trusting a weak verifier.** Section @sec-700-best-of-n showed best-of-N plateaus at the verifier's ceiling. Spending more samples against a noisy verifier is wasted compute. Measure verifier accuracy first.
+- **A PRM that can't see self-correction.** Section @sec-700-hrm showed a second, structural way a step-level verifier fails: it penalizes an early mistake even when a later step repairs it, so accuracy can *degrade* as $N$ grows regardless of verifier noise. Prefer a hierarchically-supervised reward model (HRM) trained on merged step pairs, a drop-in, same-latency fix, over a plain PRM whenever the policy model is prone to self-correction.
 - **Paying for overthinking.** A fixed maximum thinking budget on every query is a cost bug. Route: cheap path for easy prompts, heavy reasoning only when needed (section @sec-700-economics).
 - **Independence assumptions.** The pass@N and Hoeffding bounds assume independent samples. Low temperature collapses diversity and breaks independence, so the samples agree on the same (possibly wrong) answer and voting buys nothing. Maintain enough sampling temperature for genuine diversity.
 - **Treating the trace as an explanation.** The visible chain of thought is not guaranteed to faithfully describe the computation that produced the answer. Using it for audit or safety without separate faithfulness evidence is unsound. The trace is a *means to an answer*, not a certified justification.
@@ -552,7 +965,7 @@ The most instructive case is **ARC-AGI**. o3's roughly 87.5% on ARC-AGI-1 was ha
 
 ## 12. Conclusion {#sec-700-conclusion}
 
-Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Understanding that dimension is now prerequisite to understanding the field.
+Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. Verifier quality is not just about noise: section @sec-700-hrm showed that even a noiseless-looking PRM has a structural blind spot for self-correction, one that hierarchical supervision fixes at no extra inference cost, and the same hierarchical-node-compression trick that fixes it also makes automatic, MCTS-based annotation cheaper. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Understanding that dimension is now prerequisite to understanding the field.
 
 ## References {#sec-700-references}
 
@@ -569,3 +982,6 @@ Reasoning models introduced the first genuinely new scaling axis since the trans
 11. Wei, J. et al. "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models." 2022. <https://arxiv.org/abs/2201.11903>
 12. Cobbe, K. et al. "Training Verifiers to Solve Math Word Problems" (GSM8K, best-of-N verification). 2021. <https://arxiv.org/abs/2110.14168>
 13. Yao, S. et al. "Tree of Thoughts: Deliberate Problem Solving with Large Language Models." 2023. <https://arxiv.org/abs/2305.10601>
+14. Wang, T. et al. "Towards Hierarchical Multi-Step Reward Models for Enhanced Reasoning in Large Language Models." Accepted, Findings of the Association for Computational Linguistics: ACL 2026. arXiv preprint (v5, April 2026): <https://arxiv.org/abs/2503.13551>. Code: <https://github.com/tengwang0318/hierarchial_reward_model>
+15. Zhang, S., Chen, A., Zou, K., Gu, J., Xue, Y., van den Hengel, A. "Hierarchical Process Reward Models are Symbolic Vision Learners." arXiv preprint, 2025. <https://arxiv.org/abs/2512.03126>
+16. Kwok, J., Li, S., Atreya, P., Liu, Y., Jiang, Y., Finn, C., Pavone, M., Stoica, I., Mirhoseini, A. "LLM-as-a-Verifier: A General-Purpose Verification Framework" (verification as a scaling axis). arXiv preprint, 2026. <https://arxiv.org/abs/2607.05391>
