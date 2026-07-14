@@ -88,11 +88,17 @@ $$
 
 where $T \cdot k / E$ is the number of tokens an expert would receive under perfectly uniform routing and the capacity factor (commonly 1.0 to 1.5) adds headroom for imbalance. If more than $C$ tokens route to one expert, the overflow tokens are **dropped**: they skip the expert entirely and pass through only the residual connection. Capacity factor thus trades memory and compute (higher factor, fewer drops, more padding) against efficiency (lower factor, more drops). Token dropping is a feature of the batched GPU implementation, not of the mathematics, and our CPU reference computes the true routing without dropping so the mechanism is visible in isolation; the production code section returns to capacity as a deployment concern.
 
-## 6. Production Code
+## 6. Compressing a Hybrid MoE for Deployment
+
+A trained MoE is not the model you serve. Conditional computation cuts the FLOPs per token but not the memory footprint: every expert must be resident, and at frontier scale the parameter count (together with the KV cache) dominates the interactive-serving budget rather than arithmetic does. A production line of work therefore *compresses* a large MoE after training to meet tighter latency and concurrency targets. Bercovich et al. (2026)'s **Nemotron-Labs-3-Puzzle-75B-A9B** is a representative case: a hybrid MoE with 75B total parameters but only about 9B active per token (the "A9B"), derived from a larger parent by a multi-stage pipeline that pairs an *iterative Puzzle* compression search with knowledge distillation (the subject of the distillation chapter), reinforcement learning, quantization, and a multi-token-prediction head. Crucially, the compression jointly optimizes three coupled budgets rather than one: **heterogeneous MoE pruning** (dropping or shrinking experts unevenly across layers, since the load-balancing view of Section 4 implies different layers carry different amounts of routed information), the **active-parameter budget** (how many experts fire per token), and, because the architecture interleaves attention with Mamba state-space layers, **Mamba-layer pruning**.
+
+The payoff is a *serving* result, not an accuracy one: on a single 8xB200 node the compressed model reaches roughly 2x the server throughput of its uncompressed parent at matched per-user throughput, and on a single H100 it lifts 1M-token-context concurrency from one request to eight, while retaining most of the parent's quality across reasoning, coding, multilingual, long-context, and agentic benchmarks. The lesson for MoE practitioners is a division of labor: the routing and load-balancing machinery of this chapter sets a model's *quality*, but a separate post-training compression stage sets whether that quality is *economical to serve*.
+
+## 7. Production Code
 
 We now build a sparse top-k MoE layer end to end in PyTorch, running on the CPU. The implementation is deliberately small and deterministic so every number below is reproducible, yet it contains the real pieces: a linear router, renormalized top-k gating, per-expert dispatch, the load-balancing auxiliary loss, and a measurement of how evenly tokens spread across experts. Mature open-source building blocks (PyTorch, NumPy) carry all the weight here; nothing in this section needs a GPU.
 
-### 6.1 A Sparse Top-k MoE Layer
+### 7.1 A Sparse Top-k MoE Layer
 
 The expert is an ordinary two-layer feed-forward network. The router is a single linear layer. The forward pass computes router logits, selects the top $k$ experts per token, renormalizes their gate weights, dispatches each token's representation to its chosen experts, and accumulates the gated outputs. We also compute the load-balancing loss from the same routing decisions so it can be added to a task loss during training.
 
@@ -178,7 +184,7 @@ print(f"active params per token (router + {k} experts): "
 
 The active-parameter count is far below the total: every token uses the router plus $k$ of the $E$ experts, so adding experts grows capacity without growing per-token compute. This is the decoupling from Section 2 made concrete.
 
-### 6.2 Routing and Utilization on Synthetic Input
+### 7.2 Routing and Utilization on Synthetic Input
 
 We push a batch of synthetic tokens through the layer and inspect the routing. Two checks matter. First, the output shape must match the input, the MoE is a drop-in replacement for a dense FFN. Second, we measure expert utilization, the fraction of tokens each expert receives, which is what the load-balancing loss is trying to flatten. On a randomly initialized router the load is already somewhat uneven, which is exactly the situation the auxiliary loss is designed to correct during training.
 
@@ -208,7 +214,7 @@ print(f"observed spread (max - min): {spread:.1f} percentage points")
 
 The spread between the busiest and idlest expert is the imbalance the auxiliary loss penalizes. A perfectly balanced router would put every bar at the ideal share; a collapsed router would pile almost all tokens onto one or two experts.
 
-### 6.3 Training Drives the Router Toward Balance
+### 7.3 Training Drives the Router Toward Balance
 
 To show the load-balancing loss working, we train the layer for a short loop on a trivial reconstruction objective (make the output match a fixed linear target), adding the auxiliary loss to the task loss. We track the imbalance over steps. The point is not the task itself but that the combined loss flattens the expert distribution, the mechanism from Section 4 in action.
 
@@ -248,7 +254,7 @@ for step in range(201):
 
 The task loss falls steadily while the auxiliary loss holds the routing in check, which is the behavior we want: the primary objective improves without the router being free to collapse onto a few experts. The cleaner demonstration that the auxiliary term matters is the controlled ablation in the next subsection, where the same run with the loss removed drifts to a markedly worse imbalance. In a real model the auxiliary coefficient $\alpha$ is tuned so that it balances load without overwhelming the language-modeling loss.
 
-### 6.4 The Effect of the Auxiliary Loss
+### 7.4 The Effect of the Auxiliary Loss
 
 A final controlled comparison isolates the auxiliary loss. We train two routers from the same initialization, one with the load-balancing loss and one without, and compare the final imbalance. Turning the auxiliary loss off should let the router drift toward collapse.
 
@@ -286,7 +292,7 @@ print(f"the auxiliary loss reduces imbalance by "
 
 This is the load-balancing loss earning its place: with the same data, optimizer, and initialization, the only difference is the auxiliary term, and it produces a measurably more even distribution of work across experts.
 
-### 6.5 Scaling Up: Switch Transformer and Mixtral (requires GPU / large model)
+### 7.5 Scaling Up: Switch Transformer and Mixtral (requires GPU / large model)
 
 The CPU layer above is the same design that runs at frontier scale, but training or serving a real MoE model needs accelerators, sharded experts, and optimized dispatch kernels. The code below is the genuine library invocation a reader would use on a GPU; it is shown, not executed, because no GPU is available in this environment.
 
@@ -341,7 +347,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
-### 6.6 Expert-Parallel Training (requires GPU cluster)
+### 7.6 Expert-Parallel Training (requires GPU cluster)
 
 At training scale the experts of a single layer are distributed across devices, a scheme called **expert parallelism**. Each device holds a subset of the experts, and an all-to-all collective shuffles tokens to the device that owns their selected expert, runs the expert, then shuffles the results back. The mature open-source tooling for this is DeepSpeed-MoE and Megatron-LM; the snippet shows the DeepSpeed MoE layer wrapping the same expert-and-gate structure built above, configured for expert parallelism across a GPU cluster.
 
@@ -368,7 +374,7 @@ output, aux_loss, _ = moe_layer(hidden_states)
 
 The conceptual model is unchanged from the CPU implementation: route to top-k, gate, combine, and balance the load. Expert parallelism is purely a systems answer to the fact that the experts no longer fit on one device.
 
-## 7. Pitfalls and When to Use
+## 8. Pitfalls and When to Use
 
 **Routing collapse is the failure mode to watch.** Without an effective load-balancing loss the router concentrates tokens on a few experts and the rest never train. Monitor per-expert utilization during training, not just the loss curve; a healthy run keeps every expert busy. The auxiliary coefficient $\alpha$ is the main knob: too small and load drifts toward collapse, too large and balancing fights the language-modeling objective and degrades quality. The Switch value of $10^{-2}$ is a reasonable starting point.
 
@@ -390,3 +396,4 @@ The conceptual model is unchanged from the CPU implementation: route to top-k, g
 6. Zoph, B. et al. "ST-MoE: Designing Stable and Transferable Sparse Expert Models." 2022. https://arxiv.org/abs/2202.08906
 7. Rajbhandari, S. et al. "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale." 2022. https://arxiv.org/abs/2201.05596
 8. Zhou, Y. et al. "Mixture-of-Experts with Expert Choice Routing." Advances in Neural Information Processing Systems, 2022. https://arxiv.org/abs/2202.09368
+9. Bercovich, A. et al. "Nemotron-Labs-3-Puzzle-75B-A9B: Compressing Hybrid MoE LLMs." 2026. https://arxiv.org/abs/2607.04371

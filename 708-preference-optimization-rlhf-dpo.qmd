@@ -60,6 +60,24 @@ $$
 $$
 which it then plugs into the same clipped surrogate as PPO, with an explicit KL term to the reference. Dropping the value model halves the memory footprint and removes a notoriously finicky component, which is why GRPO became the default for reinforcement learning with verifiable rewards (math and code, where $r_i$ can be a correctness check rather than a learned reward model).
 
+### 2.2 The Training-Inference Mismatch and Monotonic Inference Policy Improvement
+
+PPO and GRPO both assume the probabilities in the clipped surrogate are the ones that produced the rollouts. In a production RL stack that assumption quietly fails. To generate rollouts fast, systems sample from an inference engine (such as vLLM, often in FP8), while gradients are computed in a separate training engine (such as Megatron) at higher precision. Even with identical parameters, the two engines assign different probabilities to the same token, so the **sampler policy** $\mu$ that actually generated a trajectory differs from the **training policy** $\pi$ that the gradient sees. This is a persistent, structural off-policyness that worsens as the rollout engine is quantized and, left unchecked, destabilizes or collapses training.
+
+Liang et al. (2026) argue the deeper issue is an *objective* misalignment: an update that provably improves the training policy $\pi$ need not improve the inference policy $\mu$, which is the one actually deployed. They make the real target explicit by decomposing the inference-policy gain across an update into three terms,
+$$
+J(\mu_{k+1}) - J(\mu_k)
+= \underbrace{\big[J(\mu_{k+1}) - J(\pi_{k+1})\big]}_{\text{post-update mismatch}}
++ \underbrace{\big[J(\pi_{k+1}) - J(\pi_k)\big]}_{\text{training gain}}
++ \underbrace{\big[J(\pi_k) - J(\mu_k)\big]}_{\text{pre-update mismatch}},
+$$
+and name the goal **Monotonic Inference Policy Improvement (MIPI)**: make the whole left-hand side positive, not merely the middle term that ordinary RL optimizes. Their **MIPU** procedure enforces this in two steps. Step one references the update to the *sampler* rather than to the old training policy, optimizing a truncated importance-weighted surrogate
+$$
+\mathcal{J}(\theta) = \mathbb{E}\Big[\, \bar w_i \cdot \min\big(\rho_i(\theta)\,\hat A_i,\; \operatorname{clip}(\rho_i(\theta),\,1-\epsilon,\,1+\epsilon)\,\hat A_i\big) \Big],
+\qquad \bar w_i = \min\!\Big(\tfrac{\pi_k}{\mu_k},\, w_{\max}\Big),
+$$
+where the weight $\bar w_i$ corrects the pre-update mismatch and $\rho_i(\theta) = \pi_\theta/\pi_k$ is the usual clipped training ratio. Step two is a guardrail: after synchronizing the candidate back to the inference engine, it estimates the post-update gap with validation rollouts, $\hat T_{\text{post}} \approx -\,\mathbb{E}_{\mu_{k+1}}[\tilde\rho_i \hat A_i]$, where $\tilde\rho_i$ is a length-normalized importance weight between the *updated* trainer and sampler ($\pi_{k+1}$ versus $\mu_{k+1}$), distinct from the surrogate's training ratio $\rho_i(\theta)$ above, and it accepts the update only if $\hat T_{\text{post}} \ge -c$, otherwise rolling back to the previous checkpoint. On Qwen3-4B and Qwen3-1.7B with FP8 rollouts (a deliberately high-mismatch setting), MIPU raises average pass@1 across five math-reasoning benchmarks from $64.4\%$ to $66.7\%$ and, more importantly, holds training stable where the baselines collapse. The takeaway for anyone running RL at scale is that the sampler-versus-trainer gap is not a numerical nuisance to be ignored: it changes what the objective should be.
+
 ## 3. DPO: Preference Optimization Without Reinforcement Learning
 
 Direct Preference Optimization starts from a striking observation. The KL-regularized RLHF objective of Section 2 has a *closed-form* optimal policy. For a fixed reward $r$ and reference $\pi_{\text{ref}}$, the maximizer of expected reward minus $\beta$ times KL is the Gibbs distribution
@@ -528,3 +546,4 @@ The classical PPO path swaps `GRPOTrainer` for `PPOTrainer` and additionally req
 8. Azar, M. G. et al. "A General Theoretical Paradigm to Understand Learning from Human Preferences" (IPO). AISTATS 2024. https://arxiv.org/abs/2310.12036
 9. von Werra, L. et al. "TRL: Transformer Reinforcement Learning." Hugging Face, 2020 onward. https://github.com/huggingface/trl
 10. Hu, E. J. et al. "LoRA: Low-Rank Adaptation of Large Language Models." ICLR 2022. https://arxiv.org/abs/2106.09685
+11. Liang, J. et al. "The Mirage of Optimizing Training Policies: Monotonic Inference Policies as the Real Objective for LLM Reinforcement Learning" (MIPI/MIPU). 2026. https://arxiv.org/abs/2606.29526
