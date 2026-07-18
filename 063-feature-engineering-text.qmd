@@ -2,7 +2,7 @@
 
 Text is the most abundant and least structured data modality in modern machine learning. A document is a sequence of characters with no fixed length, no inherent numeric meaning, and no obvious alignment between examples. Before any statistical learner can operate on text, that sequence must be transformed into a finite vector of features. This transformation is the subject of feature engineering for text, and despite the dominance of large neural language models, the classical pipeline remains indispensable. It is fast, interpretable, cheap to deploy, and frequently competitive on the tasks that actually fill production backlogs.
 
-This chapter develops the classical text feature pipeline from first principles: tokenization, bag of words, n-grams, term weighting with TF-IDF, and the hashing trick for scale. It then builds a bridge to distributed representations, word and sentence embeddings, and closes with a sober account of when sparse classical features still outperform dense neural ones.
+This chapter develops the classical text feature pipeline from first principles: tokenization, bag of words, n-grams, term weighting with TF-IDF, and the hashing trick for scale. It then builds a bridge to distributed representations, word and sentence embeddings, and gives a sober account of when sparse classical features still outperform dense neural ones. It closes with a modern case study in which the feature space itself is induced by LLMs.
 
 The pipeline is best understood as a sequence of maps from one representation to the next, each adding structure or shedding cost.
 
@@ -21,7 +21,7 @@ flowchart LR
     H --> I
 ```
 
-The top path is the sparse symbolic pipeline that dominates Sections 1 through 5. The lower paths are the dense semantic routes of Section 6. Section 7 explains when each is the right choice.
+The top path is the sparse symbolic pipeline that dominates Sections 1 through 5. The lower paths are the dense semantic routes of Section 6. Section 7 explains when each is the right choice, and Section 8 studies a third route absent from this diagram entirely: feature spaces induced by LLMs.
 
 ## 1. From Characters to Tokens
 
@@ -257,6 +257,321 @@ A handful of mistakes recur often enough to enumerate explicitly.
 - **Forgetting L2 normalization.** Without it, long documents have larger vector norms and dominate distance and similarity computations purely because of length. Normalize unless you have a specific reason not to.
 - **Expecting averaged embeddings to capture order.** Mean pooling word vectors discards word order just as BoW does, so it cannot distinguish `dog bites man` from `man bites dog`. When order or compositional meaning is essential, use a contextual sentence encoder rather than an average.
 
+## 8. Case Study: LLM-Induced Feature Spaces {#sec-llm-induced-features}
+
+Every representation in this chapter engineers features from the surface of text: which tokens appear, how often, in what local order, or where they sit in a pretrained embedding space. A 2026 study of AI-generated fiction demonstrates a third route with no classical equivalent: use LLMs to *induce* a compact, human-readable feature space that describes what a text *does* (its narrative decisions) rather than which words it contains, then hand those features to exactly the classical toolkit this chapter has been building: mixed-type encoding, gradient-boosted trees, and per-feature attribution [@russell2026storyscope]. The study, STORYSCOPE, is worth a close look both for its findings and because it is a complete, replicable template for LLM-driven feature engineering, with code and data released under an open license.
+
+### 8.1 The task: detect AI fiction without reading its style
+
+Stylistic tells of AI text (overused words, characteristic punctuation, sentence rhythm) are highly discriminative but fleeting: vendors patch them, and fine-tuning to mimic human style has been shown to drop creative-writing detection rates from 97% to 3%. StoryScope therefore asks whether the *narrative choices* underlying a story (who has agency, how time flows, how explicitly themes are stated) separate human from AI fiction even when all stylistic signal is withheld.
+
+The corpus is a parallel design: 10,272 human-written short stories are extracted from the Books3 corpus, a writing prompt is reverse-engineered from each with Gemini 2.5 Flash, and then five frontier models (Claude Sonnet 4.6, GPT 5.4, Gemini 3 Flash, DeepSeek V3.2, and Kimi K2.5) each write a story from the same prompt. That yields 61,608 stories averaging 4,753 words across six *sources* (the human author plus five models), all telling comparable premises, generated for a total API cost of about $4.4k.
+
+### 8.2 A five-stage induction pipeline
+
+Manually annotating narrative decisions across 60k long stories is infeasible, so the feature space itself is induced by LLMs, grounded in the ten-dimension NarraBench taxonomy of narrative structure (agent, social network, event, plot, structure, setting, time, revelation, perspective, and style) [@hamilton2025narrabench]:
+
+```{mermaid}
+flowchart LR
+    A["61,608 stories from six sources"] --> B["Structured templates, GPT-5.1"]
+    B --> C["Cross-source comparison on a 600-story pool"]
+    C --> D["Feature discovery: 408 candidate questions"]
+    D --> E["Embedding dedup to 304 features"]
+    E --> F["Feature assignment, Gemini 3 Flash"]
+    F --> G["Mixed-type encoding"]
+    G --> H["XGBoost and SHAP"]
+```
+
+1. **Structured templates.** GPT-5.1 converts each story into a JSON template organized along the ten dimensions (character names, roles, and motivations for agent; causal chains and key events for event; and so on). The template is a controlled intermediate representation: downstream stages reason over narrative content, not prose.
+2. **Cross-source comparison.** For a held-out discovery pool of 600 stories over 100 prompts, GPT-5.1 reads all six templates per prompt and writes a structured comparative analysis of where the sources diverge. This stage compresses roughly 2.7M tokens of raw text into about 686K tokens of observations.
+3. **Feature discovery.** Ten dimension-specific expert prompts ask GPT-5.1 to propose discriminative features as closed-form questions with discrete answers. Three discovery runs yield 408 candidates, deduplicated by embedding clustering (cosine threshold 0.85), leaving $d = 304$ features in five response types: categorical (124), ordinal (59), scale (45), binary (44), and multi-select (32).
+4. **Feature assignment.** Gemini 3 Flash annotates every story with all 304 features. Assignment is reliable: repeatability across five independent runs reaches Krippendorff's $\alpha = 0.88$, and agreement with human annotators on a 240-feature subset averages Cohen's $\kappa = 0.84$.
+5. **Classification and attribution.** XGBoost classifiers [@chen2016xgboost] are trained on the encoded features, and SHAP [@lundberg2017shap] decomposes every prediction into per-feature contributions.
+
+The design choice worth internalizing is the middle of the pipeline: instead of asking one model to simultaneously read, compare, and formalize, each stage consumes the previous stage's compressed artifact. That is what makes an interpretable feature space *inducible* at corpus scale.
+
+### 8.3 Encoding a mixed-type feature vector
+
+The annotation stage yields a typed semantic vector $z = (z_1, \dots, z_d)$ per story. The classifier does not consume $z$ directly; each feature is encoded according to its type,
+
+$$
+\phi_j(z_j) =
+\begin{cases}
+\operatorname{onehot}(z_j) \in \{0,1\}^{|V_j|} & \text{categorical with option set } V_j \\
+\operatorname{multihot}(z_j) \in \{0,1\}^{|V_j|} & \text{multi-select} \\
+z_j \in \{1, \dots, K_j\} & \text{ordinal and scale, kept numeric} \\
+z_j \in \{0, 1\} & \text{binary}
+\end{cases}
+$$
+
+and the encoded blocks are concatenated into $x = [\phi_1(z_1) \,\|\, \cdots \,\|\, \phi_d(z_d)] \in \mathbb{R}^D$. For the full 304-feature set $D = 1{,}108$; the narrative-only variant (257 features, all style features removed) has $D = 958$; the style-only variant (39 features) has $D = 129$. Splits are grouped at the prompt level (7,383 train, 1,405 validation, and 1,384 test prompts) so that no premise straddles train and test, the same leakage discipline as Section 7.5's rule about fitting vectorizers on the training fold only, applied one level up.
+
+### 8.4 What 304 interpretable dimensions buy
+
+The headline results, all macro-F1 on the held-out test set of 8,301 stories:
+
+| Model | Features | Binary F1 | Binary AUPRC | 6-way F1 |
+|---|---|---|---|---|
+| Narrative only | 257 | 93.2 | .959 | 68.4 |
+| Core only | 30 | 84.8 | .828 | 46.5 |
+| Core + fingerprint | 101 | 91.1 | .934 | 63.4 |
+| Narrative + style | 304 | 96.0 | .982 | 77.3 |
+| Style only | 39 | 85.8 | .867 | 60.4 |
+| ModernBERT (raw text) | | 99.9 | 1.00 | 99.8 |
+| Stylometric + XGBoost (raw text) | 144 | 99.8 | .999 | 99.6 |
+| TF-IDF + XGBoost (raw text) | 5,000 | 99.7 | .999 | 99.5 |
+| Binoculars (zero-shot) | | 55.9 | .404 | |
+
+Read the table through this chapter's lens. The raw-text baselines at the bottom are precisely the machinery of Sections 4 and 7: a 5,000-column TF-IDF matrix and a 144-feature stylometric vector, each feeding XGBoost, and they achieve near-perfect separation. On accuracy alone, classical surface features win. What the induced narrative features buy is different:
+
+- **Interpretability.** Each of the 257 dimensions is a named, answerable question about the story ("is the resolution driven by the protagonist's choices?"), and SHAP attributes every single prediction to specific narrative decisions. A TF-IDF coefficient cannot tell an editor *why* a manuscript reads as machine-written.
+- **Robustness to style editing.** When AI stories are rewritten with the LAMP span-level editing framework to remove characteristic AI phrasing (cliches, purple prose, redundant exposition) [@chakrabarty2025lamp], the narrative classifier barely moves: 93.9 versus 95.5 macro-F1 on the same stories unedited. Style detectors are brittle to exactly this attack.
+- **Compactness.** Thirty core features retain 84.8 macro-F1. The human-AI boundary lives in a small, auditable subset of narrative decisions.
+- **No length confound.** A length-only classifier reaches 55.9 macro-F1, and on a length-matched test subset the narrative model still scores 93.2, unchanged.
+
+### 8.5 From SHAP to feature roles: core and fingerprint
+
+The paper's post-hoc analysis is a model of disciplined feature selection. Importance and stability are assessed by bootstrap SHAP analysis: $B = 50$ prompt-level resampling iterations of the binary task, giving each feature $j$ a mean absolute SHAP importance $\bar{s}_j$, a bootstrap stability score $\operatorname{stab}_j$, a top-25 rate $\operatorname{top25}_j$ (how often the feature ranks among the 25 most important across iterations), and a permutation $p$-value $p_j$ against a shuffled-label null. A feature is *important* if $\bar{s}_j$ exceeds the top quartile of importances, and *stable-important* if its stability is at least the median among important features and its importance beats the 95th-percentile null with $p_j \le 0.10$. A *core* feature must clear all of that plus three magnitude thresholds:
+
+$$
+j \in \text{Core} \iff
+\text{stable-important}(j)
+\,\wedge\, \operatorname{stab}_j \ge 0.55
+\,\wedge\, \operatorname{top25}_j \ge 0.60
+\,\wedge\, |\Delta_j| \ge 0.20
+\,\wedge\, \sigma_j^{\text{AI}} \le 0.35,
+$$
+
+where $\Delta_j$ is the human-AI gap in mean encoded value and $\sigma_j^{\text{AI}}$ is the spread of that mean across the five AI models (a core feature must separate humans from *all* models consistently, not from one). This yields 30 core features. *Fingerprint* features come from the six-way task instead: a feature qualifies when its SHAP importance concentrates in a single source class and that source's values visibly differ, yielding 75 fingerprint features, distributed very unevenly (human 32, Claude 26, GPT 11, Gemini 11, DeepSeek 7, Kimi 3).
+
+The core features read like an editor's checklist of AI habits. AI stories over-explain themes (narrators state the moral 77% of the time versus 52% for humans), use dialogue for philosophical debate (59% vs. 34%), avoid subplots (79% subplot-free vs. 57%), resolve through protagonist choice (69% vs. 46%), and render emotion through bodies and senses (embodied emotion 81% vs. 38%, smell imagery 82% vs. 57%, explicit emotion labels only 8% vs. 29%). Human authors name real texts and authors (47% vs. 24%), break the fourth wall (67% vs. 39%), address the reader (28% vs. 7%), and write morally ambivalent protagonists (59% vs. 38%). The fingerprints are just as legible: Claude escalates events the least and favors epilogues over dream sequences, GPT over-indexes on gossip as a plot mechanism (64%) and on subverted expectations (41%), Gemini writes the tidiest endings and the bleakest settings (88% tagged bleak), DeepSeek front-loads crucial context, and Kimi sits at the generic center of the AI distribution with the fewest fingerprints and the lowest attribution F1.
+
+### 8.6 A miniature StoryScope
+
+The pipeline's downstream half fits in one code cell. The simulation below generates a parallel corpus in which each source's feature marginals are taken from the paper where reported (the core rates above, the fingerprint rates for GPT, Claude, and Gemini) and set to plausible illustrative values where the paper is qualitative, adds annotation noise consistent with the reported human-model agreement, then runs the paper's exact recipe: mixed-type encoding, a prompt-grouped split, XGBoost for binary detection and six-way attribution, and TreeSHAP importances straight from XGBoost's `pred_contribs` (no extra library needed).
+
+```{python}
+#| label: code-063-storyscope-mini
+#| code-fold: false
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import f1_score
+from sklearn.model_selection import GroupShuffleSplit
+
+rng = np.random.default_rng(7)
+
+SOURCES = ["human", "claude", "gpt", "gemini", "deepseek", "kimi"]
+N_PROMPTS = 1000
+
+# Core-style binary features as (human rate, shared AI rate). Every pair is a
+# marginal reported in the paper (sections 4.1 and 5).
+CORE_RATES = {
+    "narrator_explains_theme": (0.52, 0.77),
+    "dialogue_as_philosophy":  (0.34, 0.59),
+    "no_subplots":             (0.57, 0.79),
+    "protagonist_resolution":  (0.46, 0.69),
+    "olfactory_imagery":       (0.57, 0.82),
+    "named_reference":         (0.47, 0.24),
+    "addresses_reader":        (0.28, 0.07),
+    "breaks_fourth_wall":      (0.67, 0.39),
+    "ambivalent_protagonist":  (0.59, 0.38),
+    "vague_allusions_only":    (0.50, 0.72),
+    "balanced_reference_mix":  (0.37, 0.16),
+    "subplots_serve_theme":    (0.42, 0.21),
+    "acceptance_resolution":   (0.27, 0.47),
+}
+
+# One categorical feature: dominant mode of emotional expression. The explicit
+# (29% vs 8%) and embodied (38% vs 81%) rates are the paper's; the remainder
+# goes to behavioral cues.
+EMOTION_LEVELS = ["explicit_label", "embodied", "behavioral"]
+EMOTION_P = {"human": [0.29, 0.38, 0.33], "ai": [0.08, 0.81, 0.11]}
+
+# 1-5 scale features as (human mean, AI mean). The explicitness pair is the
+# paper's moral/philosophical weighting means (3.26 vs 3.68); the discontinuity
+# gap is illustrative, direction only (humans jump across time more).
+SCALE_MEANS = {
+    "thematic_explicitness":       (3.26, 3.68),
+    "chronological_discontinuity": (2.90, 2.30),
+}
+
+# Fingerprint features: a shared default rate plus per-model overrides. GPT's
+# gossip (64%) and subversion (41%), Claude's continuism (62%), and Gemini's
+# bleak settings (88%) are reported values; the defaults, the dream and
+# epilogue rates, and the DeepSeek front-loading override are illustrative.
+# Kimi deliberately gets no override, matching its 'generic center of the AI
+# distribution' role in the paper.
+FP_BASE = {
+    "gossip_mechanism":      0.50,
+    "subverts_expectations": 0.32,
+    "continuist_tradition":  0.47,
+    "bleak_setting":         0.55,
+    "frontloads_context":    0.40,
+    "dream_sequence":        0.10,
+    "writes_epilogue":       0.30,
+    "extended_denouement":   0.35,
+}
+FP_OVERRIDES = {
+    "gpt":      {"gossip_mechanism": 0.64, "subverts_expectations": 0.41,
+                 "dream_sequence": 0.30},
+    "claude":   {"continuist_tradition": 0.62, "writes_epilogue": 0.55,
+                 "dream_sequence": 0.03},
+    "gemini":   {"bleak_setting": 0.88, "extended_denouement": 0.60},
+    "deepseek": {"frontloads_context": 0.70},
+}
+# Claude's 'notably flat event escalation' as an illustrative scale gap.
+ESCALATION_MEAN = {"claude": 2.1}
+ESCALATION_DEFAULT = 3.0
+
+ANNOTATION_FLIP = 0.02  # imperfect LLM annotation (human-model kappa is 0.84)
+
+rows = []
+for prompt in range(N_PROMPTS):
+    for src in SOURCES:
+        is_ai = src != "human"
+        row = {"prompt": prompt, "source": src}
+        for name, (h, a) in CORE_RATES.items():
+            row[name] = rng.random() < (a if is_ai else h)
+        row["emotion_mode"] = EMOTION_LEVELS[
+            rng.choice(3, p=EMOTION_P["ai" if is_ai else "human"])
+        ]
+        for name, (h, a) in SCALE_MEANS.items():
+            row[name] = int(np.clip(round(rng.normal(a if is_ai else h, 0.8)), 1, 5))
+        for name, base in FP_BASE.items():
+            row[name] = rng.random() < FP_OVERRIDES.get(src, {}).get(name, base)
+        row["event_escalation"] = int(
+            np.clip(round(rng.normal(ESCALATION_MEAN.get(src, ESCALATION_DEFAULT), 0.8)), 1, 5)
+        )
+        for name in list(CORE_RATES) + list(FP_BASE):
+            if rng.random() < ANNOTATION_FLIP:
+                row[name] = not row[name]
+        rows.append(row)
+
+df = pd.DataFrame(rows)
+
+# Encode exactly as the paper does: one-hot for categorical, numeric for
+# ordinal/scale, binary as-is.
+X = pd.get_dummies(df.drop(columns=["prompt", "source"]),
+                   columns=["emotion_mode"]).astype(float)
+groups = df["prompt"].to_numpy()
+
+# Prompt-level grouped split so no prompt straddles train and test.
+train_idx, test_idx = next(
+    GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=0).split(X, groups=groups)
+)
+
+# Binary detection: human is the positive minority class at a 1:5 ratio, so we
+# weight it 5x as the paper does.
+y_bin = (df["source"] == "human").astype(int).to_numpy()
+clf_bin = xgb.XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.1,
+                            reg_lambda=2.0, scale_pos_weight=5.0,
+                            eval_metric="logloss", random_state=0)
+clf_bin.fit(X.iloc[train_idx], y_bin[train_idx])
+f1_b = f1_score(y_bin[test_idx], clf_bin.predict(X.iloc[test_idx]), average="macro")
+
+# Six-way attribution with the same features.
+codes = {s: i for i, s in enumerate(SOURCES)}
+y_six = df["source"].map(codes).to_numpy()
+clf_six = xgb.XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.1,
+                            reg_lambda=1.0, eval_metric="mlogloss", random_state=0)
+clf_six.fit(X.iloc[train_idx], y_six[train_idx])
+pred_six = clf_six.predict(X.iloc[test_idx])
+f1_s = f1_score(y_six[test_idx], pred_six, average="macro")
+per_class = f1_score(y_six[test_idx], pred_six, average=None)
+
+print(f"binary human-vs-AI macro-F1:   {f1_b:.3f}"
+      "   (paper: 0.932 with 257 features, 0.848 with the 30 core)")
+print(f"six-way attribution macro-F1:  {f1_s:.3f}"
+      "   (paper: 0.684 with 257 features, 0.465 with the 30 core)\n")
+print("per-source F1 (paper ordering: human > Claude > GPT >> Gemini/DeepSeek/Kimi):")
+for s in np.argsort(per_class)[::-1]:
+    print(f"  {SOURCES[s]:<9} {per_class[s]:.3f}")
+
+# SHAP via XGBoost's built-in TreeSHAP (pred_contribs), no extra library needed.
+dtest = xgb.DMatrix(X.iloc[test_idx])
+contrib_bin = clf_bin.get_booster().predict(dtest, pred_contribs=True)[:, :-1]
+imp = np.abs(contrib_bin).mean(axis=0)
+top = np.argsort(imp)[::-1][:6]
+print("\ntop core features by mean |SHAP| (binary task):")
+for j in top:
+    print(f"  {X.columns[j]:<28} {imp[j]:.3f}")
+
+# Multiclass SHAP: (n, classes, D+1). A fingerprint feature is one whose
+# importance concentrates in a single source class.
+contrib_six = clf_six.get_booster().predict(dtest, pred_contribs=True)[:, :, :-1]
+imp_six = np.abs(contrib_six).mean(axis=0)
+print("\ntop fingerprint feature per AI source (multiclass SHAP):")
+for s in SOURCES[1:]:
+    k = codes[s]
+    j = int(np.argmax(imp_six[k]))
+    print(f"  {s:<9} -> {X.columns[j]:<28} {imp_six[k, j]:.3f}")
+```
+
+The miniature reproduces the paper's qualitative structure with about two dozen features instead of 257. Binary detection is easy and lands near the paper's 30-feature core band; six-way attribution is much harder, exactly as in the paper, and sits between chance (0.167) and the core-only result because our eight fingerprint-style features cover only a sliver of the paper's 75. The per-source breakdown recovers the paper's ordering: the human class is easiest, Claude is the most separable AI source (its flat escalation and epilogue habit stick out), and Kimi, which by construction has no distinguishing marginal, is hardest, matching its role in the paper as the model with the fewest fingerprints. The binary SHAP ranking surfaces the features with the largest marginal gaps (embodied emotion, thematic explicitness), and the multiclass SHAP correctly concentrates each AI source's importance on its planted fingerprint. When importance is diffuse and weak, as for Kimi, that absence is itself the finding.
+
+### 8.7 Running the real pipeline
+
+The authors released the full replication package under the MIT license: the pipeline code, the 10,272 writing prompts, all 51,336 AI-generated stories, and the per-story feature vectors (human story texts are withheld for copyright reasons, since they derive from Books3). The repository is at [github.com/jenna-russell/storyscope](https://github.com/jenna-russell/storyscope), with the full dataset mirrored on Hugging Face as [`jjrussell10/storyscope`](https://huggingface.co/datasets/jjrussell10/storyscope). A 100-prompt dev slice (`data/stories_dev.parquet`), the final taxonomy (`data/taxonomy.json`), the extracted feature matrix (`data/storyscope_features.parquet`), and the trained XGBoost weights (`data/models/`) ship inside the repository itself, so the analysis stages run without spending anything on generation.
+
+```bash
+git clone https://github.com/jenna-russell/storyscope.git
+cd storyscope
+pip install -r requirements.txt
+```
+
+Providers and models for each stage are set in `config/models.yaml`, with API keys read from the environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GOOGLE_CLOUD_PROJECT` depending on provider):
+
+```yaml
+pipeline:
+  story_generation:
+    provider: openai          # openai, anthropic, vertex, or huggingface
+    model: gpt-5.4
+  feature_application:
+    provider: vertex
+    model: gemini-3-flash
+```
+
+The six stages map one-to-one onto Section 8.2:
+
+```bash
+# 1. Generate stories from prompts
+python -m storyscope.1_story_generation.generate_stories \
+    --prompts data/prompts.json --output-dir outputs/stories --parallel 4
+
+# 2. Extract structured narrative templates
+python -m storyscope.2_template_extraction.extract_templates \
+    --csv data/stories_dev.parquet --output-dir outputs/templates --parallel 4
+
+# 3. Blinded cross-source comparison
+python -m storyscope.3_cross_source_comparison.compare_sources \
+    --templates-dir outputs/templates --output-dir outputs/comparisons --parallel 4
+
+# 4. Induce the feature taxonomy (discover, union, dedup at cosine 0.85)
+python -m storyscope.4_feature_discovery.discover_features \
+    --comparisons-dir outputs/comparisons --output-dir outputs/taxonomy --runs 3
+python -m storyscope.4_feature_discovery.build_taxonomy \
+    --input-dir outputs/taxonomy --output outputs/taxonomy/union_taxonomy.json
+python -m storyscope.4_feature_discovery.cluster_features \
+    --taxonomy outputs/taxonomy/union_taxonomy.json \
+    --output-dir outputs/taxonomy/clustered --sim-threshold 0.85
+
+# 5. Apply the 304 features across the story corpus
+python -m storyscope.5_feature_application.apply_features \
+    --csv data/stories_train.parquet --taxonomy data/taxonomy.json \
+    --output-dir outputs/features --parallel 24
+
+# 6. Train classifiers and run bootstrap SHAP analysis
+python -m storyscope.6_classification.train_classifier \
+    --features data/storyscope_features.parquet --taxonomy data/taxonomy.json \
+    --output-dir outputs/classification --task both
+python -m storyscope.6_classification.shap_analysis \
+    --features data/storyscope_features.parquet --taxonomy data/taxonomy.json \
+    --output-dir outputs/shap --task both --bootstrap 50
+```
+
+Stages 1 through 5 call paid LLM APIs (the full corpus cost the authors roughly $4.4k); stage 6 is pure local compute on the shipped parquet files, which makes it the natural entry point for coursework and for extending the classifier analysis. As a closing note on the theme of this chapter: the highest-leverage feature engineering in this study was not done by a person writing extractors, it was done by one LLM interrogating the output of five others, with humans validating a sample of the annotations afterward.
+
 ## References
 
 1. Manning, C. D., Raghavan, P., and Schütze, H. *Introduction to Information Retrieval*. Cambridge University Press, 2008. https://nlp.stanford.edu/IR-book/
@@ -269,3 +584,8 @@ A handful of mistakes recur often enough to enumerate explicitly.
 8. Wang, S. and Manning, C. D. "Baselines and Bigrams: Simple, Good Sentiment and Topic Classification." ACL, 2012. https://aclanthology.org/P12-2018/
 9. Pedregosa, F. et al. "Scikit-learn: Machine Learning in Python." *JMLR*, 2011. https://jmlr.org/papers/v12/pedregosa11a.html
 10. Joulin, A., Grave, E., Bojanowski, P., and Mikolov, T. "Bag of Tricks for Efficient Text Classification." EACL, 2017. https://arxiv.org/abs/1607.01759
+11. Russell, J., Rajendhran, R., Pham, C. M., Iyyer, M., and Wieting, J. "StoryScope: Investigating Idiosyncrasies in AI Fiction." arXiv:2604.03136, 2026. https://doi.org/10.48550/arXiv.2604.03136
+12. Hamilton, S., Wilkens, M., and Piper, A. "NarraBench: A Comprehensive Framework for Narrative Benchmarking." arXiv:2510.09869, 2025. https://doi.org/10.48550/arXiv.2510.09869
+13. Chen, T. and Guestrin, C. "XGBoost: A Scalable Tree Boosting System." KDD, 2016. https://doi.org/10.1145/2939672.2939785
+14. Lundberg, S. M. and Lee, S.-I. "A Unified Approach to Interpreting Model Predictions." NeurIPS, 2017. https://doi.org/10.48550/arXiv.1705.07874
+15. Chakrabarty, T., Laban, P., and Wu, C.-S. "Can AI Writing Be Salvaged? Mitigating Idiosyncrasies and Improving Human-AI Alignment in the Writing Process through Edits." CHI, 2025. https://doi.org/10.1145/3706598.3713559
