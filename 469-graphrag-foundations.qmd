@@ -2978,6 +2978,111 @@ class HybridRetriever:
         return {entity_ids[i]: float(scores[i]) for i in range(n)}
 ```
 
+### Modular Multi-Step Construction with Compact Extraction Models {#sec-ragu-compact-graphrag}
+
+The knowledge graph construction machinery developed earlier in this chapter, spanning entity and relation extraction, coreference resolution, entity linking, and community detection, is often presented as a single monolithic extraction call. In practice the quality of a GraphRAG system depends far more on how carefully these stages are decomposed and composed than on the raw capacity of the language model that performs the inner extraction. RAGU, an open-source modular GraphRAG engine, makes this argument explicit and provides an implementation that pushes the entire pipeline onto a single GPU [@komarov2026ragu].
+
+The central design choice in RAGU is to separate entity and relation extraction from graph consolidation. Rather than asking one model to emit a clean graph in a single noisy pass, RAGU runs a two-stage extraction pipeline that first proposes candidate entities and relations and then refines them, followed by explicit deduplication, summarization, and community detection stages. This mirrors the pipeline structure assembled by hand across the earlier sections: extraction (see the discussion of large language models for knowledge extraction), consolidation through coreference and linking, and community summarization for global queries. Isolating these concerns makes each stage individually testable and lets the system recover from local extraction errors during consolidation, instead of propagating them into the final graph.
+
+The thesis that motivates this decomposition concerns model size. The skills an in-pipeline language model actually needs are comprehension of a text chunk, extraction of the entities and relations it states, and reasoning over provided context. RAGU argues that these are language skills that grow only weakly with parameter count, so a compact domain-adapted model is sufficient for the inner LLM calls, provided the surrounding pipeline is engineered well. To test this, the authors train Meno-Lite-0.1, a 7B model specialized for the construction task. It outperforms the much larger Qwen2.5-32B on knowledge graph construction by 12.5 percent relative, measured as the harmonic mean of the construction metrics, while matching it on English GraphRAG benchmarks and showing strong retrieval on medical question answering. Because the compact model carries the extraction load, the whole system runs on a single GPU and ships as an installable package under a permissive license.
+
+The practical takeaway sharpens the message of this chapter. GraphRAG quality is bottlenecked by pipeline engineering, the multi-step extraction and consolidation logic, more than by the size of the extraction model. That reframing is what makes local, cheap, and private GraphRAG deployment feasible: a modest domain-adapted model plus a disciplined pipeline can replace a large general-purpose model behind an API. The cell below is a compact conceptual walkthrough of that multi-step pipeline, working from a small set of triples "extracted" from a toy corpus through consolidation, community detection, and the contrast between a global and a local query.
+
+```{python}
+#| label: ragu-pipeline-demo
+import networkx as nx
+from networkx.algorithms.community import greedy_modularity_communities
+
+# Stage 1: triples "extracted" from a toy corpus by an inner LLM call.
+# Some entities appear under aliased surface forms (J. Doe / Jane Doe,
+# New York University / NYU), exactly the noise consolidation must fix.
+raw_triples = [
+    ("Jane Doe", "affiliated_with", "NYU"),
+    ("J. Doe", "coauthored", "GraphNet"),
+    ("Jane Doe", "advised_by", "Alan Roe"),
+    ("Alan Roe", "affiliated_with", "New York University"),
+    ("GraphNet", "cites", "TransE"),
+    ("Bob Lin", "affiliated_with", "MIT"),
+    ("Bob Lin", "coauthored", "VecStore"),
+    ("Carol Ng", "affiliated_with", "MIT"),
+    ("Carol Ng", "coauthored", "VecStore"),
+    ("VecStore", "cites", "FAISS"),
+]
+
+# Stage 2: entity consolidation. A separate deduplication step merges
+# aliased surface forms onto canonical entities before the graph is built.
+alias_to_canonical = {
+    "J. Doe": "Jane Doe",
+    "New York University": "NYU",
+}
+def canon(name):
+    return alias_to_canonical.get(name, name)
+
+triples = [(canon(h), r, canon(t)) for h, r, t in raw_triples]
+
+# Stage 3: build the consolidated knowledge graph.
+G = nx.Graph()
+for head, rel, tail in triples:
+    G.add_edge(head, tail, relation=rel)
+
+print(f"raw entities:          {len({e for h, _, t in raw_triples for e in (h, t)})}")
+print(f"consolidated entities: {G.number_of_nodes()}")
+
+# Stage 4: community detection groups densely connected entities into
+# coherent units for global summarization.
+communities = list(greedy_modularity_communities(G))
+
+# Global query: one summary per community (a corpus-level overview).
+print("\nGlobal query (per-community overview):")
+for i, community in enumerate(communities):
+    members = sorted(community)
+    rels = {d["relation"] for u, v, d in G.edges(members, data=True)
+            if u in community and v in community}
+    print(f"  community {i}: {members}")
+    print(f"    relations: {sorted(rels)}")
+
+# Local query: the immediate neighborhood of a single focus entity.
+focus = "Jane Doe"
+print(f"\nLocal query (neighborhood of {focus!r}):")
+for neighbor in sorted(G.neighbors(focus)):
+    print(f"  {focus} --[{G[focus][neighbor]['relation']}]--> {neighbor}")
+```
+
+The demo compresses the full engine into a few lines, but it exposes the load-bearing idea: the alias merge in stage 2 is what lets community detection in stage 4 place Jane Doe and her advisor in the same cluster, and it is the pipeline, not the extractor, that does that work. A production deployment would call a compact model such as Meno-Lite for the extraction in stage 1 and reuse the community and neighborhood structure to answer global and local queries at scale, the same global versus local distinction developed in the community detection and context assembly sections above. The block below sketches the real RAGU API for reference.
+
+```python
+# requires the graph_ragu package + an LLM/embedder backend and a GPU; shown, not executed
+# pip install graph_ragu   (MIT license, runs on a single GPU)
+# companion 7B model: bond005/meno-lite on Hugging Face
+# source: github.com/RaguTeam/RAGU
+import asyncio
+from graph_ragu import (
+    KnowledgeGraph,
+    LocalSearchEngine,
+    GlobalSearchEngine,
+)
+
+knowledge_graph = KnowledgeGraph(
+    llm=llm,                          # e.g. a Meno-Lite backend
+    embedder=embedder,
+    chunker=chunker,
+    artifact_extractor=artifact_extractor,
+)
+
+# multi-step extraction + consolidation + community detection over the corpus
+asyncio.run(knowledge_graph.build_from_docs(docs))
+
+# local query: reason over the neighborhood of the matched entities
+local_engine = LocalSearchEngine(knowledge_graph)
+local_answer = asyncio.run(local_engine.a_query("What did Jane Doe work on?"))
+
+# global query: synthesize across community summaries
+global_engine = GlobalSearchEngine(knowledge_graph)
+global_answer = asyncio.run(
+    global_engine.a_search("What themes span the whole corpus?")
+)
+```
+
 ## Summary
 
 Graph-based retrieval-augmented generation extends the capabilities of language models by organizing knowledge into explicit relational structures. The graph representation enables multi-hop reasoning, relationship-aware retrieval, and structured context assembly that flat vector retrieval cannot achieve.

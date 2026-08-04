@@ -336,7 +336,161 @@ Reflection mechanisms are modular and compose naturally with other agent compone
 
 The deepest connection is to the idea of test-time compute scaling: given a fixed model, better answers can be obtained by spending more inference-time computation. Reflection is one architecture for this; others include best-of-$n$ sampling, Monte Carlo tree search over reasoning steps, and process reward models. What distinguishes reflection from pure sampling approaches is that it uses the model's own structured feedback to direct the search, rather than sampling blindly and selecting post hoc. This directed search is more compute-efficient when the model's critiques are informative, and less efficient when they are not, which returns us to the calibration problem identified by Sun et al.
 
-Understanding when model self-evaluation is trustworthy, and designing hybrid architectures that route to external verification when it is not, is an active research frontier. The frameworks covered in this chapter represent the foundational vocabulary for that ongoing work.
+Understanding when model self-evaluation is trustworthy, and designing hybrid architectures that route to external verification when it is not, is an active research frontier. The frameworks covered so far are the foundational vocabulary for that ongoing work. The two sections that follow widen the frame around them: first a taxonomy that locates Self-Refine, Reflexion, and CRITIC within the full design space of self-improving agents, then a concrete system that occupies the quadrant of that space they leave empty.
+
+## 8. A Two-Axis Taxonomy of Self-Improving Agents {#sec-self-improvement-taxonomy}
+
+The frameworks in this chapter treat reflection narrowly, as an inference-time loop that rewrites a single output or steers the next episode. Zooming out, they are instances of a much larger design space. Ren et al. (2026) survey that space in *Self-Improvements in Modern Agentic Systems*, and their organizing lens is worth adopting because it clarifies exactly what Self-Refine, Reflexion, and CRITIC are doing and what they leave on the table. The survey (with contributors including Mingchen Zhuge and Jurgen Schmidhuber) is useful here less for any single benchmark number and more for its vocabulary: a clean way to reason about any self-improving agent by asking two questions, what it updates and what signal drives the update [@ren2026selfimprove].
+
+The starting point is a definition of the agent itself. A modern agent is not just a model; it is a configuration that couples a foundation model (the cognitive core, typically an LLM or vision-language model) with an operational scaffold of prompts, memory, tools, and control logic. The foundation model supplies raw competence, while the scaffold shapes what the agent observes, which actions it can take, and how it sequences them. Self-improvement is then formalized as a self-induced update operator that obtains and commits changes to either the model parameters or the scaffold components. This framing is what lets otherwise dissimilar methods sit on the same map: whether an agent fine-tunes its weights or merely rewrites a prompt template, both are update operators acting on parts of the same configuration.
+
+The first axis is the **update target**: what the operator actually modifies. One option is the foundation model, moving parameters from $\theta_t$ to $\theta_{t+1}$ through gradient-based training. The other is the scaffold, a non-parametric change from $\Sigma_t$ to $\Sigma_{t+1}$ that edits prompts, memory structures, tool interfaces, or control logic while leaving the weights frozen. Every technique covered earlier in @sec-reflection-agents lives on the scaffold side of this axis. Reflexion writes to episodic memory; Self-Refine rewrites the working output within the context window; CRITIC augments the tool interface with an external verifier. None of them touches the weights, which is precisely why they operate at inference time with no training run. Seeing this makes the boundary of the chapter explicit: these are scaffold-level self-improvers, and a whole complementary family of weight-level methods (self-generated fine-tuning data, reinforcement from executable feedback) sits alongside them.
+
+The second axis is the **driving signal**: where the improvement pressure originates. The survey distinguishes three sources. Intrinsic generative demonstrations are training data the agent produces for itself, such as solved trajectories it can later imitate. Intrinsic evaluative feedback is the agent's own critique or rubric applied to its outputs. Extrinsic exploratory experience is signal harvested from interacting with a real or simulated environment. This axis sharpens the central caution of @sec-reflection-agents. Self-Refine runs on intrinsic evaluative feedback alone, which is exactly the regime where self-correction proved unreliable when the model's evaluation error rate approaches its generation error rate. Reflexion and CRITIC succeed because they pull in extrinsic signal, an environment reward or a tool's ground-truth output, so the update is no longer conditioned only on the same reasoning process that produced the error. The two-axis reading thus reconstructs the chapter's own conclusion from first principles: reliable self-improvement usually requires a driving signal that is independent of the model, not just a place to write the update.
+
+Laid over these axes, the survey catalogs applications where self-improving agents are already operating, including software engineering (agents that refine code against test-suite feedback), web navigation, strategic game play through self-play, scientific discovery with closed-loop experimentation, embodied robotics with autonomous practice and data flywheels, and general computer control. It also separates evaluation into metric-based scoring on benchmarks and judge-based assessment by an LLM or human evaluator, and it draws a further line between mechanism-level benchmarks that probe an individual model or scaffold component and domain-specific benchmarks that measure end-to-end task success. The open questions it foregrounds are the ones that matter most as these systems leave the lab: guarding evaluation signals against reward hacking, assigning credit across nested improvement loops so one can tell which update actually helped, and containing recursive self-modification with layered gating and governance so the loop does not diverge or forget. The framing throughout is of a field transitioning from experimental prototypes toward real-world deployment, where the hard part is no longer whether an agent can update itself but whether it can do so safely and verifiably. For the purposes of this chapter, the takeaway is compact: reflection and self-improvement are not one technique but a design space, and the fastest way to place any new method within it is to ask what it updates, weights or scaffold, and what signal drives that update.
+
+## 9. Frontis-MA1 and the Operator Algebra of Self-Improvement {#sec-497-frontis-operator-algebra}
+
+The taxonomy of @sec-self-improvement-taxonomy leaves one of its own cells conspicuously empty as far as this chapter is concerned. Self-Refine, Reflexion, and CRITIC all update the scaffold and leave the weights frozen. The complementary quadrant, updating the foundation model itself under an extrinsic driving signal that comes from execution rather than from the model's own judgment, is where **recursive self-improvement (RSI)** actually lives, and it has been hard to study because systems that attempt it are typically closed. Yang, Jiang, and colleagues supply the missing concrete instantiation, released end to end [@yang2026frontis]. Their framing is worth stating precisely: RSI requires AI systems that improve the process of building AI, abbreviated **AI4AI**, and **machine learning engineering (MLE)** is offered as an executable testbed for it, because every candidate solution is a program whose quality a held-out metric settles without a human in the loop.
+
+The stack, **OpenMLE**, has three layers: OpenMLE-Gym provides verifiable task environments with execution feedback, OpenMLE-RL handles operator learning, and OpenMLE-Evo runs long-horizon search. On top of it @yang2026frontis post-train **Frontis-MA1**, a 35B meta-evolution agent for MLE, on data deduplicated against every evaluation benchmark used.
+
+**Four operators, trained and composed.** The design decision that gives the system its shape is that post-training and inference are aligned around the same four atomic program-evolution operators: **Draft**, **Improve**, **Debug**, and **Crossover**. Model a run as a population of programs $P_t = \{p_1, \ldots, p_N\}$ scored by a fitness $f: \mathcal{P} \to \mathbb{R}$ that the environment computes by executing each program. Each operator is then a transition kernel on program space, distinguished by its arity and its conditioning:
+
+$$
+\text{Draft: } K_{\mathrm{D}}(\cdot \mid \tau), \quad
+\text{Improve: } K_{\mathrm{I}}(\cdot \mid p, \tau), \quad
+\text{Debug: } K_{\mathrm{B}}(\cdot \mid p, e, \tau), \quad
+\text{Crossover: } K_{\mathrm{X}}(\cdot \mid p_a, p_b, \tau)
+$$
+
+where $\tau$ is the task specification and $e$ is an execution error trace. Draft is nullary and seeds the population; Improve is unary and local; Debug is unary but conditioned on the failure signal, mapping infeasible programs back into the feasible region; Crossover is binary. The four kernels are trained by execution-grounded supervised fine-tuning and reinforcement learning, and then those same kernels are the move set that the long-horizon search composes. That identity is what closes the loop between learning and evolution: an improvement to a kernel is immediately an improvement to the search, and search traces are immediately training data for the kernel.
+
+**Expected improvement per generation.** Let $f_t^\star = \max_{p \in P_t} f(p)$ be the incumbent, and suppose one generation draws children $c_1, \ldots, c_m$ from selected kernels, with $F_k(u) = \Pr[f(c_k) \le u]$ the fitness CDF of child $k$. Assume the children are drawn independently given the parent population, so that the CDF of the generation's best child factorizes as $\Pr[\max_k f(c_k) \le u] = \prod_k F_k(u)$; this is the one substantive assumption below, and it is what an asynchronous search that samples parents and operators independently is designed to approximate. Since selection is elitist, the incumbent improves by $(\max_k f(c_k) - f_t^\star)^+$, and the identity $\mathbb{E}[(X - a)^+] = \int_a^\infty (1 - F_X(u))\,du$ gives
+
+$$
+\Delta_t \;=\; \mathbb{E}\!\left[\max\!\Big(f_t^\star, \max_k f(c_k)\Big) - f_t^\star\right]
+\;=\; \int_{f_t^\star}^{\infty} \left(1 - \prod_{k=1}^{m} F_k(u)\right) du .
+$$
+
+Two things follow. First, $\Delta_t$ depends only on the kernels' upper tails above the incumbent, so raising tail mass (a better model) and composing more or better-chosen operator calls (a better search framework) are two substitutable routes to the same quantity, which is exactly the pair of axes the paper ablates. Second, progress stalls when $F_k(f_t^\star) \to 1$ for every available kernel: no reachable child beats the incumbent, and only an operator whose support extends beyond the current neighborhood can restart it.
+
+**Why Crossover changes the reachable set.** Encode a program by a signature $\phi(p) \in \{0,1\}^d$ over $d$ design decisions (feature blocks, model family, validation scheme, ensembling, and so on). Improve and Debug are local: a single model call edits a bounded number of components, so both place essentially all their mass inside an edit ball $B_r(p) = \{q : d_H(\phi(q), \phi(p)) \le r\}$ for small $r$. The one-step reachable support of a unary-only search is therefore a union of balls, $R_1^{\mathrm{ID}}(P) = \bigcup_i B_r(p_i)$. Crossover adds the recombination span
+
+$$
+\mathrm{span}(p_a, p_b) = \big\{\, q : \phi(q)_\ell \in \{\phi(p_a)_\ell, \phi(p_b)_\ell\} \ \ \forall \ell \,\big\},
+\qquad |\mathrm{span}(p_a, p_b)| = 2^{h}, \quad h = d_H(\phi(p_a), \phi(p_b)).
+$$
+
+If $h > 2r$, pick $q$ that agrees with $p_a$ on half the differing coordinates and with $p_b$ on the other half; then $d_H(q, p_a) = d_H(q, p_b) = h/2 > r$, so $q$ lies in the span but outside every ball. The span is thus not contained in $R_1^{\mathrm{ID}}(P)$, and it grows exponentially in the population's diversity $h$. Reaching such a $q$ with unary operators alone takes at least $\lceil h/(2r) \rceil$ sequential accepted steps, and under greedy acceptance that path is simply blocked whenever the intermediate configurations score worse than either parent, which is the normal case for a half-migrated pipeline that no longer runs. Crossover crosses that valley in one evaluation. This is the formal sense in which it changes what the search can reach, not merely how fast it arrives.
+
+**Results.** On MLE-Bench Lite under a 12-hour per-task budget, on a single RTX 4090 capped at 12 GB of VRAM, Frontis-MA1 (35B) with OpenMLE-Evo raises Medal Average from 39.39% to 60.61% over its own base model, and reaches 71.21% with OpenMLE-Evo-Max, which adds benchmark-independent experience priors and asynchronous search. The paper reports that this places the system above GPT-5.5 with Codex and close to both GPT-5.6 Sol and the 2.8T Kimi K3, a striking placement for a 35B model on one consumer card; the hardware cap matters as much as the score, because it puts replication within reach of anyone with a desktop GPU.
+
+The evidence that separates the two contributions is the transfer ablation on the held-out NatureBench Lite, and it is best read as one chain of three configurations rather than as two independent comparisons with a shared baseline. Base model, no Evo: 20% Match-SOTA. Base model, plus OpenMLE-Evo: 50%. Trained model, plus OpenMLE-Evo: 70%. The framework swap is thus the 20 to 50 step and the model swap is the 50 to 70 step, and the two sentences the paper states them in share the middle cell, not the baseline. Neither component alone explains the system, and both transfer off the benchmark they were developed on. Model weights and the full stack are released.
+
+The simulation below reproduces that decomposition on a synthetic landscape. Programs are component signatures in $\{0,1\}^{48}$, fitness counts assembled components, and each operator call costs one evaluation against a fixed budget. The model axis varies how often an Improve proposal lands, how often it breaks the program, and how often Debug repairs it; the framework axis switches Crossover on and off.
+
+```{python}
+#| label: fig-497-operator-algebra-ablation
+#| fig-cap: "Program-evolution search under a fixed evaluation budget, averaged over 60 seeds. Dashed curves use Improve and Debug only; solid curves add Crossover. Training the operators (grey to blue) and adding recombination to the search (grey to orange) each buy a comparable share of the gain, and the two compose."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+N_COMP, POP, BUDGET, SEEDS = 48, 8, 560, 60
+
+# Operator quality profiles: the trained agent's Improve proposals land more
+# often (p_hit), break the program less often (p_break), and its Debug repairs
+# a broken program more reliably (p_fix). This is the model axis.
+BASE = dict(p_hit=0.18, p_break=0.35, p_fix=0.40)
+TRAINED = dict(p_hit=0.34, p_break=0.12, p_fix=0.85)
+
+def evolve(p_hit, p_break, p_fix, use_crossover, seed, p_x=0.5):
+    """Population search over programs encoded as signatures in {0,1}^d.
+    Fitness counts correctly assembled components; one evaluation is charged
+    per operator call, mirroring a fixed compute budget per task."""
+    rng = np.random.default_rng(seed)
+    pop = (rng.random((POP, N_COMP)) < 0.05).astype(np.int8)      # Draft
+    fit = pop.sum(axis=1).astype(float)
+    broken = np.zeros(POP, dtype=bool)
+    curve = np.empty(BUDGET)
+    best = fit.max()
+    curve[:POP] = best
+    for t in range(POP, BUDGET):
+        i = int(rng.integers(POP))
+        # Crossover may only recombine two working programs. A broken program
+        # carries fitness 0.0, so pulling components out of one would hand the
+        # framework arm a free repair path that Improve and Debug do not have.
+        partners = np.flatnonzero(~broken)
+        partners = partners[partners != i]
+        do_crossover = (use_crossover and not broken[i]
+                        and partners.size > 0 and rng.random() < p_x)
+        if broken[i]:                                             # Debug
+            if rng.random() < p_fix:
+                broken[i] = False
+                fit[i] = float(pop[i].sum())
+        elif do_crossover:                                        # Crossover
+            ja, jb = (int(v) for v in rng.choice(partners, size=2))
+            j = ja if fit[ja] >= fit[jb] else jb
+            take_i = rng.random(N_COMP) < 0.5
+            child = np.where(take_i, pop[i], pop[j]).astype(np.int8)
+            child_fit = float(child.sum())
+            if child_fit >= fit[i]:
+                pop[i], fit[i] = child, child_fit
+        else:                                                     # Improve
+            missing = np.flatnonzero(pop[i] == 0)
+            if missing.size and rng.random() < p_hit:
+                child = pop[i].copy()
+                child[missing[rng.integers(missing.size)]] = 1
+                pop[i] = child
+                if rng.random() < p_break:
+                    broken[i], fit[i] = True, 0.0
+                else:
+                    fit[i] = float(child.sum())
+        best = max(best, fit.max())
+        curve[t] = best
+    return curve / N_COMP
+
+arms = {
+    ("base", False): ("base model, no Crossover", "#9aa5b1", "--"),
+    ("trained", False): ("trained model, no Crossover", "#3b6ea5", "--"),
+    ("base", True): ("base model, full Evo", "#c98a3a", "-"),
+    ("trained", True): ("trained model, full Evo", "#2e7d5b", "-"),
+}
+profiles = {"base": BASE, "trained": TRAINED}
+curves = {k: np.stack([evolve(use_crossover=k[1], seed=s, **profiles[k[0]])
+                       for s in range(SEEDS)]).mean(axis=0) for k in arms}
+
+baseline = curves[("base", False)][-1]
+rows = [("baseline (base model, Improve/Debug only)", ("base", False)),
+        ("model swap only (framework fixed)", ("trained", False)),
+        ("framework swap only (model fixed)", ("base", True)),
+        ("both (trained model + full Evo)", ("trained", True))]
+print(f"{'arm':44}{'assembly score':>16}{'delta':>9}")
+for label, key in rows:
+    s = curves[key][-1]
+    d = "." if key == ("base", False) else f"{100 * (s - baseline):+.1f}"
+    print(f"{label:44}{100 * s:>15.1f}%{d:>9}")
+
+fig, ax = plt.subplots(figsize=(6.4, 3.9))
+for key, (label, color, style) in arms.items():
+    ax.plot(np.arange(BUDGET), 100 * curves[key], style, color=color,
+            lw=1.8, label=label)
+ax.set_xlabel("evaluation budget (operator calls)")
+ax.set_ylabel("best-of-population assembly score (%)")
+ax.set_title("Trained operators and Crossover search contribute separately")
+ax.legend(loc="lower right", fontsize=8, frameon=False)
+ax.grid(alpha=0.25, lw=0.6)
+fig.tight_layout()
+plt.show()
+```
+
+The printed table has the shape the paper reports. Against a baseline of 37.7% of components assembled at the end of the budget, the model swap alone adds 27.8 points, the framework swap alone adds 24.1 points, and running both adds 51.2 points, near the sum of the two. Each axis alone buys a large fraction of the gain, the framework swap somewhat less than the model swap here, and the two together land well above either. The curves show why: without Crossover the eight lineages are eight independent hill climbs and the best of them is all the search can offer, so the budget is spent solving the same components eight times over; with Crossover, components solved in different lineages are pooled into one program for the price of a single evaluation.
+
+One caveat about what this toy does and does not illustrate. Its fitness simply counts assembled components, so it is additive and monotone in the signature and the landscape has no valleys: every target configuration is already reachable by unary Improve alone, given enough budget. What the simulation demonstrates is therefore the *budget* consequence of recombination, not an enlargement of the reachable set. The reachable-set separation proved above requires a landscape in which the intermediate configurations along a unary path score worse than either parent, so greedy acceptance blocks the path outright, and this toy deliberately has no such intermediates.
+
+**What this does and does not show.** It is worth being careful about the size of the claim. What the system demonstrates is measurable self-improvement at machine learning engineering, on a fixed benchmark suite, under a verifiable and cheaply computable reward, with a human-designed operator set and a human-designed training pipeline. That is a bounded slice of RSI, and it is bounded in the way that makes it tractable: the outer loop that decided there should be four operators, that chose the SFT and RL recipes, and that built the Gym, did not improve itself. What is genuinely new is that the slice is now executable and open, so the loop can be measured rather than argued about, and the transfer ablation shows the gains are not purely benchmark-fitted. The gap between "an agent that gets better at building models" and "an agent that recursively improves its own capacity to improve" remains, and closing it would require the update operator to start rewriting the parts of the stack that are currently fixed. The open questions flagged in @sec-self-improvement-taxonomy, reward hacking of the verification signal, credit assignment across nested loops, and gating on recursive self-modification, all apply here with more force, not less, precisely because this loop actually runs.
 
 ## References
 
@@ -347,3 +501,7 @@ Understanding when model self-evaluation is trustworthy, and designing hybrid ar
 3. Gou, Z., Shao, Z., Gong, Y., Shen, Y., Yang, Y., Duan, N., & Chen, W. (2023). CRITIC: Large Language Models Can Self-Correct with Tool-Interactive Critiquing. *arXiv preprint arXiv:2305.11738*. https://arxiv.org/abs/2305.11738
 
 4. Sun, Z., Shen, Y., Zhou, Q., Zhang, H., Chen, Z., Cox, D., ... & Gan, C. (2023). Principle-Driven Self-Alignment of Language Models from Scratch with Minimal Human Supervision. *arXiv preprint arXiv:2310.01798*. https://arxiv.org/abs/2310.01798
+
+5. Ren, Z., Chen, Y., Guo, D., Rong, G., Li, T., Xiong, R. B., ... & Schmidhuber, J. (2026). Self-Improvements in Modern Agentic Systems: A Survey. *arXiv preprint arXiv:2607.13104*. https://arxiv.org/abs/2607.13104
+
+6. Yang, J., Jiang, C., Fu, Y., Luo, T., Ren, C., Wang, W., ... & Zhang, K. (2026). Frontis-MA1: Training an AI4AI Model towards Recursive Self-Improvement in Machine Learning Engineering. *arXiv preprint arXiv:2607.28568*. https://arxiv.org/abs/2607.28568

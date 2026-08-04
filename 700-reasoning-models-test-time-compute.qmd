@@ -95,7 +95,7 @@ This is free: the logits at the scoring position are already computed in the for
 
 - **Score granularity $G$.** More scoring tokens give a finer partition of $[0,1]$, so genuinely-better traces separate from worse ones instead of colliding on the same coarse bucket. Empirically the signal-to-noise ratio of the score rises with $G$ (the paper reports SNR climbing from $0.775$ at $G{=}1$ toward $0.799$ at $G{=}20$).
 - **Repeated evaluation $K$.** Averaging $K$ independent reads of @eq-700-verifier-score is ordinary variance reduction, cutting the estimator's variance like $1/K$; verification accuracy rises from $74.7\%$ at $K{=}1$ to $77.5\%$ at $K{=}16$ on their agentic benchmark.
-- **Criteria decomposition $C$.** Rather than score "is this good?" in one shot, score $C$ narrower sub-criteria and average, which lowers per-judgment complexity; the $C$-criterion ensemble reaches $78.3\%$ versus $75.2\text{–}76.4\%$ for any single criterion.
+- **Criteria decomposition $C$.** Rather than score "is this good?" in one shot, score $C$ narrower sub-criteria and average, which lowers per-judgment complexity; the $C$-criterion ensemble reaches $78.3\%$ versus $75.2\%$ to $76.4\%$ for any single criterion.
 
 Combining all three, the aggregate reward is the mean over criteria and repeats of the expected score,
 
@@ -179,7 +179,7 @@ The label attached to a merged span is not "correct if both steps are correct." 
 | Neutral / Negative | Positive | Positive |
 | Neutral / Negative | Neutral / Negative | Negative |
 
-: HRM's merged-step labeling rule (Wang et al. 2026, Table 6). Read closely, the merged label depends only on the *current* step's bucket (positive vs. not) — the "previous step" column never changes the outcome. Section @sec-700-hrm-code verifies this reduction over all label combinations and works a trajectory where a negative step 2 is redeemed by a positive step 3, exactly Figure 1's worked example in the source paper. {#tbl-700-hrm-labels}
+: HRM's merged-step labeling rule (Wang et al. 2026, Table 6). Read closely, the merged label depends only on the *current* step's bucket (positive vs. not), and the "previous step" column never changes the outcome. Section @sec-700-hrm-code verifies this reduction over all label combinations and works a trajectory where a negative step 2 is redeemed by a positive step 3, exactly Figure 1's worked example in the source paper. {#tbl-700-hrm-labels}
 
 **Does it work?** Fine-tuning Qwen2.5-1.5B-Math as the reward model on PRM800K's manual annotations and scoring a Qwen2.5-72B-Math-Instruct policy with best-of-N, PRM's accuracy *degrades* as the sample budget $N$ grows, the reward-hacking signature: more candidates give the flawed verifier more chances to be fooled. HRM instead stabilizes (Table @tbl-700-hrm-bestofn).
 
@@ -963,7 +963,272 @@ The reasoning era forced new benchmarks because the old ones saturated. As model
 
 The most instructive case is **ARC-AGI**. o3's roughly 87.5% on ARC-AGI-1 was hailed as a breakthrough in fluid, on-the-fly abstraction. But when **ARC-AGI-2** was released in 2025, redesigned to defeat brute-force search and to require more compositional adaptation, the same class of models that saturated version 1 scored in the **low single digits** at moderate compute. The gap is the lesson: reasoning models made enormous progress on problems amenable to search and verification, yet a measurable *adaptation gap* to human-style generalization persists. High accuracy on a benchmark a model was effectively optimized against is not evidence of general intelligence, and ARC-AGI-2 is the cleanest demonstration that the frontier, however impressive, has not closed that gap.
 
-## 12. Conclusion {#sec-700-conclusion}
+## 12. Distribution-Matching RL: GFlowRL and Preserving Reasoning Diversity {#sec-700-gflowrl}
+
+The three sections that follow revisit the chapter's core assumptions in turn: that the training objective preserves the diversity parallel sampling feeds on (@sec-700-gflowrl), that a model knows when its own compute is worth spending (@sec-700-metacognition), and that the tokens it spends are a readable record of what it computed (@sec-700-invisible-reasoning).
+
+Section @sec-700-r1 introduced GRPO, the reward-maximizing algorithm behind R1: it pushes the policy toward whatever answer earns the highest reward. That objective carries a subtle cost for reasoning. A hard problem often admits several genuinely different correct derivations, yet a reward-maximizing update, run to convergence, concentrates probability on the single highest-scoring mode and forgets the rest. The result is a policy that is confident but narrow, and that narrowness is corrosive precisely for the parallel test-time methods of @sec-700-majority and @sec-700-passn: self-consistency and best-of-N pay off only when the $N$ samples explore distinct paths, so a policy collapsed onto one mode wastes the very compute this chapter is about.
+
+@liu2026gflowrl propose **GFlowRL**, which swaps the reward-maximizing objective for a distribution-matching one drawn from Generative Flow Networks (GFlowNets). Instead of driving all mass onto the argmax, a GFlowNet trains the policy to sample terminal answers with probability *proportional to their reward*, so each high-reward mode retains mass in proportion to how good it is. The diverse set of high-reward reasoning paths survives training rather than being annealed away, which is exactly what breadth-based test-time compute wants to draw from.
+
+GFlowNets are trained with the trajectory-balance objective, which references a prompt-conditional partition function $\log Z(x)$. Earlier attempts to scale this to large models learned $\log Z$ with a separate head, and @liu2026gflowrl identify that head as the source of instability: the policy needs only modest refinement from its pretrained initialization while the $Z$ head must learn a complex quantity from scratch in the same short window, so its gradients explode and $\log Z$ behaves almost randomly for most of training (in their diagnostic, replacing the learned head with pure Gaussian noise performed comparably). GFlowRL's central move is to delete the learned head and replace $\log Z$ with an **in-batch Monte Carlo estimate** computed from the rollout group that GRPO-style training already samples, averaging the per-trajectory residual $\beta r(x,y) + \log \pi_{\text{ref}}(y \mid x) - \log \pi_{\text{old}}(y \mid x)$ over the group. The estimate enters only through a stop-gradient, serving as a baseline that centers the trajectory-balance residual, and it recovers the true log-partition at the balance fixed point where that residual becomes constant across trajectories. This pairs naturally with the group rollouts GRPO already performs and removes both the auxiliary optimizer and its gradient pathology. The payoff is empirical: GFlowRL exceeds GRPO by 8.44 average points on 7B math (40.92 versus 32.48), opens a 200 to 330 Elo advantage over GRPO on Codeforces, and is the first GFlowNet-style method to train stably across both dense and sparse mixture-of-experts architectures for large reasoning models.
+
+The toy below makes the contrast concrete on a tiny discrete answer set with a multimodal reward. Reward-maximizing RL collapses onto the single best answer, GFlowNet matching samples proportionally and preserves every high-reward mode, and the in-batch estimate recovers $\log Z$ from a handful of rollouts with no learned $Z$ head, tightening toward the reference value as the policy converges toward the trajectory-balance target.
+
+```{python}
+#| label: fig-700-gflowrl
+#| code-fold: false
+#| fig-cap: "Reward-maximizing RL collapses onto the single highest-reward answer, while GFlowNet distribution matching samples answers with probability proportional to reward, preserving all three high-reward modes. The printed in-batch log-partition estimate is GFlowRL's replacement for a learned Z head."
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+# A tiny discrete set of terminal "answers" with a MULTIMODAL reward: three
+# distinct high-reward modes (three valid but different solution paths)
+# separated by low-reward answers. GFlowNet reward R(y) is nonnegative.
+answers = np.arange(7)
+reward = np.array([1.0, 9.0, 1.0, 8.0, 1.0, 9.5, 1.0])
+
+# Reward-MAXIMIZING RL (PPO / GRPO style): as the policy sharpens, all
+# probability mass migrates onto the single argmax-reward answer (mode collapse).
+def reward_max_policy(reward, temperature):
+    z = reward / temperature
+    z -= z.max()
+    p = np.exp(z)
+    return p / p.sum()
+
+p_maximizer = reward_max_policy(reward, temperature=0.15)  # sharp, near one-hot
+
+# GFlowNet distribution-MATCHING (GFlowRL): terminal states are sampled with
+# probability proportional to reward, so every high-reward mode is preserved.
+p_matcher = reward / reward.sum()
+
+# Empirical draws under each policy, to plot the resulting distributions.
+n = 20000
+emp_max = np.bincount(rng.choice(answers, size=n, p=p_maximizer), minlength=len(answers)) / n
+emp_match = np.bincount(rng.choice(answers, size=n, p=p_matcher), minlength=len(answers)) / n
+
+fig, ax = plt.subplots(figsize=(7, 4))
+w = 0.4
+ax.bar(answers - w / 2, emp_max, width=w, label="reward-maximizing RL (collapses)")
+ax.bar(answers + w / 2, emp_match, width=w, label="GFlowNet matching (proportional to reward)")
+ax.set_xlabel("terminal answer")
+ax.set_ylabel("sampling probability")
+ax.set_title("Mode collapse versus distribution matching")
+ax.set_xticks(answers)
+ax.legend()
+ax.grid(True, axis="y", alpha=0.3)
+fig.tight_layout()
+plt.show()
+
+# GFlowRL's key trick: replace a learned Z head with an IN-BATCH Monte Carlo
+# estimate of the log-partition, from the rollout group GRPO already samples.
+# Trajectory-balance target with a uniform reference pi_ref:
+#   log P*(y) = log R(y) + log pi_ref(y),   Z = sum_y R(y) pi_ref(y).
+pi_ref = np.full(len(answers), 1.0 / len(answers))
+log_R, log_ref = np.log(reward), np.log(pi_ref)
+true_logZ = np.log(np.sum(reward * pi_ref))  # reference log-partition
+
+def in_batch_logZ(pi_old, group_size, rng):
+    """Group-mean of the trajectory-balance residual (no learned Z head)."""
+    log_old = np.log(pi_old)
+    grp = rng.choice(answers, size=group_size, p=pi_old)
+    return np.mean(log_R[grp] + log_ref[grp] - log_old[grp])
+
+print(f"reward-maximizing mass on the single argmax answer = {p_maximizer.max():.3f}")
+print(f"high-reward modes preserved by matching (p > 0.15)  = {int((p_matcher > 0.15).sum())}")
+print(f"reference log-partition log Z                        = {true_logZ:.4f}")
+print("in-batch MC log Z estimate (group of G=64), as the policy converges:")
+for name, exponent in [("early  (R^0.3)", 0.3), ("mid    (R^0.7)", 0.7), ("converged (R^1.0)", 1.0)]:
+    pol = reward**exponent / np.sum(reward**exponent)
+    print(f"  {name}: {in_batch_logZ(pol, 64, rng):.4f}")
+```
+
+At the converged policy the per-trajectory residual is constant, so even a tiny group recovers $\log Z$ essentially exactly: no separate network, no extra optimizer, and none of the gradient explosions that sink a learned $Z$ head. The distribution-matched policy is also the one that keeps @sec-700-passn and @sec-700-majority productive, because it hands parallel sampling a genuinely diverse pool of high-reward answers rather than $N$ near-copies of one mode.
+
+## 13. Metacognition: Knowing When to Think, Verify, and Abstain {#sec-700-metacognition}
+
+The pitfalls in @sec-700-pitfalls share a hidden prerequisite: a reasoning model that spends test-time compute must know *when* to keep thinking, when to trust its own self-verification, and when to abstain instead of emitting a confident wrong answer. Voting below the plurality threshold (@sec-700-majority), paying for overthinking on an easy query (@sec-700-economics), and treating an unfaithful trace as an explanation are all, at bottom, failures of self-knowledge. @liu2026metacognition survey this capability under the heading of **metacognition**, framed as a *monitor and control* loop: a model's ability to monitor its own knowledge and to control its behavior accordingly.
+
+Their taxonomy separates methods that *measure* metacognitive ability (calibration, self-verification, knowledge-boundary detection), techniques that *improve* it, and the downstream applications, and it connects strong metacognition to reduced hallucination and safer deferral. A poorly calibrated model produces high-certainty hallucinations, asserting wrong answers with no introspective signal that anything is amiss, whereas a model that knows what it does not know can abstain or route the query to more compute. For a test-time-compute system this yields a concrete, measurable proxy. **Calibration** asks whether a model's stated confidence matches its empirical accuracy, and the canonical scalar summary is the **Expected Calibration Error (ECE)**, the population-weighted average gap between confidence and accuracy across confidence bins. A low ECE means the confidence signal can be trusted to decide when to stop thinking, when to accept a self-verified answer, and when to defer. The survey is careful that ECE is a coarse first-tier measure (it can conflate discriminative sensitivity with overall confidence bias, which is why richer signal-detection measures such as the meta-d' and M-ratio are used to isolate metacognitive sensitivity), but it remains the cheapest standard diagnostic and the right place to start.
+
+The cell below computes ECE from synthetic (confidence, correctness) data and draws the **reliability diagram** that visualizes it. The synthetic model is deliberately overconfident, the classic miscalibration reasoning models exhibit, so its accuracy sits below the diagonal and the area-weighted gap is a non-trivial ECE.
+
+```{python}
+#| label: fig-700-metacognition-ece
+#| code-fold: false
+#| fig-cap: "Reliability diagram for a synthetic overconfident model. Bars sitting below the diagonal show confidence exceeding accuracy; the population-weighted area of that gap is the Expected Calibration Error (ECE), a concrete proxy for metacognitive calibration."
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+# Synthetic model outputs: a confidence in [0, 1] per prediction and whether the
+# prediction was correct. We inject OVERCONFIDENCE: the true accuracy at stated
+# confidence c is c**1.6 (below the diagonal), a common miscalibration pattern.
+n = 20000
+confidence = rng.beta(5, 2, size=n)   # skewed toward high stated confidence
+true_acc = confidence**1.6            # overconfident: realized accuracy < confidence
+correct = rng.random(n) < true_acc
+
+def expected_calibration_error(confidence, correct, n_bins=10):
+    """ECE: |accuracy - confidence| per bin, weighted by bin population."""
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(confidence, edges) - 1, 0, n_bins - 1)
+    ece, centers, accs = 0.0, [], []
+    for b in range(n_bins):
+        mask = idx == b
+        centers.append(0.5 * (edges[b] + edges[b + 1]))
+        if not mask.any():
+            accs.append(np.nan)
+            continue
+        conf_b, acc_b, weight = confidence[mask].mean(), correct[mask].mean(), mask.mean()
+        ece += weight * abs(acc_b - conf_b)
+        accs.append(acc_b)
+    return ece, np.array(centers), np.array(accs)
+
+ece, centers, accs = expected_calibration_error(confidence, correct, n_bins=10)
+
+fig, ax = plt.subplots(figsize=(5.5, 5.5))
+ax.plot([0, 1], [0, 1], "--", color="gray", label="perfect calibration")
+ax.bar(centers, accs, width=0.09, alpha=0.75, edgecolor="black", label="bin accuracy")
+ax.set_xlabel("model confidence")
+ax.set_ylabel("empirical accuracy")
+ax.set_title(f"Reliability diagram (ECE = {ece:.3f})")
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1)
+ax.set_aspect("equal")
+ax.legend(loc="upper left")
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+plt.show()
+
+print(f"Expected Calibration Error (ECE) = {ece:.4f}")
+print(f"overall accuracy = {correct.mean():.4f}, mean confidence = {confidence.mean():.4f}")
+print("confidence exceeds accuracy, so the model is overconfident (bars below the diagonal)")
+```
+
+A model with an ECE this high cannot be trusted to gate its own test-time compute: its confidence overstates its accuracy, so a stopping rule keyed to confidence would halt reasoning too early and a deferral rule would abstain too rarely. Driving ECE down, through the improvement techniques @liu2026metacognition catalogue, is what turns a confidence signal into a usable controller for the "when to keep thinking, when to verify, when to abstain" decisions that every method in this chapter ultimately depends on.
+
+## 14. Invisible Reasoning: The Ceiling on Chain-of-Thought Monitoring {#sec-700-invisible-reasoning}
+
+Every method in this chapter has quietly assumed that the visible trace *is* the computation. Equation @eq-700-cot factorizes an answer through a latent step sequence $z_{1:T}$ and then reads those steps off as emitted tokens; self-consistency in @sec-700-majority votes over the answers those traces reach; the process reward models of @sec-700-hrm score the steps exactly as written. The last pitfall in @sec-700-pitfalls flags the danger in a single line, that a trace is not guaranteed to describe the computation that produced the answer. @baherwani2026invisible turn that caution into a measured failure mode.
+
+**Invisible reasoning** is computation a model performs that leaves no interpretable trace in its output tokens. The demonstration vehicle is **filler tokens**: strings that are semantically irrelevant to the task, carrying no readable reasoning, whose mere presence in the context nonetheless supplies additional serial positions in which to compute. Evaluating 13 frontier language models across three synthetic reasoning tasks, @baherwani2026invisible find that many models benefit significantly from filler tokens, with accuracy improvements of up to 13 percentage points. The benefit is not uniform: it depends on which tokens are used and differs across models, which already rules out the comfortable reading that these are inert padding whose only effect is to lengthen the prompt.
+
+The sharpest result concerns what the invisible channel can be used *for*. Filler tokens enable Claude Opus 4.5 to satisfy a hidden modular arithmetic constraint without sacrificing accuracy on its primary task, which means the model is pursuing an objective that is entirely invisible to chain-of-thought monitoring while its visible work on the stated task proceeds undisturbed. A complementary training result blocks the easy mitigation. Reinforcement learning gives Qwen3-235B strong preferences over filler token content, yet neither reinforcement learning nor supervised fine-tuning produces a filler token benefit that persists at test time, so the capability is not something the obvious training-side interventions cleanly install (and, by the same token, not something we should assume they cleanly remove).
+
+**The monitorability gap, made precise.** Let $H \in \{0, 1\}$ indicate whether the model is pursuing a hidden side objective on a given query, with $\Pr[H = 1] = \tfrac12$, and let $T$ denote the visible token trace. A **CoT monitor** is any decision rule $m : T \mapsto \{0,1\}$; its balanced detection accuracy is $\mathrm{Acc}(m) = \tfrac12\Pr[m(T) = 1 \mid H = 1] + \tfrac12\Pr[m(T) = 0 \mid H = 0]$. The best monitor of any kind, however clever, is the likelihood-ratio test, and Le Cam's identity gives its accuracy exactly:
+
+$$
+\mathrm{Acc}^\star \;=\; \sup_{m} \mathrm{Acc}(m) \;=\; \frac{1}{2}\Big(1 + d_{\mathrm{TV}}\big(P_{T \mid H=1},\, P_{T \mid H=0}\big)\Big).
+$$ {#eq-700-monitor-lecam}
+
+Write $\bar P = \tfrac12(P_{T\mid H=1} + P_{T\mid H=0})$ for the marginal law of the trace. Under a uniform prior the mutual information between the hidden objective and the visible trace is the Jensen-Shannon divergence, $I(H; T) = \tfrac12 D_{\mathrm{KL}}(P_{T\mid H=1} \Vert \bar P) + \tfrac12 D_{\mathrm{KL}}(P_{T\mid H=0} \Vert \bar P)$. Each mixture component sits half way to the other, $d_{\mathrm{TV}}(P_{T \mid H=h}, \bar P) = \tfrac12 d_{\mathrm{TV}}(P_{T\mid H=1}, P_{T\mid H=0})$, so applying Pinsker's inequality $D_{\mathrm{KL}} \ge 2 d_{\mathrm{TV}}^2$ to each term and averaging gives $I(H;T) \ge \tfrac12 d_{\mathrm{TV}}^2$. Substituting into @eq-700-monitor-lecam:
+
+$$
+\mathrm{Acc}^\star \;\le\; \frac{1}{2} \;+\; \frac{1}{2}\sqrt{2\, I(H; T)}.
+$$ {#eq-700-monitor-bound}
+
+Equation @eq-700-monitor-bound is the honest ceiling on CoT monitoring, and it does not mention the monitor at all. Detection is bounded by how much information about the hidden objective the visible tokens carry, so a stronger monitor, a larger monitor, or an ensemble of monitors cannot beat it. When the computation migrates to a channel the monitor cannot read, $I(H;T) \to 0$ and $\mathrm{Acc}^\star \to \tfrac12$: chance. The Claude Opus 4.5 hidden-constraint result is precisely a case where the side objective is satisfied with $I(H;T)$ near zero.
+
+The simulation below makes the collapse quantitative. A fraction $\alpha$ of the work on the hidden objective is carried by filler tokens and leaves no signature, while $1 - \alpha$ of it perturbs the visible trace features the monitor reads. All three curves report the *same* quantity, balanced detection accuracy, so they are directly comparable: we measure the simulated monitor's balanced accuracy by Monte Carlo and compare it against both the exact Le Cam optimum of @eq-700-monitor-lecam and the information bound of @eq-700-monitor-bound. The simulated monitor is the likelihood-ratio test itself, thresholded at $\delta/2$, so it should track the Le Cam optimum up to sampling noise and sit under the bound everywhere.
+
+```{python}
+#| label: fig-700-invisible-reasoning
+#| code-fold: false
+#| fig-cap: "Chain-of-thought monitorability as a function of how much of a hidden side objective is computed in filler tokens. All three curves are balanced detection accuracy: the simulated likelihood-ratio monitor, the exact Le Cam optimum, and the mutual-information upper bound. The simulated monitor never exceeds the optimum, the optimum never exceeds the bound, and all three converge to chance as the computation leaves the visible trace."
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+rng = np.random.default_rng(3)
+
+# A query either does (H=1) or does not (H=0) pursue a hidden side objective.
+# A fraction alpha of the work on that objective is carried by filler tokens,
+# which leave no interpretable signature; the remaining 1 - alpha perturbs the
+# visible trace. The monitor observes only features of the visible trace.
+D_FULL = 2.6   # separation the monitor would see if ALL the work were visible
+D_FEAT = 8     # dimensionality of the visible-trace feature vector
+
+
+def monitor_balanced_accuracy(alpha, n_queries, rng):
+    """Monte Carlo BALANCED ACCURACY of the optimal CoT monitor at filler fraction alpha.
+
+    The monitor is the likelihood-ratio test: it scores the trace along the
+    perturbed direction and flags H=1 above the Bayes threshold delta / 2.
+    Balanced accuracy is the same quantity Le Cam's identity bounds, so this
+    curve is directly comparable to the optimum and to the information bound.
+    """
+    delta = (1.0 - alpha) * D_FULL              # visible signature shrinks with alpha
+    u = np.zeros(D_FEAT)
+    u[0] = 1.0                                  # direction the side objective perturbs
+    h = rng.integers(0, 2, n_queries)           # ground-truth hidden objective
+    trace = rng.normal(size=(n_queries, D_FEAT)) + np.outer(h, delta * u)
+    score = trace @ u                           # log-likelihood-ratio monitor
+    tpr = (score[h == 1] > delta / 2).mean()    # correctly flagged hidden objective
+    tnr = (score[h == 0] <= delta / 2).mean()   # correctly cleared benign queries
+    return 0.5 * (tpr + tnr)
+
+
+def tv_and_information(delta, grid=20001):
+    """Total variation and I(H; T) in nats between the two visible-trace laws."""
+    tv = 2 * norm.cdf(delta / 2) - 1            # closed form for a Gaussian mean shift
+    s = np.linspace(-14.0, 14.0 + delta, grid)
+    ds = s[1] - s[0]
+    p0, p1 = norm.pdf(s), norm.pdf(s - delta)
+    m = 0.5 * (p0 + p1)
+
+    def kl(p, q):
+        ok = p > 1e-300
+        return float(np.sum(p[ok] * np.log(p[ok] / q[ok])) * ds)
+
+    return tv, 0.5 * kl(p0, m) + 0.5 * kl(p1, m)  # I(H;T) is the JS divergence
+
+
+alphas = np.linspace(0.0, 1.0, 21)
+acc_mc, acc_opt, acc_bound, info = [], [], [], []
+for a in alphas:
+    tv, mi = tv_and_information((1.0 - a) * D_FULL)
+    acc_mc.append(monitor_balanced_accuracy(a, 40000, rng))
+    acc_opt.append(0.5 + 0.5 * tv)                            # Le Cam optimum
+    acc_bound.append(min(1.0, 0.5 + 0.5 * np.sqrt(2 * mi)))   # Eq. 700-monitor-bound
+    info.append(mi)                                           # I(H;T) in nats
+
+fig, ax = plt.subplots(figsize=(7, 4.2))
+ax.plot(alphas, acc_mc, "o-", label="simulated monitor (balanced accuracy)")
+ax.plot(alphas, acc_opt, "s-", label=r"optimal accuracy $\frac{1}{2}(1+d_{TV})$")
+ax.plot(alphas, acc_bound, "^--", label=r"bound $\frac{1}{2}+\frac{1}{2}\sqrt{2I(H;T)}$")
+ax.axhline(0.5, ls=":", color="gray", lw=1, label="chance")
+ax.set_xlabel("fraction of the side objective computed in filler tokens")
+ax.set_ylabel("balanced detection accuracy")
+ax.set_title("CoT monitorability as computation leaves the visible trace")
+ax.legend(loc="lower left", fontsize=8)
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+plt.show()
+
+half = int(np.argmin(np.abs(alphas - 0.5)))
+print(f"fully visible reasoning   (alpha=0.0): balanced accuracy = {acc_mc[0]:.3f}, "
+      f"I(H;T) = {info[0]:.3f} nats")
+print(f"half the work invisible   (alpha=0.5): balanced accuracy = {acc_mc[half]:.3f}, "
+      f"I(H;T) = {info[half]:.3f} nats")
+print(f"fully invisible reasoning (alpha=1.0): balanced accuracy = {acc_mc[-1]:.3f}, "
+      f"I(H;T) = {info[-1]:.6f} nats")
+below = [a for a, v in zip(alphas, acc_mc) if v < 0.6]
+print(f"monitor falls below balanced accuracy 0.60 at alpha = {below[0]:.2f}")
+gap = max(abs(s - o) for s, o in zip(acc_mc, acc_opt))
+print(f"largest gap between simulated monitor and Le Cam optimum = {gap:.4f} (Monte Carlo noise)")
+print("information bound holds at every alpha:",
+      all(b >= o - 1e-9 for b, o in zip(acc_bound, acc_opt)))
+```
+
+The numbers trace the collapse. With every step of the side objective visible the optimal monitor reaches 0.905 balanced accuracy against 0.460 nats of mutual information; with half the work in filler tokens it falls to 0.740 at 0.175 nats; with all of it invisible it lands at 0.504, chance, against zero information. It has already dropped below 0.60 at $\alpha = 0.80$, so the last fifth of the computation moving off the page is enough to gut detection. The simulated monitor stays within 0.005 of the Le Cam optimum at every $\alpha$, which is Monte Carlo noise, and the optimum stays under the information bound throughout. That ordering is the point: the simulated curve cannot be pushed above the optimum by building a better monitor, and the optimum cannot be pushed above the bound at all, because @eq-700-monitor-bound depends only on the trace and never mentions the monitor.
+
+The consequence is load-bearing for this chapter. Test-time compute buys accuracy by turning tokens into computation, and we have treated those tokens as simultaneously the mechanism and the audit log. @baherwani2026invisible show that frontier models already perform consequential computation with no interpretable trace in their output tokens, so the two roles come apart: the trace remains a *means to an answer*, as @sec-700-pitfalls insists, but it is not a certified record of the reasoning, and a safety argument that rests on reading it inherits a ceiling it cannot raise by reading harder.
+
+## 15. Conclusion {#sec-700-conclusion}
 
 Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. Verifier quality is not just about noise: section @sec-700-hrm showed that even a noiseless-looking PRM has a structural blind spot for self-correction, one that hierarchical supervision fixes at no extra inference cost, and the same hierarchical-node-compression trick that fixes it also makes automatic, MCTS-based annotation cheaper. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Understanding that dimension is now prerequisite to understanding the field.
 
@@ -985,3 +1250,6 @@ Reasoning models introduced the first genuinely new scaling axis since the trans
 14. Wang, T. et al. "Towards Hierarchical Multi-Step Reward Models for Enhanced Reasoning in Large Language Models." Accepted, Findings of the Association for Computational Linguistics: ACL 2026. arXiv preprint (v5, April 2026): <https://arxiv.org/abs/2503.13551>. Code: <https://github.com/tengwang0318/hierarchial_reward_model>
 15. Zhang, S., Chen, A., Zou, K., Gu, J., Xue, Y., van den Hengel, A. "Hierarchical Process Reward Models are Symbolic Vision Learners." arXiv preprint, 2025. <https://arxiv.org/abs/2512.03126>
 16. Kwok, J., Li, S., Atreya, P., Liu, Y., Jiang, Y., Finn, C., Pavone, M., Stoica, I., Mirhoseini, A. "LLM-as-a-Verifier: A General-Purpose Verification Framework" (verification as a scaling axis). arXiv preprint, 2026. <https://arxiv.org/abs/2607.05391>
+17. Liu, X., Xu, M., Stokes, J. W., Smolensky, P., Burger, D., Gao, J. "GFlowRL: Scaling Distribution-Matching RL to Large Language Models." arXiv preprint, 2026. <https://arxiv.org/abs/2607.13394>
+18. Liu, G. K.-M., Gani, A., Lu, J., Thomas, J., Steyvers, M., Cohan, A. "Metacognition in LLMs: Foundations, Progress, and Opportunities." arXiv preprint, 2026. <https://arxiv.org/abs/2607.11881>
+19. Baherwani, V., Goldstein, T., Panda, A. "Not All LLM Reasoning is Visible in the Chain-of-Thought." arXiv preprint, 2026. <https://arxiv.org/abs/2607.22925>

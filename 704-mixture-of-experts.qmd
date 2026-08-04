@@ -374,6 +374,122 @@ output, aux_loss, _ = moe_layer(hidden_states)
 
 The conceptual model is unchanged from the CPU implementation: route to top-k, gate, combine, and balance the load. Expert parallelism is purely a systems answer to the fact that the experts no longer fit on one device.
 
+### 7.7 Extreme Sparsity at Frontier Scale {#sec-704-extreme-sparsity}
+
+The toy layer above uses $E = 8$ experts with $k = 2$, the Mixtral-style setting that most tutorials adopt. A genuine frontier MoE looks nothing like that. @kimi2026k3 introduce Kimi K3, a 2.8 trillion parameter mixture of experts with roughly 104 billion activated parameters per token, native vision, and a one-million-token context window. Its **Stable LatentMoE** block, in the architecture description of that report, activates 16 of 896 routed experts per token, and the team reports about a 2.5x improvement in overall scaling efficiency over its predecessor together with fully released model weights, which makes it a rare case where the architecture of a frontier-class system is inspectable rather than inferred.
+
+The number worth pausing on is the sparsity. Write the **routing activation ratio** as $\rho_{\text{route}} = k/E$ and the **active parameter fraction** as $\rho_{\text{param}} = P_{\text{act}}/P_{\text{total}}$. For K3,
+
+$$
+\rho_{\text{route}} = \frac{16}{896} = \frac{1}{56} \approx 1.79\%,
+\qquad
+\rho_{\text{param}} = \frac{104 \times 10^{9}}{2.8 \times 10^{12}} \approx 3.71\%,
+$$
+
+against the textbook baseline of $2/8 = 25\%$ and Mixtral's $13/47 \approx 27.7\%$. Each comparison has its own baseline, so it is worth stating them separately. At the router, K3 is about fourteen times sparser than the 2-of-8 layer our code cells simulate ($25\% / 1.79\% \approx 14.0$). In parameters, K3 is about seven and a half times sparser than Mixtral ($27.7\% / 3.71\% \approx 7.5$), which is the right comparison because the toy layer has no full model attached and therefore no parameter fraction of its own. The active parameter fraction sits above the routing ratio for the usual reason: attention, embeddings, and any always-on dense components are paid by every token regardless of routing, so they dilute the sparsity of the expert bank.
+
+Extreme sparsity is not free, and the first bill arrives at load balancing. Take a batch of $N$ tokens routed top-$k$ over $E$ experts. Even with a perfectly unbiased router, the indicator that token $t$ selects expert $i$ is Bernoulli with probability $k/E$, so the per-expert load $L_i$ is marginally binomial:
+
+$$
+\mu = \mathbb{E}[L_i] = \frac{Nk}{E},
+\qquad
+\mathrm{Var}[L_i] = N\frac{k}{E}\Big(1 - \frac{k}{E}\Big),
+\qquad
+\mathrm{CV} = \sqrt{\frac{1 - k/E}{Nk/E}} \approx \frac{1}{\sqrt{\mu}}.
+$$
+
+Holding $N$ and $k$ fixed and growing $E$ shrinks $\mu$ proportionally, so the coefficient of variation grows like $\sqrt{E}$. At $N = 8192$ tokens, the 2-of-8 layer gives $\mu = 2048$ and, from the exact expression rather than the $1/\sqrt{\mu}$ approximation, $\mathrm{CV} = 1.9\%$; 16-of-896 gives $\mu \approx 146.3$ and $\mathrm{CV} = 8.2\%$. The approximation is fine once $k/E$ is small, but it overstates the spread by a factor $1/\sqrt{1 - k/E} \approx 1.15$ at $k/E = 0.25$, which is how $1.9\%$ turns into the $2.2\%$ one gets from $1/\sqrt{\mu}$; the table below prints the exact formula next to the measured value. This is pure sampling noise, before any of the routing collapse of Section 4 enters the picture. It is exactly why very sparse MoE needs stronger balancing than the auxiliary loss alone was designed for.
+
+The payoff is a **straggler** argument for expert parallelism. In the all-to-all scheme of Section 7.6, a training step cannot finish until the most heavily loaded expert finishes, so step time is set by $\max_i L_i$, not by the mean. Treating the loads as approximately Gaussian and weakly dependent, the expected maximum of $E$ such variables is about $\mu\,(1 + \mathrm{CV}\sqrt{2\ln E})$, giving a straggler factor
+
+$$
+S = \frac{\max_i L_i}{\mu} \approx 1 + \sqrt{\frac{2 \ln E}{\mu}}.
+$$
+
+Both terms move the wrong way as the model gets sparser: $\ln E$ rises in the numerator while $\mu = Nk/E$ falls in the denominator. At $N = 8192$ the formula gives $S \approx 1.04$ for the 2-of-8 layer and $S \approx 1.30$ for 16-of-896; the simulation below measures $1.025$ and $1.263$, because the Gaussian maximum runs slightly high for counts this discrete and for the mild negative dependence top-$k$ routing induces between experts. Read $S$ as an overhead on step time, not as an idle fraction: a measured $S = 1.263$ means every step takes twenty-six percent longer than the balanced ideal, so the average device spends $1 - 1/1.263 \approx 21\%$ of the step waiting on the slowest expert. A fifth of a frontier training fleet sitting idle is an enormous amount of hardware to leave on the table, and it is why balanced expert-parallel training is a real engineering claim in that work rather than a throwaway phrase. The same arithmetic sets the capacity factor of Section 5: the headroom needed to avoid dropping tokens is essentially $S$, so extreme sparsity forces either a larger capacity factor (padding waste) or a smarter balancer.
+
+The second bill arrives at inference, where extreme sparsity shifts the memory-to-FLOP ratio. An expert GEMM processing $m$ tokens in bfloat16 does about $2mP_e$ FLOPs while reading $2P_e$ bytes of weights, so its arithmetic intensity is simply $m$ FLOPs per byte, and $m = Nk/E$ is the tokens-per-expert figure above. A modern accelerator has a ridge point near 300 FLOPs per byte, so staying compute bound requires roughly $N \gtrsim 300\,E/k$ tokens in flight per expert-parallel group: about 1,200 for 2-of-8 but about 16,800 for 16-of-896. Below that, the layer is bandwidth bound and the sparsity buys latency but not throughput. Sparse models are therefore batch-hungry in a way dense models are not.
+
+The simulation below routes synthetic tokens with an unbiased router at four sparsity settings and measures the load spread and the straggler factor directly. The printed table is taken at the $N = 8192$ batch quoted above, with the measured coefficient of variation averaged over trials and the closed-form predictions alongside it.
+
+```{python}
+#| label: fig-704-extreme-sparsity
+#| fig-cap: "Straggler factor (max expert load divided by mean expert load) under a perfectly unbiased top-k router. Sparser configurations need far larger batches before routing noise averages out."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+SETTINGS = [(8, 2, "2 of 8 (Mixtral-style)"),
+            (64, 8, "8 of 64"),
+            (256, 8, "8 of 256"),
+            (896, 16, "16 of 896 (Kimi K3)")]
+BATCHES = [1024, 4096, 8192, 16384, 65536]
+REF = 8192                      # the batch size quoted in the text above
+TRIALS, CHUNK = 4, 4096
+
+
+def expert_loads(n_tokens, E, k, rng):
+    """Token counts per expert for an unbiased top-k router."""
+    counts = np.zeros(E, dtype=np.int64)
+    done = 0
+    while done < n_tokens:
+        m = min(CHUNK, n_tokens - done)
+        logits = rng.standard_normal((m, E), dtype=np.float32)
+        top = np.argpartition(-logits, k - 1, axis=1)[:, :k]
+        counts += np.bincount(top.ravel(), minlength=E)
+        done += m
+    return counts
+
+
+curves, ref_runs = {}, {}
+for E, k, name in SETTINGS:
+    row = []
+    for n in BATCHES:
+        runs = [expert_loads(n, E, k, rng) for _ in range(TRIALS)]
+        row.append(float(np.mean([c.max() / c.mean() for c in runs])))
+        if n == REF:
+            ref_runs[name] = runs
+    curves[name] = row
+
+hdr = (f"{'setting':>23} {'k/E':>7} {'tok/exp':>8} {'CV':>7} {'CV thy':>7} "
+       f"{'S':>6} {'S thy':>6}")
+print(f"at N = {REF:,} tokens per batch, {TRIALS} trials each\n{hdr}")
+for E, k, name in SETTINGS:
+    runs = ref_runs[name]                       # CV averaged over trials
+    mu = REF * k / E
+    cv = float(np.mean([c.std(ddof=1) / c.mean() for c in runs]))
+    s = float(np.mean([c.max() / c.mean() for c in runs]))
+    cv_thy = np.sqrt((1 - k / E) / mu)
+    s_thy = 1 + cv_thy * np.sqrt(2 * np.log(E))
+    print(f"{name:>23} {100 * k / E:6.2f}% {mu:8.1f} {cv:7.3f} {cv_thy:7.3f} "
+          f"{s:6.3f} {s_thy:6.3f}")
+
+print(f"\nstraggler factor at N = {BATCHES[-1]:,}: " + ", ".join(
+    f"{name} {curves[name][-1]:.3f}" for _, _, name in SETTINGS))
+print(f"active parameter fraction, Kimi K3:      {100 * 104e9 / 2.8e12:.2f}%")
+print(f"active parameter fraction, Mixtral 8x7B:  {100 * 13 / 47:.2f}%")
+for E, k, name in SETTINGS:
+    print(f"batch needed to stay compute bound, {name}: {int(300 * E / k):,} tokens")
+
+fig, ax = plt.subplots(figsize=(7.0, 4.2))
+for _, _, name in SETTINGS:
+    ax.plot(BATCHES, curves[name], marker="o", label=name)
+ax.axhline(1.0, ls="dashed", lw=1, color="gray")
+ax.set_xscale("log", base=2)
+ax.set_xlabel("tokens per batch (per expert-parallel group)")
+ax.set_ylabel("straggler factor (max load / mean load)")
+ax.set_title("Load imbalance from routing noise alone")
+ax.legend(frameon=False)
+fig.tight_layout()
+plt.show()
+```
+
+The 2-of-8 curve falls from 1.082 at 1,024 tokens to about 1.03 by 4,096, sits near that level through 16,384, and only reaches 1.011 at 65,536. Getting inside a couple of percent takes tens of thousands of tokens even in the easy configuration, but the tax is small enough throughout that the balancing problem looks solved in small demonstrations. The 16-of-896 curve starts at 1.914, near a factor of two, and is still paying a nine percent tax at 65,536 tokens per batch, a batch size no single device will see on its own. That gap is why frontier systems push balance into the router design, the capacity policy, and the parallelism strategy rather than relying on the auxiliary loss alone.
+
+This closes the loop on the tradeoff that opened the chapter. MoE decouples total capacity from per-token compute, and $\rho_{\text{route}}$ is the dial that sets how aggressively you exploit that decoupling. Turning it down toward two percent buys enormous capacity per unit of compute, which is precisely the scaling efficiency K3 reports. What you pay for it is not accuracy but engineering surface: a routing distribution whose noise floor grows like $\sqrt{E}$, a training step whose duration is set by the unluckiest expert, an inference regime that only reaches peak throughput at very large batch, and a memory footprint that still holds all 2.8 trillion parameters even though any one token touches under four percent of them. Sparsity is a compute discount financed by a systems debt, and the size of that debt is what separates a textbook MoE layer from a frontier one.
+
 ## 8. Pitfalls and When to Use
 
 **Routing collapse is the failure mode to watch.** Without an effective load-balancing loss the router concentrates tokens on a few experts and the rest never train. Monitor per-expert utilization during training, not just the loss curve; a healthy run keeps every expert busy. The auxiliary coefficient $\alpha$ is the main knob: too small and load drifts toward collapse, too large and balancing fights the language-modeling objective and degrades quality. The Switch value of $10^{-2}$ is a reasonable starting point.
@@ -397,3 +513,4 @@ The conceptual model is unchanged from the CPU implementation: route to top-k, g
 7. Rajbhandari, S. et al. "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale." 2022. https://arxiv.org/abs/2201.05596
 8. Zhou, Y. et al. "Mixture-of-Experts with Expert Choice Routing." Advances in Neural Information Processing Systems, 2022. https://arxiv.org/abs/2202.09368
 9. Bercovich, A. et al. "Nemotron-Labs-3-Puzzle-75B-A9B: Compressing Hybrid MoE LLMs." 2026. https://arxiv.org/abs/2607.04371
+10. Kimi Team. "Kimi K3: Open Frontier Intelligence." 2026. https://arxiv.org/abs/2607.24653

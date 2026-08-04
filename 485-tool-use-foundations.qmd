@@ -139,6 +139,206 @@ Effective tool use depends as much on tool design as on model capability. Four p
 
 **Parseable outputs.** Tool return values should be structured (JSON, typed dataclasses) rather than free text. Free-text returns require the model to parse natural language before reasoning over results, introducing an additional failure mode. Structured returns enable direct field access in subsequent reasoning.
 
+### Context Management as a Tool Rather Than a Harness Policy {#sec-485-context-editing-tools}
+
+The four principles above concern tools that reach outward, into the world. A less obvious application turns the same machinery inward. The agent's context window is itself a scarce resource, and the operations that manage it can be exposed as callable tools rather than hard-wired into the runtime loop. @li2026acm makes precisely this move with **Agentic Context Management (ACM)**, which equips agents with purpose-built context editing tools and lets the agent decide when to invoke them. Their diagnosis of the status quo is sharp: existing compression schemes lose information and fire on rigid heuristic rules, so the moment of compression is chosen by a policy that knows nothing about what the agent currently cares about.
+
+**A budgeted buffer.** Model the context as a buffer of capacity $B$ tokens into which each turn appends roughly $a$ tokens, so the window holds about $k = B/a$ turns of history. Define the **reuse distance** $D_i$ of an appended item as the number of turns between the moment it is written and the next turn at which it is actually needed. Under threshold truncation that drops the oldest entries, item $i$ is destroyed before its next use exactly when $D_i > k$, so the probability that a still-needed token has been evicted is simply the tail of the reuse distance distribution:
+
+$$\Pr[\text{loss}] = \Pr[D > k], \qquad k \approx B/a.$$
+
+This is a discouraging quantity, because reuse distances in long-horizon trajectories are heavy tailed. A file read in the opening minutes of a coding episode is consulted again after two hundred intervening turns; a search result is revisited after a long detour into an unrelated subgoal. If $D$ has a Pareto tail with index $\alpha$, then $\Pr[D > k] \propto k^{-\alpha}$, and for $\alpha$ near one, doubling the context budget barely halves the loss. Buying more window is a weak lever against a fat tail.
+
+**Eviction as a decision rather than a consequence.** Let $E_i \in \{0,1\}$ indicate that item $i$ leaves the working context before its next use, and $Y_i \in \{0,1\}$ indicate that item $i$ is in fact needed again. Expected unrecoverable loss over an episode is
+
+$$L = \sum_i \Pr[E_i = 1,\, Y_i = 1]\,(1 - r_i),$$
+
+where $r_i$ is the probability the content can be fetched back when the need arises. Threshold truncation is the degenerate corner of this expression: $E_i$ is a deterministic function of position alone, carrying no information about $Y_i$ beyond what recency itself implies, and $r_i = 0$ because destroyed content is destroyed. Each term collapses back to $\Pr[D > k]$.
+
+ACM attacks both factors independently. Offloading rather than deleting makes $r_i > 0$: discarded content is written to an external memory system and queried back on demand, so **lossless** here names a move rather than a drop. And letting the agent choose the moment makes $E_i$ a function of the agent's own belief about future use, introducing a correlation
+
+$$\rho = \mathrm{corr}(E, Y), \qquad \Pr[E = 1,\, Y = 1] = \mathbb{E}[E]\,\mathbb{E}[Y] + \rho\sqrt{\mathrm{Var}(E)\,\mathrm{Var}(Y)},$$
+
+between the eviction decision and the true future-use indicator that no positional rule can have. Read the second identity carefully, because the sign is the whole point. Holding the number of evicted items fixed pins $\mathbb{E}[E]$, so $L$ is *increasing* in $\rho$: a policy that evicts precisely the items it will need again is the worst possible one. The objective is to drive $\rho$ as far negative as the marginals allow, evicting exactly the material the agent does not expect to consult. A policy with $\rho = 0$ is evicting blind, and pays the base rate.
+
+This is the classical frame of **cache replacement theory**, and it is worth naming explicitly. Belady's MIN algorithm evicts the line with the largest forward reuse distance and is optimal precisely because it has oracle access to $Y$, which is to say it attains the most negative $\rho$ the marginals permit. FIFO and fixed-threshold truncation sit some way up from that floor, using recency as a weak proxy that buys only a mildly negative $\rho$. Real caches close the gap with profiled or learned hints, and ACM's wager is that a model reasoning over its own trajectory is a better hint generator than a positional rule, because it knows which subgoal is active and therefore which observations are finished being useful. The post-training pipeline in @li2026acm exists to sharpen that signal, constructing demonstrations of good context management so the policy learns *when* to edit, not merely *how*.
+
+**Tool interface.** The framework reduces to three atomic operations over a single external store. The schemas below are our own illustrative rendering of those operations in the style of Section 2, written to show what the interface has to express; they are not a transcription of the published ACM API, and field names, defaults, and argument shapes in @li2026acm differ. Note that the three satisfy the atomicity principle: compression, eviction, and retrieval are separable, so a failed query is distinguishable from a bad compression.
+
+```json
+[
+  {
+    "name": "context_compress",
+    "description": "Replace a contiguous span of the working context with a summary, keeping the span retrievable in full from external memory. Use when a subtask is complete and only its conclusion is still relevant.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "span_ids": {"type": "array", "items": {"type": "string"},
+                     "description": "Message or observation IDs to compress"},
+        "summary": {"type": "string",
+                    "description": "Replacement text preserving conclusions and open questions"}
+      },
+      "required": ["span_ids", "summary"]
+    }
+  },
+  {
+    "name": "context_offload",
+    "description": "Move items out of the working context into external memory without leaving a summary. Use for observations that are finished being useful, e.g. raw tool output already acted upon.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "span_ids": {"type": "array", "items": {"type": "string"}},
+        "tags": {"type": "array", "items": {"type": "string"},
+                 "description": "Retrieval keys, e.g. file paths or entity names"}
+      },
+      "required": ["span_ids"]
+    }
+  },
+  {
+    "name": "context_query",
+    "description": "Retrieve previously compressed or offloaded content back into the working context. Returns matching items with their original IDs.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "Natural-language description of the needed content"},
+        "top_k": {"type": "integer", "description": "Maximum items to return (default 3)"}
+      },
+      "required": ["query"]
+    }
+  }
+]
+```
+
+@li2026acm report three effects from this arrangement, and the third is easy to overlook. Peak token pressure falls, because the agent compresses before the buffer is desperate rather than after. Explorations run longer, because the effective horizon is no longer capped by the raw window. And solutions become **more consistent across independent trials**, which is a statement about variance rather than about the mean: two runs of the same task that discard different material diverge, whereas two runs that retain the same decisive evidence converge. The simulation below speaks to the second and third only. It cannot speak to the first, because a fair comparison has to impose the same hard budget and the same compaction trigger on every policy, which fixes peak occupancy by construction and leaves nothing to measure there. What remains is the pair of quantities the setup genuinely isolates: how much needed material each policy destroys, and how much that quantity varies from run to run.
+
+```{python}
+#| label: fig-485-context-editing-policies
+#| fig-cap: "Long-horizon buffer simulation over 40 independent trials. All three policies run under an identical hard budget and an identical compaction trigger, so peak occupancy is held fixed by construction and only the eviction rule varies. Agent-invoked offload with retrieval on miss cuts unrecoverable information loss (left) and tightens the run-to-run spread (right) relative to rigid threshold truncation and random eviction."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+SEED = 20260726
+B = 12_000                 # context budget in tokens
+N_TURNS = 400              # turns in one long horizon episode
+ALPHA = 0.9                # Pareto tail index of the reuse distance
+P_REUSE = 0.45             # fraction of items ever needed again
+SIGNAL_ACC = 0.85          # agent accuracy at predicting future reuse
+RECALL = 0.90              # probability an offloaded item is queried back
+N_TRIALS = 40
+HI, LO = 0.92 * B, 0.60 * B   # identical trigger and target for every policy,
+                              # so peak occupancy is held fixed by construction
+
+def trajectory(rng):
+    """One episode: token size and next-need turn for each appended item."""
+    size = rng.lognormal(np.log(400.0), 0.6, N_TURNS)
+    reused = rng.random(N_TURNS) < P_REUSE
+    dist = np.ceil(rng.pareto(ALPHA, N_TURNS) + 1.0).astype(int)
+    nxt = np.arange(N_TURNS) + dist
+    return size, np.where(reused & (nxt < N_TURNS), nxt, -1)
+
+def run(policy, rng):
+    size, need_at = trajectory(rng)
+    truth = need_at >= 0
+    flipped = rng.random(N_TURNS) > SIGNAL_ACC
+    pred = np.where(flipped, ~truth, truth)   # agent's noisy "still useful" belief
+
+    schedule = {}
+    for i, t in enumerate(need_at):
+        if t >= 0:
+            schedule.setdefault(int(t), []).append(i)
+
+    offloads = policy == "agent_offload"
+
+    live, order, memory = {}, [], set()
+    occ = peak = 0.0
+    needed = lost = queries = 0
+
+    def make_room(incoming):
+        nonlocal occ
+        if occ + incoming <= HI:
+            return
+        if offloads:                       # agent ranks by predicted future use
+            cand = [i for i in order if not pred[i]] + [i for i in order if pred[i]]
+        elif policy == "random_evict":
+            cand = [int(i) for i in rng.permutation(order)]
+        else:                              # rigid threshold truncation: drop oldest
+            cand = list(order)
+        for i in cand:
+            if occ + incoming <= LO:
+                break
+            occ -= live.pop(i)
+            order.remove(i)
+            if offloads:
+                memory.add(i)
+
+    for t in range(N_TURNS):
+        make_room(size[t])
+        live[t] = size[t]; order.append(t); occ += size[t]
+        peak = max(peak, occ)
+
+        for i in schedule.get(t, []):
+            needed += 1
+            if i in live:
+                continue
+            if i in memory:                # recoverable: pay a query, not a loss
+                queries += 1
+                if rng.random() < RECALL:
+                    make_room(size[i])
+                    live[i] = size[i]; order.append(i); occ += size[i]
+                    peak = max(peak, occ)
+                    continue
+            lost += 1
+
+    return peak / B, lost / max(needed, 1), queries
+
+POLICIES = ["threshold_truncate", "random_evict", "agent_offload"]
+res = {p: {"peak": [], "loss": [], "q": []} for p in POLICIES}
+master = np.random.default_rng(SEED)
+for _ in range(N_TRIALS):
+    s = int(master.integers(1 << 31))      # same trajectory for all three policies
+    for p in POLICIES:
+        pk, ls, q = run(p, np.random.default_rng(s))
+        res[p]["peak"].append(pk); res[p]["loss"].append(ls); res[p]["q"].append(q)
+
+print(f"{'policy':<20}{'loss':>9}{'loss sd':>10}{'spread':>9}{'queries':>9}{'peak/B':>9}")
+print("=" * 66)
+for p in POLICIES:
+    ls = np.array(res[p]["loss"]); pk = np.array(res[p]["peak"])
+    print(f"{p:<20}{ls.mean():>9.4f}{ls.std(ddof=1):>10.4f}{ls.max() - ls.min():>9.4f}"
+          f"{np.mean(res[p]['q']):>9.1f}{pk.mean():>9.3f}")
+print("\npeak/B is equal by construction (shared cap), not a measured difference")
+
+LABELS = ["threshold\ntruncation", "random\neviction", "agent-invoked\noffload"]
+COLORS = ["#b5651d", "#7a7a7a", "#1f6f8b"]
+fig, ax = plt.subplots(1, 2, figsize=(8.6, 3.6))
+x = np.arange(3)
+
+mu = np.array([np.mean(res[p]["loss"]) for p in POLICIES])
+sd = np.array([np.std(res[p]["loss"], ddof=1) for p in POLICIES])
+ax[0].bar(x, mu, yerr=sd, capsize=5, color=COLORS)
+ax[0].set_ylabel("needed but unrecoverable")
+ax[0].set_title("Information loss (mean $\\pm$ sd)")
+
+jit = np.random.default_rng(1).normal(0, 0.06, (3, N_TRIALS))
+for j, p in enumerate(POLICIES):
+    v = np.array(res[p]["loss"])
+    ax[1].scatter(j + jit[j], v, s=14, alpha=0.65, color=COLORS[j])
+    ax[1].hlines(v.mean(), j - 0.28, j + 0.28, color="k", lw=1.6)
+ax[1].set_ylabel("loss rate per trial")
+ax[1].set_title(f"Run to run spread ({N_TRIALS} trials)")
+
+for a in ax:
+    a.set_xticks(x); a.set_xticklabels(LABELS, fontsize=8.5)
+    a.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+```
+
+Random eviction is the control that isolates the mechanism: it runs under the same budget and the same trigger as the other two but with $\rho \approx 0$, and at a loss rate of 0.193 it destroys roughly three times as much needed material as threshold truncation at 0.059. Threshold truncation does better only because recency is a weak proxy for future use, worth a mildly negative $\rho$. Agent-invoked offload combines a more negative $\rho$ with $r_i > 0$ and lands at 0.011, a further factor of about five, at a cost of roughly 14 retrieval queries per episode. The run-to-run standard deviation falls with it, from 0.020 under truncation to 0.007, which is the variance result in miniature: policies that destroy material at rule-chosen moments make outcomes depend on which trajectory happened to cross the threshold when. Peak occupancy is 0.919 for all three, which is the shared cap read back out rather than a finding. Compacting early is a design choice a harness can impose on any eviction rule, and it is imposed identically here precisely so that it cannot flatter the agent policy.
+
+The design lesson closes the loop on this section's argument about where behavior belongs. Threshold truncation lives in the harness because the harness is the only component that can see the token counter, but it is the wrong place to make the decision, since the harness cannot see intent. The correct division is that the harness owns the *mechanism* and the *invariant* (it enforces the hard budget and will truncate if the agent does not act) while the agent owns the *policy*, invoking `context_compress` and `context_offload` at moments it selects. Exposing context management as a tool is not a convenience wrapper; it moves a decision to the only component holding the information needed to make it well, which is the same argument that justifies giving the model a calculator instead of a rounding rule.
+
 ## 8. Implementing a Tool-Use Loop
 
 The following implementation demonstrates the complete tool-use loop without external API dependencies, using a rule-based dispatcher in place of a language model to make the mechanics visible.
@@ -326,3 +526,5 @@ Mitigations include explicit stopping criteria in system prompts, tool-use train
 3. Yang, Z., Li, L., Wang, J., Lin, K., Azarnasab, E., Ahmed, F., Liu, Z., Liu, C., Zeng, M., & Wang, L. (2023). MM-ReAct: Prompting ChatGPT for Multimodal Reasoning and Action. *arXiv preprint*. https://arxiv.org/abs/2303.11381
 
 4. Gao, J., Gu, L., Su, J., Guo, Y., Li, M., Li, J., Chen, W., & Bi, W. (2024). Efficient Tool Use with Chain-of-Abstraction Reasoning. *arXiv preprint*. https://arxiv.org/abs/2401.17464
+
+5. Li, X., Ming, R., Chu, M., Shao, S., Jin, R., & Xiong, C. (2026). ACM: Agentic Context Management for Long Horizon Tasks. *arXiv preprint*. https://arxiv.org/abs/2607.23809

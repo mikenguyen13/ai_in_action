@@ -78,6 +78,118 @@ $$
 $$
 where the weight $\bar w_i$ corrects the pre-update mismatch and $\rho_i(\theta) = \pi_\theta/\pi_k$ is the usual clipped training ratio. Step two is a guardrail: after synchronizing the candidate back to the inference engine, it estimates the post-update gap with validation rollouts, $\hat T_{\text{post}} \approx -\,\mathbb{E}_{\mu_{k+1}}[\tilde\rho_i \hat A_i]$, where $\tilde\rho_i$ is a length-normalized importance weight between the *updated* trainer and sampler ($\pi_{k+1}$ versus $\mu_{k+1}$), distinct from the surrogate's training ratio $\rho_i(\theta)$ above, and it accepts the update only if $\hat T_{\text{post}} \ge -c$, otherwise rolling back to the previous checkpoint. On Qwen3-4B and Qwen3-1.7B with FP8 rollouts (a deliberately high-mismatch setting), MIPU raises average pass@1 across five math-reasoning benchmarks from $64.4\%$ to $66.7\%$ and, more importantly, holds training stable where the baselines collapse. The takeaway for anyone running RL at scale is that the sampler-versus-trainer gap is not a numerical nuisance to be ignored: it changes what the objective should be.
 
+### 2.3 Counterfactual Replay for Token-Level Credit {#sec-708-cort-token-credit}
+
+GRPO's second structural weakness is not the sampler gap but **credit assignment**. Write out the surrogate at token granularity, which is how it is actually implemented:
+$$
+\mathcal{L}^{\text{GRPO}}(\theta)
+= \mathbb{E}\left[\frac{1}{G}\sum_{i=1}^{G} \frac{1}{|y_i|}\sum_{t=1}^{|y_i|}
+\min\!\big(\rho_{i,t}(\theta)\,\hat{A}_i,\;
+\operatorname{clip}(\rho_{i,t}(\theta),\,1-\epsilon,\,1+\epsilon)\,\hat{A}_i\big)\right],
+\qquad
+\rho_{i,t}(\theta) = \frac{\pi_\theta(y_{i,t}\mid y_{i,<t}, x)}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid y_{i,<t}, x)} .
+$$
+The advantage carries index $i$ but not $t$. A single scalar is **broadcast uniformly** to every token of the response. This is defensible when the reward is a binary correctness check, since the whole trajectory really did succeed or fail together. It is much harder to defend under **rubric-based reinforcement learning**, where a judge evaluates the response against a list of explicit written criteria (cite a source, hedge the uncertain claim, state the assumption) and those structured judgments are then collapsed into one number. The tokens that actually satisfied a criterion and the tokens that were pure connective tissue receive exactly the same gradient.
+
+@zhang2026cort attack this with **CoRT** (Counterfactual Replay for Token-level rubric-guided policy optimization). The idea is that the credit signal is already latent in the model and can be read out for the price of one extra forward pass. Take a response $y_i$ that has *already been sampled* under the rubric-conditioned prompt $x_{\text{rubric}}$, and rescore that same token sequence under a matched **criteria-free prompt** $x_{\varnothing}$, identical in every respect except that the rubric text is removed. The per-token **counterfactual credit** is the log-probability difference:
+$$
+c_{i,t} \;=\; \log \pi\big(y_{i,t}\mid y_{i,<t},\, x_{\text{rubric}}\big)
+\;-\; \log \pi\big(y_{i,t}\mid y_{i,<t},\, x_{\varnothing}\big) .
+$$
+A token that the rubric made likely (the citation the criterion demanded) has a large positive $c_{i,t}$; a token the model would have emitted regardless has $c_{i,t}\approx 0$. The word *counterfactual* here refers to the **conditioning, not the sampling**: we do not draw a second response, we replay the existing one against a counterfactual prompt. That is what makes it cheap. There is no rollout, no reward model, and no learned relevance head.
+
+Raw log-probability differences are on an arbitrary scale and vary with response length, so they are normalized across the response before use. Softmax over positions at temperature $\tau$, rescaled by the length, gives
+$$
+\tilde{c}_{i,t}
+= |y_i| \cdot \frac{\exp(c_{i,t}/\tau)}{\sum_{s=1}^{|y_i|} \exp(c_{i,s}/\tau)},
+\qquad\text{so that}\qquad
+\frac{1}{|y_i|}\sum_{t=1}^{|y_i|} \tilde{c}_{i,t} = 1 ,
+$$
+and the token-level advantage that replaces the broadcast scalar is
+$$
+\boxed{\;\hat{A}_{i,t} = \hat{A}_i \cdot \tilde{c}_{i,t}\;}
+\qquad\Longrightarrow\qquad
+\frac{1}{|y_i|}\sum_{t=1}^{|y_i|} \hat{A}_{i,t} = \hat{A}_i .
+$$
+
+That last identity is the whole design argument. Because the normalized credits average to one by construction, the response-level expectation of the advantage is **exactly preserved**. CoRT *redistributes* gradient mass within a response rather than rescaling it, so a response the group baseline judged mediocre stays mediocre in total; only the internal allocation changes. The group baseline, the KL coefficient $\beta$, the group size $G$, and the standardization of $\hat{A}_i$ therefore all keep their calibration, which is why this slots into an existing GRPO trainer rather than demanding a new algorithm. One qualification: only the per-response *mean* advantage is preserved, not the per-token magnitudes. The normalized credit $\tilde{c}_{i,t}$ ranges over $(0, |y_i|]$, so an individual token's advantage can be rescaled by a factor of up to the response length (48 in the cell below), which materially changes how the PPO clip interacts with that token. The clip range $\epsilon$ is the one hyperparameter that does see the new magnitudes and may need revisiting. Empirically @zhang2026cort report that CoRT beats matched response-level GRPO in the vast majority of comparisons with an average gain of **4.4 percentage points**, and stays competitive with learned token-level credit baselines while avoiding their separate relevance-learning stage entirely.
+
+The cell below isolates the mechanism on a synthetic sequence where we *know* which positions are causally responsible for satisfying a criterion, so we can measure how well each credit scheme recovers them.
+
+```{python}
+#| label: fig-708-cort-token-credit
+#| fig-cap: "Credit assigned per token position under uniform response-level broadcast (flat) and counterfactual replay (concentrated), against the ground-truth mask of positions that actually satisfy the rubric criterion."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+T, K, N_RESP, TAU = 48, 8, 512, 1.0   # tokens, responsible positions, rollouts, temp
+DELTA, SIGMA = 1.2, 0.6               # rubric log-prob lift, and nuisance jitter
+
+mask = np.zeros(T, dtype=bool)
+mask[np.sort(rng.choice(T, size=K, replace=False))] = True
+
+def counterfactual_credit(n):
+    """c_{i,t} = log pi(y|x_rubric) - log pi(y|x_empty) for n replayed responses."""
+    return DELTA * mask[None, :] + rng.normal(0.0, SIGMA, size=(n, T))
+
+def normalise(c, tau=TAU):
+    """Softmax over positions, length-rescaled so per-token credits average to 1."""
+    z = np.exp((c - c.max(axis=1, keepdims=True)) / tau)
+    return T * z / z.sum(axis=1, keepdims=True)
+
+c_raw = counterfactual_credit(N_RESP)
+cred_cort = normalise(c_raw)                       # A_{i,t} / A_i under CoRT
+cred_unif = np.ones_like(cred_cort)                # A_{i,t} / A_i under GRPO
+assert np.allclose(cred_cort.mean(axis=1), 1.0)    # response-level mean preserved
+
+# Ideal allocation: all credit on responsible tokens, same response-level mean.
+ideal = mask.astype(float) * (T / K)
+def cosine(v, w): return float(v @ w / (np.linalg.norm(v) * np.linalg.norm(w)))
+
+def precision_at_k(cred):
+    """Fraction of the top-K credited positions that are truly responsible."""
+    jitter = rng.normal(0, 1e-9, size=cred.shape)  # breaks uniform's exact ties
+    top = np.argsort(-(cred + jitter), axis=1)[:, :K]
+    return float(mask[top].mean())
+
+# Gradient noise: per-token score-function estimate g_t = mean_i A_i * cred_it * s_it.
+A = rng.normal(size=(N_RESP, 1)); A = (A - A.mean()) / A.std()   # GRPO group baseline
+s = rng.normal(size=(N_RESP, T))                                 # score-function noise
+off = ~mask                                                      # irrelevant positions
+var_unif = float((A * cred_unif * s)[:, off].var())
+var_cort = float((A * cred_cort * s)[:, off].var())
+
+print(f"cosine(credit, ground truth)  uniform={cosine(cred_unif.mean(0), ideal):.3f}"
+      f"   CoRT={cosine(cred_cort.mean(0), ideal):.3f}")
+print(f"precision@K (K={K} of T={T})   uniform={precision_at_k(cred_unif):.3f}"
+      f"   CoRT={precision_at_k(cred_cort):.3f}   (chance={K/T:.3f})")
+print(f"off-target gradient variance  uniform={var_unif:.4f}   CoRT={var_cort:.4f}"
+      f"   reduction={100*(1 - var_cort/var_unif):.1f}%")
+
+fig, ax = plt.subplots(figsize=(9, 3.6))
+pos = np.arange(T)
+for t in pos[mask]:
+    ax.axvspan(t - 0.5, t + 0.5, color="tab:green", alpha=0.16, lw=0)
+ax.plot(pos, cred_unif.mean(0), lw=2, color="tab:red",
+        label=r"uniform broadcast  $\tilde c_{i,t}=1$")
+ax.plot(pos, cred_cort.mean(0), lw=2, color="tab:blue", marker="o", ms=3.5,
+        label=r"counterfactual replay  $\tilde c_{i,t}$")
+ax.axvspan(-9, -8, color="tab:green", alpha=0.16, lw=0, label="responsible tokens")
+ax.set_xlim(-0.5, T - 0.5); ax.set_xlabel("token position $t$")
+ax.set_ylabel(r"credit  $\hat A_{i,t}/\hat A_i$")
+ax.legend(loc="upper right", fontsize=8, framealpha=0.95)
+ax.set_title("Where the response-level advantage actually lands")
+fig.tight_layout()
+plt.show()
+```
+
+Uniform broadcast scores at chance on both recovery metrics, which is the point: a constant vector carries no information about which tokens mattered, so its cosine with the ground truth is fixed at $\sqrt{K/T}$ by geometry alone and its top-$K$ ranking is arbitrary. Counterfactual credit recovers most of the responsible positions, and because it pushes the multiplier below one everywhere else, it also shrinks the gradient variance injected at tokens that had nothing to do with the reward. The response-level total is unchanged throughout, exactly as the boxed identity requires. Read that recovery number with the setup in mind, though: `counterfactual_credit` *constructs* the signal as a lift of `DELTA` on the ground-truth mask, so the cell assumes the counterfactual log-probability difference already carries the causal information and measures only whether the softmax normalization can recover it at a signal-to-noise ratio of $\Delta/\sigma = 2$. Whether real rubric-conditioned log-probability differences actually track causal responsibility is @zhang2026cort's central empirical claim, and it is what their benchmark results test, not what this cell tests.
+
+The connection to the rest of this chapter is direct. Section 1 asked where the preference signal comes from; CoRT is a reminder to also ask *how coarsely it is applied* once it arrives. DPO faces the same question in its own form: the gradient in Section 3.1 raises $\log \pi_\theta(y_w\mid x)$ and lowers $\log \pi_\theta(y_l\mid x)$ as whole-sequence quantities, with no notion that only a clause or two may separate a good answer from a bad one. Rubrics make the criteria explicit, and counterfactual replay is one cheap way to route each criterion's signal back to the tokens that earned it.
+
 ## 3. DPO: Preference Optimization Without Reinforcement Learning
 
 Direct Preference Optimization starts from a striking observation. The KL-regularized RLHF objective of Section 2 has a *closed-form* optimal policy. For a fixed reward $r$ and reference $\pi_{\text{ref}}$, the maximizer of expected reward minus $\beta$ times KL is the Gibbs distribution
@@ -547,3 +659,4 @@ The classical PPO path swaps `GRPOTrainer` for `PPOTrainer` and additionally req
 9. von Werra, L. et al. "TRL: Transformer Reinforcement Learning." Hugging Face, 2020 onward. https://github.com/huggingface/trl
 10. Hu, E. J. et al. "LoRA: Low-Rank Adaptation of Large Language Models." ICLR 2022. https://arxiv.org/abs/2106.09685
 11. Liang, J. et al. "The Mirage of Optimizing Training Policies: Monotonic Inference Policies as the Real Objective for LLM Reinforcement Learning" (MIPI/MIPU). 2026. https://arxiv.org/abs/2606.29526
+12. Zhang, Y. et al. "CoRT: Counterfactual Replay for Token-Level Rubric-Guided Policy Optimization." 2026. https://arxiv.org/abs/2607.25659

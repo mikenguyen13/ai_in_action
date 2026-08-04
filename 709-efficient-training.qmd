@@ -515,6 +515,66 @@ FP8 is the current production frontier rather than a universal default: it gives
 
 The through-line is that these techniques are *composable and ordered*. A typical large-scale recipe is bf16 autocast for speed and activation memory, activation checkpointing on the transformer blocks, gradient accumulation to reach the target batch size, and FSDP or ZeRO to shard the model and optimizer state across the cluster, with fp8 added on the newest hardware once the rest is stable. Each attacks a different term in the memory budget of Section 1, and together they are what make training at the frontier fit on real machines.
 
+### Million-Token RL Post-Training: Response Replay Under a Fixed GPU Budget {#sec-longstraw-million-token-rl}
+
+The memory accounting of Section 1 was written for supervised pretraining, where the sequence length is a hyperparameter you choose. Reinforcement-learning post-training of reasoning models breaks that assumption from both ends. On the inference side, a single chain of thought now routinely runs to millions of tokens, so the behavior we most want to reward is a behavior that only appears at book-length context. On the training side, on-policy RL algorithms such as GRPO must differentiate through the responses they score, and the backward pass therefore has to hold activations for the entire prompt-plus-response sequence at once. That is the same activation term $M_{\text{act}} \approx c \cdot L \cdot b \cdot s \cdot h$ from Section 1, now with $s$ pushed into the millions, and it is why RL post-training in practice tends to max out around 256K tokens even when the deployed model generates far longer. LongStraw [@zhou2026longstraw] is an objective- and architecture-aware training system built to close exactly this gap: to run million-token RL post-training under a *fixed* GPU budget rather than by adding hardware.
+
+Its central move is the same memory-for-compute trade that activation checkpointing makes in Section 3, but relocated from inside a single forward pass to the structure of an RL rollout. In GRPO a group of responses is sampled from one shared prompt, so the naive implementation builds a single autograd graph over the shared prompt and every sampled response and differentiates the whole thing together. LongStraw instead evaluates the shared prompt exactly once *without* automatic differentiation, retaining only the model-specific state that later tokens will need to attend to, and then *replays* the short response branches one at a time under autograd. The live training graph at any instant is thus reduced from the full prompt-plus-response sequence down to a single response branch resting on top of a compact resident prompt state. As with checkpointing, the price is recomputation: each branch is re-evaluated under autograd rather than kept resident, so wall-clock replay time rises while peak activation memory falls sharply. The system organizes this around three ideas that its authors name directly: resident state management (deciding what prompt-derived state to keep and in what layout), response replay (re-running one branch at a time under autograd), and distributed execution (spreading the resident state and the replayed branches across devices).
+
+What makes LongStraw a systems paper rather than a single trick is that the retained resident state is *architecture-specific*, so the same principle is instantiated differently for very different model families. The paper works with GRPO and specializes it for two: a hybrid model that mixes recurrent layers with full attention (Qwen3.6-27B), where the prompt-derived state is carried as sharded key-value pages, and a compressed-attention mixture-of-experts model (GLM-5.2), where replay is organized around the experts (MoE replay). Reported on H20 GPUs, this lets exact-attention GRPO run past two million token positions, well beyond the range that a single monolithic autograd graph over prompt and responses would fit.
+
+The arithmetic below makes the core reduction concrete without any model or GPU. It contrasts two ways of holding the live autograd graph for one GRPO group: the naive scheme, which keeps the full prompt of length $P$ plus all $G$ response branches of length $R$ differentiable at once, against the replay scheme, which keeps only a compact resident prompt state (a small fraction $\rho$ of a full activation record per prompt token, standing in for retained KV pages) plus exactly one branch under autograd. Everything is expressed in activation-records-per-token so the comparison is a pure ratio.
+
+```{python}
+#| label: longstraw-live-graph-memory
+import numpy as np
+import matplotlib.pyplot as plt
+
+# All quantities are in "activation records per token": one unit is the
+# per-token activation footprint that autograd must retain to backprop
+# through one token of the model stack. This is unit-free on purpose.
+R = 4096          # tokens per sampled response branch
+G = 16            # GRPO group size (responses sampled per shared prompt)
+RHO = 0.02        # resident prompt state per token (retained KV pages) as a
+                  # fraction of a full autograd activation record
+
+def naive_live(P, G, R):
+    # One autograd graph over the shared prompt plus every response branch.
+    return P + G * R
+
+def replay_live(P, R, rho):
+    # Peak of the replay scheme: compact resident prompt state carried
+    # without autograd, plus a single branch replayed under autograd.
+    return rho * P + R
+
+prompts = np.array([16_384, 131_072, 524_288, 2_097_152])  # 16K ... 2M tokens
+print(f"group size G = {G}, response length R = {R}, resident fraction rho = {RHO}")
+print(f"{'prompt P':>12} {'naive graph':>14} {'replay graph':>14} {'reduction':>11}")
+for P in prompts:
+    n = naive_live(P, G, R)
+    r = replay_live(P, R, RHO)
+    print(f"{P:>12,} {n:>14,.0f} {r:>14,.0f} {n / r:>10.1f}x")
+
+# Reduction factor as the shared prompt grows, for two group sizes.
+P_grid = np.logspace(np.log10(4096), np.log10(2_097_152), 200)
+plt.figure(figsize=(7, 4))
+for g in (8, 16, 32):
+    red = naive_live(P_grid, g, R) / replay_live(P_grid, R, RHO)
+    plt.plot(P_grid, red, label=f"G = {g} responses")
+plt.xscale("log")
+plt.xlabel("shared prompt length P (tokens, log scale)")
+plt.ylabel("live-graph reduction (naive / replay)")
+plt.title("Response replay shrinks the live GRPO autograd graph")
+plt.legend()
+plt.grid(True, which="both", alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+The table and curve show why the trade matters most precisely where RL post-training wants to go. When the prompt is short the two schemes are close, because a single branch already dominates the live graph. As the shared prompt grows into the hundreds of thousands and then millions of tokens, the naive graph grows with $P + G\cdot R$ while the replay graph grows only with $\rho P + R$, so the reduction climbs and is largest exactly in the book-length regime. The extra work is real (each of the $G$ branches is replayed under autograd rather than differentiated in place, which is a recomputation cost of the same flavor as Section 3), but it is what converts a live graph that cannot fit into one that does.
+
+The chapter-level lesson is a restatement of Section 1 for the RL era. As reasoning-model training moves to book-length contexts, the binding constraint is once again peak activation memory during the backward pass, not the parameter or optimizer state that sharding already handles. LongStraw is the argument that the right response is the same one checkpointing makes at the layer level, applied at the level of the rollout: hold the shared context in a compact resident form, and recompute or replay only the single branch that autograd currently needs, so that million-token on-policy RL fits a fixed GPU budget instead of demanding a larger one.
+
 ## References
 
 1. Micikevicius, P. et al. "Mixed Precision Training." *ICLR* 2018. https://arxiv.org/abs/1710.03740

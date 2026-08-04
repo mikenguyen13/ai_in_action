@@ -340,6 +340,112 @@ A complementary open method, **Wanda** (Sun et al., 2023), reaches similar 2:4 r
 
 When should you reach for pruning at all? Use **structured pruning** when you need a faster model on ordinary hardware and can afford a short fine-tune. Use **2:4 semi-structured sparsity** when you serve on Ampere-or-newer GPUs and want a hardware-accelerated speedup with modest accuracy loss. Use **one-shot methods (SparseGPT, Wanda)** when you must compress a large pretrained model and cannot afford to retrain it. Reach for **unstructured magnitude pruning** when the goal is storage or when you have a sparse-aware deployment target. In every case, treat the accuracy-versus-sparsity curve as something to measure on your own data, not a number to assume.
 
+### Pruning the Context, Not the Weights: SWE-Pruner Pro {#sec-context-pruning-swepruner}
+
+Everything so far in this chapter prunes a network's **weights**: we zero entries of $\theta$, whether individually, in aligned structures, or in a 2:4 pattern, and the mask is fixed once training or calibration finishes. There is a second, orthogonal axis of sparsity that is easy to miss precisely because it lives outside the parameters. At inference, a model also has an **input** it must process, and on long agentic trajectories that input is often where the real capacity is being wasted. Pruning the input rather than the weights is a form of learned **dynamic sparsity**: the sparsity pattern is not baked into $\theta$, it is recomputed per example from the content the model is actually reading. It is worth keeping the two ideas cleanly separated. Weight pruning shrinks the function $f(\cdot; \theta)$; context pruning shrinks the argument $x$ that a fixed $f$ is applied to. They compose, and neither substitutes for the other.
+
+The setting where this pays off most sharply is a coding agent. Such an agent runs a loop of tool calls (reading files, running tests, grepping a repository) and feeds each tool's output back into its own context. Tool outputs are long and mostly irrelevant: a test run prints hundreds of lines, of which a handful name the failing assertion. Left uncompressed, these outputs dominate the prompt, inflate both prefill and decode cost, and push the useful signal further from the model's attention. **SWE-Pruner Pro** [@wang2026swepruner] addresses exactly this by pruning tool-output tokens inside the agent, keeping the lines that matter and dropping the rest before they accumulate in the trajectory.
+
+The mechanism is what makes it belong in a chapter on sparsity rather than in one on retrieval. As the agent's backbone performs its ordinary prefill over a tool response, it already computes a hidden-state vector for every token. SWE-Pruner Pro attaches a small classifier head that reads those hidden states, ones the forward pass produced anyway, and emits a keep-or-prune label per line (a line is retained when a majority of its tokens score above threshold). Crucially, the head is conditioned on a **length-aware embedding keyed to the tool output's line count**, because the cost of a mistake is wildly non-uniform in that count: dropping two lines from a five-line response can be catastrophic, while dropping two from a three-hundred-line response is nothing. This is the same "learn to zero a fraction of your input" idea as weight pruning, but the saliency signal is the model's own representation of each line, and the mask is regenerated for every tool output rather than sorted once and frozen.
+
+This design is what separates SWE-Pruner Pro from the original SWE-Pruner. The original ran a **separate lightweight 0.6B "skimmer"** model and steered it with explicit natural-language goals like "focus on error handling," an external classifier bolted onto the agent. SWE-Pruner Pro needs no such external model: it reuses the agent's own forward pass, so the pruning decision comes from representations the agent already paid for, at a bounded overhead on top of normal generation. The reported effect is a reduction of up to 39% of prompt and completion tokens while preserving task quality on multi-turn coding benchmarks (SWE-Bench Verified, SWE-QA, and long-context suites), where the original SWE-Pruner reported 23 to 54% token reduction on agent tasks and up to 14.84x compression on single-turn long-context question answering.
+
+The cell below is a toy of the core mechanism, not the real system. We synthesize "line representations" as random hidden-state vectors (standing in for what the agent's backbone would compute), label a line "relevant" when its vector aligns with a fixed task direction, and train a tiny keep-or-prune head, fed a length-aware embedding keyed to each output's line count, for a handful of gradient steps. We then report the token-savings ratio, the fraction of lines the head chooses to prune.
+
+```{python}
+#| label: prune-context-swepruner-head
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+# --- Synthetic "tool outputs": each is a list of line representations. ---
+# A line is "relevant" if its hidden vector aligns with a fixed task direction.
+H = 32                    # hidden size the agent already computes per line
+task_dir = torch.randn(H)
+task_dir = task_dir / task_dir.norm()
+
+
+def make_tool_output(n_lines):
+    hidden = torch.randn(n_lines, H)                            # agent line reps
+    relevance = hidden @ task_dir + 0.4 * torch.randn(n_lines)  # noisy signal
+    keep = (relevance > 0.6).float()                            # keep label
+    return hidden, keep
+
+
+# A batch of tool outputs with varied line counts (5 to 60 lines each).
+line_counts = [5, 8, 12, 20, 30, 45, 60] * 8
+batch = [make_tool_output(n) for n in line_counts]
+
+
+class PrunerHead(nn.Module):
+    """Reads a line representation plus a length-aware embedding keyed to the
+    tool output's line count, and emits a keep-or-prune logit per line."""
+
+    def __init__(self, hidden=H, n_buckets=8):
+        super().__init__()
+        self.len_embed = nn.Embedding(n_buckets, hidden)   # length awareness
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    @staticmethod
+    def bucket(n):
+        return min(int(np.log2(max(n, 1))), 7)             # 8 length buckets
+
+    def forward(self, hidden, n_lines):
+        idx = torch.full((hidden.shape[0],), self.bucket(n_lines), dtype=torch.long)
+        return self.net(hidden + self.len_embed(idx)).squeeze(-1)
+
+
+head = PrunerHead()
+opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+
+for step in range(150):                       # a handful of gradient steps
+    opt.zero_grad()
+    loss = 0.0
+    for hidden, keep in batch:
+        logit = head(hidden, hidden.shape[0])
+        loss = loss + F.binary_cross_entropy_with_logits(logit, keep)
+    (loss / len(batch)).backward()
+    opt.step()
+
+# --- Evaluate: how many tokens (lines) does the learned head prune? ---
+kept = pruned = correct = total = 0
+for hidden, keep in batch:
+    with torch.no_grad():
+        decision = (head(hidden, hidden.shape[0]) > 0).float()
+    kept += int(decision.sum())
+    pruned += int((1 - decision).sum())
+    correct += int((decision == keep).sum())
+    total += keep.numel()
+
+print(f"line-level keep/prune accuracy: {correct / total:.3f}")
+print(f"lines kept: {kept}, lines pruned: {pruned}")
+print(f"token-savings ratio (fraction of lines pruned): {pruned / (kept + pruned):.3f}")
+```
+
+The head learns to keep the relevant lines and drop the rest, reclaiming a large fraction of the tokens the tool outputs would otherwise cost. The real system differs in one structural way that the toy cannot show: the hidden states are not synthetic, they are the agent's own, read off the live forward pass. The show-only fence below marks that integration point. It needs the agent's internal hidden states at inference, so it is illustrative, not executed here.
+
+```python
+# Show-only: needs the coding agent's internal hidden states at inference.
+# Reference: github.com/Ayanami1314/swe-pruner-pro (Pro, no external model)
+#            github.com/Ayanami1314/swe-pruner   (original 0.6B skimmer variant)
+def prune_tool_output(agent, tool_text):
+    # The backbone already computes per-token hidden states during prefill.
+    hidden = agent.prefill_hidden_states(tool_text)      # [n_tokens, H], reused
+    n_lines = tool_text.count("\n") + 1
+    logits = pruner_head(hidden, n_lines)                # keep-or-prune per token
+    keep_line = line_majority_vote(logits, tool_text)    # aggregate to lines
+    return "\n".join(l for l, k in zip(tool_text.splitlines(), keep_line) if k)
+```
+
+The takeaway generalizes past this one system and is the reason the section sits here rather than in a chapter on agents. Sparsity is not only about zeroing weights. At inference on a long agent trajectory, the cheapest capacity you can reclaim is often in the **context**, and a model can learn to prune its own inputs using representations it has already computed. Weight pruning from earlier in @sec-pruning-and-sparsity and context pruning are two coordinates of the same underlying idea, spend compute only where it earns its keep, applied to two different objects: the parameters and the input.
+
 ## References
 
 1. LeCun, Y., Denker, J., Solla, S. "Optimal Brain Damage." *NeurIPS*, 1989. https://proceedings.neurips.cc/paper/1989/hash/6c9882bbac1c7093bd25041881277658-Abstract.html

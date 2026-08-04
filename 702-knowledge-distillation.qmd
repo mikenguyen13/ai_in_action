@@ -357,6 +357,224 @@ trainer.train()
 
 The arithmetic that justifies all of this is simple. If distillation cuts parameters by 40 percent and latency by 60 percent while keeping accuracy within a few points, then at serving scale it cuts the accelerator fleet and the per-query cost by a similar fraction. That recurring saving, paid once in training compute, is why distillation is standard practice for shipping large models.
 
+## SEED: Distilling Self-Knowledge to Densify Sparse RL {#sec-seed-self-distillation}
+
+On-policy distillation, as introduced above, still assumes two models: a student that samples and a stronger teacher that scores. Agentic reinforcement learning poses a harder version of the same supervision problem without any obvious teacher on hand. An LLM agent trained with outcome-based RL sees only a sparse reward at the end of a long trajectory, one scalar for a sequence of many actions, so the credit-assignment signal over intermediate tokens is thin exactly where the decisive choices were made. SEED (Self-Evolving On-Policy Distillation) of @wu2026seed closes this gap with a move that reframes what distillation even is: the same policy is both actor and teacher, and it distills structured self-knowledge back into itself to densify the sparse RL signal.
+
+The mechanism is a two-stage self-evolving loop. In the first stage the policy learns to analyze its own completed trajectories and emit **hindsight skills**, natural-language descriptions of reusable workflows, decisive observations, or failure-avoidance rules distilled from what actually happened in an episode. In the second stage this analysis capability is turned on-policy: the latest checkpoint simultaneously acts (collecting trajectories) and analyzes (extracting skills from them), so the hindsight supervision improves in lockstep with the policy rather than lagging behind a frozen teacher.
+
+The distillation signal itself comes from a rescoring trick that maps cleanly onto the temperature-free on-policy objective of the previous section. The sampled actions are held fixed, then re-scored under two contexts: a **skill-augmented** context, in which the policy conditions on the hindsight skill, and the ordinary interaction context. The skill-augmented distribution plays the role of $p(T)$, the teacher target, and the plain-context distribution plays the role of $q(T)$, the student, except that both come from one model. Their per-token divergence is a dense token-level on-policy distillation loss, one number for every action rather than one scalar for the whole rollout. A confidence gate $g = \sigma(\beta_{\text{opd}} \cdot \Delta)$ on the detached log-probability shift $\Delta$ concentrates this supervision on the tokens the skill actually endorses. The full objective adds it to the ordinary RL loss, $\mathcal{L}_{\text{SEED}} = \mathcal{L}_{\text{RL}} + \lambda_{\text{opd}}\,\mathcal{L}_{\text{OPD}}$, so the dense self-distillation term and the sparse outcome reward are optimized jointly.
+
+The toy below strips SEED to that core contrast. It treats one model's skill-augmented next-token distribution as the teacher target and its plain-context distribution as the student, computes the dense per-token forward-KL, and sets it beside the single sparse scalar an outcome reward would provide over the same trajectory.
+
+```{python}
+#| label: seed-dense-vs-sparse
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+# A toy generated trajectory of T actions (tokens) over a small vocab V.
+T_len, V = 8, 6
+
+# "teacher" logits: the SAME policy's next-token distribution when its context
+# is augmented with a hindsight skill (a reusable workflow or failure-avoidance
+# rule the policy wrote about its own completed trajectories).
+skill_logits = torch.randn(T_len, V)
+
+# "student" logits: the same policy scoring the same actions in the plain
+# context, with no skill attached. On-policy: both score tokens the policy
+# itself sampled, so there is no second model anywhere in the loop.
+plain_logits = skill_logits + 0.6 * torch.randn(T_len, V)
+
+p_skill = F.softmax(skill_logits, dim=-1)          # skill-augmented target
+logq_plain = F.log_softmax(plain_logits, dim=-1)   # plain-context student
+
+# Dense per-token forward-KL on-policy distillation loss: one value per token.
+per_token_kl = (p_skill * (p_skill.clamp_min(1e-12).log() - logq_plain)).sum(-1)
+opd_loss = per_token_kl.mean()
+
+# The outcome-based RL signal is a SINGLE sparse scalar for the whole rollout.
+outcome_reward = torch.tensor(1.0)   # e.g. "task solved", delivered only at the end
+
+dense = [round(x, 4) for x in per_token_kl.tolist()]
+print("dense per-token OPD loss:", dense)
+print(f"mean OPD loss (dense)   : {opd_loss.item():.4f}")
+print(f"sparse outcome reward   : {outcome_reward.item():.1f}  (1 scalar for {T_len} tokens)")
+print(f"supervision density     : {T_len} dense token signals vs 1 sparse trajectory signal")
+```
+
+The printed vector is the point: where outcome-based RL hands the optimizer a single number to explain an entire episode, the skill-augmented rescoring produces a graded signal at every action, turning the flat trajectory reward into per-token guidance that says which moves the policy's own hindsight would have reinforced.
+
+The full training loop, which needs an RL stack rather than a handful of tensors, has the following shape. The reference implementation (github.com/jinyangwu/SEED, MIT licensed) is built on veRL.
+
+```python
+# conceptual sketch; full training needs veRL + vLLM + a GPU cluster; shown, not executed
+for step in range(num_rl_steps):
+    # Stage 1: the policy analyzes its OWN completed trajectories and emits
+    # natural-language hindsight skills (reusable workflows, decisive
+    # observations, failure-avoidance rules). Same checkpoint acts and analyzes.
+    trajectories = policy.rollout(prompts)                 # actor role
+    skills = policy.analyze(trajectories)                  # analyzer role (self)
+
+    # Stage 2: re-score the SAME sampled actions in skill-augmented vs. plain
+    # contexts to produce dense token-level on-policy distillation targets.
+    logp_skill = policy.score(trajectories, context=skills)   # teacher target
+    logp_plain = policy.score(trajectories, context=None)     # student
+    gate = torch.sigmoid(beta_opd * (logp_skill - logp_plain).detach())
+    opd_loss = gate * per_token_kl(logp_skill.detach(), logp_plain)
+
+    # Combine the dense self-distillation signal with the sparse outcome reward.
+    rl_loss = grpo_loss(trajectories, outcome_rewards)
+    (rl_loss + lambda_opd * opd_loss.mean()).backward()
+    optimizer.step()
+```
+
+Reported across text-based and vision-based agent tasks (ALFWorld, WebShop, search-based QA, EZPoints, Sokoban), SEED improves both performance and sample efficiency and generalizes to unseen scenarios, matching full-data outcome-only baselines with a fraction of the training data and transferring its learned strategies to held-out tasks. Placed against the rest of this chapter, it is a useful reminder that distillation is not always a teacher handing knowledge to a separate student. Here it is a model distilling structured self-knowledge back into itself, a bridge between knowledge distillation and agentic RL that inherits the dense token-level supervision of on-policy distillation without requiring a stronger model to supply it.
+
+## ReOPD: The Prefix Trap in Multi-Turn Distillation {#sec-702-reopd-prefix-trap}
+
+SEED (@sec-seed-self-distillation) attacks the *density* of the supervision signal: one sparse trajectory reward becomes one number per token. @liao2026reopd attack a different and prior question in the same agentic setting, namely *where in the interaction history the teacher should be queried at all*. Their target is fully online multi-turn on-policy distillation (OPD), in which an LLM agent acts over many turns and the student imitates a teacher across those histories. That procedure is brutally expensive for a reason that has nothing to do with model size: every update demands a fresh student rollout *through the live environment*, so each gradient step drags a chain of real tool calls behind it, and then the teacher must be queried at each newly visited history. Their proposal, **ReOPD (Replayed-Prefix On-Policy Distillation)**, is an off-environment substitute. A bank of teacher trajectories is collected once; thereafter the student acts only at selected steps inside a **replayed prefix**, and the teacher supplies dense per-step supervision without a single new environment interaction.
+
+The intellectual core is the failure mode they name the **prefix trap**. Let $t$ index the **takeover depth**: the number of turns the student itself generates, starting from a replayed teacher prefix, before the teacher is asked for a target. Two quantities move in opposite directions along this one axis. **Student relevance** $\rho(t)$ increases with $t$, because a history containing more student-generated turns sits closer to the student's own occupancy measure, which is exactly the distribution the student will face at deployment. **Teacher reliability** $\kappa(t)$ decreases with $t$, because that same drift carries the query point off the teacher's own occupancy, where its per-step target degrades from expertise into guesswork. The distillation value of a query at depth $t$ is therefore a product of two opposing terms,
+
+$$
+v(t) \;\propto\; \rho(t)\,\kappa(t),
+$$
+
+and a product of an increasing and a decreasing factor is maximized in the interior. Setting $v'(t) = 0$ gives the balance-of-elasticities condition
+
+$$
+\frac{\rho'(t)}{\rho(t)} \;=\; -\,\frac{\kappa'(t)}{\kappa(t)},
+$$
+
+which says: keep pushing the takeover deeper only while relevance is growing proportionally faster than reliability is decaying. This is the **two-sided distribution shift** between student occupancy and teacher reliability, and it is why "make the histories as on-policy as possible" is the wrong instinct. A useful closed form makes the point sharp. Take the exponential surrogate $\rho(t) = 1 - e^{-t/a}$ and $\kappa(t) = e^{-t/b}$, where $a$ measures how fast the student's own distribution is reached and $b$ how robust the teacher is off-distribution. Then
+
+$$
+t^\star \;=\; a\,\log\!\Big(1 + \frac{b}{a}\Big),
+$$
+
+which is finite for every finite $b$. The fully on-policy extreme $t = H$ is optimal only in the limit $b \to \infty$, that is, only for a teacher whose targets never degrade off its own support. No real teacher qualifies.
+
+Solving for the optimal prefix distribution directly would require estimating $\kappa$, which means knowing where the teacher is unreliable, which is the hard part. ReOPD instead adopts a **step-decaying sampling schedule**, a geometric prior $w(t) \propto \gamma^{\,t-1}$ that concentrates mass on early, lower-shift prefixes. It has one hyperparameter, needs no reliability estimate, and has mean takeover depth $1/(1-\gamma)$, so $\gamma$ doubles as the cost dial: shallow takeovers are cheap because the student generates few turns and the environment is never touched.
+
+The simulation below makes all of this concrete in a small multi-turn environment. It builds the relevance curve from actual occupancy measures and models reliability as decaying with distance from the teacher's own occupancy, locates the interior optimum, and prices three prefix distributions against each other. Only $\rho$ is measured, as the overlap between the mixed prefix distribution and the student's occupancy; $\kappa$ is an assumed kernel, so with $\rho$ increasing and $\kappa$ decreasing by construction the interior optimum is fixed before the code runs and illustrates the algebra above rather than supplying independent evidence for it.
+
+```{python}
+#| label: fig-702-reopd-prefix-trap
+#| code-fold: false
+#| fig-cap: "Left: student relevance rises with takeover depth while teacher reliability falls, so their product peaks in the interior rather than at the fully on-policy extreme. Right: the step-decaying prefix schedule captures the most expected distillation value while touching the environment zero times."
+import numpy as np
+import matplotlib.pyplot as plt
+
+# A small multi-turn tool-use environment: a 9x9 grid, start (0,0), goal (8,8).
+# Every turn is one live environment interaction, the cost ReOPD refuses to pay.
+G, H = 9, 10                      # grid side, and turns per episode
+S = G * G
+MOVES = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+
+def transition(eps):
+    """State-to-state matrix for an eps-greedy goal-seeking policy."""
+    T = np.zeros((S, S))
+    for s in range(S):
+        x, y = s % G, s // G
+        good = [a for a, (dx, dy) in enumerate(MOVES)
+                if (dx > 0 and x < G - 1) or (dy > 0 and y < G - 1)]
+        good = good or list(range(4))
+        p = np.full(4, eps / 4.0)
+        p[good] += (1.0 - eps) / len(good)
+        for a, (dx, dy) in enumerate(MOVES):
+            nx, ny = min(max(x + dx, 0), G - 1), min(max(y + dy, 0), G - 1)
+            T[s, ny * G + nx] += p[a]
+    return T
+
+def push(d, T, n):
+    for _ in range(n):
+        d = d @ T
+    return d
+
+T_teacher = transition(0.02)      # near-optimal teacher
+T_student = transition(0.70)      # weak student that drifts off the diagonal
+d0 = np.zeros(S); d0[0] = 1.0
+
+# Takeover depth t: replay the teacher prefix for H - t turns, let the student act
+# for t turns, then query the teacher at the resulting history. t = H is fully
+# online OPD; t = 0 is pure teacher replay with no student input at all.
+occ_teacher = push(d0, T_teacher, H)    # teacher occupancy at turn H
+occ_student = push(d0, T_student, H)    # student occupancy at turn H
+
+# The teacher's per-step target is trustworthy in proportion to how much of its
+# OWN occupancy sits at that history. Off its support it is extrapolating.
+reliab = occ_teacher / (occ_teacher + 0.04 * occ_teacher.max())
+reliab /= reliab.max()
+
+ts = np.arange(H + 1)
+rho = np.zeros(H + 1)             # student relevance
+kappa = np.zeros(H + 1)           # teacher reliability
+for t in ts:
+    m = push(push(d0, T_teacher, H - t), T_student, t)
+    rho[t] = np.minimum(m, occ_student).sum()    # overlap with student occupancy
+    kappa[t] = float(m @ reliab)                 # teacher reliability there
+
+value = rho * kappa
+value /= value.max()              # report value as a fraction of the peak
+t_star = int(np.argmax(value))
+
+# Three prefix distributions over admissible takeover depths t in {1, ..., H}.
+gamma, tk = 0.6, ts[1:]
+schedules = {
+    "fully on-policy (OPD)": np.eye(H)[H - 1],
+    "uniform prefix": np.ones(H) / H,
+    f"step-decaying (gamma={gamma})": (gamma ** (tk - 1)) / (gamma ** (tk - 1)).sum(),
+}
+
+print(f"prefix trap: rho rises {rho[1]:.3f} -> {rho[H]:.3f}, "
+      f"kappa falls {kappa[1]:.3f} -> {kappa[H]:.3f}")
+print(f"interior optimum at takeover depth t* = {t_star} of {H}\n")
+print(f"{'prefix schedule':<30}{'E[v]':>7}{'E[t]':>7}{'env steps':>11}{'per rollout':>13}")
+for name, w in schedules.items():
+    Ev, Et = float(w @ value[1:]), float(w @ tk)
+    env = H if name.startswith("fully") else 0
+    print(f"{name:<30}{Ev:>7.3f}{Et:>7.2f}{env:>11d}{H / Et:>12.1f}x")
+
+Et_re = float(schedules[f"step-decaying (gamma={gamma})"] @ tk)
+print(f"\nOPD   per rollout: {H} live environment interactions, {H} teacher queries")
+print(f"ReOPD per rollout: 0 live environment interactions, "
+      f"{Et_re:.2f} student turns on a replayed prefix")
+print(f"environment interactions avoided per rollout: {H} "
+      f"({H / Et_re:.1f}x fewer sequential agent turns)")
+
+fig, axes = plt.subplots(1, 2, figsize=(10.5, 4))
+ax = axes[0]
+ax.plot(ts, rho, "o-", label=r"student relevance $\rho(t)$")
+ax.plot(ts, kappa, "s-", label=r"teacher reliability $\kappa(t)$")
+ax.plot(ts, value, "^-", lw=2.2, label=r"value $v(t)\propto\rho(t)\kappa(t)$")
+ax.axvline(t_star, ls=":", c="k", alpha=0.6)
+ax.annotate(f"$t^*={t_star}$", (t_star, value[t_star]),
+            textcoords="offset points", xytext=(7, -13))
+ax.set_xlabel("takeover depth $t$ (student turns before the teacher query)")
+ax.set_ylabel("normalized quantity")
+ax.set_title("The prefix trap: value peaks in the interior")
+ax.set_ylim(0, 1.36)
+ax.legend(fontsize=7.5, loc="upper center", ncol=3, frameon=False)
+ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+names = list(schedules)
+ax.bar(range(3), [float(schedules[n] @ value[1:]) for n in names],
+       color=["#c1554d", "#8d8d8d", "#3d7ea6"])
+ax.set_xticks(range(3))
+ax.set_xticklabels([n.replace(" (", "\n(") for n in names], fontsize=8)
+ax.set_ylabel(r"expected value $\mathbb{E}_w[v(t)]$")
+ax.set_title("Expected value under three prefix distributions")
+ax.grid(True, axis="y", alpha=0.3)
+fig.tight_layout(); plt.show()
+```
+
+The printed table is the argument in miniature. Pushing all the mass to the fully on-policy extreme buys maximal relevance and lands on the *worst* expected value of the three, because the teacher is being interrogated precisely where its answers have decayed, and it pays ten live environment interactions per rollout to get there. The uniform schedule recovers most of the attainable value at zero environment cost. The step-decaying schedule does best on both axes at once: the highest expected value, zero tool calls during student training, and a mean takeover depth of roughly two and a half turns against the ten-turn online rollout. Separately, @liao2026reopd report an at-least-fourfold per-rollout speedup across mathematical reasoning with Python and search environments, over several teacher and student scales, while preserving or improving OPD-level accuracy. The resemblance between those two numbers is a coincidence and nothing should be read into it: the ratio printed above is a count of agent turns that follows arithmetically from the arbitrary settings $\gamma = 0.6$ and $H = 10$, while theirs is a measured wall-clock speedup on real workloads. The simulation shows the direction of the effect, not its magnitude.
+
+This lands squarely on the chapter's running question of what distillation costs and what it buys. The earlier sections priced distillation in teacher forward passes over a transfer set, which is why caching soft targets is standard. Agentic distillation adds a second and far more punishing bill: sequential, non-cacheable, latency-bound interactions with a real environment. ReOPD's contribution is to notice that this bill is not intrinsic. Because teacher trajectories are reusable and the reliable supervision lives in the shallow part of the history anyway, the environment can be paid for once and then amortized indefinitely. What began as a per-update cost becomes a fixed asset, and the transfer set of the earlier sections reappears in agentic form as a bank of replayable prefixes.
+
 ## Pitfalls and When to Use
 
 **The teacher caps the student.** Distillation transfers the teacher's knowledge, including its biases and errors. A student cannot reliably exceed a weak teacher on the distilled task, and a teacher that is systematically wrong will teach the student to be confidently wrong in the same way. Keep the hard-label term (a nonzero $1 - \alpha$) so the student stays anchored to ground truth where it exists.
@@ -382,3 +600,5 @@ The arithmetic that justifies all of this is simple. If distillation cuts parame
 7. Agarwal, R. et al. "On-Policy Distillation of Language Models" (generalized KD). 2024. https://arxiv.org/abs/2306.13649
 8. Mirzadeh, S. et al. "Improved Knowledge Distillation via Teacher Assistant." 2020. https://arxiv.org/abs/1902.03393
 9. Yu, X. et al. "DOPD: Dual On-policy Distillation." 2026. https://arxiv.org/abs/2606.30626
+10. Wu, J. et al. "SEED: Self-Evolving On-Policy Distillation for Agentic Reinforcement Learning." 2026. https://arxiv.org/abs/2607.14777
+11. Liao, B., Dong, H., Monz, C., Xu, X., Dong, L., and Wei, F. "Multi-Turn On-Policy Distillation with Prefix Replay." 2026. https://arxiv.org/abs/2607.04763

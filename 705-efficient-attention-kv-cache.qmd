@@ -132,9 +132,163 @@ where $Z_{i,c}$ is the ordinary softmax normalizer *within* chunk $c$, and $\hat
 
 **What it buys.** Trained at a modest context length, HiLS extrapolates far beyond it, reported at over $64\times$ the training length while sustaining roughly $90\%$ needle-in-a-haystack retrieval accuracy, a regime where full attention's length generalization collapses. Because the factorization has the same intra-/inter-chunk form at any length, an existing full-attention model can be *converted* to HiLS with lightweight continued pretraining, keeping in-domain quality while gaining ultra-long-context reach. It also composes with the rest of this chapter: the KV of unselected chunks need not stay resident in fast memory, so HiLS cuts KV *traffic* (Section 3) the way GQA cuts KV *size* (Section 4), and the two are orthogonal.
 
-## 8. Production Code
+## 8. Native Memory States: When the Cache Becomes Part of the Model {#sec-705-native-memory-state}
 
-### 8.1 A From-Scratch KV-Cache, Executed on CPU
+Step back from the mechanics for a moment. The KV-cache *is* a memory: it is the model's record of everything it has read. But it is a peculiar one. It grows without bound in the history length $n$ (Section 3), it is a raw transcript rather than a summary, and it is thrown away when the session ends. Every technique so far accepts that shape and manages it: GQA makes each token cheaper, paged attention packs the transcript efficiently, sliding windows truncate it, HiLS reads only part of it. @zhang2026metis asks a different question: what if memory were a **native** capability of the backbone rather than an external buffer the serving stack maintains? Their **memory foundation model** formulation has two parts, a persistent and dynamically evolving memory state living inside the network, and **native memory procedures** that store and retrieve information through ordinary model computation rather than through an external retriever. Their prototype, **Metis**, compresses history into that state and reads it back through **memory attention**.
+
+**Memory attention, formally.** Recall the cached decode step of Section 3, where the keys and values come from the token history. Memory attention keeps the same functional form but swaps out where $K$ and $V$ come from. Let the state at step $t$ be a pair of fixed-size matrices $M^K_t \in \mathbb{R}^{m \times d_k}$ and $M^V_t \in \mathbb{R}^{m \times d_v}$ per layer and per KV head, holding $m$ **slots**. As in the decoders of Section 4 we assume $d_v = d_k$ throughout, so a slot costs the same as a cached position. Then
+
+$$
+o_t = \operatorname{softmax}\!\left(\frac{q_t \big(M^K_t\big)^\top}{\sqrt{d_k}}\right) M^V_t ,
+\qquad
+\big(M^K_t, M^V_t\big) = \Phi\big(M^K_{t-1}, M^V_{t-1}, x_t\big),
+$$
+
+where $\Phi$ is the learned write procedure. Two properties of $\Phi$ matter for this chapter. It is **gradient-free**: the update is a forward pass, not an optimization step. And at inference all model weights are **frozen**; only the state moves. That is what separates this from test-time training approaches, which adapt parameters on the fly and therefore pay a backward pass and lose the ability to share weights across concurrent requests. Here the state, not the weight matrix, is the thing that changes, which keeps a served model's weights a read-only shared resource exactly as they are today.
+
+**The accounting.** Take the Section 3 formula at batch one, with $b$ bytes per element and $g$ KV groups as in Section 4. A bounded state is normally paired with a local window of $w$ exact positions, so recent tokens stay lossless:
+
+$$
+\text{KV bytes}(n) = 2\, n_{\text{layers}}\, g\, d_k\, n\, b ,
+\qquad
+\text{state bytes}(m) = 2\, n_{\text{layers}}\, g\, d_k\, (m + w)\, b .
+$$
+
+The first grows in $n$; the second does not depend on $n$ at all. They cross at $n^\star_{\text{bytes}} = m + w$. Per-token attention work tells the same story. Counting the two matrix products of the decode step,
+
+$$
+C_{\text{kv}}(n) = 4\, n_{\text{layers}}\, h\, d_k\, n ,
+\qquad
+C_{\text{mem}}(m) = 4\, n_{\text{layers}}\, h\, d_k \big(w + (1 + \alpha) m\big),
+$$
+
+where $\alpha$ charges the amortized cost of the forward-pass write relative to a read. The KV-cache is $O(n)$ memory and $O(n)$ work per generated token; the state is $O(m)$ and $O(m)$, flat in history length, with crossover at $n^\star_{\text{cost}} = w + (1 + \alpha) m$. Past that point every additional token of history is free.
+
+**The ceiling nobody can engineer around.** Nothing is free, and here the price is information. A state of $m$ slots holds at most $16\, b\, n_{\text{layers}}\, g\, d_k\, m$ bits (the factor $16 = 2 \times 8$ covers keys plus values and bytes to bits). If the history carries roughly $H$ bits per token, then for $n > 16\, b\, n_{\text{layers}}\, g\, d_k\, m / H$ the map from histories to states is many-to-one by the pigeonhole principle: two distinguishable pasts must collapse to the same state, and no decoder can separate them again. A fixed-size memory cannot losslessly represent an unbounded history. The design question is therefore never "can we avoid loss" but "which information do we keep", and that is precisely the question @zhang2026metis pushes into the training objective, constructing memory-specific data and multiple objectives during mid-training so the write procedure learns what is worth retaining.
+
+The cell below makes both halves of the trade visible at once: the asymptotic win on the left and center, the fidelity cost on the right. The recall probe implements exactly the memory attention written above, including the $1/\sqrt{d_k}$ temperature, so its synthetic keys are drawn at norm $\sqrt{d_k}$, the scale keys actually sit at in a trained model, rather than normalized to unit length.
+
+```{python}
+#| label: fig-705-native-memory-state
+#| fig-cap: "A growing KV-cache versus a fixed-size memory state. Left and center: footprint and per-token attention work against history length for a 32-layer GQA decoder, with dots marking the crossover length. Right: exact recall accuracy when a stream of key/value items is compressed into m slots, showing the lossiness that buys the flat cost."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Footprint and per-token cost for a Llama-style decoder with GQA (Section 4), fp16.
+n_layers, h, g, d_k, b = 32, 32, 8, 128, 2   # b = bytes per element
+w = 1024        # local window of exact KV kept beside the memory state
+alpha = 0.5     # amortized forward-pass write cost, per unit of read cost
+
+n_grid = np.logspace(np.log10(1e3), np.log10(4e6), 300)
+
+def kv_gb(n):            # KV-cache bytes grow linearly in history length
+    return 2 * n_layers * g * d_k * n * b / 1e9
+
+def mem_gb(m):           # memory state plus local window: constant in n
+    return 2 * n_layers * g * d_k * (m + w) * b / 1e9
+
+def kv_gflop(n):         # per-token attention work against n cached positions
+    return 4 * n_layers * h * d_k * n / 1e9
+
+def mem_gflop(m):        # per-token memory attention plus the amortized write
+    return 4 * n_layers * h * d_k * (w + (1 + alpha) * m) / 1e9
+
+m_values = [2048, 8192, 32768]
+colors = ["#1b9e77", "#d95f02", "#7570b3"]
+
+def recall_at_length(n_items, m, d=64, n_probe=200, seed=0):
+    """Write n_items (key, value) pairs into m slots, read them back through
+    memory attention, and measure exact recall accuracy."""
+    r = np.random.default_rng(seed)
+    # Scale keys to norm sqrt(d), the scale real attention keys sit at, so the
+    # 1 / sqrt(d_k) temperature of the equation above is the right one here too.
+    keys = r.normal(size=(n_items, d))
+    keys *= np.sqrt(d) / np.linalg.norm(keys, axis=1, keepdims=True)
+    vals = r.normal(size=(n_items, d))
+    vals /= np.linalg.norm(vals, axis=1, keepdims=True)
+
+    # Write: the first min(n, m) items get private slots; every later item is
+    # merged (running mean) into the slot whose key it matches best. A crude
+    # stand-in for a learned write procedure, but the capacity limit is real.
+    k_slots, v_slots = keys[:m].copy(), vals[:m].copy()
+    counts = np.ones(len(k_slots))
+    for i in range(len(k_slots), n_items):
+        j = int(np.argmax(k_slots @ keys[i]))
+        counts[j] += 1.0
+        lr = 1.0 / counts[j]
+        k_slots[j] = (1 - lr) * k_slots[j] + lr * keys[i]
+        k_slots[j] *= np.sqrt(d) / np.linalg.norm(k_slots[j])   # keep slot keys at norm sqrt(d)
+        v_slots[j] = (1 - lr) * v_slots[j] + lr * vals[i]
+
+    # Read: keys and values come from the state, not from the token history.
+    probe = r.choice(n_items, size=min(n_probe, n_items), replace=False)
+    scores = (keys[probe] @ k_slots.T) / np.sqrt(d)   # softmax(q (M^K)^T / sqrt(d_k))
+    scores -= scores.max(axis=1, keepdims=True)
+    p = np.exp(scores)
+    p /= p.sum(axis=1, keepdims=True)
+    pred = np.argmax((p @ v_slots) @ vals.T, axis=1)   # nearest true value
+    return float(np.mean(pred == probe))
+
+slot_counts = [64, 128, 256]
+stream_lengths = [32, 64, 128, 256, 512, 1024, 2048]
+recall = {m: [recall_at_length(n, m) for n in stream_lengths] for m in slot_counts}
+
+fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0))
+
+ax = axes[0]
+ax.loglog(n_grid, kv_gb(n_grid), color="black", lw=2, label="KV-cache, grows as O(n)")
+for m, c in zip(m_values, colors):
+    ax.axhline(mem_gb(m), color=c, ls="--", lw=1.6, label=f"state, m = {m}")
+    ax.plot([m + w], [mem_gb(m)], "o", color=c, ms=6)
+ax.set_xlabel("history length n (tokens)")
+ax.set_ylabel("footprint (GB, fp16)")
+ax.set_title("memory footprint")
+ax.legend(fontsize=7, loc="upper left")
+ax.grid(alpha=0.3, which="both")
+
+ax = axes[1]
+ax.loglog(n_grid, kv_gflop(n_grid), color="black", lw=2, label="KV-cache attention")
+for m, c in zip(m_values, colors):
+    ax.axhline(mem_gflop(m), color=c, ls="--", lw=1.6, label=f"memory attn, m = {m}")
+    ax.plot([w + (1 + alpha) * m], [mem_gflop(m)], "o", color=c, ms=6)
+ax.set_xlabel("history length n (tokens)")
+ax.set_ylabel("per-token attention work (GFLOP)")
+ax.set_title("per-token cost (dots mark crossover)")
+ax.legend(fontsize=7, loc="upper left")
+ax.grid(alpha=0.3, which="both")
+
+ax = axes[2]
+for m, c in zip(slot_counts, colors):
+    ax.plot(stream_lengths, recall[m], "o-", color=c, lw=1.8, label=f"m = {m} slots")
+    ax.axvline(m, color=c, ls=":", lw=1.0)
+ax.set_xscale("log")
+ax.set_xlabel("items written to the state")
+ax.set_ylabel("exact recall accuracy")
+ax.set_title("fidelity (dotted line: capacity m)")
+ax.set_ylim(-0.03, 1.03)
+ax.legend(fontsize=7, loc="lower left")
+ax.grid(alpha=0.3)
+
+fig.tight_layout()
+plt.show()
+
+print(f"{'m (slots)':>10} {'state GB':>10} {'byte crossover':>16} {'cost crossover':>16}")
+for m in m_values:
+    print(f"{m:>10} {mem_gb(m):>10.3f} {m + w:>16,} {int(w + (1 + alpha) * m):>16,}")
+
+print(f"\nrecall accuracy\n{'items':>8}" + "".join(f"{'m=' + str(m):>10}" for m in slot_counts))
+for i, n_items in enumerate(stream_lengths):
+    print(f"{n_items:>8}" + "".join(f"{recall[m][i]:>10.2f}" for m in slot_counts))
+```
+
+The left and center panels show why anyone would want this: a state of $m = 8192$ slots holds a flat footprint (1.208 GB) and a flat per-token cost forever, while the KV-cache line keeps climbing. The two curves cross at 9,216 tokens on footprint and at 13,312 tokens on cost, so beyond roughly thirteen thousand tokens of history the bounded state is strictly cheaper on both axes. The right panel shows what it costs. While the stream fits in the slots, recall is perfect; once it exceeds capacity, accuracy tracks the reciprocal of the overwrite factor for the first few doublings and then degrades faster than that. At $m = 64$ the executed values are 0.48, 0.23, and 0.12 at $2\times$, $4\times$, and $8\times$ overcapacity, close to $1/2$, $1/4$, and $1/8$, but then 0.01 at $16\times$ and 0.00 at $32\times$, well below the reciprocal's 0.06 and 0.03, because merged slots blur items that a raw cache would have kept apart. A learned write procedure is far better than the running-mean policy used here, but no policy repeals the pigeonhole bound above.
+
+Treat this as an open direction, not a settled result. @zhang2026metis is explicit that Metis is a first prototype and reports limitations alongside its strengths, and the honest reading is that native memory changes the shape of the tradeoff rather than removing it. This chapter's core tension has been exact access versus bounded cost: the KV-cache buys exactness by paying $O(n)$, sliding windows buy $O(w)$ by giving up reach, HiLS buys sparsity by learning what to fetch from a cache that still exists. A memory foundation model pushes the same dial one notch further, keeping no transcript at all beyond the local window and betting entirely on what the model learned to write down. Whether that bet pays off at production context lengths is exactly the question the next few years of this literature will answer.
+
+## 9. Production Code
+
+### 9.1 A From-Scratch KV-Cache, Executed on CPU
 
 The following cell implements single-head causal self attention two ways: the **naive** decoder that recomputes attention over the full prefix at every step, and the **cached** decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder's superlinear growth against the cache's near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.
 
@@ -254,7 +408,7 @@ for t in [128, 256, 512, 1024]:
 
 The naive column grows faster than the cached column as the prefix doubles, the empirical signature of $O(t^2)$ versus $O(t)$ per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.
 
-### 8.2 Grouped-Query and Multi-Query Attention, Executed on CPU
+### 9.2 Grouped-Query and Multi-Query Attention, Executed on CPU
 
 This cell implements one attention layer parameterized by the number of KV groups $g$. Setting $g = h$ gives multi-head attention, $g = 1$ gives multi-query attention, and $1 < g < h$ gives grouped-query attention. We repeat each KV head across its query group with `repeat_interleave`, run a forward pass for several values of $g$, and report the resulting KV-cache size so the $h/g$ reduction is explicit.
 
@@ -331,7 +485,7 @@ print("GQA with g = n_heads is structurally identical to MHA (per-head KV, no sh
 
 The KV bytes fall exactly by the factor $h/g$: halving the number of KV groups halves the cache. MQA ($g = 1$) is eight times smaller than MHA here, and GQA at $g = 4$ or $g = 2$ gives an intermediate footprint, the trade space real models tune for quality versus memory.
 
-### 8.3 FlashAttention (requires GPU)
+### 9.3 FlashAttention (requires GPU)
 
 FlashAttention ships as a fused CUDA kernel. The cleanest way to use it in practice is through PyTorch's `scaled_dot_product_attention`, which dispatches to a FlashAttention backend on supported GPUs, or through the `flash-attn` package directly. The code below is the real invocation; it is not executed here because the speedup depends on the GPU SRAM-versus-HBM gap.
 
@@ -360,7 +514,7 @@ from flash_attn import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True)
 ```
 
-### 8.4 Paged Attention with vLLM (requires GPU)
+### 9.4 Paged Attention with vLLM (requires GPU)
 
 vLLM implements paged attention and continuous batching behind a simple serving API. The KV-cache management, block tables, and prefix sharing are internal; the user just gets high throughput. Shown, not executed, because it loads a multi-billion-parameter model onto a GPU.
 
@@ -379,7 +533,7 @@ for output in llm.generate(prompts, params):
     print(output.outputs[0].text)
 ```
 
-### 8.5 Sliding-Window Attention on GPU
+### 9.5 Sliding-Window Attention on GPU
 
 Sliding-window attention is a property of the model architecture and is applied by the serving stack. With FlashAttention the window is passed as a kernel argument so the bounded attention is computed fused, and the KV-cache is capped at the window size. Shown, not executed, because it needs the GPU kernel.
 
@@ -391,7 +545,7 @@ from flash_attn import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True, window_size=(4096, 0))
 ```
 
-### 8.6 Running it on a GPU (executed)
+### 9.6 Running it on a GPU (executed)
 
 The CPU cells above show the asymptotics on small tensors. To see the KV-cache pay off on a real model and real hardware, the cell below loads a small open-weights instruct model (Qwen2.5-0.5B-Instruct, with a gpt2 fallback) onto the GPU and times autoregressive generation twice: once with `use_cache=True`, which keeps the running keys and values exactly as in Section 3, and once with `use_cache=False`, which forces the model to recompute attention over the whole growing prefix at every step. Both decode the same fixed number of new tokens from the same prompt under identical greedy settings, so the only difference is whether the cache is reused.
 
@@ -487,7 +641,7 @@ else:
 
 The `use_cache=True` path is the production default and decodes each token in roughly constant time, because every step attends one new query against the stored cache. The `use_cache=False` path recomputes keys and values for the whole prefix at every step, so its per-token cost climbs with position and its total time is several times larger even for this short generation. The peak-memory line shows the other side of the trade from Section 3: the cache that buys the speedup is itself resident memory, modest here but the quantity that, at production context lengths, dominates the serving budget.
 
-## 9. Pitfalls and When to Use
+## 10. Pitfalls and When to Use
 
 **The KV-cache is almost always the right default for decoding, but it is not free.** It trades recomputation for memory, and at long context the cache can exceed the model weights in size. Budget for it explicitly using the formula in Section 3 before assuming a context length fits. If memory is the binding constraint, the levers in order of disruption are GQA or MQA (architectural, set at training time), KV-cache quantization to int8 or fp8 (cheap, small quality cost), and sliding-window or other sparse attention (changes the model's reach).
 
@@ -512,3 +666,4 @@ The `use_cache=True` path is the production default and decodes each token in ro
 9. Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867
 10. Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288
 11. Hu, X. et al. "Hierarchical Sparse Attention Done Right: Toward Infinite Context Modeling" (HiLS attention). 2026. https://arxiv.org/abs/2607.02980
+12. Zhang, Z. et al. "Metis: Memory Foundation Model" (native memory states and memory attention). 2026. https://arxiv.org/abs/2607.26760

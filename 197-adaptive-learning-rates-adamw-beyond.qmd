@@ -73,7 +73,7 @@ vhat = v / (1 - b2**t)
 theta = theta - lr * (mhat / (sqrt(vhat) + eps) + wd * theta)
 ```
 
-### 3.3 A precise statement of the decoupling
+### 3.1 A precise statement of the decoupling
 
 It is worth writing the two updates side by side so the single point of divergence is unambiguous. Let $P_t = \operatorname{diag}\!\big(\sqrt{\hat v_t} + \epsilon\big)$ be the diagonal preconditioner. **L2-regularized Adam** folds the penalty into the gradient, $\tilde g_t = g_t + \lambda \theta_{t-1}$, and feeds $\tilde g_t$ through the moment recursions, giving
 
@@ -91,11 +91,11 @@ where $\hat m_t$ is built from the *unpenalized* gradient $g_t$ alone. The decay
 
 A useful sanity check is the fixed point. Suppose training reaches a coordinate where the data gradient is zero, $g_{t}=0$. Then $\hat m_t \to 0$, the adaptive term vanishes, and the AdamW update reduces to pure geometric shrinkage $\theta_t = (1-\alpha\lambda)\,\theta_{t-1}$, pulling that weight cleanly toward the origin. Under coupled L2 the same coordinate would still be shrunk, but by the curvature-warped amount $\alpha\lambda\,\theta_{t-1,i}/(\sqrt{\hat v_{t,i}}+\epsilon)$, which depends on a stale second-moment estimate that has nothing to do with the regularizer. The reference implementation below makes this fixed point a unit test.
 
-### 3.1 Practical consequences
+### 3.2 Practical consequences
 
 Decoupling has two practical payoffs. First, the optimal weight decay $\lambda$ becomes far more stable across learning rates, so the two hyperparameters can be tuned more independently. Loshchilov and Hutter report that the region of good $(\alpha, \lambda)$ pairs becomes much wider and more diagonal under decoupling. Second, decoupling consistently improves generalization on image and language benchmarks, and it has become the default optimizer for training transformers. When a schedule scales $\alpha$ over training, note that the decay magnitude $\alpha\lambda$ scales with it as well, so some implementations decouple the schedule from the decay too.
 
-### 3.2 A note on the bias of the denominator
+### 3.3 A note on the bias of the denominator
 
 The argument above also clarifies why decoupling matters more for adaptive methods than for momentum SGD. The damage comes specifically from dividing the penalty by $\sqrt{\hat{v}_t}$. Any optimizer with a per coordinate preconditioner inherits the same pathology, which is why decoupled decay is now standard not only for Adam but for related methods such as LAMB and RAdam.
 
@@ -169,11 +169,198 @@ The four methods address different axes of the same problem. AdamW fixes how reg
 
 A useful unifying view is that each method is a choice of preconditioner and a choice of how regularization enters relative to that preconditioner. Adam and AdamW share the diagonal $1/\sqrt{\hat{v}_t}$ preconditioner and differ only in whether decay passes through it. AMSGrad changes the preconditioner to a monotone variant. Lion replaces the preconditioner with a sign nonlinearity. Adafactor approximates the preconditioner with a factored estimate. In all cases the AdamW insight holds: regularization should act on the parameters directly, not be filtered through whatever adaptive scaling the optimizer applies to gradients.
 
-## 8. Summary
+## 8. Higher-Order Optimizers: Muon, SOAP, and Update-RMS Matching {#sec-197-higher-order-spectral}
 
-The equivalence between $L_2$ regularization and weight decay is a property of plain gradient descent that adaptive methods quietly break, because dividing the penalty by a per coordinate curvature estimate turns uniform shrinkage into curvature dependent shrinkage. AdamW restores the intended behavior by decoupling decay from the adaptive step, which both improves generalization and makes the learning rate and decay hyperparameters more orthogonal. AMSGrad, Lion, and Adafactor then vary the preconditioner itself, for convergence guarantees, for memory and robustness, and for sublinear state respectively, while inheriting the decoupled decay lesson. Understanding which quantity a given optimizer rescales, and where regularization enters relative to that rescaling, is the key to reasoning about all of them.
+Every method surveyed so far treats a weight matrix as a bag of independent scalars. Adam, AdamW, AMSGrad, Lion, and Adafactor all build a preconditioner that acts entrywise, so the matrix structure of a linear layer is invisible to the optimizer. A useful way to see what that assumption costs is the linear minimization oracle view: the update direction is the minimizer of a linearized objective over a norm ball, and the choice of norm is what separates optimizer families. The Adam family implicitly picks an elementwise norm, while **matrix-aware** or **higher-order** methods such as Shampoo and Muon pick a spectral norm, which respects the fact that a weight matrix acts on vectors rather than on coordinates. @khona2026soapmuon take the two leading representatives of this family, Muon and SOAP, and push them to language model pretraining scale, reporting that both consistently beat AdamW at the scales they tested and that the advantage is largest at very large batch sizes, up to roughly 100M tokens per batch.
 
-## 9. A From-Scratch AdamW Implementation
+**Muon** keeps a single momentum buffer with the same shape as the weight matrix, $M_t = \mu M_{t-1} + G_t$, and then discards its singular values entirely. Writing the singular value decomposition $M_t = U \Sigma V^\top$, the update direction is the orthogonal factor of the polar decomposition,
+
+$$
+\mathrm{ortho}(M_t) = U V^\top, \qquad W_t = W_{t-1} - \alpha \, \mathrm{ortho}(M_t).
+$$
+
+Because $UV^\top$ has all singular values equal to one, it is exactly the maximizer of $\langle M_t, \Delta \rangle$ over the unit spectral norm ball, which is the linear minimization oracle solution for the spectral geometry. Every direction in the row and column space is advanced by the same amount, so a direction whose gradient signal is small is not starved by a large one. In production the SVD is replaced by a few steps of a Newton-Schulz style polynomial iteration, which needs only matrix multiplies and stays in low precision. One consequence matters below: for an $m \times n$ matrix, $\|UV^\top\|_F^2 = \min(m,n)$, so $\mathrm{RMS}(\mathrm{ortho}(M)) = 1/\sqrt{\max(m,n)}$, a number that shrinks as layers get wider.
+
+**SOAP** starts from Shampoo, which accumulates two second-moment matrices, one on each side of the gradient,
+
+$$
+L_t = \beta L_{t-1} + (1-\beta)\, G_t G_t^\top \in \mathbb{R}^{m \times m}, \qquad
+R_t = \beta R_{t-1} + (1-\beta)\, G_t^\top G_t \in \mathbb{R}^{n \times n},
+$$
+
+with the Shampoo step $\Delta W_t \propto L_t^{-1/4} G_t R_t^{-1/4}$. SOAP observes that most of Shampoo's benefit comes from the *rotation*, not the inverse roots. Eigendecomposing $L_t = Q_L \Lambda_L Q_L^\top$ and $R_t = Q_R \Lambda_R Q_R^\top$, it rotates the gradient into that basis, runs an ordinary AdamW update there, and rotates back:
+
+$$
+G_t' = Q_L^\top G_t Q_R, \qquad U_t' = \frac{\hat m_t'}{\sqrt{\hat v_t'} + \epsilon}, \qquad \Delta W_t = Q_L\, U_t'\, Q_R^\top .
+$$
+
+The eigenbasis is refreshed only every $f$ steps, typically every ten to a few hundred, which amortizes the decomposition cost across many cheap AdamW steps. The remaining obstacles are numerical rather than conceptual, and this is where @khona2026soapmuon contribute: they stabilize SOAP under large batch training with **QR orthogonalization** in place of a fragile eigendecomposition and with improved preconditioner accumulation, then build a **layer-wise distributed optimizer** compatible with Megatron-LM so that the per-layer preconditioner work is sharded rather than replicated, and release the resulting codebase.
+
+The methodological contribution is separate from either algorithm and is the part most likely to change how you read optimizer papers. Define the update root mean square for a matrix update $\Delta W \in \mathbb{R}^{m \times n}$ as
+
+$$
+\mathrm{RMS}(\Delta W) = \Big( \tfrac{1}{mn} \sum_{i,j} \Delta W_{ij}^2 \Big)^{1/2}.
+$$
+
+Different optimizers emit updates of systematically different scale at the same nominal learning rate. An elementwise AdamW update has $|U_{ij}| \approx 1$ by construction, so $\mathrm{RMS} \approx 1$, whereas Muon's orthogonalized update has $\mathrm{RMS} = 1/\sqrt{\max(m,n)}$, which is about $0.03$ for a $1024 \times 1024$ layer. Comparing the two at a shared $\alpha$ therefore compares steps that differ by more than an order of magnitude in size, and the result mostly measures how well each learning rate happened to be tuned. **Update-RMS matching** removes that confound: measure each optimizer's characteristic $\mathrm{RMS}(\Delta W)$ over a short calibration window, then fix a constant per-optimizer factor $c_o = \rho / \overline{\mathrm{RMS}}_o$ that rescales its update to a common target $\rho$ before the shared learning rate is applied. This is a reparameterization, not a per-step normalization, so it leaves the within-run dynamics intact while putting all optimizers on the same step-size footing. The specific recipe stated here, a short measurement window followed by one frozen constant per optimizer, is our concrete rendering of that principle rather than a transcription of the paper's exact calibration protocol; treat the constants and the window length as knobs, not as a fixed algorithm.
+
+The cell below makes the point concrete on an ill-conditioned matrix least squares problem, comparing an elementwise Adam update, a Muon-style orthogonalized update, and a SOAP-style eigenbasis Adam update, first at a shared learning rate and then with their update RMS matched. Decoupled weight decay is left out of all three arms, since it acts on the parameters rather than on the update direction and so plays no role in the update-RMS argument; the elementwise arm is therefore labeled `adam`, not `adamw`.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| label: fig-197-rms-matching
+#| fig-cap: "Loss curves for Adam, SOAP, and Muon style updates on an ill-conditioned matrix least squares problem. At a shared learning rate (left) Adam appears to dominate, but once each optimizer's update RMS is matched to a common target (right) SOAP overtakes it by more than a factor of ten, while Muon roughly halves its deficit and still finishes about an order of magnitude above Adam."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+d, k, n = 32, 32, 256
+
+# Ill-conditioned matrix least squares: f(W) = ||X W - Y||_F^2 / (2n).
+Q1, _ = np.linalg.qr(rng.standard_normal((n, d)))
+Q2, _ = np.linalg.qr(rng.standard_normal((d, d)))
+X = (Q1 * np.logspace(0.0, -2.0, d)) @ Q2.T          # condition number 100
+W_star = rng.standard_normal((d, k)) / np.sqrt(d)
+Y = X @ W_star
+
+def loss_grad(W):
+    R = X @ W - Y
+    return 0.5 * np.sum(R * R) / n, (X.T @ R) / n
+
+def rms(A):
+    return float(np.sqrt(np.mean(A * A)))
+
+def ortho(M):
+    """Orthogonal polar factor U V^T of M = U S V^T (the spectral LMO solution)."""
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+B1, B2, EPS, MOM, FREQ = 0.9, 0.95, 1e-8, 0.95, 10
+
+def fresh():
+    return dict(t=0, m=np.zeros((d, k)), v=np.zeros((d, k)),
+                L=np.zeros((d, d)), R=np.zeros((k, k)),
+                QL=np.eye(d), QR=np.eye(k))
+
+def direction(kind, G, s):
+    s["t"] += 1
+    t = s["t"]
+    if kind == "muon":                              # spectral norm LMO
+        s["m"] = MOM * s["m"] + G
+        return ortho(s["m"])
+    if kind == "soap":                              # Adam in Shampoo's eigenbasis
+        s["L"] = B2 * s["L"] + (1 - B2) * (G @ G.T)
+        s["R"] = B2 * s["R"] + (1 - B2) * (G.T @ G)
+        if (t - 1) % FREQ == 0:                     # slow eigenbasis refresh
+            s["QL"] = np.linalg.eigh(s["L"])[1]
+            s["QR"] = np.linalg.eigh(s["R"])[1]
+        G = s["QL"].T @ G @ s["QR"]
+    # Adam moments. Decoupled weight decay is omitted from every arm: it acts on
+    # the parameters, not on the update direction, so it cannot affect update RMS.
+    s["m"] = B1 * s["m"] + (1 - B1) * G
+    s["v"] = B2 * s["v"] + (1 - B2) * G * G
+    U = (s["m"] / (1 - B1**t)) / (np.sqrt(s["v"] / (1 - B2**t)) + EPS)
+    return s["QL"] @ U @ s["QR"].T if kind == "soap" else U
+
+CALIB, STEPS, LR = 10, 150, 0.01
+
+def run(kind, scale=1.0):
+    W, s, hist, mags = np.zeros((d, k)), fresh(), [], []
+    for i in range(STEPS):
+        f, G = loss_grad(W)
+        hist.append(f)
+        U = scale * direction(kind, G, s)
+        if i < CALIB:                               # calibration window
+            mags.append(rms(U))
+        W = W - LR * U
+    hist.append(loss_grad(W)[0])
+    return np.array(hist), float(np.mean(mags))
+
+kinds = ["adam", "soap", "muon"]
+raw = {kd: run(kd) for kd in kinds}
+target = raw["adam"][1]                             # common update RMS target
+matched = {kd: run(kd, scale=target / raw[kd][1]) for kd in kinds}
+
+print(f"target update RMS = {target:.4f}   (shared lr = {LR})")
+print(f"{'optimizer':<8} {'RMS raw':>8} {'scale':>7} {'RMS matched':>12}"
+      f" {'loss raw':>11} {'loss matched':>13}")
+for kd in kinds:
+    print(f"{kd:<8} {raw[kd][1]:8.4f} {target / raw[kd][1]:7.2f} {matched[kd][1]:12.4f}"
+          f" {raw[kd][0][-1]:11.3e} {matched[kd][0][-1]:13.3e}")
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 3.8), sharey=True)
+for kd in kinds:
+    ax[0].semilogy(raw[kd][0], label=kd)
+    ax[1].semilogy(matched[kd][0], label=kd)
+ax[0].set_title("shared learning rate, update RMS unmatched")
+ax[1].set_title("shared learning rate, update RMS matched")
+ax[0].set_ylabel("training loss")
+for a in ax:
+    a.set_xlabel("step")
+    a.grid(alpha=0.3)
+    a.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Julia
+
+```julia
+using LinearAlgebra
+
+# Muon: replace the momentum matrix by the orthogonal factor of its polar decomposition.
+ortho(M) = (F = svd(M); F.U * F.Vt)
+
+rms(A) = sqrt(sum(abs2, A) / length(A))
+
+# Update RMS matching: one constant per optimizer, calibrated on a short warmup.
+match_scale(target, measured_rms) = target / measured_rms
+
+function muon_step!(W, M, G; lr = 0.01, mom = 0.95, scale = 1.0)
+    M .= mom .* M .+ G
+    W .-= (lr * scale) .* ortho(M)
+    return W
+end
+```
+
+## Rust
+
+```rust
+use nalgebra::DMatrix;
+
+/// Orthogonal polar factor U V^T of M = U S V^T (the spectral norm LMO solution).
+fn ortho(m: &DMatrix<f64>) -> DMatrix<f64> {
+    let svd = m.clone().svd(true, true);
+    svd.u.as_ref().unwrap() * svd.v_t.as_ref().unwrap()
+}
+
+fn rms(a: &DMatrix<f64>) -> f64 {
+    (a.iter().map(|x| x * x).sum::<f64>() / a.len() as f64).sqrt()
+}
+
+/// One Muon step with a constant update RMS matching factor.
+fn muon_step(w: &mut DMatrix<f64>, m: &mut DMatrix<f64>, g: &DMatrix<f64>,
+             lr: f64, mom: f64, scale: f64) {
+    *m = &*m * mom + g;
+    *w -= ortho(m) * (lr * scale);
+}
+```
+
+:::
+
+The printed table tells the story, and it is more nuanced than a glance at the curves suggests. At the shared learning rate the Adam update has RMS near $0.867$ while Muon's orthogonalized update sits at exactly $1/\sqrt{32} \approx 0.1768$ and SOAP's rotated update lands in between at $0.328$, so Adam finishes at loss $3.79 \times 10^{-6}$ against SOAP's $3.12 \times 10^{-5}$ and Muon's $8.93 \times 10^{-5}$, roughly $8\times$ and $24\times$ worse, purely because it is taking much larger steps. Rescaling each optimizer by its calibrated constant reverses the verdict for one of them and only softens it for the other: SOAP drops to $2.84 \times 10^{-7}$, about thirteen times below Adam, while Muon improves to $3.80 \times 10^{-5}$, which cuts its deficit from $24\times$ to roughly $10\times$ but still leaves it an order of magnitude above Adam. So RMS matching flips the SOAP comparison outright and roughly halves Muon's gap without closing it. Even that partial correction is the point: the unmatched ranking was substantially an artifact of update scale, which is why @khona2026soapmuon insist on RMS matching before drawing any conclusion about which optimizer converges faster. Muon still trails here because a fixed quadratic rewards the per-direction curvature scaling that SOAP retains and that pure orthogonalization throws away, a caveat worth remembering when reading small-scale optimizer benchmarks.
+
+When should a practitioner actually reach for these? The honest answer is at scale and on matrix-shaped parameters. The gains reported by @khona2026soapmuon appear in language model pretraining with very large batches, exactly the regime where AdamW's per-coordinate adaptivity saturates and the extra information in the matrix structure has something left to contribute. If you are fine-tuning, training a model that fits on one accelerator, or working with parameters that are mostly vectors and embeddings, AdamW remains the right default: the preconditioner state, the periodic decompositions, and the distributed plumbing are real engineering costs that buy nothing at that scale. Muon and SOAP are also typically applied only to the two-dimensional weights, with biases, norms, and embeddings left on AdamW, so adopting them is a hybrid decision rather than a wholesale switch. And whichever you evaluate, calibrate update RMS before you compare, or your benchmark will measure your learning rate sweep instead of your optimizer.
+
+## 9. Summary
+
+The equivalence between $L_2$ regularization and weight decay is a property of plain gradient descent that adaptive methods quietly break, because dividing the penalty by a per coordinate curvature estimate turns uniform shrinkage into curvature dependent shrinkage. AdamW restores the intended behavior by decoupling decay from the adaptive step, which both improves generalization and makes the learning rate and decay hyperparameters more orthogonal. AMSGrad, Lion, and Adafactor then vary the preconditioner itself, for convergence guarantees, for memory and robustness, and for sublinear state respectively, while inheriting the decoupled decay lesson. Muon and SOAP change the underlying geometry rather than the preconditioner's entries: reading the update as a linear minimization oracle over a norm ball, they trade the Adam family's elementwise norm for a spectral one, so a weight matrix is treated as an operator instead of a bag of scalars. That switch also changes the natural size of an update, which makes update-RMS matching a prerequisite for any honest comparison, since two optimizers run at the same nominal learning rate are otherwise taking steps of systematically different magnitude. Understanding which quantity a given optimizer rescales, where regularization enters relative to that rescaling, and how large a step the result actually takes, is the key to reasoning about all of them.
+
+## 10. A From-Scratch AdamW Implementation
 
 The companion `aiinaction` package ships a small, dependency-light AdamW that follows the four-line update exactly: maintain `m` and `v`, bias-correct, then take the adaptive step plus a *decoupled* decay applied straight to the parameters. The same algorithm is implemented in Python, Julia, and Rust, and a shared set of numeric fixtures keeps the three at parity. Below we minimize a diagonal quadratic $f(x) = \tfrac12 (x - x^\star)^\top A (x - x^\star)$ with $A = \operatorname{diag}(3, 1)$ and optimum $x^\star = (2, -1)$, whose gradient is $\nabla f(x) = A\,(x - x^\star)$.
 
@@ -262,3 +449,4 @@ All three share the fixtures `theta = [0.899000002, -1.898000001, 0.3995000005]`
 5. Shazeer, N., and Stern, M. Adafactor: Adaptive Learning Rates with Sublinear Memory Cost. ICML 2018. https://arxiv.org/abs/1804.04235
 6. You, Y., et al. Large Batch Optimization for Deep Learning: Training BERT in 76 Minutes (LAMB). ICLR 2020. https://arxiv.org/abs/1904.00962
 7. Liu, L., et al. On the Variance of the Adaptive Learning Rate and Beyond (RAdam). ICLR 2020. https://arxiv.org/abs/1908.03265
+8. Khona, M., Vavre, A., et al. SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales. 2026. https://arxiv.org/abs/2607.20548

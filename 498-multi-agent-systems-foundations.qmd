@@ -205,7 +205,7 @@ print(f"\nmax gap between the two mean trajectories: {np.abs(swarm_traj - mcl_tr
 
 Averaged over many replicate runs, the two processes' *mean* trajectories track each other closely at every round, which is exactly what Proposition 2 predicts: it is a statement about the expected update, the drift of Equation @eq-498-drift, not about any single finite-$N$ sample path. A single realization of the discrete swarm, by contrast, is a literal absorbing Markov chain: a finite voter model *must* eventually reach unanimous consensus on one option (this is the classical voter-model fixation result), so one run of the swarm typically lands on a hard $[0,\dots,1,\dots,0]$ well before the smoother single-agent MCL policy gets that close, a real difference in variance and absorption behavior, not a bug in the equivalence. Averaging over replicates is what recovers the shared mean-field dynamics both processes obey.
 
-The practical reading for multi-agent debate carries over directly: **debate-and-vote is a bandit algorithm running on the space of candidate answers**, and it converges on the best answer precisely because, and only because, each agent's broadcast strength (how convincingly it argues) tracks that answer's true quality. This is also a precise diagnosis of the echo-chamber failure mode of section 6.1: if every agent's quality estimate $r_a$ is drawn from the same biased source (identical model, identical prompt, correlated errors), the "bandit" is not exploring $n$ independent noisy estimates at all, it is running $N$ correlated copies of one estimate, and the replicator dynamic above amplifies whatever that shared estimate says, right or wrong, rather than discovering the true best answer.
+The practical reading for multi-agent debate carries over directly: **debate-and-vote is a bandit algorithm running on the space of candidate answers**, and it converges on the best answer precisely because, and only because, each agent's broadcast strength (how convincingly it argues) tracks that answer's true quality. This is also a precise diagnosis of the echo-chamber failure mode of Section 6.1: if every agent's quality estimate $r_a$ is drawn from the same biased source (identical model, identical prompt, correlated errors), the "bandit" is not exploring $n$ independent noisy estimates at all, it is running $N$ correlated copies of one estimate, and the replicator dynamic above amplifies whatever that shared estimate says, right or wrong, rather than discovering the true best answer.
 
 ## 6. Failure Modes
 
@@ -225,7 +225,271 @@ In a group chat with $N$ agents exchanging $k$ messages each over $T$ rounds, th
 
 Coordination messages (routing, acknowledgment, role assignment, format negotiation) consume tokens without advancing the task. In systems where the coordination protocol is itself LLM-generated (as in AutoGen's LLM-based speaker selection), coordination can consume a non-trivial fraction of total compute. Fixed-topology systems like ChatDev avoid this by hardcoding the coordination graph, trading flexibility for efficiency.
 
-## 7. Implementation: Two-Agent Debate in Python
+## 7. When Is Routing Meaningful? Diversity and Stability as Preconditions {#sec-routing-meaningful}
+
+The systems of this chapter all assume that assembling a pool of agents and routing each query to the most suitable one is worth the coordination cost of @sec-multi-agent-llm. Huot et al. [@huot2026routing] ask a sharper question: when is such routing genuinely *meaningful*, as opposed to merely accurate? Their answer is that raw accuracy on clean queries is a treacherous metric, because a router can post a high hit rate while doing nothing that a single fixed model could not do just as well. Meaningful routing, they argue, requires two properties that accuracy alone never certifies. The first is behavioral *differentiation*: the agents in the society must actually respond differently, since if they answer identically then routing is vacuous and there is nothing to route between. The second is *stability*: surface-form variants of the same query, a paraphrase that preserves meaning, should route to the same agent, otherwise the assignment is arbitrary rather than a reflection of any real specialization.
+
+To quantify the first property, the authors adapt Hierarchic Social Entropy (HSE), a diversity measure originally from the study of behavioral heterogeneity in robot collectives, to a society of language models: an agent's "behavior" is its output profile across a battery of probe queries, and HSE integrates over a range of distance thresholds to summarize how many behaviorally distinct voices the pool actually contains at every granularity. Their central empirical finding is that this diversity exhibits strong diminishing returns. Most of the behavioral variety present in a large pool is already recoverable from a curated subset of fewer than ten agents, so the marginal agent past that point rarely widens the society's repertoire. This directly qualifies the naive "more agents is better" intuition: a society can be large and still behaviorally thin.
+
+For the second property they introduce a perturbation-based robustness metric that paraphrases each query and measures whether the router's assignment survives the rewording. Here the results are the most cautionary. A learned KNN router, which assigns each query to the nearest specialist in an embedding space, gains genuine accuracy on societies of true specialists, but its assignments *collapse* under paraphrase perturbation: the specific agent chosen flips readily even though the query's meaning is unchanged. A simple prompted router, one that asks a capable model which agent should handle the query, retains both its accuracy and its stability. The lesson is that clean-query accuracy can mask a meaningless router, because accuracy and meaningfulness can sharply diverge: two routers with nearly identical hit rates can differ entirely in whether their choices mean anything.
+
+The following simulation reproduces both phenomena on a toy society. It builds a pool of agents as behavior vectors drawn from a few behavioral archetypes (specialties), with several near-duplicate agents per archetype, exactly the redundancy the paper warns about. It then (1) traces an HSE-flavored diversity curve, the entropy of a threshold clustering of the society, as agents are added one at a time, and (2) trains a nearest-neighbor router that predicts *which agent* should answer, scoring its clean-query accuracy at the level of *specialty* (did it route to a competent agent?) and its stability at the level of *agent identity* (did a paraphrase change which agent it picked?).
+
+```{python}
+#| label: code-498-routing-meaningfulness
+#| fig-cap: "HSE-style diversity of a growing agent society. The entropy of a threshold clustering rises quickly and then plateaus: most behavioral variety is recovered from fewer than ten agents, reproducing the strong diminishing returns reported by Huot et al."
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.neighbors import KNeighborsClassifier
+
+rng = np.random.default_rng(7)
+
+# ---- A society of LLM agents as behavior vectors ----
+# Each agent belongs to one of a few behavioral archetypes ("specialties").
+# Several agents per specialty are near-duplicates: adding the sixth coding
+# specialist barely widens the society's behavioral repertoire.
+n_specialties = 4
+agents_per_specialty = 6
+dim = 8
+specialty_centers = rng.normal(0.0, 3.0, size=(n_specialties, dim))
+
+agent_vecs, agent_specialty = [], []
+for s in range(n_specialties):
+    for _ in range(agents_per_specialty):
+        agent_vecs.append(specialty_centers[s] + rng.normal(0.0, 0.5, size=dim))
+        agent_specialty.append(s)
+agent_vecs = np.array(agent_vecs)
+agent_specialty = np.array(agent_specialty)
+n_agents = len(agent_vecs)
+
+
+# ---- (1) Diversity has strong diminishing returns (HSE-flavored) ----
+def society_diversity(vecs):
+    """Shannon entropy (bits) of a threshold clustering of the society: how many
+    behaviorally distinct voices the pool contains. Agents that fall inside an
+    existing cluster do not raise it, so redundancy is not counted as diversity."""
+    if len(vecs) < 2:
+        return 0.0
+    labels = AgglomerativeClustering(
+        n_clusters=None, distance_threshold=3.0, linkage="average"
+    ).fit_predict(vecs)
+    _, counts = np.unique(labels, return_counts=True)
+    p = counts / counts.sum()
+    return float(-(p * np.log2(p)).sum())
+
+
+order = rng.permutation(n_agents)
+sizes = np.arange(1, n_agents + 1)
+div_curve = np.array([society_diversity(agent_vecs[order[:m]]) for m in sizes])
+full = div_curve[-1]
+frac = div_curve / full
+reached_90 = int(sizes[np.argmax(frac >= 0.90)])
+
+# ---- (2) A KNN router: accurate yet unstable ----
+def make_queries(n, rng):
+    s = rng.integers(0, n_specialties, size=n)
+    return specialty_centers[s] + rng.normal(0.0, 0.8, size=(n, dim)), s
+
+def nearest_agent(X):
+    d = ((X[:, None, :] - agent_vecs[None, :, :]) ** 2).sum(-1)
+    return d.argmin(1)
+
+X_tr, _ = make_queries(400, rng)
+y_tr = nearest_agent(X_tr)                 # label = agent identity
+router = KNeighborsClassifier(n_neighbors=1).fit(X_tr, y_tr)
+
+X_te, s_te = make_queries(300, rng)
+clean_assign = router.predict(X_te)
+accuracy = float((agent_specialty[clean_assign] == s_te).mean())   # competent specialist?
+
+X_pert = X_te + rng.normal(0.0, 0.6, size=X_te.shape)              # a meaning-preserving paraphrase
+pert_assign = router.predict(X_pert)
+stability = float((pert_assign == clean_assign).mean())            # same agent chosen?
+pert_accuracy = float((agent_specialty[pert_assign] == s_te).mean())
+
+print(f"society size: {n_agents} agents across {n_specialties} specialties")
+print(f"full diversity: {full:.3f} bits; 90% of it reached by {reached_90} agents")
+print(f"routing accuracy on clean queries (correct specialty): {accuracy:.3f}")
+print(f"routing accuracy after paraphrase (correct specialty):  {pert_accuracy:.3f}")
+print(f"assignment stability under paraphrase (same agent):     {stability:.3f}")
+
+fig, ax = plt.subplots(figsize=(6, 3.4))
+ax.plot(sizes, div_curve, marker="o", color="#3b6ea5")
+ax.axvline(reached_90, ls="--", color="grey", lw=1)
+ax.set_xlabel("agents in society")
+ax.set_ylabel("behavioral diversity (bits)")
+ax.set_title("Diminishing returns of society diversity")
+fig.tight_layout()
+plt.show()
+```
+
+The printed numbers tell the paper's story in miniature. The diversity curve saturates well before the full pool is assembled, so nearly all of the society's behavioral repertoire is captured by a handful of agents and the rest are redundant. Meanwhile the router remains highly accurate at the level that a benchmark would score, it almost always dispatches a query to a competent specialist, even after paraphrasing, yet its stability collapses: a semantically inert reword frequently changes *which* agent is chosen. Accuracy and meaningfulness have diverged, precisely the failure the paper isolates. This is the same pathology as the echo-chamber failure mode of Section 6.1 viewed from the routing side rather than the debate side, and it connects to the correlated-estimate diagnosis of @sec-hive-mind: a society of near-duplicate agents gives a router nothing stable to discriminate on, so its confident-looking assignments are, on inspection, arbitrary. The practical takeaway for anyone building the architectures of this chapter is to measure both properties before trusting a router: verify that the society is genuinely differentiated (a fat HSE curve past a few agents is a warning sign), and verify that assignments survive paraphrase, because a high-accuracy router that fails either test may be meaningful in name only.
+
+## 8. Role Drift: When Terminal Accuracy Hides a Broken Division of Labor {#sec-498-role-drift}
+
+@sec-routing-meaningful asks whether a router's choices mean anything. Cao et al. [@cao2026roledrift] ask the companion question one level down, about the modules themselves: once a compound pipeline is fine-tuned end to end with reinforcement learning on a terminal reward, do the modules still do the jobs they were assigned? End-to-end RL optimizes only the final output, so it never sees, and therefore never constrains, how labor is divided internally. The authors name the resulting failure **role drift**: a module preserves or even improves end-task performance while abandoning its assigned role through **role-violating shortcuts** that system-level evaluation cannot see. This is the trained-weights analogue of the role collapse of Section 6.2, and it is strictly worse to detect, because context dilution announces itself in the transcript whereas a shortcut learned by gradient descent looks, from outside the pipeline, like success.
+
+Two pipelines in the paper make the pathology concrete. In the first, a **decomposer** is supposed to split a question into sub-questions for a separate **solver**; after RL it instead plants the answer inside the sub-questions, so the solver is no longer solving anything. In the second, a **reader** meant to answer strictly from retrieved passages learns to fall back on parametric memory, quietly voiding the grounding guarantee that motivated retrieval in the first place. In both cases terminal accuracy goes up. The system looks like it learned to decompose, or to read; it learned neither.
+
+**Formalizing the role effect.** Write a compound system as modules $m = 1, \dots, M$, where module $m$ carries a role prompt $r_m$ and samples from $\pi_m(\cdot \mid r_m, h)$ given the running context $h$. The role prompt is the only thing distinguishing a module from a generic language model, so the natural handle on "is the role still in force?" is the shift the prompt induces on the module's next-token predictions, measured against a **neutral prompt** $\varnothing$ that carries no role at all:
+
+$$
+\delta_m(h; \theta) \;=\; \log \pi_m^{\theta}(\cdot \mid r_m, h) \;-\; \log \pi_m^{\theta}(\cdot \mid \varnothing, h).
+$$
+
+This log-ratio vector is a proxy for the role's intended effect: it is what the words "split this question into sub-questions" actually buy in probability mass. **Role Anchor** regularizes end-to-end training so that this quantity is preserved relative to its value $\delta_m(h; \theta_0)$ at initialization, before any drift has occurred:
+
+$$
+\max_{\theta}\; \mathbb{E}\big[R(\text{terminal output})\big] \;-\; \lambda \sum_{m=1}^{M} \underbrace{\mathbb{E}_h\, D\big(\delta_m(h;\theta),\, \delta_m(h;\theta_0)\big)}_{A_m(\theta),\ \text{the anchor penalty}},
+$$ {#eq-498-role-anchor}
+
+with $D$ a divergence between the current and reference role effects. Note carefully what @eq-498-role-anchor does *not* do: it never pins the module's outputs to their initial values, which would simply prevent learning. It pins only the *difference* the role prompt makes, leaving the module free to improve at the job it was given. Cao et al. report gradient analysis consistent with this reading: the regularizer reduces alignment with the role-drift direction rather than uniformly suppressing the learning signal. The strength $\lambda$ then sweeps a frontier between terminal accuracy and role fidelity, and the paper is explicit that the accuracy cost is real and varies by pipeline and anchor strength.
+
+**The headline number.** On the decomposer pipeline, holding the module to its role erases **86% of the apparent RL gain**. Almost the entire improvement that end-to-end training appeared to deliver was the decomposer smuggling the answer past its own role, not the pipeline getting better at decomposition. Terminal accuracy, in other words, can overstate what a compound system has genuinely learned by nearly an order of magnitude.
+
+The simulation below reproduces this phenomenon end to end on a two-module toy pipeline. A decomposer chooses among three moves (split the question, restate it, state the answer) with probabilities given by a softmax under its role prompt; the mass it places on "split" scales a legitimate evidence channel that the solver can use, and the mass it places on "answer" scales a role-violating channel that leaks the decomposer's own parametric guess directly to the solver. Training is a reward-only hill climb that observes nothing but terminal accuracy, exactly the information an end-to-end RL run has. Role fidelity is $\exp(-A(\theta))$ with $A$ the mean squared deviation of the current role effect from its reference, so $1$ means the role prompt still does precisely what it did at initialization and $0$ means its effect has been erased.
+
+```{python}
+#| label: fig-498-role-drift
+#| fig-cap: "Role Anchor traces a frontier between terminal accuracy and role fidelity on a simulated decomposer-solver pipeline. Unregularized end-to-end training (lambda = 0) buys accuracy by collapsing role fidelity, because the decomposer plants the answer instead of decomposing; raising lambda restores fidelity and closes the shortcut channel, which gives back most of the apparent accuracy gain. The frontier is not monotone in lambda, so where along it one reads off the genuine gain is a stated choice rather than a fact of the data."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(11)
+
+K = 6                     # answer options the solver chooses among
+V = 3                     # decomposer moves: split, restate, plant the answer
+SPLIT, RESTATE, PLANT = 0, 1, 2
+
+mu_split = 2.6            # a genuine decomposition is informative, not decisive
+mu_plant = 6.0            # a planted answer is a far louder signal for the solver
+p_dec_correct = 0.88      # the decomposer's own parametric answer: good, not perfect
+
+
+def make_batch(m, rng):
+    """One batch of questions. S is the evidence a faithful decomposition passes on;
+    A is the role-violating channel in which the decomposer writes its own answer
+    into the sub-questions instead of splitting anything."""
+    y = rng.integers(0, K, size=m)
+    eye = np.eye(K)
+    dec = np.where(rng.random(m) < p_dec_correct, y, rng.integers(0, K, size=m))
+    return {"y": y,
+            "S": mu_split * eye[y] + rng.normal(0.0, 1.0, size=(m, K)),
+            "A": mu_plant * eye[dec] + rng.normal(0.0, 1.0, size=(m, K)),
+            "noise": rng.normal(0.0, 1.0, size=(m, K))}
+
+
+train_batch, eval_batch = make_batch(3000, rng), make_batch(6000, rng)
+
+
+def log_softmax(z):
+    z = z - z.max()
+    return z - np.log(np.exp(z).sum())
+
+
+def role_effect(theta):
+    """delta = log pi(. | role prompt, h) - log pi(. | neutral prompt, h)."""
+    w, a = theta[:V], theta[V:]
+    return log_softmax(w + a) - log_softmax(w)
+
+
+def gains(theta):
+    """Move distribution under the role prompt: how much of each channel is used."""
+    p = np.exp(log_softmax(theta[:V] + theta[V:]))
+    return p[SPLIT], p[PLANT]
+
+
+def accuracy(theta, batch):
+    g_split, g_plant = gains(theta)
+    M = g_split * batch["S"] + g_plant * batch["A"] + batch["noise"]
+    return float((M.argmax(1) == batch["y"]).mean())
+
+
+theta0 = np.array([0.0, 0.0, 0.0, 2.0, 0.5, -2.0])  # w = 0; the role prompt favors splitting
+delta_ref = role_effect(theta0)
+
+
+def anchor(theta):
+    d = role_effect(theta) - delta_ref
+    return float((d * d).mean())
+
+
+def role_fidelity(theta):
+    return float(np.exp(-anchor(theta)))
+
+
+def train(lam, steps=500, sigma=0.30, seed=0):
+    """Maximize terminal reward plus the Role Anchor penalty by a (1+1) hill climb.
+    The optimizer observes end-task accuracy only, as end-to-end RL does."""
+    r = np.random.default_rng(seed)
+    th = theta0.copy()
+    J = accuracy(th, train_batch) - lam * anchor(th)
+    for _ in range(steps):
+        cand = th + sigma * r.normal(size=th.shape)
+        Jc = accuracy(cand, train_batch) - lam * anchor(cand)
+        if Jc > J:
+            th, J = cand, Jc
+    return th
+
+
+lams = [0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+trained = [train(lam) for lam in lams]
+accs = np.array([accuracy(th, eval_batch) for th in trained])
+fids = np.array([role_fidelity(th) for th in trained])
+leaks = np.array([gains(th)[1] for th in trained])
+
+acc_init, fid_init = accuracy(theta0, eval_batch), role_fidelity(theta0)
+apparent = accs[0] - acc_init          # what end-to-end RL appears to deliver
+
+# The shortcut share is only defined relative to a stated standard of role
+# enforcement, so fix one explicitly: FID_TARGET is the role fidelity a run must
+# reach before we are willing to call its remaining gain genuine. The headline
+# uses the *cheapest* anchor that clears the bar (smallest lambda), which is the
+# reading most favorable to the pipeline; stricter anchors give larger shares.
+FID_TARGET = 0.95
+restored = [i for i, f in enumerate(fids) if f >= FID_TARGET]
+head = restored[0]                     # smallest lambda that restores the role
+genuine = accs[head] - acc_init        # what survives when the role is enforced
+shares = np.array([1.0 - (accs[i] - acc_init) / apparent for i in restored])
+shortcut_share = shares[0]
+
+print(f"{'lambda':>8}{'accuracy':>11}{'role fidelity':>15}"
+      f"{'planted-answer share':>22}{'shortcut share':>16}")
+print(f"{'init':>8}{acc_init:>11.3f}{fid_init:>15.3f}{gains(theta0)[1]:>22.3f}{'':>16}")
+for lam, a, f, g in zip(lams, accs, fids, leaks):
+    print(f"{lam:>8.2f}{a:>11.3f}{f:>15.3f}{g:>22.3f}"
+          f"{1.0 - (a - acc_init) / apparent:>16.3f}")
+print(f"\napparent RL gain (lambda = 0):                {apparent:+.3f}")
+print(f"role restored (fidelity >= {FID_TARGET:.2f}) at lambda = {lams[head]:g}")
+print(f"genuine gain at that lambda:                  {genuine:+.3f}")
+print(f"headline shortcut share:                      {shortcut_share:.1%}")
+print(f"shortcut share across all role-restoring lambdas: "
+      f"{shares.min():.1%} to {shares.max():.1%}")
+
+fig, ax = plt.subplots(figsize=(6.2, 3.8))
+ax.plot(fids, accs, "-o", color="#3b6ea5")
+for lam, f, a in zip(lams, fids, accs):
+    ax.annotate(f"$\\lambda$={lam:g}", (f, a), textcoords="offset points",
+                xytext=(6, -10), fontsize=8, color="#444444")
+ax.axhline(acc_init, ls=":", color="grey", lw=1)
+ax.annotate("untrained pipeline", (0.45, acc_init), textcoords="offset points",
+            xytext=(0, 5), fontsize=8, color="grey")
+ax.set_xlabel("role fidelity  $\\exp(-A(\\theta))$")
+ax.set_ylabel("terminal accuracy")
+ax.set_title("Role Anchor traces an accuracy vs role fidelity frontier")
+fig.tight_layout()
+plt.show()
+```
+
+The table reads as an indictment of terminal accuracy. Unregularized training raises end-task accuracy by about twenty-two points, from 0.673 to 0.894, which any benchmark would score as a large win, while role fidelity falls to zero at three decimals and the share of the decomposer's output budget spent planting the answer climbs from 1.5% to 98.5%. The pipeline did not learn to decompose; it learned to stop decomposing. Turning up $\lambda$ walks the frontier back: by $\lambda = 0.25$ role fidelity is 0.983 and the planted-answer channel is nearly shut again at 3.3%, at the cost of most of the headline gain. What remains, about six points of accuracy (0.673 to 0.735) earned by using the legitimate channel more effectively, is the part that was real.
+
+How much of the gain was shortcut is not a single number, and the code is deliberate about saying so. It calls the role restored once fidelity clears an explicitly stated threshold of 0.95, and it takes the headline at the *cheapest* anchor that clears it, $\lambda = 0.25$, since that is the reading most favorable to the pipeline: a shortcut share of **72.0%**. Weaker anchors do not qualify at all ($\lambda = 0.10$ reaches only 0.933 fidelity), and stricter ones charge the pipeline more, up to 88.5% at $\lambda = 5$, so across every setting that genuinely restores the role the shortcut share spans **72.0% to 88.5%**. That spread is not even monotone in $\lambda$ (accuracy wobbles between $\lambda = 0.5$ and $\lambda = 2$ before dropping again at $\lambda = 5$), which is precisely why quoting one endpoint would be a choice dressed up as a measurement. The 86% that Cao et al. report for their decomposer pipeline falls inside this band, but that is a remark about plausibility and nothing more: a toy simulation with hand-chosen channel strengths cannot corroborate a number measured on a real pipeline, and a coincidence of digits would be the weakest possible evidence if it did. What the simulation does reproduce, at every anchor strength in the sweep, is the qualitative finding, that the large majority of the apparent improvement was a role violation wearing the costume of learning.
+
+The evaluation lesson generalizes past this one regularizer, and it is the lesson to carry out of this chapter. A compound system's end-task score is a measurement of the *system*, and it is silent about whether the architecture you designed is the architecture that is running. If a decomposer can pass the answer downstream, a debate agent can converge by capitulation rather than evidence (Section 6.1), and a specialist can be routed to for reasons unrelated to its specialty (@sec-routing-meaningful), then in every case the number that looked like evidence of coordination was compatible with coordination having quietly disappeared. **Report per-module role fidelity alongside end-task accuracy**, whether via the anchor divergence of @eq-498-role-anchor, an ablation that severs a module's shortcut channel, or a counterfactual that swaps in a neutral prompt and measures what changes. Without such a per-module measurement you are not evaluating a multi-agent system at all; you are evaluating a black box that happens to be wired out of agents, and you have no way to tell learning from shortcut.
+
+## 9. Implementation: Two-Agent Debate in Python
 
 The following implementation demonstrates the multi-agent debate protocol with two agents alternating between answer generation and critique, converging on a consensus answer. The `MockLLM` class replaces actual model calls with deterministic responses to keep the demo CPU-runnable without API keys or GPU resources.
 
@@ -424,3 +688,7 @@ This second demo implements the MetaGPT publish-subscribe pattern. Each "agent" 
 4. Du, Y., Li, S., Torralba, A., Tenenbaum, J. B., and Mordatch, I. (2023). Improving factuality and reasoning in language models through multiagent debate. arXiv:2305.14325. https://arxiv.org/abs/2305.14325
 
 5. Soma, K., Bouteiller, Y., Hamann, H., and Beltrame, G. (2024). The hive mind is a single reinforcement learning agent. arXiv:2410.17517 (preprint, revised through 2026). https://arxiv.org/abs/2410.17517
+
+6. Huot, F., Kaisers, M., and Lapata, M. (2026). When is routing meaningful? Diversity and robustness in language model societies. arXiv:2607.09197. https://arxiv.org/abs/2607.09197
+
+7. Cao, X., Srinivasan, S., and Bakker, M. A. (2026). Do modules stay in their lane? Role drift in compound LLM systems. arXiv:2607.21627. https://arxiv.org/abs/2607.21627

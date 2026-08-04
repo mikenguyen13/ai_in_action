@@ -280,6 +280,86 @@ The vanilla method needs a separate small draft model that shares the target's t
 
 All three preserve the exactness guarantee, because they change only how candidates are *proposed*; the accept-reject verification against the target distribution is unchanged, so the output distribution is still exactly the target's.
 
+### Speculating Tool Calls, Not Tokens {#sec-706-tool-call-speculation}
+
+Everything above speculates at the granularity of a single token. @ji2026selfspec push the same idea up a level: inside an agentic loop, the unit worth guessing is not the next token but the next **tool call**. An agent that queries a search index, runs a snippet of code, or hits a remote API spends most of its wall-clock time waiting for that call to return, and during the wait the accelerator is not merely underused, it is idle. If the serving system can guess the call the agent is about to make and start executing it early, the tool latency hides behind the agent's own generation.
+
+The obstacle is the one Section 2.4 already quantified for tokens, wearing new clothes. Prior tool-call speculators were separate draft models or caches of past trajectories, and @ji2026selfspec name the resulting failure mode the **speculator-agent gap**: a draft never trained on the deployed policy's behavior guesses that policy's calls badly, exactly as a misaligned $q$ yields a low $\alpha$. Their observation is that the target agent is already the best available predictor of its own next call, which points at the tool-level analogue of self-drafting. A single **self-speculating agent** runs in two modes, *agent mode* to solve the task and *speculator mode* to predict its own next call from a partial trajectory, trained by a joint agent-speculator reinforcement learning scheme that derives speculation targets from the agent's own rollouts and alternates agent and speculator updates so the speculator tracks the policy as it moves. Because both modes condition on the same conversation prefix, speculator mode reuses the prefix KV cache outright (the subject of the key-value caching chapter), so a speculative call costs only the few dozen decoded tokens of the call itself with no prefill at all. That is what makes the dual-mode design close to free, though the particular value of $\sigma$ plotted below is our own illustrative assumption rather than a figure measured in the paper.
+
+Let $\alpha_{\text{tool}}$ be the **next-call hit rate**, reported as Hit@1. It plays precisely the role $\alpha$ plays for tokens: the probability that a proposal survives verification, where verification here is the trivial test of whether the agent's eventual call equals the speculated one. Write $T_{\text{gen}}$ for the time the agent spends generating its turn, $T_{\text{tool}}$ for tool execution or network round trip, and $T_{\text{spec}}$ for the cost of emitting the speculative call. Without speculation the turn is strictly serial and costs $T_{\text{gen}} + T_{\text{tool}}$. With speculation the guessed call is dispatched at the start of the turn, concurrent with generation, so on a hit the result is available at $\max(T_{\text{gen}}, T_{\text{tool}})$, while on a miss the real call only starts once generation finishes. The expected turn latency is therefore
+
+$$
+\mathbb{E}\big[T_{\text{turn}}\big] = T_{\text{spec}} + T_{\text{gen}} + T_{\text{tool}} - \alpha_{\text{tool}}\,\min\big(T_{\text{gen}},\, T_{\text{tool}}\big),
+$$
+
+since a hit saves exactly the overlap between the two, never more. Dividing through by $T_{\text{gen}}$ and writing $\rho = T_{\text{tool}} / T_{\text{gen}}$ for the tool-to-generation latency ratio and $\sigma = T_{\text{spec}} / T_{\text{gen}}$ for the speculation overhead gives the speedup
+
+$$
+S(\alpha_{\text{tool}}, \rho, \sigma) = \frac{1 + \rho}{1 + \rho + \sigma - \alpha_{\text{tool}}\,\min(1, \rho)}.
+$$
+
+Set this beside $S(k, \alpha, c)$ from Section 2.4 and the family resemblance is obvious: an acceptance rate multiplying the saving, a small additive overhead ($\sigma$ here, $kc$ there), and a ceiling fixed by how much work a single verification can cover. What differs is the economics. A wrongly drafted token wastes microseconds of a memory-bound forward pass; a correctly speculated tool call erases an entire network round trip, which on a search or retrieval backend is commonly several times the generation time. The break-even hit rate is merely $\alpha_{\text{tool}} > \sigma / \min(1, \rho)$, and with prefix KV reuse driving $\sigma$ toward a few percent, even a coin-flip speculator pays. That is why the paper's reported gains matter at all: joint training lifts average Hit@1 from 44.1 to 61.2 for Qwen3-4B and from 48.9 to 66.3 for Qwen3.5-4B across agentic search QA and conversational tool-use benchmarks, while agent task success is preserved.
+
+Two caveats deserve naming before anyone ships this. First, pre-execution is only sound when the speculated call is **side-effect-free or safely replayable**. A read-only retrieval, a search query, or a pure computation can be fired speculatively and discarded at no cost beyond compute and API quota. A call that charges a card, sends a message, or mutates a row cannot, because a miss leaves the world changed in a way the agent never sanctioned. The practical gate is a per-tool idempotency or read-only annotation, with speculation restricted to the safe subset, which mechanically lowers the effective $\alpha_{\text{tool}}$ you can exploit. Second, the exactness theorem of Section 2.3 does not transfer. The accept-on-match rule does preserve the agent's action sequence, since a mismatched speculation is simply thrown away, but the dual-mode training itself changes the policy weights, so preservation of task quality is an empirical finding here rather than a distributional guarantee.
+
+```{python}
+#| label: fig-706-tool-call-speculation
+#| code-fold: false
+#| fig-cap: "Expected wall-clock speedup from tool-call speculation versus the next-call hit rate, for several tool-to-generation latency ratios rho. Dotted vertical lines mark the Hit@1 rates reported before and after joint agent-speculator RL; the black markers trace Qwen3-4B's move from 0.441 to 0.612 along the rho = 2 curve."
+import numpy as np
+import matplotlib.pyplot as plt
+
+SIGMA = 0.05  # speculative call costs 5% of a generation turn, thanks to prefix KV reuse
+
+def spec_speedup(alpha, rho, sigma=SIGMA):
+    """Serial turn cost over expected speculative turn cost, in units of T_gen."""
+    alpha = np.asarray(alpha, dtype=float)
+    return (1.0 + rho) / (1.0 + rho + sigma - alpha * np.minimum(1.0, rho))
+
+alphas = np.linspace(0.0, 1.0, 201)
+ratios = [0.25, 0.5, 1.0, 2.0, 4.0]
+hits = {"Qwen3-4B before": 0.441, "Qwen3-4B after": 0.612,
+        "Qwen3.5-4B before": 0.489, "Qwen3.5-4B after": 0.663}
+
+fig, ax = plt.subplots(figsize=(7.2, 4.4))
+for rho in ratios:
+    ax.plot(alphas, spec_speedup(alphas, rho), label=f"$\\rho$ = {rho:g}")
+for a in hits.values():
+    ax.axvline(a, color="0.75", lw=0.8, ls=":")
+pts = [hits["Qwen3-4B before"], hits["Qwen3-4B after"]]
+ax.plot(pts, [spec_speedup(a, 2.0) for a in pts], "o-", color="black", lw=1.8,
+        label="Qwen3-4B, RL gain at $\\rho$ = 2")
+ax.set_xlabel(r"next-call hit rate $\alpha_{\rm tool}$")
+ax.set_ylabel("expected wall-clock speedup")
+ax.set_title("Tool-call speculation: speedup versus hit rate")
+ax.legend(fontsize=8, loc="upper left")
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Implied wall-clock reduction, 1 - 1/S, at each reported operating point.
+header = " ".join(f"{'rho=' + format(r, 'g'):>9}" for r in ratios)
+print(f"{'setting':>18} {'alpha':>6} {header}")
+for name, a in hits.items():
+    row = " ".join(f"{100 * (1 - 1 / spec_speedup(a, r)):8.1f}%" for r in ratios)
+    print(f"{name:>18} {a:6.3f} {row}")
+
+# Monte Carlo check of the closed form on a multi-turn trajectory.
+rng = np.random.default_rng(0)
+def simulate(alpha, rho, turns=200_000, sigma=SIGMA):
+    hit = rng.random(turns) < alpha
+    per_turn = sigma + np.where(hit, np.maximum(1.0, rho), 1.0 + rho)
+    return (1.0 + rho) / per_turn.mean()
+
+print("\nclosed form vs simulated 200k-turn trajectory")
+for a in (0.441, 0.612):
+    for rho in (0.5, 2.0):
+        print(f"  alpha={a:.3f} rho={rho:.1f}  closed={float(spec_speedup(a, rho)):.4f}"
+              f"  simulated={simulate(a, rho):.4f}")
+```
+
+The table makes the shape of the win concrete. Benefit peaks near $\rho = 1$, where a hit hides the tool completely inside the generation window, and decays for very slow tools because one turn of overlap can only absorb $T_{\text{gen}}$ of waiting. That decay is the tool-level counterpart of the interior optimum in $k$ from Section 3.5, and it motivates the same response: speculate further ahead. Guessing $k$ calls deep multiplies hit probabilities, so depth pays only when the per-step $\alpha_{\text{tool}}$ is high, which is precisely what the joint training buys. Whether the unit is a token, a block of tokens, or an entire tool invocation, the governing quantity never changes: the speedup is a function of the acceptance rate, and every worthwhile advance in speculative execution is an advance in aligning the proposer with the thing doing the verifying.
+
 ## 5. Production Code
 
 In production you do not implement the accept-reject loop by hand. Mature open-source serving frameworks ship speculative decoding as a configuration flag, with optimized fused kernels, tree attention, paged key-value caches, and continuous batching already integrated. The free, widely used options are **vLLM**, **Hugging Face Text Generation Inference (TGI)**, and **NVIDIA TensorRT-LLM**, plus the `transformers` library itself for quick experiments. The code in this section requires a GPU and large model weights, so it is shown rather than executed here. Each block is a faithful, runnable invocation.
@@ -393,3 +473,4 @@ When these conditions are met, namely latency-bound serving, a well-aligned draf
 6. Stern, M., Shazeer, N., and Uszkoreit, J. "Blockwise Parallel Decoding for Deep Autoregressive Models." Advances in Neural Information Processing Systems, 2018. https://arxiv.org/abs/1811.03115
 7. Xia, H., Yang, Z., Dong, Q., Wang, P., Li, Y., Ge, T., Liu, T., Li, W., and Sui, Z. "Unlocking Efficiency in Large Language Model Inference: A Survey of Speculative Decoding." Findings of the Association for Computational Linguistics, 2024. https://arxiv.org/abs/2401.07851
 8. vLLM developers. "Speculative Decoding." vLLM documentation. https://docs.vllm.ai/en/latest/features/spec_decode.html
+9. Ji, J., Liu, Y., An, L., Jain, R., Polatkan, G., Zhu, S., and Chang, S. "Speculate While You Reason: Teaching Agents to Predict Their Next Tool Call via Joint Agent-Speculator RL." 2026. https://arxiv.org/abs/2607.25816
