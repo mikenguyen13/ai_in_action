@@ -122,6 +122,7 @@ pub mod ch201_batch_norm;
 pub mod ch202_layer_norm;
 pub mod ch204_dropout;
 pub mod ch207_densenet;
+pub mod ch525_oversight;
 
 #[cfg(test)]
 mod tests {

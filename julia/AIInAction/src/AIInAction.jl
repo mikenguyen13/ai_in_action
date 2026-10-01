@@ -98,5 +98,6 @@ include("ch201_batch_norm.jl")
 include("ch202_layer_norm.jl")
 include("ch204_dropout.jl")
 include("ch207_densenet.jl")
+include("ch525_oversight.jl")
 
 end # module AIInAction
