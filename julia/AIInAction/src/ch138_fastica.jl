@@ -184,7 +184,13 @@ function fit_ica(X; n_components=nothing, max_iter::Integer=200)
     S = Xc * components'  # n x k
     Smu = vec(sum(S; dims=1) ./ n)
     var = vec(sum(abs2, S .- Smu'; dims=1) ./ (n - 1))
-    order = sortperm(var; rev=true)
+    # Whitening makes these variances (nearly) equal, so quantize them at 1e-9
+    # relative: variances that agree to that tolerance are ties and keep their
+    # natural order (stable MergeSort). Without this the permutation is decided by
+    # floating-point noise, which changed with Julia 1.13.
+    scale = maximum(var) > 0 ? maximum(var) : 1.0
+    key = floor.(var ./ scale .* 1e9 .+ 0.5)
+    order = sortperm(key; rev=true, alg=MergeSort)
     W = W[order, :]
     components = components[order, :]
 
