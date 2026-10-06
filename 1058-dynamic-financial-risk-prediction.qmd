@@ -1,0 +1,703 @@
+---
+title: "Dynamic Financial Risk Prediction with Multiview Data"
+subtitle: "Discrete representations, monotone hazards, and a replication of DRDL"
+---
+
+# Dynamic Financial Risk Prediction with Multiview Data {#sec-dynamic-financial-risk}
+
+A lender, an investor, or a regulator rarely asks only whether a company will get into trouble. They ask when. A firm that will report a loss next year and a firm that will report one in three years call for different actions, and a model that can only say "risky" or "safe" throws that distinction away. *Dynamic financial risk prediction* (DFRP) is the task of predicting the probability that a company's first risk event (a net loss, a delisting trigger, a tail loss on its stock) occurs by each of several future horizons. At the same time, the information available about a company has multiplied: financial statements, the narrative of annual and current reports, legal judgments, stock forum posts, financial news, and the network of shared directors and suppliers. Each of these *views* carries part of the risk signal, and the views overlap.
+
+This chapter is built around a 2026 paper in *Information Systems Research* by Zhao Wang, Wanliu Che, Cuiqing Jiang, and Huimin Zhao, *Leveraging Multiview Data Through Discrete and Regularized Deep Learning for Dynamic Financial Risk Prediction* (Wang et al., 2026). The paper proposes DRDL (discrete and regularized deep learning), which combines two ideas that are each worth understanding on their own:
+
+1. **Disentangle, then fuse.** Map every view's embeddings onto a shared, discrete codebook (vector quantization), regularize the codebook toward orthogonality, and then *mask* repeated codes so that information that several views carry redundantly is counted once.
+2. **Predict a monotone risk trajectory.** Turn network outputs into cumulative risk probabilities through a *risk accumulation function* that is nondecreasing across horizons by construction, rank companies by when they fail with a *focal survival loss*, and resolve conflicts between the two training objectives with *adaptive gradient balancing*.
+
+We derive every component, show that the risk accumulation function is exactly a classical grouped-time proportional hazards model, prove two geometric facts the paper does not state (a floor on the orthogonality loss, and the masking rate that arises by chance alone), implement DRDL and its benchmarks in PyTorch, and replicate the paper's experimental design on a simulated multiview company panel.
+
+::: {.callout-note appearance="simple"}
+## What "replication" means in this chapter
+
+We read the full published paper and implement DRDL from its equations (1) through (11). Two things could not be reproduced exactly. The paper's online appendices, which hold the view-specific embedding details and the tuned hyperparameters, are not part of the article, so the embedding layer and hyperparameters below are our own documented defaults. And the paper's data (Chinese A-share companies from the CNRDS database, NASDAQ companies, and NEEQ unlisted companies, with text, legal, forum, news, and network views) are proprietary. We therefore replicate the *experimental design* (time-to-risk evaluation, out-of-time evaluation, identification performance, and the ablation study of the paper's Table 8) on simulated data whose structure (redundant and complementary views, horizon-dependent risk drivers) mirrors the paper's motivation. The simulation tests whether the mechanisms do what the paper says they do. It cannot test the paper's empirical claims about real markets, and we report its results as they come out, including where DRDL does not win.
+:::
+
+## From Default Prediction to Dynamic Risk {#sec-1058-background}
+
+Corporate risk prediction has a long history in finance. Altman's Z-score (Altman, 1968) combined five accounting ratios in a linear discriminant to separate bankrupt from healthy firms one period ahead. Shumway (2001) showed that this static design is biased, because it uses one observation per firm and ignores how long each firm has been at risk, and proposed a discrete-time hazard model: a logit on firm-year observations that is equivalent to a survival model. Campbell, Hilscher, and Szilagyi (2008) extended the hazard approach with market variables and multiple horizons. The modern deep learning literature (DeepSurv, Katzman et al., 2018; DeepHit, Lee et al., 2018; see Wiegrebe et al., 2024 for a review) replaces the linear predictor with a neural network but keeps the survival framing.
+
+Two facts about financial risk shape the method. First, risk *accumulates*: a company has to survive the first period before it can fail in the second, so the probability of a first event by horizon $t$ can only grow with $t$. The paper calls this **time-wise monotonicity**. Second, a company that fails earlier should be scored as riskier than one that fails later or not at all. The paper calls this **instance-wise monotonicity**. A model that predicts each horizon with an independent sigmoid can violate the first property, and a model trained only with per-horizon classification losses has no direct pressure toward the second.
+
+### The discrete-time survival setup {#sec-1058-setup}
+
+Let $T$ be the time of a company's first risk event and $C$ the end of the observation window, with horizons $t_1 < t_2 < \dots < t_m = C$ (for example three years, three quarters, or three months). We observe $A = \min(T, C)$ and an event flag $\delta = \mathbb{1}[T \le C]$. The quantity DFRP predicts is the cumulative distribution function at each horizon,
+
+$$
+F(t_u) = P(T \le t_u), \qquad u = 1, \dots, m,
+$$ {#eq-1058-cdf}
+
+which is paper Eq. (1) on the discrete grid. Write $h_u = P(T = t_u \mid T \ge t_u)$ for the discrete hazard (the probability of a first event in interval $u$ given survival to its start). Surviving through horizon $u$ means not failing in any of the first $u$ intervals, so the survival function and the cumulative risk are
+
+$$
+S(t_u) = \prod_{j=1}^{u} (1 - h_j), \qquad F(t_u) = 1 - \prod_{j=1}^{u} (1 - h_j).
+$$ {#eq-1058-survival}
+
+Because each factor $1 - h_j$ lies in $[0, 1]$, $S$ is nonincreasing and $F$ nondecreasing in $u$: any model that outputs hazards and multiplies them out is time-wise monotone automatically. The log-likelihood of a company observed to fail in interval $A$ (or censored at $A = m$) follows from the same product:
+
+$$
+\ell = \delta \log h_A + \sum_{j=1}^{A - \delta} \log(1 - h_j).
+$$ {#eq-1058-loglik}
+
+## The Risk Accumulation Function Is a Grouped-Time Hazard Model {#sec-1058-raf}
+
+DRDL's prediction layer outputs unconstrained scores $o_1, \dots, o_m$, one per interval, and maps them to probabilities with the risk accumulation function (paper Eq. 8):
+
+$$
+p_u = 1 - \exp\!\left(-\sum_{j=1}^{u} \exp(o_j)\right).
+$$ {#eq-1058-raf}
+
+The paper motivates the form by analogy to integrating a hazard into a survival function. The analogy is exact. Suppose each interval's hazard has a complementary log-log link, $h_j = 1 - \exp(-\exp(o_j))$. Then $1 - h_j = \exp(-\exp(o_j))$ and @eq-1058-survival gives
+
+$$
+S(t_u) = \prod_{j=1}^{u} \exp\!\big(-e^{o_j}\big) = \exp\!\Big(-\sum_{j=1}^{u} e^{o_j}\Big),
+\qquad F(t_u) = 1 - \exp\!\Big(-\sum_{j=1}^{u} e^{o_j}\Big) = p_u.
+$$
+
+So the risk accumulation function is the cumulative incidence of a discrete-time hazard model with a complementary log-log link, which is precisely the grouped-data version of the Cox proportional hazards model (Prentice and Gloeckler, 1978). If $o_j = \alpha_j + \eta(x)$ with an interval effect $\alpha_j$ and a company score $\eta(x)$, then $\sum_j e^{o_j} = e^{\eta(x)} \sum_j e^{\alpha_j}$, a baseline cumulative hazard multiplied by a relative risk. DRDL lets the network produce a different $o_j$ for every interval, which relaxes proportional hazards while keeping the cumulative structure. Two consequences follow:
+
+* **Monotonicity is guaranteed, not encouraged.** Each increment $e^{o_j} > 0$, so $p_1 < p_2 < \dots < p_m < 1$ for every input. No penalty term is needed and none can be overridden by the main loss.
+* **The outputs have a hazard interpretation.** $e^{o_j}$ is the cumulative hazard accrued in interval $j$, so the model can say not only how risky a company is but in which interval the risk builds up.
+
+```{python}
+#| label: fig-1058-raf
+#| fig-cap: "Left: the risk accumulation function turns arbitrary scores into a nondecreasing risk trajectory, while independent sigmoids applied to the same scores do not. Right: on 10,000 random score vectors, the risk accumulation function is monotone every time; independent sigmoids violate time-wise monotonicity for most of them."
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sympy as sp
+from aiinaction.ch1058_drdl import risk_accumulation
+
+# Symbolic check: cloglog hazards multiplied out give the risk accumulation function.
+o1, o2, o3 = sp.symbols("o1 o2 o3", real=True)
+h = [1 - sp.exp(-sp.exp(o)) for o in (o1, o2, o3)]
+F3_hazard = 1 - (1 - h[0]) * (1 - h[1]) * (1 - h[2])
+F3_raf = 1 - sp.exp(-(sp.exp(o1) + sp.exp(o2) + sp.exp(o3)))
+print("cloglog hazard product equals Eq. 8:", sp.simplify(F3_hazard - F3_raf) == 0)
+print("increment p3 - p2 =", sp.simplify((1 - sp.exp(-(sp.exp(o1) + sp.exp(o2) + sp.exp(o3))))
+                                         - (1 - sp.exp(-(sp.exp(o1) + sp.exp(o2))))))
+
+rng = np.random.default_rng(1058)
+scores = rng.normal(0.0, 1.5, size=(10_000, 3))
+raf = risk_accumulation(scores)
+sig = 1.0 / (1.0 + np.exp(-scores))
+example = np.array([[0.8, -1.5, 0.2]])
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 3.6))
+ax[0].plot([1, 2, 3], risk_accumulation(example)[0], "o-", label="risk accumulation (Eq. 8)")
+ax[0].plot([1, 2, 3], 1 / (1 + np.exp(-example[0])), "s--", label="independent sigmoids")
+ax[0].set_xticks([1, 2, 3]); ax[0].set_xlabel("horizon"); ax[0].set_ylabel("predicted P(T <= t)")
+ax[0].legend(frameon=False, fontsize=8)
+viol = pd.Series({"risk accumulation": float((np.diff(raf, axis=1) < 0).any(axis=1).mean()),
+                  "independent sigmoids": float((np.diff(sig, axis=1) < 0).any(axis=1).mean())})
+ax[1].bar(viol.index, viol.values, color=["C0", "C1"])
+ax[1].set_ylabel("share of score vectors with a decrease")
+plt.tight_layout()
+plt.show()
+viol.round(3)
+```
+
+## Disentangling Views with a Discrete Codebook {#sec-1058-recoder}
+
+### The entanglement effect
+
+Each view mixes information that only it carries (complementary information) with information other views also carry (redundant information). The paper's diagnosis, which it calls the *entanglement effect*, is that common fusion methods cannot separate the two. Concatenation counts redundant signals twice. Attention reweights whole views, and a high weight on a view amplifies its redundant part along with its complementary part. Inspired by chunking theory in cognitive psychology (Johnson, 1970), in which people remember complex material by recoding it into a small set of discrete chunks, DRDL recodes every view's embeddings into discrete codes from a shared codebook and treats repeated codes as redundancy.
+
+```{mermaid}
+%%| label: fig-1058-architecture
+%%| fig-cap: "Outline of DRDL, following Figure 3 of Wang et al. (2026). The disentangled multiview learning module recodes view embeddings into discrete codes and masks repeats; the monotonicity-aware multiperiod module turns the masked representation into a monotone risk trajectory."
+flowchart LR
+    V1["View 1 financial"] --> E1["View embedding"]
+    V2["View 2 reports"] --> E2["View embedding"]
+    V3["View 3 network"] --> E3["View embedding"]
+    E1 --> C["Combined embeddings"]
+    E2 --> C
+    E3 --> C
+    C --> Q["Nearest code lookup"]
+    CB["Shared codebook"] --> Q
+    Q --> M["Mask repeated codes"]
+    M --> P["Prediction layer"]
+    P --> R["Risk accumulation"]
+    R --> L1["Multiperiod BCE"]
+    R --> L2["Focal survival loss"]
+    L1 --> G["Adaptive gradient balancing"]
+    L2 --> G
+```
+
+### Vector quantization and the straight-through estimator
+
+Let $E^{(\text{view})} = [e_1, \dots, e_f] \in \mathbb{R}^{f \times d}$ be the $f$ embeddings produced for one company by the view-specific embedding layers, and $E^{(\text{code})} = [c_1, \dots, c_l] \in \mathbb{R}^{l \times d}$ the codebook. The discrete multiview recoder assigns each embedding to its nearest code (paper Eq. 2),
+
+$$
+z_i = \arg\min_{k} \lVert e_i - c_k \rVert_2, \qquad e^{(\text{match})}_i = c_{z_i},
+$$ {#eq-1058-vq}
+
+which is the vector quantization step of VQ-VAE (van den Oord et al., 2017). The $\arg\min$ has zero gradient almost everywhere, so training uses the straight-through estimator (Bengio et al., 2013): the forward pass uses $\tilde e_i = e_i + \operatorname{sg}[c_{z_i} - e_i]$, whose value is $c_{z_i}$, while the backward pass treats the quantizer as the identity, $\partial \tilde e_i / \partial e_i = I$. Two losses then train the codebook and keep the encoder close to it (paper Eqs. 5 and 6):
+
+$$
+\mathcal{L}_{\text{codebook}} = \lVert \operatorname{sg}[E^{(\text{view})}] - E^{(\text{match})} \rVert_2^2, \qquad
+\mathcal{L}_{\text{commit}} = \lVert E^{(\text{view})} - \operatorname{sg}[E^{(\text{match})}] \rVert_2^2 .
+$$ {#eq-1058-vq-losses}
+
+The codebook loss has a familiar form. Its gradient with respect to code $c_k$ is $2 \sum_{i: z_i = k} (c_k - e_i)$, which vanishes when $c_k$ equals the mean of the embeddings assigned to it: gradient descent on $\mathcal{L}_{\text{codebook}}$ is online $k$-means. The commitment loss stops the embeddings from drifting away from the codes faster than the codes can follow.
+
+### The orthogonality loss and the Welch floor
+
+To push the codes toward independent factors, DRDL normalizes the codebook to unit rows $u_k = c_k / \lVert c_k \rVert$ and penalizes the strict upper triangle of their Gram matrix $G = U U^\top$ (paper Eq. 7):
+
+$$
+\mathcal{L}_{\text{orth}} = \lVert \operatorname{triu}(G) \rVert_F = \Big( \sum_{k < k'} \cos^2(c_k, c_{k'}) \Big)^{1/2}.
+$$ {#eq-1058-orth}
+
+This loss cannot reach zero when the codebook has more codes than dimensions, and there is a closed-form floor. $G$ is symmetric positive semidefinite with $\operatorname{tr} G = l$ (unit diagonal) and $\operatorname{rank} G \le d$. Its nonzero eigenvalues $\lambda_1, \dots, \lambda_r$ ($r \le d$) sum to $l$, so by Cauchy-Schwarz
+
+$$
+\lVert G \rVert_F^2 = \sum_{s=1}^{r} \lambda_s^2 \ \ge\ \frac{\big(\sum_s \lambda_s\big)^2}{r} \ \ge\ \frac{l^2}{d}.
+$$
+
+Subtracting the $l$ diagonal ones and halving for the upper triangle,
+
+$$
+\mathcal{L}_{\text{orth}} \ \ge\ \sqrt{\frac{1}{2}\Big(\frac{l^2}{d} - l\Big)} \qquad (l > d),
+$$ {#eq-1058-welch}
+
+which is the Welch bound on the cross-correlation of $l$ unit vectors in $\mathbb{R}^d$ (Welch, 1974). With $l = 64$ codes of dimension $d = 16$ the floor is $\sqrt{96} \approx 9.80$. The practical reading is that "orthogonal codebook" is only achievable for $l \le d$; for larger codebooks the regularizer spreads the codes as evenly as the dimension allows, and its value should be judged against @eq-1058-welch rather than against zero.
+
+### The mask-based view fusion decoder
+
+Given the codes $z_1, \dots, z_f$, the decoder keeps the first occurrence of each code and zeroes every repeat (paper Eqs. 3 and 4):
+
+$$
+m_i = \begin{cases} 0 & \text{if } z_i \in \{z_1, \dots, z_{i-1}\}, \\ 1 & \text{otherwise}, \end{cases}
+\qquad E^{(\text{mask})} = E^{(\text{match})} \odot m .
+$$ {#eq-1058-mask}
+
+Two embeddings that land on the same code, within a view or across views, are treated as carrying the same chunk of information, and only one copy reaches the prediction layer. This is the "explicit and precise" redundancy removal the paper contrasts with attention.
+
+A collision can also happen by chance, and it helps to know how often. If $f$ embeddings were assigned to codes independently with code probabilities $\pi_1, \dots, \pi_l$, the number of distinct codes would have expectation $\sum_k \big(1 - (1 - \pi_k)^f\big)$ by linearity of expectation over the indicators "code $k$ is used at least once". The expected masked share under this null is
+
+$$
+\bar m_0 = 1 - \frac{1}{f}\sum_{k=1}^{l} \big(1 - (1 - \pi_k)^f\big), \qquad
+\bar m_0^{\text{uniform}} = 1 - \frac{l}{f}\Big(1 - \big(1 - \tfrac{1}{l}\big)^f\Big).
+$$ {#eq-1058-null-mask}
+
+With $f = 36$ embeddings and $l = 64$ uniformly used codes, about 23 percent of embeddings would be masked by chance alone. A masked share well above $\bar m_0$ computed with the *empirical* code frequencies means embeddings of the same company are genuinely collapsing onto shared codes, which is the redundancy the decoder is meant to catch. We use this as a redundancy probe in @sec-1058-mechanisms.
+
+```{python}
+#| label: tbl-1058-geometry
+#| tbl-cap: "Geometry of the discrete recoder. The Welch floor on the orthogonality loss, checked against an optimized codebook, and the masked share expected by chance for several token and codebook sizes."
+import torch
+from aiinaction.ch1058_drdl import orthogonal_loss, first_occurrence_mask
+
+def welch_floor(l, d):
+    return float(np.sqrt(max(0.0, (l * l / d - l) / 2)))
+
+def optimized_orth(l, d, steps=1500, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    c = torch.randn(l, d, generator=g, requires_grad=True)
+    opt = torch.optim.Adam([c], lr=0.05)
+    for _ in range(steps):
+        u = torch.nn.functional.normalize(c, dim=1)
+        loss = (torch.triu(u @ u.T, 1) ** 2).sum()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return orthogonal_loss(c.detach().numpy())
+
+def null_masked_uniform(f, l):
+    return 1 - (l / f) * (1 - (1 - 1 / l) ** f)
+
+rows = []
+for l, d in [(16, 16), (32, 16), (64, 16), (256, 16)]:
+    rows.append({"codes l": l, "dim d": d, "Welch floor": round(welch_floor(l, d), 3),
+                 "optimized loss": round(optimized_orth(l, d), 3)})
+geo = pd.DataFrame(rows)
+
+# Monte Carlo check of the uniform null masking rate.
+rng = np.random.default_rng(0)
+mc = []
+for f, l in [(36, 64), (36, 256), (108, 256), (108, 1024)]:
+    sims = [1 - first_occurrence_mask(rng.integers(0, l, size=f)).mean() for _ in range(4000)]
+    mc.append({"tokens f": f, "codes l": l, "null masked share (formula)": round(null_masked_uniform(f, l), 4),
+               "null masked share (simulation)": round(float(np.mean(sims)), 4)})
+print(pd.DataFrame(mc).to_string(index=False))
+geo
+```
+
+## Training for Rank and for Monotone Risk {#sec-1058-training}
+
+### Multiperiod BCE
+
+With cumulative labels $y_{iu} = \mathbb{1}[\delta_i = 1, A_i \le u]$, the main loss sums binary cross-entropy across horizons:
+
+$$
+\mathcal{L}_{\text{BCE}} = -\frac{1}{n}\sum_{i=1}^{n}\sum_{u=1}^{m}\Big[y_{iu}\log p_{iu} + (1 - y_{iu})\log(1 - p_{iu})\Big].
+$$ {#eq-1058-bce}
+
+This is not the survival likelihood @eq-1058-loglik: it scores each horizon separately and never asks whether companies are ordered correctly relative to each other. That gap is what the second loss fills.
+
+### The focal survival loss
+
+A pair $(i, j)$ is *comparable* when company $i$ is known to fail before $j$: $\delta_i = 1$ and either $A_i < A_j$, or $A_i = A_j$ with $\delta_j = 0$. Evaluated at the horizon where $i$ failed, instance-wise monotonicity requires $p_{i,A_i} > p_{j,A_i}$. The focal survival loss penalizes only the violations (paper Eqs. 9 and 10):
+
+$$
+\mathcal{L}_{\text{FSL}} = \frac{\sum_{(i,j)\ \text{comparable}} \sigma\big(\max(0,\ p_{j,A_i} - p_{i,A_i})\big)}{\#\{\text{comparable pairs}\}},
+\qquad
+\sigma(x) = \frac{2}{1 + e^{-x^{\gamma}}} - 1 .
+$$ {#eq-1058-fsl}
+
+The clamp makes correctly ranked pairs contribute exactly zero, which is what distinguishes it from ranking losses that keep pushing every pair (such as DeepHit's exponential ranking loss). The name echoes the focal loss of Lin et al. (2017), which likewise concentrates training on the examples the model gets wrong. The shape parameter $\gamma$ controls how hard small violations are pushed. Differentiating,
+
+$$
+\sigma'(x) = \frac{2\gamma\, x^{\gamma - 1}\, e^{-x^{\gamma}}}{\big(1 + e^{-x^{\gamma}}\big)^2},
+$$ {#eq-1058-fsl-grad}
+
+so for $\gamma < 1$ the gradient diverges as $x \to 0$ (near-misses are pushed hardest), for $\gamma = 1$ it is finite and equal to $1/2$ at zero, and for $\gamma > 1$ it vanishes at zero (small violations are tolerated and large ones dominate). The loss is a smooth surrogate for the fraction of discordant comparable pairs, that is for one minus the time-dependent concordance index of @sec-1058-metrics.
+
+### Adaptive gradient balancing
+
+The two losses can pull the shared parameters in opposite directions. The paper treats BCE as primary ("whether") and the focal survival loss as auxiliary ("when"), and projects out the conflicting part of the auxiliary gradient on the last layer of the prediction network (paper Eq. 11):
+
+$$
+\nabla'_{\text{FSL}} = \begin{cases}
+\nabla_{\text{FSL}} - \dfrac{\langle \nabla_{\text{FSL}}, \nabla_{\text{BCE}} \rangle}{\lVert \nabla_{\text{BCE}} \rVert^2}\,\nabla_{\text{BCE}} & \text{if } \cos(\nabla_{\text{BCE}}, \nabla_{\text{FSL}}) < 0, \\[6pt]
+\nabla_{\text{FSL}} & \text{otherwise}.
+\end{cases}
+$$ {#eq-1058-agb}
+
+When the projection fires, $\langle \nabla'_{\text{FSL}}, \nabla_{\text{BCE}} \rangle = 0$, so the combined update direction $g = \nabla_{\text{BCE}} + \nabla'_{\text{FSL}}$ satisfies $\langle g, \nabla_{\text{BCE}} \rangle = \lVert \nabla_{\text{BCE}} \rVert^2 \ge 0$. A small step against $g$ therefore never increases the primary loss to first order, while still making whatever progress on ranking is orthogonal to it. This is a one-sided version of PCGrad (Yu et al., 2020), which projects both gradients symmetrically; the asymmetry encodes the paper's view that "whether" comes before "when". The other main family of multi-loss balancing, GradNorm (Chen et al., 2018), rescales the loss weights instead of editing gradient directions.
+
+```{python}
+#| label: fig-1058-losses
+#| fig-cap: "Left: the focal penalty sigma(x) for three values of gamma. Smaller gamma punishes small ranking violations more sharply. Right: adaptive gradient balancing on random gradient pairs. Before projection about a fifth of the auxiliary gradients point against the primary loss; after projection none do, and the combined step never increases the primary loss to first order."
+from aiinaction.ch1058_drdl import focal_sigma, project_conflicting
+
+x_ = sp.symbols("x", positive=True)
+g_ = sp.symbols("gamma", positive=True)
+sigma_sym = 2 / (1 + sp.exp(-x_**g_)) - 1
+claimed = 2 * g_ * x_**(g_ - 1) * sp.exp(-x_**g_) / (1 + sp.exp(-x_**g_))**2
+print("derivative of sigma matches the closed form:", sp.simplify(sp.diff(sigma_sym, x_) - claimed) == 0)
+print("slope at 0 for gamma = 1:", sp.limit(sp.diff(sigma_sym.subs(g_, 1), x_), x_, 0))
+
+xs = np.linspace(0, 1, 200)
+rng = np.random.default_rng(7)
+a = rng.normal(size=(5000, 8))
+b = rng.normal(size=(5000, 8)) + 0.3 * a
+cos_before = (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1))
+b_proj = np.array([project_conflicting(ai, bi) for ai, bi in zip(a, b)])
+cos_after = (a * b_proj).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b_proj, axis=1) + 1e-12)
+first_order = ((a + b_proj) * a).sum(1) - (a * a).sum(1)
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 3.6))
+for gm, ls in ((0.5, "-"), (1.0, "--"), (2.0, ":")):
+    ax[0].plot(xs, focal_sigma(xs, gm), ls, label=f"gamma = {gm}")
+ax[0].set_xlabel("ranking violation x"); ax[0].set_ylabel("penalty sigma(x)"); ax[0].legend(frameon=False)
+ax[1].hist(cos_before, bins=50, alpha=0.6, label="before projection")
+ax[1].hist(cos_after, bins=50, alpha=0.6, label="after projection")
+ax[1].axvline(0, c="k", lw=0.8); ax[1].set_xlabel("cosine to the primary gradient"); ax[1].legend(frameon=False, fontsize=8)
+plt.tight_layout()
+plt.show()
+print(f"conflicting before: {np.mean(cos_before < 0):.3f}, after: {np.mean(cos_after < -1e-9):.3f}; "
+      f"min first-order gain on primary loss: {first_order.min():.2e}")
+```
+
+## Evaluation Metrics {#sec-1058-metrics}
+
+The paper evaluates *time-to-risk* prediction with the concordance index, *calibration* with the integrated Brier score, and risk ranking at a single horizon with time-dependent AUC. We use the discrete-time versions that match the setup of @sec-1058-setup.
+
+* **Time-dependent concordance** (Antolini et al., 2005; Harrell et al., 1982 for the classical version): over comparable pairs, the share with $p_{i,A_i} > p_{j,A_i}$, ties counted as one half. It measures whether the model orders companies by when they fail.
+* **Cumulative/dynamic AUC at horizon $u$** (Heagerty et al., 2000): the probability that a company failing by $t_u$ receives a higher $p_u$ than one known to be event-free through $t_u$.
+* **Brier score at horizon $u$** (Graf et al., 1999): $\frac1n \sum_i (y_{iu} - p_{iu})^2$, averaged over horizons for the integrated score. With censoring only at the end of the window, as in the paper's design, no inverse-probability weighting is needed.
+
+## What the Paper Found {#sec-1058-paper-results}
+
+Wang et al. evaluated DRDL on three markets (Shanghai and Shenzhen A-shares, NASDAQ, and the NEEQ market of unlisted public companies), three windows (yearly, quarterly, monthly), and three event definitions: a negative net profit (fundamental distress), a closing bid below one dollar for 30 consecutive days (the NASDAQ delisting rule, regulatory listing risk), and a daily loss beyond a GARCH-based 99 percent value-at-risk (market tail risk, backtested with the Kupiec, 1995, test). They compared against 21 benchmarks: Cox, random survival forests, DeepSurv, DeepHit, a temporal fusion transformer (Lim et al., 2021), and four multitask architectures (concatenation CML, gated multimodal units GMU, hierarchical attention ATT, transformer encoder TEN), each trained with four loss combinations (the main loss alone, plus a monotonicity loss, plus a ranking loss, and plus both).
+
+| Market and window | Best benchmark (C-index) | DRDL (C-index) |
+|---|---|---|
+| A-shares, yearly | ATT_Mono_Rank 0.712 | 0.775 |
+| A-shares, quarterly | ATT_Mono_Rank 0.726 | 0.746 |
+| A-shares, monthly | GMU_Mono_Rank 0.645 | 0.656 |
+| NASDAQ, yearly | ATT_Mono_Rank 0.825 | 0.856 |
+| NASDAQ, quarterly | ATT_Mono_Rank 0.811 | 0.837 |
+| NASDAQ, monthly | ATT_Mono_Rank 0.678 | 0.698 |
+
+: Time-to-risk C-index reported in Table 5 of Wang et al. (2026), mean over 50 estimates from five repetitions of 10-fold cross-validation. {#tbl-1058-paper}
+
+The ablation study (their Table 8, A-share yearly task) removed one component at a time from the full model (C-index 0.775): adaptive gradient balancing (0.763), the focal survival loss (0.722), the risk accumulation function replaced by sigmoids (0.765), the mask-based decoder (0.734), the orthogonal loss (0.742), and the view-specific embedding layer (0.738). Every component helped, with the focal survival loss and the mask contributing most. A mechanism analysis also found DRDL's representations more disentangled than those of $eta$-VAE and FactorVAE on the SEPIN@k and WSEPIN metrics (Do and Tran, 2020). In investment simulations, low-risk pools selected by DRDL contained fewer distressed companies than pools selected by any benchmark, and high-profit pools earned higher average return on assets and equity.
+
+## Replication on a Simulated Multiview Panel {#sec-1058-replication}
+
+### Simulation design {#sec-1058-simulation}
+
+The simulator (`make_multiview_risk_panel` in `aiinaction.ch1058_drdl_model`) draws seven latent factors per company: solvency, profitability, liquidity, legal and governance exposure, investor sentiment, interfirm contagion, and a nuisance factor with no risk signal. The hazard in each of three horizons is a logistic function of the factors with **horizon-specific loadings**: sentiment, contagion, and legal exposure drive near-term risk, while solvency and profitability dominate the third horizon, echoing the paper's argument that event-driven views signal short-term risk and fundamentals signal long-term risk. A first event is drawn horizon by horizon from these hazards, so the true $F(t_u)$ follows @eq-1058-survival exactly.
+
+Three views observe the factors through random nonlinear mixing plus noise:
+
+| View | Latent factors carried | Unique to this view | Shared with another view |
+|---|---|---|---|
+| Financial indicators | solvency, profitability, liquidity, nuisance | solvency | profitability, liquidity |
+| Report text | profitability, legal, sentiment, nuisance | legal, sentiment | profitability |
+| Interfirm network | liquidity, contagion, nuisance | contagion | liquidity |
+
+: Information structure of the simulated views. Every view mixes complementary information with information another view also carries, and all three carry a nuisance factor unrelated to risk. {#tbl-1058-views}
+
+We run two predefined scenarios: **base** (36 features, moderate noise) and **entangled** (three times as many features per view, at twice the noise variance relative to signal), the latter closer to the paper's setting of high-dimensional, overlapping views. Each scenario has 3,000 companies split 60/20/20 into training, validation, and test sets over three seeds, plus an **out-of-time** cohort of 1,500 companies drawn with shifted factor means and higher base hazards, standardized with the training statistics.
+
+```{python}
+#| label: tbl-1058-panel
+#| tbl-cap: "Event shares in the simulated panel by horizon, the analogue of Table 4 in Wang et al. (2026). Roughly a third of companies experience a first risk event within the three-horizon window, front-loaded toward the first horizon."
+from aiinaction.ch1058_drdl_model import make_multiview_risk_panel
+
+SCENARIOS = {"base": dict(noise=0.8, width=1), "entangled": dict(noise=1.5, width=3)}
+N_COMPANIES = 3000
+rows = []
+for name, kw in SCENARIOS.items():
+    for cohort, extra in (("in time", dict(seed=0)), ("out of time", dict(seed=100, drift=0.5))):
+        p = make_multiview_risk_panel(N_COMPANIES if cohort == "in time" else N_COMPANIES // 2, **kw, **extra)
+        rows.append({"scenario": name, "cohort": cohort, "companies": p.n,
+                     "features per view": "/".join(str(v.shape[1]) for v in p.views),
+                     **{f"first event in t{u}": f"{((p.events == 1) & (p.times == u)).mean():.1%}" for u in (1, 2, 3)},
+                     "no event by t3": f"{(p.events == 0).mean():.1%}"})
+pd.DataFrame(rows)
+```
+
+### Methods compared
+
+We implement DRDL and six benchmarks from the paper's three families, all trained with Adam (Kingma and Ba, 2015), early stopping on validation concordance, and identical splits:
+
+* **COX**: linear Cox proportional hazards with a Breslow baseline (Cox, 1972), the classical survival benchmark.
+* **DeepHit** (Lee et al., 2018): a network that outputs a probability mass over the horizons plus "later", trained on the survival likelihood plus a ranking loss.
+* **CML** and **CML_Mono_Rank**: the concatenation multitask base architecture with independent sigmoid outputs, trained with multiperiod BCE, and with added monotonicity and ranking losses.
+* **ATT** and **ATT_Mono_Rank**: view-level attention fusion instead of concatenation, without and with the extra losses.
+* **DRDL**: per-feature numerical tokenization with one transformer encoder layer per view (Gorishniy et al., 2022), the discrete recoder with codebook, commitment ($\beta = 0.25$), and orthogonal (weight 0.1) losses, the mask decoder, the risk accumulation function, the focal survival loss ($\gamma = 1$), and adaptive gradient balancing. The codebook size, which the paper treats as a tuned hyperparameter, is chosen per scenario on the validation set of the first seed from $\{64, 256\}$.
+
+```{python}
+#| label: replication-fits
+#| code-fold: true
+import time
+from aiinaction.ch1058_drdl import td_concordance
+from aiinaction.ch1058_drdl_model import (
+    standardize, DRDLConfig, DRDL, BaselineNet, DeepHitNet, CoxNet,
+    TrainConfig, fit, predict_cumulative, evaluate,
+)
+
+torch.set_num_threads(8)
+SEEDS = [0, 1, 2]
+t_start = time.time()
+
+def three_way_split(panel, seed):
+    idx = np.random.default_rng(seed).permutation(panel.n)
+    a, b = int(0.6 * panel.n), int(0.8 * panel.n)
+    return panel.subset(idx[:a]), panel.subset(idx[a:b]), panel.subset(idx[b:])
+
+def method_zoo(dims, codebook_size):
+    return {
+        "COX": (lambda: CoxNet(dims), ()),
+        "DeepHit": (lambda: DeepHitNet(dims), ()),
+        "CML": (lambda: BaselineNet(dims, fusion="concat"), ()),
+        "CML_Mono_Rank": (lambda: BaselineNet(dims, fusion="concat"), ("mono", "rank")),
+        "ATT": (lambda: BaselineNet(dims, fusion="attention"), ()),
+        "ATT_Mono_Rank": (lambda: BaselineNet(dims, fusion="attention"), ("mono", "rank")),
+        "DRDL": (lambda: DRDL(DRDLConfig(dims, codebook_size=codebook_size)), ()),
+    }
+
+results, fitted, chosen_l = [], {}, {}
+for scen, kw in SCENARIOS.items():
+    panel = make_multiview_risk_panel(N_COMPANIES, seed=0, **kw)
+    oot_raw = make_multiview_risk_panel(N_COMPANIES // 2, seed=100, drift=0.5, **kw)
+    dims = [v.shape[1] for v in panel.views]
+
+    tr, va, _ = three_way_split(panel, 0)
+    tr, va = standardize(tr, va)
+    val_scores = {}
+    for l in (64, 256):
+        torch.manual_seed(0)
+        cfg = TrainConfig(seed=0)
+        fit(DRDL(DRDLConfig(dims, codebook_size=l)), tr, va, cfg)
+        val_scores[l] = cfg.history["best_valid_c"]
+    chosen_l[scen] = max(val_scores, key=val_scores.get)
+
+    for seed in SEEDS:
+        tr, va, te = three_way_split(panel, seed)
+        tr, va, te, oot = standardize(tr, va, te, oot_raw)
+        for name, (ctor, extras) in method_zoo(dims, chosen_l[scen]).items():
+            torch.manual_seed(seed)
+            model = ctor()
+            cfg = TrainConfig(seed=seed, loss_extras=extras, log_conflicts=(name == "DRDL"))
+            fit(model, tr, va, cfg)
+            f_te, f_oot = predict_cumulative(model, te), predict_cumulative(model, oot)
+            fitted[(scen, seed, name)] = dict(model=model, f_te=f_te, te=te, f_oot=f_oot, oot=oot, history=cfg.history)
+            results.append({"scenario": scen, "seed": seed, "method": name, **evaluate(f_te, te),
+                            "oot_c_index": td_concordance(f_oot, oot.times, oot.events)})
+res = pd.DataFrame(results)
+print("codebook size chosen on validation:", chosen_l, f"| fits took {time.time() - t_start:.0f} s")
+```
+
+### Time-to-risk and out-of-time performance {#sec-1058-results}
+
+```{python}
+#| label: tbl-1058-main
+#| tbl-cap: "Replication results on the simulated panel: mean (standard deviation) over three seeds of the time-dependent C-index on the test set, AUC at each horizon, integrated Brier score (lower is better), the share of test companies with a non-monotone predicted trajectory, and the C-index on the out-of-time cohort."
+order = ["COX", "DeepHit", "CML", "CML_Mono_Rank", "ATT", "ATT_Mono_Rank", "DRDL"]
+
+def mean_sd(s):
+    return f"{s.mean():.3f} ({s.std(ddof=1):.3f})"
+
+table = (res.groupby(["scenario", "method"])
+           .agg(c_index=("c_index", mean_sd), auc_1=("auc_1", mean_sd), auc_2=("auc_2", mean_sd),
+                auc_3=("auc_3", mean_sd), ibs=("ibs", mean_sd),
+                nonmonotone=("nonmonotone_share", lambda s: f"{s.mean():.2f}"),
+                oot_c_index=("oot_c_index", mean_sd))
+           .reset_index())
+table["method"] = pd.Categorical(table["method"], order)
+table = table.sort_values(["scenario", "method"]).set_index(["scenario", "method"])
+means = res.groupby(["scenario", "method"])["c_index"].mean()
+best_base = means["base"].drop("DRDL").idxmax(); best_ent = means["entangled"].drop("DRDL").idxmax()
+DRDL_BASE, BEST_BASE = f"{means['base','DRDL']:.3f}", f"{means['base', best_base]:.3f}"
+DRDL_ENT, BEST_ENT = f"{means['entangled','DRDL']:.3f}", f"{means['entangled', best_ent]:.3f}"
+table
+```
+
+The codebook size selected on validation was 64 in the base scenario and 256 in the entangled one. In the **base** scenario DRDL reaches a mean test C-index of about 0.73, against 0.769 for the best benchmark (the concatenation model CML, with linear Cox at 0.768). In the **entangled** scenario DRDL reaches about 0.75, against 0.781 for CML. On our simulated data, then, DRDL does not reproduce the margin the paper reports on real markets; every benchmark beats it, by 0.02 to 0.04 in C-index, and the time-dependent AUCs tell the same story. The reason is visible in the design: the simulated risk is a smooth function of a handful of continuous factors, and quantizing every feature embedding onto a finite codebook throws away some of the magnitude information a continuous network keeps. The paper anticipates this when it positions discretization "as one useful design component within a multiview survival framework, rather than as a universally superior representation".
+
+Two of the paper's claims do reproduce. **Time-wise monotonicity:** DRDL's risk trajectories never decrease (as for Cox and DeepHit, whose cumulative risk is also built from a survival structure), while the sigmoid-output multitask models produce decreasing trajectories for up to 6 percent of companies, and adding a monotonicity *penalty* does not remove them (CML_Mono_Rank is the worst offender in both scenarios). **Robustness out of time:** on the drifted cohort DRDL degrades no more than the benchmarks. In the entangled scenario every method loses about 0.03 of C-index (DRDL included, within the benchmarks' range of 0.027 to 0.035); in the base scenario the shifts are small for every method. DRDL's out-of-time C-index nonetheless remains the lowest, because it starts lower.
+
+DRDL's numbers are a few thousandths apart between reruns, because multithreaded CPU training of the codebook lookup is not bit-for-bit deterministic (its backward pass accumulates gradients by scatter-add); the benchmarks reproduce exactly. None of the comparisons in this section changes between reruns.
+
+### Ablations {#sec-1058-ablations}
+
+```{python}
+#| label: tbl-1058-ablation
+#| tbl-cap: "Ablation of DRDL's components on the entangled scenario (mean over three seeds), the analogue of Table 8 in Wang et al. (2026): test C-index, the share of non-monotone predicted trajectories, and seconds per training epoch."
+ablations = {
+    "DRDL (M0)": {}, "M1: no adaptive gradient balancing": dict(use_agb=False),
+    "M2: no focal survival loss": dict(use_fsl=False), "M3: sigmoid instead of risk accumulation": dict(use_risk_accumulation=False),
+    "M4: no mask-based decoder": dict(use_mask=False), "M5: no orthogonal loss": dict(use_orth=False),
+    "M6: no view-specific embedding": dict(use_view_embedding=False),
+}
+panel_e = make_multiview_risk_panel(N_COMPANIES, seed=0, **SCENARIOS["entangled"])
+dims_e = [v.shape[1] for v in panel_e.views]
+abl_rows = []
+for seed in SEEDS:
+    tr, va, te = three_way_split(panel_e, seed)
+    tr, va, te = standardize(tr, va, te)
+    for name, kw in ablations.items():
+        if name == "DRDL (M0)":
+            r = res[(res.scenario == "entangled") & (res.seed == seed) & (res.method == "DRDL")].iloc[0]
+            abl_rows.append({"variant": name, "seed": seed, "c_index": r.c_index, "nonmonotone": r.nonmonotone_share,
+                             "sec_per_epoch": np.nan})
+            continue
+        torch.manual_seed(seed)
+        t1 = time.time()
+        cfg = TrainConfig(seed=seed)
+        model = fit(DRDL(DRDLConfig(dims_e, codebook_size=chosen_l["entangled"], **kw)), tr, va, cfg)
+        r = evaluate(predict_cumulative(model, te), te)
+        abl_rows.append({"variant": name, "seed": seed, "c_index": r["c_index"], "nonmonotone": r["nonmonotone_share"],
+                         "sec_per_epoch": (time.time() - t1) / cfg.history["epochs"]})
+abl = pd.DataFrame(abl_rows).groupby("variant", sort=False).agg(
+    c_index=("c_index", "mean"), c_sd=("c_index", "std"), nonmonotone=("nonmonotone", "mean"),
+    sec_per_epoch=("sec_per_epoch", "mean")).round(3)
+M0_C = f"{abl.loc['DRDL (M0)', 'c_index']:.3f}"
+abl
+```
+
+The ablations separate DRDL's components into those our simulation supports and those it does not. (The M0 row reuses the main-comparison fits, so its time per epoch is not re-measured.) The **risk accumulation function (M3)** gives the cleanest result: replacing it with independent sigmoids leaves the C-index roughly unchanged but makes about 11 percent of the predicted trajectories decrease across horizons, exactly the failure the paper designed it to prevent. The **focal survival loss (M2)**, **gradient balancing (M1)**, **orthogonal loss (M5)**, and **view-specific embedding (M6)** each move the C-index by a few thousandths at most, far less than the 0.01 to 0.05 the paper reports on real data; on a simulator whose views are small numeric blocks, there is little cross-view structure for them to exploit, and the simpler embedding of M6 trains about a third faster. The **mask (M4)** goes the other way: removing it *raises* the C-index from about 0.75 to 0.76. The redundancy probe below explains why.
+
+### Mechanism diagnostics {#sec-1058-mechanisms}
+
+```{python}
+#| label: fig-1058-mechanisms
+#| fig-cap: "Inside a trained DRDL (entangled scenario, seed 0). Left: cosine between the BCE and focal-survival-loss gradients on the last layer over training; negative values are conflicts that adaptive gradient balancing resolves. Middle: observed masked share against the chance rate under uniform and empirical code frequencies (the redundancy probe of the null-masking equation). Right: orthogonality loss of the trained codebook against its Welch floor."
+fit0 = fitted[("entangled", 0, "DRDL")]
+model0, te0 = fit0["model"], fit0["te"]
+with torch.no_grad():
+    model0.eval()
+    model0([torch.from_numpy(v) for v in te0.views])
+    codes0 = model0.aux["codes"].numpy()
+    mask0 = model0.aux["mask"].numpy()
+f_tok, l_codes = codes0.shape[1], model0.cfg.codebook_size
+freq = np.bincount(codes0.ravel(), minlength=l_codes) / codes0.size
+null_uniform = null_masked_uniform(f_tok, l_codes)
+null_empirical = 1 - (1 - (1 - freq) ** f_tok).sum() / f_tok
+observed = 1 - mask0.mean()
+cos_hist = np.array(fit0["history"]["cosines"])
+orth_val = orthogonal_loss(model0.codebook.detach().numpy())
+floor = welch_floor(l_codes, model0.cfg.d)
+
+fig, ax = plt.subplots(1, 3, figsize=(12, 3.5))
+ax[0].plot(cos_hist, lw=0.6)
+ax[0].axhline(0, c="k", lw=0.8)
+ax[0].set_xlabel("training step"); ax[0].set_ylabel("cos(grad BCE, grad FSL)")
+ax[1].bar(["observed", "chance (empirical)", "chance (uniform)"], [observed, null_empirical, null_uniform], color=["C0", "C1", "C2"])
+ax[1].set_ylabel("masked share of tokens"); ax[1].tick_params(axis="x", labelsize=8)
+ax[2].bar(["trained codebook", "Welch floor"], [orth_val, floor], color=["C0", "C2"])
+ax[2].set_ylabel("orthogonality loss")
+plt.tight_layout()
+plt.show()
+print(f"conflicting steps: {np.mean(cos_hist < 0):.1%} | codes used: {len(np.unique(codes0))} of {l_codes} | "
+      f"masked: observed {observed:.3f}, chance {null_empirical:.3f} (empirical), {null_uniform:.3f} (uniform)")
+print(f"orthogonality loss {orth_val:.2f} vs Welch floor {floor:.2f} (codebook {l_codes} x {model0.cfg.d})")
+```
+
+Three readings follow. Gradient conflicts are not rare edge cases: in half of all training steps the focal-loss gradient points against the BCE gradient on the last layer, so the balancing step is doing real work. The orthogonality loss of the trained 256-code, 16-dimensional codebook sits within about 0.1 of its Welch floor (43.82), confirming @eq-1058-welch: the regularizer has spread the codes as evenly as the dimension allows, and no codebook of this shape can do better. And the **redundancy probe** is negative. The observed masked share (about 0.23) is above the uniform-chance rate (0.18) only because some codes are used far more than others; measured against chance under the *empirical* code frequencies (about 0.32), tokens of the same company collide *less* often than random draws would. Each feature position tends to use its own subset of codes, so a repeated code within a company rarely signals the same information twice. The mask therefore deletes mostly non-redundant information here, which is why the M4 ablation improved. On real multiview data, where two views can carry literally the same ratio or the same news event, the probe may come out the other way, and it is the test to run before relying on the mask.
+
+### Identification performance {#sec-1058-identification}
+
+The paper's impact analysis asks how many companies that go on to suffer a risk event end up in a low-risk investment pool chosen by the model. We form pools from the 10 to 40 percent of test companies with the lowest predicted three-horizon risk and count those that had an event (the analogue of the paper's Table 7; lower is better).
+
+```{python}
+#| label: tbl-1058-identification
+#| tbl-cap: "Identification performance on the test sets: mean number of companies with a risk event inside a low-risk pool of the given size (fraction of the test set), averaged over three seeds. Lower is better."
+id_rows = []
+for (scen, seed, name), d in fitted.items():
+    risk3 = d["f_te"][:, -1]
+    order_idx = np.argsort(risk3, kind="stable")
+    for frac in (0.1, 0.2, 0.3, 0.4):
+        pool = order_idx[: int(frac * len(order_idx))]
+        id_rows.append({"scenario": scen, "method": name, "pool": f"{int(frac * 100)}%",
+                        "risky in pool": int(d["te"].events[pool].sum())})
+ident = (pd.DataFrame(id_rows).groupby(["scenario", "method", "pool"])["risky in pool"].mean()
+           .unstack("pool").round(1))
+ident = ident.reindex(pd.MultiIndex.from_product([list(SCENARIOS), order], names=["scenario", "method"]))
+ident
+```
+
+The identification analysis mirrors the ranking results. In the paper, DRDL's low-risk pools contained the fewest distressed companies of any method (for example 11.3 against 14.8 for the best benchmark in the 10 percent A-share pool). In our simulation the ordering reverses at the smallest pool size: in the base scenario DRDL's 10 percent pool contains several more companies that later had a risk event than any benchmark's, and in the entangled scenario it ties the weakest benchmarks. The gap narrows as pools grow; at 30 and 40 percent of the base-scenario test set, DeepHit's pools are worse than DRDL's.
+
+## Putting DFRP into Production {#sec-1058-production}
+
+The method is only as good as the data alignment around it, and the paper's experimental choices encode several lessons worth making explicit.
+
+* **Respect disclosure lags.** Features dated year $t$ must be available when the prediction is made. The paper starts quarterly and monthly windows only after the annual report disclosure period (four months in China, three for NASDAQ). Using year-end figures before they are published is look-ahead bias that inflates every metric.
+* **Define the event before the model.** "Risk" is an event definition: a net loss, a delisting rule, a value-at-risk breach. Each has its own horizon, base rate, and noise, and model comparisons are only meaningful within one definition. For market tail risk, backtest the risk model that defines the event (the paper used Kupiec's unconditional coverage test).
+* **Evaluate out of time, not only out of sample.** Random splits let a model learn the macro conditions of the test years. Train on earlier cohorts and test on later ones, as in @tbl-1058-main.
+* **Check the mask before trusting it.** Compute the redundancy probe of @eq-1058-null-mask on your own data. If the masked share is close to chance, the mask is mostly deleting information.
+* **Keep monotonicity structural.** Penalties can be outweighed by the main loss; the risk accumulation function cannot. Any model whose risk trajectories feed governance decisions (watchlists, covenant triggers, provisioning) should be monotone by construction.
+* **Monitor and keep humans able to override.** Risk models drift as markets change (@sec-model-monitoring), and the people who act on them need the oversight conditions discussed in @sec-human-in-the-loop. DRDL's discrete codes help here: the paper shows that individual codes can be traced to views and labeled, which gives risk officers something concrete to inspect.
+
+## Reference Implementation {#sec-1058-reference}
+
+The deterministic core (risk accumulation, nearest-code assignment, redundancy mask, orthogonality loss, focal survival loss, multiperiod BCE, gradient projection, and the evaluation metrics) is implemented in all three of the book's languages with shared test fixtures; the PyTorch model, benchmarks, simulator, and training loop are in `aiinaction.ch1058_drdl_model`.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| code-fold: false
+from aiinaction.ch1058_drdl import (
+    risk_accumulation, nearest_codes, first_occurrence_mask, orthogonal_loss,
+    focal_survival_loss, multiperiod_bce, project_conflicting, td_concordance, td_auc,
+)
+
+outputs = [[-1.0, 0.5, -0.3], [0.2, -2.0, 0.1], [-3.0, -1.0, 1.0], [0.0, 0.0, 0.0]]
+times, events = [1, 2, 3, 3], [1, 1, 1, 0]
+F = risk_accumulation(outputs)
+print("cumulative risk:\n", F.round(4))
+print("codes:", nearest_codes([[0.1, 0.9], [1.0, 0.0], [0.6, 0.6], [-0.9, 0.1]],
+                              [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]).tolist())
+print("mask:", first_occurrence_mask([2, 0, 2, 1, 0, 3]).tolist())
+print(f"orthogonal loss: {orthogonal_loss([[1.0, 0.0], [1.0, 1.0], [0.0, 2.0]]):.4f}")
+print(f"focal survival loss: {focal_survival_loss(F, times, events, gamma=1.0):.6f}")
+print(f"multiperiod BCE: {multiperiod_bce(F, times, events):.6f}")
+print("projected gradient:", project_conflicting([1.0, 0.0, 1.0], [-1.0, 2.0, 0.0]).tolist())
+print(f"C-index: {td_concordance(F, times, events):.3f}, AUC at t2: {td_auc(F, times, events, 2):.3f}")
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch1058Drdl
+
+outputs = [-1.0 0.5 -0.3; 0.2 -2.0 0.1; -3.0 -1.0 1.0; 0.0 0.0 0.0]
+times, events = [1, 2, 3, 3], [1, 1, 1, 0]
+F = risk_accumulation(outputs)
+println("cumulative risk: ", round.(F, digits=4))
+println("codes: ", nearest_codes([0.1 0.9; 1.0 0.0; 0.6 0.6; -0.9 0.1], [1.0 0.0; 0.0 1.0; -1.0 0.0]))
+println("mask: ", first_occurrence_mask([2, 0, 2, 1, 0, 3]))
+println("orthogonal loss: ", round(orthogonal_loss([1.0 0.0; 1.0 1.0; 0.0 2.0]), digits=4))
+println("focal survival loss: ", round(focal_survival_loss(F, times, events; gamma=1.0), digits=6))
+println("multiperiod BCE: ", round(multiperiod_bce(F, times, events), digits=6))
+println("projected gradient: ", project_conflicting([1.0, 0.0, 1.0], [-1.0, 2.0, 0.0]))
+println("C-index: ", td_concordance(F, times, events), ", AUC at t2: ", td_auc(F, times, events, 2))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch1058_drdl::{
+    first_occurrence_mask, focal_survival_loss, multiperiod_bce, nearest_codes, orthogonal_loss,
+    project_conflicting, risk_accumulation_matrix, td_auc, td_concordance,
+};
+
+fn main() -> Result<(), String> {
+    let outputs = vec![
+        vec![-1.0, 0.5, -0.3], vec![0.2, -2.0, 0.1], vec![-3.0, -1.0, 1.0], vec![0.0, 0.0, 0.0],
+    ];
+    let (times, events) = ([1usize, 2, 3, 3], [1u8, 1, 1, 0]);
+    let f = risk_accumulation_matrix(&outputs)?;
+    println!("cumulative risk: {:?}", f);
+    let emb = vec![vec![0.1, 0.9], vec![1.0, 0.0], vec![0.6, 0.6], vec![-0.9, 0.1]];
+    let codebook = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]];
+    println!("codes: {:?}", nearest_codes(&emb, &codebook)?);
+    println!("mask: {:?}", first_occurrence_mask(&[2, 0, 2, 1, 0, 3]));
+    let cb = vec![vec![1.0, 0.0], vec![1.0, 1.0], vec![0.0, 2.0]];
+    println!("orthogonal loss: {:.4}", orthogonal_loss(&cb)?);
+    println!("focal survival loss: {:.6}", focal_survival_loss(&f, &times, &events, 1.0)?);
+    println!("multiperiod BCE: {:.6}", multiperiod_bce(&f, &times, &events, 1e-12)?);
+    println!("projected gradient: {:?}", project_conflicting(&[1.0, 0.0, 1.0], &[-1.0, 2.0, 0.0])?);
+    println!("C-index: {:.3}, AUC at t2: {:.3}", td_concordance(&f, &times, &events)?, td_auc(&f, &times, &events, 2)?);
+    Ok(())
+}
+```
+
+:::
+
+Julia's `comparable_pairs` returns 1-based row indices, while `nearest_codes` returns 0-based code indices so that all three languages share the same fixtures. Rust has no default arguments, so `gamma = 1.0` and `eps = 1e-12` are passed explicitly.
+
+## Summary {#sec-1058-summary}
+
+Dynamic financial risk prediction asks when, not only whether, a company will meet its first risk event, and modern risk data come in overlapping views. DRDL (Wang et al., 2026) answers both challenges with discrete, disentangled representations (a shared VQ codebook regularized toward orthogonality, with a mask that drops repeated codes) and with a monotonicity-aware prediction module (a risk accumulation function, a focal survival loss, and adaptive gradient balancing). We showed that the risk accumulation function is exactly the grouped-time proportional hazards model of Prentice and Gloeckler, so time-wise monotonicity is a structural guarantee; that the orthogonality loss has a Welch floor whenever the codebook outgrows its dimension; that the mask has a computable chance rate, which turns it into a testable redundancy probe; and that gradient balancing by one-sided projection never increases the primary loss to first order. Our replication on simulated multiview data confirms the structural mechanisms (guaranteed monotone trajectories, real gradient conflicts, a codebook that reaches its Welch floor) but not the headline margin: in both simulated scenarios the continuous benchmarks beat the discrete model by 0.02 to 0.04 in C-index, and the redundancy probe showed that the mask was removing information rather than redundancy. The value of discretization and masking is a property of the data, and the null-masking test tells you which side of that line your data are on. The paper's own results on three real markets remain the evidence for its use on real multiview financial data.
+
+## Exercises {#sec-1058-exercises}
+
+1. **Exact likelihood.** Replace the multiperiod BCE in `fit` with the discrete-time log-likelihood @eq-1058-loglik using the hazards $h_j = 1 - \exp(-\exp(o_j))$. Does the C-index change? Why might the paper still prefer BCE on cumulative labels?
+2. **Welch floor.** Prove that @eq-1058-welch is tight when $l$ unit vectors form a tight frame in $\mathbb{R}^d$, and verify numerically that the optimized codebooks of @tbl-1058-geometry approach the floor.
+3. **Null masking.** Derive the variance of the number of distinct codes among $f$ uniform draws from $l$ codes, and use it to build a z-test for "more masking than chance".
+4. **Focal shape.** Retrain DRDL with $\gamma \in \{0.5, 1, 2\}$ (add a small offset inside the power for $\gamma < 1$). Which value gives the best validation C-index, and how does the share of discordant comparable pairs change?
+5. **Symmetric surgery.** Implement full PCGrad (project each gradient on the other's normal plane when they conflict) and compare it with the one-sided rule of @eq-1058-agb in the ablation table.
+6. **Make the mask pay.** Modify the simulator so that redundant views carry *identical* tokens for the shared factor (for example, the same profitability ratio reported in two views). Does the mask-based decoder now beat the unmasked ablation?
+
+## References {#sec-1058-references}
+
+1. Altman, E. I. (1968). Financial ratios, discriminant analysis and the prediction of corporate bankruptcy. *The Journal of Finance*, 23(4), 589-609. https://doi.org/10.1111/j.1540-6261.1968.tb00843.x
+2. Antolini, L., Boracchi, P., and Biganzoli, E. (2005). A time-dependent discrimination index for survival data. *Statistics in Medicine*, 24(24), 3927-3944. https://doi.org/10.1002/sim.2427
+3. Bengio, Y., Léonard, N., and Courville, A. (2013). Estimating or propagating gradients through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432. https://arxiv.org/abs/1308.3432
+4. Campbell, J. Y., Hilscher, J., and Szilagyi, J. (2008). In search of distress risk. *The Journal of Finance*, 63(6), 2899-2939. https://doi.org/10.1111/j.1540-6261.2008.01416.x
+5. Chen, Z., Badrinarayanan, V., Lee, C.-Y., and Rabinovich, A. (2018). GradNorm: Gradient normalization for adaptive loss balancing in deep multitask networks. *International Conference on Machine Learning*, PMLR 80. arXiv:1711.02257. https://arxiv.org/abs/1711.02257
+6. Cox, D. R. (1972). Regression models and life-tables. *Journal of the Royal Statistical Society: Series B (Methodological)*, 34(2), 187-202. https://doi.org/10.1111/j.2517-6161.1972.tb00899.x
+7. Do, K., and Tran, T. (2020). Theory and evaluation metrics for learning disentangled representations. *International Conference on Learning Representations*. arXiv:1908.09961. https://arxiv.org/abs/1908.09961
+8. Gorishniy, Y., Rubachev, I., and Babenko, A. (2022). On embeddings for numerical features in tabular deep learning. *Advances in Neural Information Processing Systems*, 35, 24991-25004. https://doi.org/10.52202/068431-1812
+9. Graf, E., Schmoor, C., Sauerbrei, W., and Schumacher, M. (1999). Assessment and comparison of prognostic classification schemes for survival data. *Statistics in Medicine*, 18(17-18), 2529-2545. https://doi.org/10.1002/(SICI)1097-0258(19990915/30)18:17/18<2529::AID-SIM274>3.0.CO;2-5
+10. Harrell, F. E., Califf, R. M., Pryor, D. B., Lee, K. L., and Rosati, R. A. (1982). Evaluating the yield of medical tests. *JAMA*, 247(18), 2543-2546. https://doi.org/10.1001/jama.1982.03320430047030
+11. Heagerty, P. J., Lumley, T., and Pepe, M. S. (2000). Time-dependent ROC curves for censored survival data and a diagnostic marker. *Biometrics*, 56(2), 337-344. https://doi.org/10.1111/j.0006-341X.2000.00337.x
+12. Johnson, N. F. (1970). The role of chunking and organization in the process of recall. *Psychology of Learning and Motivation*, 4, 171-247. https://doi.org/10.1016/S0079-7421(08)60432-6
+13. Katzman, J. L., Shaham, U., Cloninger, A., Bates, J., Jiang, T., and Kluger, Y. (2018). DeepSurv: Personalized treatment recommender system using a Cox proportional hazards deep neural network. *BMC Medical Research Methodology*, 18, 24. https://doi.org/10.1186/s12874-018-0482-1
+14. Kingma, D. P., and Ba, J. (2015). Adam: A method for stochastic optimization. *International Conference on Learning Representations*. arXiv:1412.6980. https://arxiv.org/abs/1412.6980
+15. Kupiec, P. H. (1995). Techniques for verifying the accuracy of risk measurement models. *The Journal of Derivatives*, 3(2), 73-84. https://doi.org/10.3905/jod.1995.407942
+16. Lee, C., Zame, W., Yoon, J., and van der Schaar, M. (2018). DeepHit: A deep learning approach to survival analysis with competing risks. *Proceedings of the AAAI Conference on Artificial Intelligence*, 32(1). https://doi.org/10.1609/aaai.v32i1.11842
+17. Lim, B., Arık, S. Ö., Loeff, N., and Pfister, T. (2021). Temporal fusion transformers for interpretable multi-horizon time series forecasting. *International Journal of Forecasting*, 37(4), 1748-1764. https://doi.org/10.1016/j.ijforecast.2021.03.012
+18. Lin, T.-Y., Goyal, P., Girshick, R., He, K., and Dollár, P. (2017). Focal loss for dense object detection. *IEEE International Conference on Computer Vision*, 2999-3007. https://doi.org/10.1109/ICCV.2017.324
+19. Prentice, R. L., and Gloeckler, L. A. (1978). Regression analysis of grouped survival data with application to breast cancer data. *Biometrics*, 34(1), 57-67. https://doi.org/10.2307/2529588
+20. Shumway, T. (2001). Forecasting bankruptcy more accurately: A simple hazard model. *The Journal of Business*, 74(1), 101-124. https://doi.org/10.1086/209665
+21. van den Oord, A., Vinyals, O., and Kavukcuoglu, K. (2017). Neural discrete representation learning. *Advances in Neural Information Processing Systems*, 30. arXiv:1711.00937. https://arxiv.org/abs/1711.00937
+22. Wang, Z., Che, W., Jiang, C., and Zhao, H. (2026). Leveraging multiview data through discrete and regularized deep learning for dynamic financial risk prediction. *Information Systems Research*, 37(3), 2068-2090. https://doi.org/10.1287/isre.2024.1417
+23. Welch, L. R. (1974). Lower bounds on the maximum cross correlation of signals. *IEEE Transactions on Information Theory*, 20(3), 397-399. https://doi.org/10.1109/TIT.1974.1055219
+24. Wiegrebe, S., Kopper, P., Sonabend, R., Bischl, B., and Bender, A. (2024). Deep learning for survival analysis: A review. *Artificial Intelligence Review*, 57(3), 65. https://doi.org/10.1007/s10462-023-10681-3
+25. Yu, T., Kumar, S., Gupta, A., Levine, S., Hausman, K., and Finn, C. (2020). Gradient surgery for multi-task learning. *Advances in Neural Information Processing Systems*, 33. arXiv:2001.06782. https://arxiv.org/abs/2001.06782

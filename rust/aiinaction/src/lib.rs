@@ -123,6 +123,7 @@ pub mod ch202_layer_norm;
 pub mod ch204_dropout;
 pub mod ch207_densenet;
 pub mod ch525_oversight;
+pub mod ch1058_drdl;
 
 #[cfg(test)]
 mod tests {
