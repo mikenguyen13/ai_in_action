@@ -99,5 +99,6 @@ include("ch202_layer_norm.jl")
 include("ch204_dropout.jl")
 include("ch207_densenet.jl")
 include("ch525_oversight.jl")
+include("ch945_suva.jl")
 
 end # module AIInAction
