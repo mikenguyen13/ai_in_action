@@ -1,50 +1,129 @@
-# AI in Action
+<p align="center">
+  <img src="cover.png" alt="AI in Action cover" width="220">
+</p>
 
-Building artificial intelligence systems from the ground up, with **Python** as the working language and **mathematics** as the organizing principle.
+<h1 align="center">AI in Action</h1>
 
-This is the source for a [Quarto](https://quarto.org) book aimed at advanced undergraduates, graduate students, and practitioners who want a rigorous, implementation-focused view of AI. Rather than treating AI as a collection of library calls, every chapter stays close to the underlying math while always returning to executable Python you can run, modify, and test.
+<p align="center">
+  <strong>A Reference for Artificial Intelligence</strong><br>
+  Mike Nguyen
+</p>
 
-Each chapter follows the same pattern: introduce a concept intuitively and mathematically, derive the core algorithm step by step, implement it in Python, analyze the implementation line by line, then explore variations and failure modes on realistic data.
+<p align="center">
+  <a href="https://mikenguyen13.github.io/ai_in_action/"><img alt="Read online" src="https://img.shields.io/badge/read-online-2b4c9b?style=flat-square"></a>
+  <a href="https://github.com/mikenguyen13/ai_in_action/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/mikenguyen13/ai_in_action/ci.yml?branch=main&label=tests&style=flat-square"></a>
+  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square">
+  <img alt="Julia" src="https://img.shields.io/badge/julia-1.10%2B-9558b2?style=flat-square">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-stable-b7410e?style=flat-square">
+  <img alt="Built with Quarto" src="https://img.shields.io/badge/built%20with-Quarto-75aadb?style=flat-square">
+</p>
 
-## Reading the book
+---
 
-The rendered book is published via GitHub Pages from the [`docs/`](docs/) directory. Source and issues live at <https://github.com/mikenguyen13/ai_in_action>.
+**AI in Action** is a rigorous, implementation-first reference for modern artificial intelligence. It covers the mathematical foundations, classical machine learning, deep learning, transformers and large language models, retrieval and knowledge graphs, AI agents, and the frontier methods of 2024 to 2026. Every chapter derives the ideas carefully and then makes them run.
 
-## Building locally
+📖 **Read the book:** <https://mikenguyen13.github.io/ai_in_action/>
 
-The project uses [`uv`](https://docs.astral.sh/uv/) for Python (3.10) and [Quarto](https://quarto.org) for rendering.
+## What makes it different
+
+- **Mathematics first, never hand-waved.** Algorithms are derived step by step, with the assumptions and failure modes stated.
+- **Code that actually runs.** Python examples are executed at build time, so every figure and table in the book is produced by the code shown next to it.
+- **Three languages.** Core methods are implemented in Python, Julia, and Rust, with shared test fixtures so the three versions agree.
+- **Grounded in the literature.** Chapters cite peer-reviewed sources with DOIs and integrate recent research as it is published.
+- **Open-source tooling.** Examples favor mature, freely available libraries over proprietary services.
+
+## Contents
+
+The book is organized in eighteen parts:
+
+| Part | Topic |
+|:----:|:------|
+| I | Foundations of Intelligence |
+| II | Mathematical Foundations |
+| III | Data Foundations |
+| IV | Classical Machine Learning |
+| V | Unsupervised Learning |
+| VI | Model Evaluation and Selection |
+| VII | Neural Networks Foundations |
+| VIII | The Transformer Revolution |
+| IX | Natural Language Processing |
+| X | Economics, Business, and Finance |
+| XI | Knowledge Graphs and GraphRAG |
+| XII | AI Agents and Autonomy |
+| XIII | Computer Vision and Multimodal AI |
+| XIV | Responsible and Trustworthy AI |
+| XV | Frontier Models and Methods (2024 to 2026) |
+| XVI | Transfer Learning and Domain Adaptation |
+| XVII | ML Engineering and Production Monitoring |
+| XVIII | AI Safety and Robustness |
+
+A machine-readable chapter index is published at [`llms.txt`](https://mikenguyen13.github.io/ai_in_action/llms.txt).
+
+## Companion libraries
+
+The reference implementations behind the chapters are packaged as installable, tested libraries:
+
+| Language | Package | Location | Tests |
+|:---------|:--------|:---------|:------|
+| Python | `aiinaction` | [`src/aiinaction/`](src/aiinaction/) | `pytest` |
+| Julia | `AIInAction` | [`julia/AIInAction/`](julia/AIInAction/) | `Pkg.test()` |
+| Rust | `aiinaction` | [`rust/aiinaction/`](rust/aiinaction/) | `cargo test` |
+
+Continuous integration runs all three test suites on every push to `main`.
 
 ```bash
-# 1. Install dependencies into a local virtual environment
-uv sync
+# Python
+pip install -e ".[dev]" && pytest -q
 
-# 2. Render the whole book to docs/
-quarto render
+# Julia
+julia --project=julia/AIInAction -e 'using Pkg; Pkg.test()'
 
-# 3. Or live-preview while editing
-quarto preview
+# Rust
+cd rust/aiinaction && cargo test
 ```
 
-`quarto render` writes HTML output to `docs/`. Computational chapters are cached via `jupyter-cache`, so re-renders only re-execute changed code.
+## Building the book
+
+Requirements: [Quarto](https://quarto.org) 1.5 or newer, [uv](https://docs.astral.sh/uv/), and Julia 1.11 or newer for the chapters that execute Julia.
+
+```bash
+uv sync                                   # create .venv with the pinned dependencies
+export QUARTO_PYTHON=.venv/bin/python     # on Windows: .venv\Scripts\python.exe
+quarto render                             # build the full book into docs/
+quarto preview                            # live preview while editing
+```
+
+Executed results are cached in `_freeze/`, so after the first build only chapters whose code changed are re-run. A single chapter can be rendered with `quarto render <chapter>.qmd`.
 
 ## Repository layout
 
 | Path | Contents |
-|------|----------|
-| `_quarto.yml` | Book configuration and table of contents. The full outline is extensive; chapters not yet written are commented out. |
-| `*.qmd` | Chapter sources (Quarto Markdown). Some are numbered by their slot in the outline (e.g. `519-model-context-protocol-mcp.qmd`); others are descriptively named. |
-| `index.qmd` | Preface, audience, prerequisites, and how the book is organized. |
-| `references.bib` | Shared bibliography. |
-| `docs/` | Rendered site (GitHub Pages output). Generated, do not edit by hand. |
-| `_archive/` | Reference material salvaged from an earlier draft (notebooks, a GNN writeup, an applied example). The leading `_` makes Quarto ignore it during render; it is **not** part of the book. |
-| `pyproject.toml` / `uv.lock` | Python dependencies and lockfile. |
+|:-----|:---------|
+| `*.qmd` | Chapter sources (Quarto Markdown) |
+| `_quarto.yml` | Book configuration and table of contents |
+| `references.bib` | Shared bibliography |
+| `src/`, `tests/` | Python library and tests |
+| `julia/` | Julia library, tests, and the notebook environment for Julia-executed chapters |
+| `rust/` | Rust library and tests |
+| `theme.scss`, `theme-dark.scss` | Site typography and color themes |
+| `scripts/` | Build helpers, including the `llms.txt` generator |
+| `docs/` | Rendered site served by GitHub Pages (generated; do not edit by hand) |
 
-## Contributing a chapter
+## Feedback
 
-1. Add the `.qmd` file at the repository root.
-2. Reference it in the appropriate part under `book.chapters` in `_quarto.yml` (uncomment its planned slot, or add a new entry).
-3. Run `quarto inspect` to confirm the configuration resolves, then `quarto render` to build.
+Corrections and suggestions are welcome. Please [open an issue](https://github.com/mikenguyen13/ai_in_action/issues), or use the *Report an issue* link on any page of the online book.
+
+## Citation
+
+```bibtex
+@book{nguyen_ai_in_action,
+  author    = {Nguyen, Mike},
+  title     = {AI in Action: A Reference for Artificial Intelligence},
+  year      = {2026},
+  url       = {https://mikenguyen13.github.io/ai_in_action/}
+}
+```
 
 ## License
 
-See the repository for license details.
+© Mike Nguyen. All rights reserved. Please contact the author before reproducing the book text or figures.
