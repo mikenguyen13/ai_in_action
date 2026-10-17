@@ -1,6 +1,6 @@
 # Mixture of Experts
 
-## 1. Introduction
+## Introduction
 
 A dense transformer applies every parameter to every token. Doubling the width of the feed-forward blocks doubles both the parameter count and the cost of every forward pass, so capacity and compute are chained together. **Mixture of Experts (MoE)** breaks that chain. It replaces a single dense feed-forward network with a bank of parallel networks, the experts, and a small learned router that sends each token to only a few of them. The model can hold an enormous number of parameters while spending compute proportional to the few experts each token actually visits.
 
@@ -8,7 +8,7 @@ This decoupling of total parameters from active parameters is the central reason
 
 This chapter develops the mathematics of sparse top-k routing and the load-balancing loss that makes training stable, then builds a complete sparse MoE layer from scratch in PyTorch on the CPU, small enough to run in seconds yet faithful to the production design. It closes with the GPU-scale invocations a reader would actually use (Switch Transformer, Mixtral, expert-parallel training), shown but not executed because they require accelerators, and with the pitfalls that decide whether an MoE model trains well or collapses.
 
-## 2. The Core Idea: Conditional Computation
+## The Core Idea: Conditional Computation
 
 In a dense transformer block the feed-forward sublayer computes, for a token representation $x \in \mathbb{R}^{d}$,
 
@@ -26,7 +26,7 @@ where $\mathcal{T}(x)$ is the set of experts chosen for $x$. If $\mathcal{T}(x)$
 
 The distinction between *total* and *active* parameters is the vocabulary of MoE. Mixtral 8x7B has eight experts per layer and routes to two, so it carries roughly 47 billion total parameters but activates about 13 billion per token. Capacity that large at the cost of a 13 billion parameter forward pass is the whole point.
 
-## 3. The Gating Network
+## The Gating Network
 
 The router is a single linear map followed by a softmax over experts. Given a token $x$, the router logits are
 
@@ -50,7 +50,7 @@ Renormalizing keeps the output on the same scale regardless of how confident the
 
 The top-k selection is not differentiable in the indices, the choice of which experts to use is a hard, discrete decision. Gradients still flow to the router through the *weights* $g_i(x)$ of the experts that were selected, because those weights are smooth functions of the logits. The router therefore learns: if an expert produces output that reduces the loss, the gradient increases that expert's weight, which raises its logit, which makes the router more likely to select it again. This indirect learning signal is enough in practice, but it is also the source of the load-balancing problem in the next section.
 
-## 4. The Load-Balancing Problem
+## The Load-Balancing Problem
 
 Left to itself, the router tends to collapse. Early in training a few experts are slightly better by chance, the router sends them more tokens, those experts receive more gradient and improve faster, and the router sends them still more tokens. This positive feedback loop concentrates traffic on a small subset of experts. The unused experts receive almost no gradient and never improve, so the effective capacity of the model shrinks toward that of a much smaller dense network. This failure is called **routing collapse**, and preventing it is the defining engineering challenge of MoE training.
 
@@ -78,7 +78,7 @@ The design is subtle and worth dwelling on. The term $f_i$ counts hard dispatch 
 
 A complementary signal sometimes added is the **router z-loss**, $\mathcal{L}_z = \frac{\beta}{T}\sum_t \big(\log \sum_j e^{h_j(x_t)}\big)^2$, which penalizes large router logits and improves numerical stability of the softmax. The implementation below focuses on the load-balancing loss, which is the one that prevents collapse.
 
-## 5. Expert Capacity and Token Dropping
+## Expert Capacity and Token Dropping
 
 A second practical constraint appears when MoE runs on real hardware. Experts are implemented as fixed-size tensors, so each expert can process only a bounded number of tokens per batch. This bound is the **expert capacity**,
 
@@ -88,17 +88,17 @@ $$
 
 where $T \cdot k / E$ is the number of tokens an expert would receive under perfectly uniform routing and the capacity factor (commonly 1.0 to 1.5) adds headroom for imbalance. If more than $C$ tokens route to one expert, the overflow tokens are **dropped**: they skip the expert entirely and pass through only the residual connection. Capacity factor thus trades memory and compute (higher factor, fewer drops, more padding) against efficiency (lower factor, more drops). Token dropping is a feature of the batched GPU implementation, not of the mathematics, and our CPU reference computes the true routing without dropping so the mechanism is visible in isolation; the production code section returns to capacity as a deployment concern.
 
-## 6. Compressing a Hybrid MoE for Deployment
+## Compressing a Hybrid MoE for Deployment
 
 A trained MoE is not the model you serve. Conditional computation cuts the FLOPs per token but not the memory footprint: every expert must be resident, and at frontier scale the parameter count (together with the KV cache) dominates the interactive-serving budget rather than arithmetic does. A production line of work therefore *compresses* a large MoE after training to meet tighter latency and concurrency targets. Bercovich et al. (2026)'s **Nemotron-Labs-3-Puzzle-75B-A9B** is a representative case: a hybrid MoE with 75B total parameters but only about 9B active per token (the "A9B"), derived from a larger parent by a multi-stage pipeline that pairs an *iterative Puzzle* compression search with knowledge distillation (the subject of the distillation chapter), reinforcement learning, quantization, and a multi-token-prediction head. Crucially, the compression jointly optimizes three coupled budgets rather than one: **heterogeneous MoE pruning** (dropping or shrinking experts unevenly across layers, since the load-balancing view of Section 4 implies different layers carry different amounts of routed information), the **active-parameter budget** (how many experts fire per token), and, because the architecture interleaves attention with Mamba state-space layers, **Mamba-layer pruning**.
 
 The payoff is a *serving* result, not an accuracy one: on a single 8xB200 node the compressed model reaches roughly 2x the server throughput of its uncompressed parent at matched per-user throughput, and on a single H100 it lifts 1M-token-context concurrency from one request to eight, while retaining most of the parent's quality across reasoning, coding, multilingual, long-context, and agentic benchmarks. The lesson for MoE practitioners is a division of labor: the routing and load-balancing machinery of this chapter sets a model's *quality*, but a separate post-training compression stage sets whether that quality is *economical to serve*.
 
-## 7. Production Code
+## Production Code
 
 We now build a sparse top-k MoE layer end to end in PyTorch, running on the CPU. The implementation is deliberately small and deterministic so every number below is reproducible, yet it contains the real pieces: a linear router, renormalized top-k gating, per-expert dispatch, the load-balancing auxiliary loss, and a measurement of how evenly tokens spread across experts. Mature open-source building blocks (PyTorch, NumPy) carry all the weight here; nothing in this section needs a GPU.
 
-### 7.1 A Sparse Top-k MoE Layer
+### A Sparse Top-k MoE Layer
 
 The expert is an ordinary two-layer feed-forward network. The router is a single linear layer. The forward pass computes router logits, selects the top $k$ experts per token, renormalizes their gate weights, dispatches each token's representation to its chosen experts, and accumulates the gated outputs. We also compute the load-balancing loss from the same routing decisions so it can be added to a task loss during training.
 
@@ -184,7 +184,7 @@ print(f"active params per token (router + {k} experts): "
 
 The active-parameter count is far below the total: every token uses the router plus $k$ of the $E$ experts, so adding experts grows capacity without growing per-token compute. This is the decoupling from Section 2 made concrete.
 
-### 7.2 Routing and Utilization on Synthetic Input
+### Routing and Utilization on Synthetic Input
 
 We push a batch of synthetic tokens through the layer and inspect the routing. Two checks matter. First, the output shape must match the input, the MoE is a drop-in replacement for a dense FFN. Second, we measure expert utilization, the fraction of tokens each expert receives, which is what the load-balancing loss is trying to flatten. On a randomly initialized router the load is already somewhat uneven, which is exactly the situation the auxiliary loss is designed to correct during training.
 
@@ -214,7 +214,7 @@ print(f"observed spread (max - min): {spread:.1f} percentage points")
 
 The spread between the busiest and idlest expert is the imbalance the auxiliary loss penalizes. A perfectly balanced router would put every bar at the ideal share; a collapsed router would pile almost all tokens onto one or two experts.
 
-### 7.3 Training Drives the Router Toward Balance
+### Training Drives the Router Toward Balance
 
 To show the load-balancing loss working, we train the layer for a short loop on a trivial reconstruction objective (make the output match a fixed linear target), adding the auxiliary loss to the task loss. We track the imbalance over steps. The point is not the task itself but that the combined loss flattens the expert distribution, the mechanism from Section 4 in action.
 
@@ -254,7 +254,7 @@ for step in range(201):
 
 The task loss falls steadily while the auxiliary loss holds the routing in check, which is the behavior we want: the primary objective improves without the router being free to collapse onto a few experts. The cleaner demonstration that the auxiliary term matters is the controlled ablation in the next subsection, where the same run with the loss removed drifts to a markedly worse imbalance. In a real model the auxiliary coefficient $\alpha$ is tuned so that it balances load without overwhelming the language-modeling loss.
 
-### 7.4 The Effect of the Auxiliary Loss
+### The Effect of the Auxiliary Loss
 
 A final controlled comparison isolates the auxiliary loss. We train two routers from the same initialization, one with the load-balancing loss and one without, and compare the final imbalance. Turning the auxiliary loss off should let the router drift toward collapse.
 
@@ -292,7 +292,7 @@ print(f"the auxiliary loss reduces imbalance by "
 
 This is the load-balancing loss earning its place: with the same data, optimizer, and initialization, the only difference is the auxiliary term, and it produces a measurably more even distribution of work across experts.
 
-### 7.5 Scaling Up: Switch Transformer and Mixtral (requires GPU / large model)
+### Scaling Up: Switch Transformer and Mixtral (requires GPU / large model)
 
 The CPU layer above is the same design that runs at frontier scale, but training or serving a real MoE model needs accelerators, sharded experts, and optimized dispatch kernels. The code below is the genuine library invocation a reader would use on a GPU; it is shown, not executed, because no GPU is available in this environment.
 
@@ -347,7 +347,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
-### 7.6 Expert-Parallel Training (requires GPU cluster)
+### Expert-Parallel Training (requires GPU cluster)
 
 At training scale the experts of a single layer are distributed across devices, a scheme called **expert parallelism**. Each device holds a subset of the experts, and an all-to-all collective shuffles tokens to the device that owns their selected expert, runs the expert, then shuffles the results back. The mature open-source tooling for this is DeepSpeed-MoE and Megatron-LM; the snippet shows the DeepSpeed MoE layer wrapping the same expert-and-gate structure built above, configured for expert parallelism across a GPU cluster.
 
@@ -374,7 +374,7 @@ output, aux_loss, _ = moe_layer(hidden_states)
 
 The conceptual model is unchanged from the CPU implementation: route to top-k, gate, combine, and balance the load. Expert parallelism is purely a systems answer to the fact that the experts no longer fit on one device.
 
-### 7.7 Extreme Sparsity at Frontier Scale {#sec-704-extreme-sparsity}
+### Extreme Sparsity at Frontier Scale {#sec-704-extreme-sparsity}
 
 The toy layer above uses $E = 8$ experts with $k = 2$, the Mixtral-style setting that most tutorials adopt. A genuine frontier MoE looks nothing like that. @kimi2026k3 introduce Kimi K3, a 2.8 trillion parameter mixture of experts with roughly 104 billion activated parameters per token, native vision, and a one-million-token context window. Its **Stable LatentMoE** block, in the architecture description of that report, activates 16 of 896 routed experts per token, and the team reports about a 2.5x improvement in overall scaling efficiency over its predecessor together with fully released model weights, which makes it a rare case where the architecture of a frontier-class system is inspectable rather than inferred.
 
@@ -490,11 +490,11 @@ The 2-of-8 curve falls from 1.082 at 1,024 tokens to about 1.03 by 4,096, sits n
 
 This closes the loop on the tradeoff that opened the chapter. MoE decouples total capacity from per-token compute, and $\rho_{\text{route}}$ is the dial that sets how aggressively you exploit that decoupling. Turning it down toward two percent buys enormous capacity per unit of compute, which is precisely the scaling efficiency K3 reports. What you pay for it is not accuracy but engineering surface: a routing distribution whose noise floor grows like $\sqrt{E}$, a training step whose duration is set by the unluckiest expert, an inference regime that only reaches peak throughput at very large batch, and a memory footprint that still holds all 2.8 trillion parameters even though any one token touches under four percent of them. Sparsity is a compute discount financed by a systems debt, and the size of that debt is what separates a textbook MoE layer from a frontier one.
 
-## 8. Motif 3: What Is Left to Optimize Once Routing Is Sparse {#sec-704-motif3}
+## Motif 3: What Is Left to Optimize Once Routing Is Sparse {#sec-704-motif3}
 
 Section 7.7 read one frontier system and drew a single conclusion from it: sparsity is a compute discount financed by a systems debt. One data point cannot tell you whether the discount has a natural stopping place, and it cannot tell you where the engineering effort goes once you stop turning the routing dial. @lim2026motif3 supply the second point. Motif 3 is a decoder-only mixture of experts with 314 billion total parameters and 13.2 billion activated per token, built from sparse layers of 384 routed experts with 8 selected per token, pretrained on roughly 12.5 trillion tokens at context lengths up to 256K. It was released within weeks of @kimi2026k3 by an unrelated team, and the two reports converge on the same sparsity regime while spending their engineering budgets in almost entirely different places. That divergence is the useful part, and it is what this section unpacks.
 
-### 8.1 The Dense Floor
+### The Dense Floor
 
 Take the two ratios of Section 7.7 at face value. For Motif 3,
 
@@ -558,7 +558,7 @@ flowchart TB
     A2A --> MTP["multi token prediction heads"]
 ```
 
-### 8.2 Grouped Differential Latent Attention, the Latent Half
+### Grouped Differential Latent Attention, the Latent Half
 
 Grouped Differential Latent Attention (GDLA) is two independent ideas composed. Take the compression first, because it is where the 256K context length comes from.
 
@@ -788,7 +788,7 @@ fn main() {
 
 :::
 
-### 8.3 Grouped Differential Latent Attention, the Differential Half
+### Grouped Differential Latent Attention, the Differential Half
 
 The second idea attacks a different failure. A softmax attention row is a probability vector over $L$ positions, and because it must sum to one it necessarily places mass on positions that carry no information. At $L = 262{,}144$ that leaked mass is spread over a quarter of a million slots and does not go away with training, which is the mechanism behind attention sinks and the reason long-context retrieval degrades even when the relevant span is present.
 
@@ -850,7 +850,7 @@ $$
 
 which is $1.25$ at $r = 4$ instead of $2.0$. Sharing is not a compromise forced by budget: it is licensed by the derivation. The quantity being subtracted is by construction the component $\gamma u$ that is *not* head-specific, so estimating it once per group is the statistically natural thing to do, and pooling $r$ heads' worth of evidence into one estimate of $u$ reduces the variance of that estimate rather than increasing it. Composed with the latent cache of Section 8.2, this is GDLA: the differential mechanism buys the long-context precision, the grouping keeps its cost near a quarter rather than a double, and the latent compression keeps the memory affordable. Given the $51.5\%$ dense share computed in Section 8.1, a $1.25\times$ attention multiplier adds at most $0.25 \times 51.5\% \approx 13\%$ to the per-token budget, and less than that in practice because embeddings and the output head are part of the dense share too. That is the kind of trade only a very sparse model can justify.
 
-### 8.4 Selective MXFP8, and the All-to-All Bill
+### Selective MXFP8, and the All-to-All Bill
 
 Section 7.7 established that the binding constraint in expert-parallel training is not FLOPs but the all-to-all shuffle, and Section 7.6 showed where it sits in the layer. The straggler factor $S$ inflates the compute leg; the communication leg is a separate bill, and it is the one low precision pays down.
 
@@ -1015,7 +1015,7 @@ That is what the $3.125\%$ microscaling overhead is buying. The bandwidth arithm
 
 The word doing the most work in the phrase is **selective**. Not every tensor tolerates 8.25 bits. Router logits decide which experts a token visits, and an 8-bit perturbation there can flip a top-$k$ selection, discontinuously changing the function computed and injecting gradient noise that the auxiliary loss then chases. The load-balancing statistics of Section 4 are sums over the batch and need the accumulation range. Normalization reductions and the master weight copy in the optimizer are the classic places where low precision silently kills training. The GEMMs and the all-to-all payload go to MXFP8; the small, decision-carrying tensors stay wide. The rule of thumb is that a tensor can be narrowed when its error averages out over many terms and must stay wide when a single value determines a discrete choice.
 
-### 8.5 Multi-Token Prediction, and Why a Sparse Model Wants It
+### Multi-Token Prediction, and Why a Sparse Model Wants It
 
 The standard objective predicts one position ahead. Multi-token prediction adds $D$ auxiliary heads that predict further, giving a weighted sum
 
@@ -1040,7 +1040,7 @@ the final term counting the token the verifier itself emits when the draft is re
 
 The reason this appears in a report about a sparse model rather than a dense one comes straight from the arithmetic intensity argument of Section 7.7. There the intensity of an expert GEMM was $m = Nk/E$ FLOPs per byte, with a ridge point near 300. For Motif 3 the batch needed to stay compute bound is $300 E/k = 14{,}400$ tokens per expert-parallel group. Decoding does not remotely reach it: with 64 concurrent sequences the intensity is $64 \cdot 8 / 384 = 1.33$ FLOPs per byte, three orders of magnitude below the ridge. Speculation with $\gamma = 2$ verifies three positions per sequence in one pass, raising the intensity to $4.00$ at unchanged latency. That is still nowhere near 14,400, so speculation does not make the layer compute bound and it would be wrong to claim it does. What it does is amortize the weight read. The 13.2 billion active parameters are streamed from memory once per pass regardless, and MTP makes that single read produce up to $2.573$ accepted tokens instead of one. In a regime where the layer is unambiguously memory bound, multiplying the useful work per byte read *is* the speedup. The sparser the model, the lower $m$, and the more a bandwidth-amortizing trick is worth: this is a technique whose value is created by the same design decision that created the problem.
 
-### 8.6 Two Stabilizers Aimed at Depth and at Specialization
+### Two Stabilizers Aimed at Depth and at Specialization
 
 **Manifold-constrained hyper-connections.** Replace the single residual stream with $n$ parallel streams $H^{\ell} \in \mathbb{R}^{n \times d}$. A block reads a learned combination, writes its output back through a learned distribution, and mixes the streams:
 
@@ -1058,7 +1058,7 @@ $$
 
 where $x^i$ is taken elementwise and the RMS normalization keeps each power on the same scale so the coefficients $a_i$ are comparable. Making $(a_1, a_2, a_3, b)$ expert-specific costs four scalars per expert, or $4 \times 384 = 1536$ extra scalars per MoE layer, which is nothing against the expert weights. The reason it belongs in an MoE and not in a dense model is a tension this chapter has already set up. The auxiliary loss of Section 4 pushes the router toward equal load, and equal load pushes experts toward interchangeability, which is the opposite of the specialization that motivated the architecture. But the balancing loss constrains routing *statistics* only; it says nothing about the functional form of the experts. Giving each expert its own nonlinearity restores an axis of differentiation that the balancer cannot flatten, at a parameter cost of essentially zero. It is a cheap answer to a problem the balancing machinery creates.
 
-### 8.7 Multi-Teacher On-Policy Distillation as the Consolidation Step
+### Multi-Teacher On-Policy Distillation as the Consolidation Step
 
 Motif 3's post-training is general supervised fine-tuning, then six specialist teachers trained with reinforcement learning plus one software-engineering teacher trained with supervised fine-tuning, then a consolidation of all seven into a single student by Multi-teacher On-Policy Distillation. The on-policy part is the subject of Chapter 702 and its prefix-trap analysis in @sec-702-reopd-prefix-trap: sampling the trajectory from the student rather than the teacher makes the training distribution equal to the deployment distribution by construction, eliminating the exposure bias that off-policy sequence distillation carries. The multi-teacher part introduces a design choice with a clean and consequential answer.
 
@@ -1091,13 +1091,13 @@ With seven teachers of narrow and only partly overlapping competence, the differ
 
 It is worth noticing, without over-reading it, that the architecture and the training procedure share a shape. At inference a token consults 8 of 384 experts and their outputs are combined; at consolidation the student is pulled toward the intersection of seven specialists rather than their average. Sparse specialization with conjunctive combination, twice.
 
-### 8.8 What the Second Data Point Says
+### What the Second Data Point Says
 
 Put the two reports side by side. @kimi2026k3 and @lim2026motif3 arrive at $\rho_{\text{route}}$ of $1.786\%$ and $2.083\%$ and at always-on parameter fractions of $1.964\%$ and $2.166\%$, from different teams, different corpora, and different training stacks. The convergence is the finding. It says the routing dial has been turned about as far as it usefully goes, and Section 8.1 explains why: at these ratios roughly half the per-token cost is already the dense floor, so the remaining headroom from routing alone is under a factor of two.
 
 Where the two reports diverge is instructive. K3's contribution is on the routing and scaling axis, and Section 7.7 read it that way. Motif 3 spends its budget on the other half of the token: attention that both compresses its cache by $28.44\times$ against multi-head and cancels common-mode noise with a provably-never-worse subtraction, a numeric format that halves the all-to-all bill while keeping quiet tokens alive, an auxiliary objective that amortizes the weight read that sparse decoding cannot escape, and a post-training procedure whose target is a product rather than a mixture. Not one of those is a routing idea. Together they are the argument that once a model is sparse enough, the interesting engineering is no longer about the experts.
 
-## 9. Pitfalls and When to Use
+## Pitfalls and When to Use
 
 **Routing collapse is the failure mode to watch.** Without an effective load-balancing loss the router concentrates tokens on a few experts and the rest never train. Monitor per-expert utilization during training, not just the loss curve; a healthy run keeps every expert busy. The auxiliary coefficient $\alpha$ is the main knob: too small and load drifts toward collapse, too large and balancing fights the language-modeling objective and degrades quality. The Switch value of $10^{-2}$ is a reasonable starting point.
 

@@ -1,6 +1,6 @@
 # Efficient Attention: KV-Cache, GQA, and Flash Attention
 
-## 1. Why Attention Efficiency Decides Whether a Model Ships
+## Why Attention Efficiency Decides Whether a Model Ships
 
 A transformer language model spends most of its serving life doing one thing: predicting the next token, one token at a time, given everything generated so far. The mathematics of self attention says that to predict token $t$ the model attends over all $t-1$ previous tokens. Taken literally, generating a sequence of length $n$ recomputes attention over a growing prefix at every step, which costs $O(n^2)$ work in total and, worse, reads and writes an $O(n^2)$ matrix of attention scores through the memory hierarchy. On modern accelerators the second cost dominates: attention is **memory bound**, not compute bound, and the wall-clock bottleneck for long contexts is moving bytes, not multiplying numbers.
 
@@ -8,7 +8,7 @@ Three techniques, layered on top of one another, turn this from a research curio
 
 This chapter develops the mathematics of each, then shows code. The CPU-feasible parts (a from-scratch KV-cache and a grouped-query demo) are executed here on small tensors so you can see the asymptotics and the numerics directly, and one GPU cell is executed on an accelerator to measure the KV-cache speedup on a small real model with the Hugging Face Transformers decode path. The parts that need a clean CUDA kernel build or a multi-billion-parameter model (fused FlashAttention kernels, paged attention in vLLM, GPU sliding-window attention) are shown as real, runnable library invocations with an honest note that they require an accelerator.
 
-## 2. Self Attention and the Cost of Naive Decoding
+## Self Attention and the Cost of Naive Decoding
 
 Fix one attention head. Let the input be a sequence of $n$ token vectors stacked as rows of $X \in \mathbb{R}^{n \times d_{\text{model}}}$. Three learned projections produce queries, keys, and values,
 
@@ -26,7 +26,7 @@ where $M$ is the causal mask with $M_{ij} = -\infty$ for $j > i$ and $0$ otherwi
 
 The score matrix $S = QK^\top / \sqrt{d_k}$ is $n \times n$. Forming it costs $O(n^2 d_k)$ floating-point operations and, decisively, $O(n^2)$ memory traffic to write $S$, read it back for the softmax, and read it again for the multiply by $V$. For a single full sequence (training, or the **prefill** of a prompt) this is paid once. For autoregressive **decoding** the picture is worse: a naive implementation that re-runs the full attention at every generated step pays $\sum_{t=1}^{n} O(t^2) = O(n^3)$ across the whole generation. That cubic blowup is the wall a KV-cache exists to remove.
 
-## 3. The KV-Cache: From Quadratic to Linear Per Step
+## The KV-Cache: From Quadratic to Linear Per Step
 
 The key observation is that during decoding the keys and values of past tokens never change. When we generate token $t$, its query $q_t = x_t W_Q$ is new, but the keys $k_1, \dots, k_{t-1}$ and values $v_1, \dots, v_{t-1}$ are exactly the ones computed at earlier steps. There is no reason to recompute them.
 
@@ -54,7 +54,7 @@ The factor of two is keys plus values. This number grows linearly with context l
 
 One detail about *what* sits in those bytes matters operationally. Modern decoders position their tokens with rotary position embeddings (RoPE), introduced by Su et al. (2024) and derived in @sec-road-to-transformers: the query and key vectors are rotated by an angle proportional to the token's absolute position, so that the attention logit depends only on the relative offset between the two tokens. The rotation is applied *before* the key is written, which means the cache stores keys already bound to the absolute position they occupied at write time. Two consequences follow for everything below. Reusing a cached prefix across requests, as the paged allocator of Section 6 does through copy-on-write block sharing, is only sound when the shared blocks land at the same positions in both sequences. And the context-extension recipes that rescale the RoPE frequency base to stretch a model past its trained length change the rotation applied to every key, so a cache built under one base cannot be mixed with one built under another.
 
-## 4. Grouped-Query and Multi-Query Attention: Shrinking the Cache
+## Grouped-Query and Multi-Query Attention: Shrinking the Cache
 
 Standard **multi-head attention (MHA)** gives every one of the $h$ query heads its own key and value head. The cache therefore scales with $h$. The insight of **multi-query attention (MQA)** is that keys and values can be shared: use $h$ query heads but a single key head and a single value head, broadcast across all queries. This cuts the KV-cache by a factor of $h$ at the cost of some representational capacity, and it noticeably degraded quality in practice.
 
@@ -82,7 +82,7 @@ flowchart LR
     end
 ```
 
-## 5. FlashAttention: Never Materialize the Score Matrix
+## FlashAttention: Never Materialize the Score Matrix
 
 KV-caching and GQA reduce how much we store. **FlashAttention** changes how we compute, and it targets the prefill and training passes where the full $n \times n$ score matrix is the problem. The standard implementation writes $S = QK^\top$ to high-bandwidth memory (HBM), reads it back to compute the softmax, and reads it a third time to multiply by $V$. For long sequences those $O(n^2)$ reads and writes to HBM, not the arithmetic, set the runtime.
 
@@ -96,7 +96,7 @@ $$
 
 Subtracting the running max keeps every exponential in $[0, 1]$, so the computation is stable, and rescaling the accumulator by $e^{m - m'}$ when the max grows keeps the partial sums consistent. Because each element of $K$ and $V$ is read from HBM once per query block rather than the score matrix being round-tripped, the HBM traffic drops from $O(n^2)$ to $O(n^2 d_k / B)$ for SRAM block size $B$, a large constant-factor reduction that makes attention compute bound again. FlashAttention-2 and FlashAttention-3 further improve work partitioning and exploit newer GPU features, but the core algorithmic idea is the tiled online softmax above. This is a GPU technique: the win comes from the SRAM-versus-HBM gap, which CPUs do not have in the same form, so we show it rather than execute it.
 
-## 6. Paged Attention and Sliding-Window Attention
+## Paged Attention and Sliding-Window Attention
 
 Two further production techniques round out the picture.
 
@@ -104,7 +104,7 @@ Two further production techniques round out the picture.
 
 **Sliding-window attention** bounds the cache instead of managing it. Models such as Mistral 7B restrict each token to attend only to the previous $w$ tokens (a window), so the KV-cache never exceeds $w$ positions regardless of total sequence length. Information still propagates beyond the window because stacked layers compose their receptive fields: after $L$ layers the effective context reaches roughly $L \times w$ tokens. This trades a bounded, constant memory footprint for a controlled loss of exact long-range access, and it composes cleanly with GQA and paged attention.
 
-## 7. Learned Sparse Attention for Long Context
+## Learned Sparse Attention for Long Context
 
 Sliding-window attention (Section 6) buys a bounded cache by giving up exact long-range access: anything older than $w$ tokens is unreachable within a layer. For the tasks that most need long context, retrieval, multi-document reasoning, following a reference introduced thousands of tokens ago, that is exactly the information thrown away. The question is whether attention can stay **sparse**, so cost remains far below the $O(n^2)$ of Section 2, yet still reach the *right* distant tokens, chosen per query instead of fixed by a window. Chunk-wise sparse attention answers yes; the difficulty has always been that heuristic chunk selection is inaccurate, leaving a persistent quality gap to full attention. Hu et al. (2026) close that gap with **Hierarchical Landmark Sparse (HiLS) attention**, whose chunk selection is learned end-to-end under the language-modeling loss.
 
@@ -208,7 +208,7 @@ plt.show()
 
 The numbers make the shape of the trade concrete, and they are less flattering at both ends than the asymptotic claim suggests. Below the selection size $k$ there is nothing to select, and DSA is strictly worse than dense attention because it pays for an indexer and then attends to everything anyway. Break-even arrives almost immediately past $k$, at about $2{,}100$ tokens for $k = 2048$, since the main-attention term flattens the moment selection starts biting. But the gain is capped: as $L \to \infty$ both dense attention and the indexer are quadratic, so the speedup approaches the fixed ratio $n_h d / (H^I d_I)$, here $32\times$, set by how much narrower the indexer is than the main attention rather than by the sparsity. The indexer's share of DSA's own cost climbs from $11\%$ at $8$K tokens to $94\%$ at a million, which is the whole story in one number: at frontier context lengths a DSA model is not really running sparse attention any more, it is running a small dense attention that decides what a large sparse one should look at. Sharing the index across four layers multiplies that ceiling by four, which is exactly why the cross-layer reuse result matters more than it first appears: it lifts the asymptote rather than shifting a constant. This is the same accounting discipline as Section 4, where GQA's benefit was bounded by $h/g$, and it is the reason production long-context claims should always be read as claims about a specific context length rather than about complexity classes.
 
-## 8. Native Memory States: When the Cache Becomes Part of the Model {#sec-705-native-memory-state}
+## Native Memory States: When the Cache Becomes Part of the Model {#sec-705-native-memory-state}
 
 Step back from the mechanics for a moment. The KV-cache *is* a memory: it is the model's record of everything it has read. But it is a peculiar one. It grows without bound in the history length $n$ (Section 3), it is a raw transcript rather than a summary, and it is thrown away when the session ends. Every technique so far accepts that shape and manages it: GQA makes each token cheaper, paged attention packs the transcript efficiently, sliding windows truncate it, HiLS reads only part of it. @zhang2026metis asks a different question: what if memory were a **native** capability of the backbone rather than an external buffer the serving stack maintains? Their **memory foundation model** formulation has two parts, a persistent and dynamically evolving memory state living inside the network, and **native memory procedures** that store and retrieve information through ordinary model computation rather than through an external retriever. Their prototype, **Metis**, compresses history into that state and reads it back through **memory attention**.
 
@@ -362,9 +362,9 @@ The left and center panels show why anyone would want this: a state of $m = 8192
 
 Treat this as an open direction, not a settled result. @zhang2026metis is explicit that Metis is a first prototype and reports limitations alongside its strengths, and the honest reading is that native memory changes the shape of the tradeoff rather than removing it. This chapter's core tension has been exact access versus bounded cost: the KV-cache buys exactness by paying $O(n)$, sliding windows buy $O(w)$ by giving up reach, HiLS buys sparsity by learning what to fetch from a cache that still exists. A memory foundation model pushes the same dial one notch further, keeping no transcript at all beyond the local window and betting entirely on what the model learned to write down. Whether that bet pays off at production context lengths is exactly the question the next few years of this literature will answer.
 
-## 9. Production Code
+## Production Code
 
-### 9.1 A From-Scratch KV-Cache, Executed on CPU
+### A From-Scratch KV-Cache, Executed on CPU
 
 The following cell implements single-head causal self attention two ways: the **naive** decoder that recomputes attention over the full prefix at every step, and the **cached** decoder that stores keys and values and attends only the new query. Both produce numerically identical output (we assert it), and we time both to see the naive decoder's superlinear growth against the cache's near-linear per-step cost. Everything is small, seeded, and runs on CPU in seconds.
 
@@ -484,7 +484,7 @@ for t in [128, 256, 512, 1024]:
 
 The naive column grows faster than the cached column as the prefix doubles, the empirical signature of $O(t^2)$ versus $O(t)$ per step. On a tiny CPU example the constants are small and noisy, but the trend is the same one that, at production context lengths, is the difference between a model that serves and one that does not.
 
-### 9.2 Grouped-Query and Multi-Query Attention, Executed on CPU
+### Grouped-Query and Multi-Query Attention, Executed on CPU
 
 This cell implements one attention layer parameterized by the number of KV groups $g$. Setting $g = h$ gives multi-head attention, $g = 1$ gives multi-query attention, and $1 < g < h$ gives grouped-query attention. We repeat each KV head across its query group with `repeat_interleave`, run a forward pass for several values of $g$, and report the resulting KV-cache size so the $h/g$ reduction is explicit.
 
@@ -561,7 +561,7 @@ print("GQA with g = n_heads is structurally identical to MHA (per-head KV, no sh
 
 The KV bytes fall exactly by the factor $h/g$: halving the number of KV groups halves the cache. MQA ($g = 1$) is eight times smaller than MHA here, and GQA at $g = 4$ or $g = 2$ gives an intermediate footprint, the trade space real models tune for quality versus memory.
 
-### 9.3 FlashAttention (requires GPU)
+### FlashAttention (requires GPU)
 
 FlashAttention ships as a fused CUDA kernel. The cleanest way to use it in practice is through PyTorch's `scaled_dot_product_attention`, which dispatches to a FlashAttention backend on supported GPUs, or through the `flash-attn` package directly. The code below is the real invocation; it is not executed here because the speedup depends on the GPU SRAM-versus-HBM gap.
 
@@ -590,7 +590,7 @@ from flash_attn import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True)
 ```
 
-### 9.4 Paged Attention with vLLM (requires GPU)
+### Paged Attention with vLLM (requires GPU)
 
 vLLM implements paged attention and continuous batching behind a simple serving API. The KV-cache management, block tables, and prefix sharing are internal; the user just gets high throughput. Shown, not executed, because it loads a multi-billion-parameter model onto a GPU.
 
@@ -609,7 +609,7 @@ for output in llm.generate(prompts, params):
     print(output.outputs[0].text)
 ```
 
-### 9.5 Sliding-Window Attention on GPU
+### Sliding-Window Attention on GPU
 
 Sliding-window attention is a property of the model architecture and is applied by the serving stack. With FlashAttention the window is passed as a kernel argument so the bounded attention is computed fused, and the KV-cache is capped at the window size. Shown, not executed, because it needs the GPU kernel.
 
@@ -621,7 +621,7 @@ from flash_attn import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True, window_size=(4096, 0))
 ```
 
-### 9.6 Running it on a GPU (executed)
+### Running it on a GPU (executed)
 
 The CPU cells above show the asymptotics on small tensors. To see the KV-cache pay off on a real model and real hardware, the cell below loads a small open-weights instruct model (Qwen2.5-0.5B-Instruct, with a gpt2 fallback) onto the GPU and times autoregressive generation twice: once with `use_cache=True`, which keeps the running keys and values exactly as in Section 3, and once with `use_cache=False`, which forces the model to recompute attention over the whole growing prefix at every step. Both decode the same fixed number of new tokens from the same prompt under identical greedy settings, so the only difference is whether the cache is reused.
 
@@ -717,7 +717,7 @@ else:
 
 The `use_cache=True` path is the production default and decodes each token in roughly constant time, because every step attends one new query against the stored cache. The `use_cache=False` path recomputes keys and values for the whole prefix at every step, so its per-token cost climbs with position and its total time is several times larger even for this short generation. The peak-memory line shows the other side of the trade from Section 3: the cache that buys the speedup is itself resident memory, modest here but the quantity that, at production context lengths, dominates the serving budget.
 
-## 10. Pitfalls and When to Use
+## Pitfalls and When to Use
 
 **The KV-cache is almost always the right default for decoding, but it is not free.** It trades recomputation for memory, and at long context the cache can exceed the model weights in size. Budget for it explicitly using the formula in Section 3 before assuming a context length fits. If memory is the binding constraint, the levers in order of disruption are GQA or MQA (architectural, set at training time), KV-cache quantization to int8 or fp8 (cheap, small quality cost), and sliding-window or other sparse attention (changes the model's reach).
 

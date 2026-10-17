@@ -1,6 +1,6 @@
 # Speculative Decoding {#sec-speculative-decoding}
 
-## 1. Motivation
+## Motivation
 
 Autoregressive language models generate one token at a time. Each new token requires a full forward pass through the network, and every pass reads the entire weight matrix from memory. At the batch sizes typical of interactive serving, that forward pass is **memory-bandwidth bound**, not compute bound: the hardware spends most of its time moving billions of parameters from high-bandwidth memory into the compute units, and the actual arithmetic for a single token barely registers. A 70 billion parameter model in 16-bit precision must stream roughly 140 gigabytes per generated token. The matrix multiply for one token is trivial by comparison, so the accelerator sits mostly idle, waiting on memory.
 
@@ -10,13 +10,13 @@ The remarkable property, proved below, is that speculative decoding is **exact**
 
 The technique was introduced concurrently by Leviathan, Kalman, and Matias (speculative decoding) and by Chen and colleagues (speculative sampling) in 2023, and it now underpins production inference in essentially every mature open-source serving stack, including vLLM, TGI, and TensorRT-LLM.
 
-## 2. The Core Mathematics
+## The Core Mathematics
 
-### 2.1 Setup
+### Setup
 
 Let $p(\cdot \mid x)$ be the target model's next-token distribution given context $x$, and let $q(\cdot \mid x)$ be the draft model's distribution. We want samples from $p$, but $p$ is expensive to evaluate and $q$ is cheap. The draft proposes a block of $k$ tokens autoregressively from $q$. The target then evaluates $p$ at all $k+1$ positions in a single forward pass (the prompt plus the $k$ drafted tokens), because a transformer can compute the conditional distribution at every position of a sequence in one pass. The question is how to use those $k+1$ target distributions to accept or reject the draft so that the final output is distributed exactly as $p$.
 
-### 2.2 The acceptance test for one token
+### The acceptance test for one token
 
 Consider a single drafted token $t$ sampled from $q(\cdot \mid x)$. We accept it with probability
 
@@ -32,7 +32,7 @@ $$
 
 The claim is that the token finally emitted at this position is distributed exactly as $p(\cdot \mid x)$.
 
-### 2.3 Proof of exactness
+### Proof of exactness
 
 Fix a context $x$ and drop it from the notation. We want to show that the probability of emitting any particular token $t$ equals $p(t)$. A token $t$ can be emitted in two mutually exclusive ways: it was drafted and accepted, or it was produced by the residual after some rejection.
 
@@ -68,7 +68,7 @@ $$
 
 because $\min(a,b) + \max(0, b - a) = b$ for any reals. This holds token by token, and by induction over the block it holds for the whole sequence. Speculative decoding therefore samples from the target distribution **exactly**. Greedy decoding is the special case where both distributions are point masses and acceptance reduces to checking whether the draft's argmax matches the target's argmax.
 
-### 2.4 Expected speedup
+### Expected speedup
 
 Let $\alpha$ be the **acceptance rate**, the expected probability that a single drafted token is accepted, averaged over positions. Leviathan et al. show that with a block of $k$ draft tokens, the expected number of tokens produced per target forward pass is
 
@@ -96,11 +96,11 @@ flowchart LR
     F --> A
 ```
 
-## 3. A From-Scratch Implementation on CPU
+## A From-Scratch Implementation on CPU
 
 We now build the full accept-reject loop from scratch and measure it. To keep everything deterministic, fast, and free of any GPU dependency, we work with explicit categorical distributions over a small vocabulary. A "model" here is just a function that returns a next-token probability vector given a context. This isolates the algorithm from the machinery of a real transformer and lets us verify the exactness theorem numerically, which is the part most worth understanding deeply. Section 5 then shows the identical algorithm wired to real Hugging Face models on a GPU.
 
-### 3.1 The acceptance step
+### The acceptance step
 
 The heart of the method is a single function that takes the target and draft distributions at one position, plus the drafted token, and returns either the accepted token or a residual sample. We implement it exactly as the proof prescribes.
 
@@ -131,7 +131,7 @@ def accept_or_resample(p, q, drafted_token, u):
     return token, False
 ```
 
-### 3.2 Numerically verifying exactness
+### Numerically verifying exactness
 
 Before trusting the speedup numbers, we confirm the theorem: the emitted-token distribution must match the target $p$ to sampling error. We pick an arbitrary mismatched pair $(p, q)$, run the single-token speculative step many times, and compare the empirical histogram against $p$.
 
@@ -161,7 +161,7 @@ print("accept rate:", round(accepts / N, 4))
 
 The empirical distribution tracks the target to within a couple of thousandths, the noise floor for this many samples, confirming that the accept-reject rule is unbiased even though the draft $q$ is badly misaligned with $p$. The acceptance rate printed here equals $\sum_t \min(p_t, q_t)$, the total variation overlap of the two distributions, which is the theoretical $\alpha$ for this single-step case.
 
-### 3.3 The full block loop
+### The full block loop
 
 Now we assemble the block-level loop: draft $k$ tokens, score them against the target, accept the longest valid prefix, and append one extra token. With explicit distributions we model the per-step behavior of real models by making both $p$ and $q$ depend on the most recent token through fixed transition matrices. The draft matrix is a noised copy of the target matrix, so a single parameter controls how well aligned the two models are, which lets us sweep the acceptance rate.
 
@@ -211,7 +211,7 @@ def speculative_block(target, draft, context_tok, k, gen):
     return emitted, k
 ```
 
-### 3.4 Measuring acceptance rate and speedup
+### Measuring acceptance rate and speedup
 
 We run the loop for many steps at several draft-model noise levels, measure the realized acceptance rate and the tokens emitted per target call, and compare against the closed-form geometric prediction from Section 2.4. We use a single, deterministic seed so the numbers are reproducible.
 
@@ -251,7 +251,7 @@ for noise in [0.0, 0.1, 0.2, 0.4, 0.7]:
 
 The table shows the central trade-off. When the draft perfectly matches the target (noise 0.0) every token is accepted, the block always emits $k+1$ tokens, and the speedup hits its ceiling, here a little over three times. As the draft degrades, $\alpha$ falls, fewer tokens survive verification, and the speedup shrinks toward one. The realized tokens-per-call sits at or above the geometric prediction column: the closed form assumes a single constant acceptance probability, whereas a real draft accepts more readily in some contexts than others, and those easy contexts produce longer accepted runs that lift the average. The geometric formula is therefore a useful lower-bound intuition rather than an exact identity once acceptance varies with context, which it always does in practice.
 
-### 3.5 Choosing the block length k
+### Choosing the block length k
 
 The block length $k$ has an interior optimum that depends on $\alpha$ and the cost ratio $c$. A high acceptance rate rewards a long block; a poor draft or an expensive draft pass rewards a short one. We sweep $k$ at a fixed, decent draft to locate the optimum directly.
 
@@ -268,7 +268,7 @@ print(f"\nbest k at this acceptance rate and cost ratio: k={best[0]} (speedup {b
 
 The printed sweep shows speedup rising as $k$ grows while accepted tokens are still cheap to harvest, then flattening or falling once the per-block draft cost $kc$ dominates and the extra drafted tokens are mostly rejected. Production systems tune $k$ (often called the number of speculative tokens or the draft length) per workload exactly this way, and adaptive schemes adjust it on the fly from the recent acceptance history.
 
-## 4. Variants: Self-Drafting, Medusa, and EAGLE
+## Variants: Self-Drafting, Medusa, and EAGLE
 
 The vanilla method needs a separate small draft model that shares the target's tokenizer and is well aligned with it. Finding or training such a model is the main practical friction, and several influential variants remove it.
 
@@ -360,11 +360,11 @@ for a in (0.441, 0.612):
 
 The table makes the shape of the win concrete. Benefit peaks near $\rho = 1$, where a hit hides the tool completely inside the generation window, and decays for very slow tools because one turn of overlap can only absorb $T_{\text{gen}}$ of waiting. That decay is the tool-level counterpart of the interior optimum in $k$ from Section 3.5, and it motivates the same response: speculate further ahead. Guessing $k$ calls deep multiplies hit probabilities, so depth pays only when the per-step $\alpha_{\text{tool}}$ is high, which is precisely what the joint training buys. Whether the unit is a token, a block of tokens, or an entire tool invocation, the governing quantity never changes: the speedup is a function of the acceptance rate, and every worthwhile advance in speculative execution is an advance in aligning the proposer with the thing doing the verifying.
 
-## 5. Production Code
+## Production Code
 
 In production you do not implement the accept-reject loop by hand. Mature open-source serving frameworks ship speculative decoding as a configuration flag, with optimized fused kernels, tree attention, paged key-value caches, and continuous batching already integrated. The free, widely used options are **vLLM**, **Hugging Face Text Generation Inference (TGI)**, and **NVIDIA TensorRT-LLM**, plus the `transformers` library itself for quick experiments. The code in this section requires a GPU and large model weights, so it is shown rather than executed here. Each block is a faithful, runnable invocation.
 
-### 5.1 Draft-model speculation in `transformers`
+### Draft-model speculation in `transformers`
 
 The simplest entry point is the `assistant_model` argument to `generate`, which performs exact speculative decoding with a smaller assistant. The draft and target must share a tokenizer.
 
@@ -392,7 +392,7 @@ out = target.generate(
 print(tok.decode(out[0], skip_special_tokens=True))
 ```
 
-### 5.2 vLLM with a draft model
+### vLLM with a draft model
 
 vLLM exposes speculation through the engine configuration. The output distribution is identical to non-speculative serving; only latency changes.
 
@@ -412,7 +412,7 @@ params = SamplingParams(temperature=0.7, max_tokens=256)
 print(llm.generate(["Summarize speculative decoding in two sentences."], params)[0].outputs[0].text)
 ```
 
-### 5.3 EAGLE heads in vLLM
+### EAGLE heads in vLLM
 
 For self-contained speculation without a separate draft model, vLLM supports EAGLE and Medusa draft heads. Only the head checkpoint is extra; the base model is the target you already serve.
 
@@ -431,7 +431,7 @@ llm = LLM(
 print(llm.generate(["Describe tree attention."], SamplingParams(max_tokens=128))[0].outputs[0].text)
 ```
 
-### 5.4 A note on quantized drafts
+### A note on quantized drafts
 
 A common production pattern is a quantized draft model to make the draft pass even cheaper. Libraries such as `bitsandbytes` provide 4-bit and 8-bit loading, but they require a GPU, so this is shown, not executed. Because verification is exact, a lossy quantized draft only affects the acceptance rate, never the output distribution.
 
@@ -447,7 +447,7 @@ draft = AutoModelForCausalLM.from_pretrained(
 # Pass `draft` as assistant_model exactly as in Section 5.1.
 ```
 
-## 6. Pitfalls and When to Use
+## Pitfalls and When to Use
 
 **Speculative decoding helps latency, not throughput at saturation.** The free lunch comes from idle accelerator cycles at small batch sizes. When the server is already compute bound (large batches, high concurrency), the target forward pass is no longer cheap to widen, the extra draft work competes for the same compute, and speculation can *reduce* total throughput. Use it for latency-sensitive, low-to-moderate-concurrency serving, and measure under your real batching regime rather than assuming a benefit.
 

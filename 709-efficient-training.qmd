@@ -4,7 +4,7 @@ Training a frontier model is, more than anything, an exercise in memory manageme
 
 This chapter develops the three techniques that, together, make large-scale training feasible on real hardware: **mixed precision**, which halves the storage and roughly halves the bandwidth of most tensors while protecting numerical stability where it matters; **activation checkpointing** (also called gradient checkpointing), which trades a controlled amount of recomputation for a large reduction in activation memory; and **sharding** (the ZeRO and FSDP family), which splits the per-step state across many devices so that no single device holds the whole thing. We treat each as an engineering practice with a derivation behind it, then show production code. The CPU-feasible parts (checkpointing, autocast, gradient accumulation) are executed and measured, and the single-GPU memory and speed tradeoff of mixed precision and checkpointing is then measured directly on an NVIDIA GPU; the multi-GPU and cluster parts (FSDP, ZeRO, FP8) are shown with the real library invocations so a reader can run them on the appropriate hardware.
 
-## 1. Where the Memory Goes
+## Where the Memory Goes
 
 Before optimizing, account honestly for what a training step holds. Let the model have $\Psi$ trainable parameters. A standard mixed-precision Adam step keeps, per parameter:
 
@@ -34,9 +34,9 @@ flowchart TD
     C --> F
 ```
 
-## 2. Mixed Precision
+## Mixed Precision
 
-### 2.1 The Idea and the Hazard
+### The Idea and the Hazard
 
 Floating-point formats trade range and precision against size. The historical fp32 format uses 8 exponent bits and 23 mantissa bits. The two half-precision formats used in training differ in how they split their 16 bits:
 
@@ -45,7 +45,7 @@ Floating-point formats trade range and precision against size. The historical fp
 
 Mixed-precision training, introduced by Micikevicius et al. (2018), runs the bulk of the matrix multiplications in half precision (fast, half the memory traffic) while keeping a few operations and an fp32 master copy of the weights to protect accuracy. The central numerical hazard is the **accumulation of small updates**: an Adam update $\Delta\theta$ can be many orders of magnitude smaller than $\theta$, and adding a tiny number to a much larger one in low precision rounds the update away to nothing. Keeping the master weights in fp32 preserves these updates; the half-precision copy used in the forward and backward pass is refreshed from the master each step.
 
-### 2.2 Loss Scaling for fp16
+### Loss Scaling for fp16
 
 With bf16 the wide exponent range usually makes extra tricks unnecessary, which is why most modern large-model training uses bf16. With fp16, gradient underflow is real and the standard remedy is **loss scaling**. Multiply the loss by a large constant $S$ before the backward pass. By the chain rule every gradient is scaled by the same $S$,
 
@@ -55,7 +55,7 @@ $$
 
 which shifts small gradients up into the representable range of fp16. Before the optimizer applies the update, the gradients are divided back by $S$. Dynamic loss scaling adjusts $S$ automatically: it raises $S$ when no overflow (inf or nan) has occurred for a while, and halves $S$ and skips the step when an overflow is detected. In PyTorch this is the job of `torch.cuda.amp.GradScaler`.
 
-### 2.3 Executed Demo: Autocast in bf16 on CPU
+### Executed Demo: Autocast in bf16 on CPU
 
 The concept of automatic mixed precision is visible even on a CPU, which supports bf16 autocast for the common operations. The demo below runs a small matmul-heavy block under `torch.autocast` and confirms that the autocast region produces bf16 intermediate activations while the model parameters stay in fp32. It also shows that the bf16 result stays numerically close to the fp32 result, which is the property that makes mixed precision usable.
 
@@ -89,9 +89,9 @@ print(f"relative error fp32 vs bf16 autocast: {rel_err.item():.4e}")
 
 The activation tensor inside the autocast region is bf16 while the parameters report fp32, and the relative error is small (a fraction of a percent), confirming that the lower precision is confined to the fast path and does not corrupt the parameters. On a GPU this same pattern roughly halves activation memory and uses the tensor cores, which is where the real speedup comes from.
 
-## 3. Activation Checkpointing
+## Activation Checkpointing
 
-### 3.1 The Recompute Tradeoff
+### The Recompute Tradeoff
 
 The backward pass needs the activations produced in the forward pass. The default behavior is to *store* every activation needed downstream, which is the $M_{\text{act}} \approx c \cdot L \cdot b \cdot s \cdot h$ term from Section 1. **Activation checkpointing** stores only a small set of *checkpoint* activations (typically the inputs to each segment of the network) and discards the rest. During the backward pass, each segment's interior activations are *recomputed* on the fly from its stored input, used to compute gradients, and then discarded again.
 
@@ -101,7 +101,7 @@ $$
 \text{memory: } O(L) \to O(\sqrt{L}), \qquad \text{compute: } 1\times \to \text{about } 1.3\text{ to }2\times .
 $$
 
-### 3.2 Executed Demo: Measuring the Memory-vs-Recompute Tradeoff on CPU
+### Executed Demo: Measuring the Memory-vs-Recompute Tradeoff on CPU
 
 We make the tradeoff concrete with a small deep network on CPU. We instrument the forward pass with a counter so the *recomputation* is directly observable: a checkpointed segment's forward function runs once in the forward pass and a second time during the backward pass, so its call count doubles. We also confirm the gradients are numerically identical with and without checkpointing, because recomputation is exact, it changes *when* activations are computed, not *what* they are.
 
@@ -201,9 +201,9 @@ print(f"reduction factor                     : {bytes_plain / max(bytes_ckpt,1):
 
 The plain run saves an activation tensor for every block (the input to each `tanh` and `Linear`), so its retained-activation total grows with the stack depth. The checkpointed run saves only the small set of segment-boundary tensors and recomputes the interior on demand, so its retained total is markedly smaller and the reduction factor exceeds one. The exact ratio depends on depth and width (deeper stacks save more, because the saved term grows with $L$), but the direction is the structural point: checkpointing converts a linear-in-depth activation cost into a much smaller resident footprint, paid for with the recomputation measured in the previous cell.
 
-## 4. Gradient Accumulation
+## Gradient Accumulation
 
-### 4.1 Decoupling Batch Size from Memory
+### Decoupling Batch Size from Memory
 
 Often the *statistically* desirable batch size does not fit in memory. **Gradient accumulation** decouples the two. Instead of processing a batch of size $B$ in one step, process $K$ micro-batches of size $B/K$, accumulating their gradients, and apply the optimizer once after all $K$. Because the gradient of a sum is the sum of gradients,
 
@@ -215,7 +215,7 @@ $$
 
 the accumulated gradient is identical to the gradient of the full batch, provided each micro-batch loss is scaled by $1/K$ before backward (so the accumulated sum forms the correct mean). The cost is $K$ times more forward and backward passes per optimizer step, but the peak activation memory is that of a single micro-batch, not the full batch.
 
-### 4.2 Executed Demo: Accumulation Equals Full-Batch
+### Executed Demo: Accumulation Equals Full-Batch
 
 The demo trains nothing; it verifies the identity. We compute the gradient of the mean loss over a full batch, then compute it again by accumulating over micro-batches with the $1/K$ scaling, and confirm the two gradients match to numerical precision.
 
@@ -251,7 +251,7 @@ print(f"identical to numerical precision: {diff < 1e-5}")
 
 The two gradients agree to within floating-point rounding, confirming that gradient accumulation gives exactly the large-batch update while only ever holding one micro-batch worth of activations. In production this is the standard way to reach an effective batch size of millions of tokens on hardware that cannot hold it in one pass, and it composes cleanly with mixed precision and checkpointing.
 
-## 5. Putting It on a GPU: Mixed Precision and Checkpointing Measured
+## Putting It on a GPU: Mixed Precision and Checkpointing Measured
 
 The CPU demos above isolate each mechanism, but the payoff of mixed precision and checkpointing is a *memory and speed* tradeoff that only shows its true shape on a GPU with tensor cores and a real VRAM budget. This section measures it directly on a single NVIDIA GPU using a small pretrained model from the mature open-source Hugging Face `transformers` library, so the numbers are real rather than asserted.
 
@@ -389,9 +389,9 @@ The four rows make the tradeoffs concrete on real hardware. fp16 autocast lowers
 
 A note on what stays show-only below. The single-GPU measurements here cover the techniques that fit on one device. The sharding methods that follow (FSDP and ZeRO) require multiple GPUs and an initialized distributed process group, and fp8 requires Hopper or Blackwell tensor cores, so those remain shown with their real library invocations rather than executed on this machine.
 
-## 6. Sharding: ZeRO and FSDP
+## Sharding: ZeRO and FSDP
 
-### 6.1 The Insight
+### The Insight
 
 Data parallelism replicates the entire model on every device and averages gradients across devices each step. That is simple but wasteful: every one of $N$ devices stores the full $16\Psi$ bytes of model and optimizer state, even though each could hold only a slice. The **Zero Redundancy Optimizer (ZeRO)** observes that this replication is unnecessary and partitions the state across the $N$ data-parallel devices in three progressively aggressive stages (Rajbhandari et al., 2020):
 
@@ -408,7 +408,7 @@ flowchart LR
     C --> D["ZeRO-3 / FSDP also shard parameters about 16 psi over N"]
 ```
 
-### 6.2 Show-Only: FSDP (requires multiple GPUs)
+### Show-Only: FSDP (requires multiple GPUs)
 
 The following wraps a model in PyTorch FSDP. It requires an initialized distributed process group with at least one GPU per rank, so it is shown rather than executed here.
 
@@ -448,7 +448,7 @@ model = FSDP(
 # Launch with: torchrun --nproc_per_node=8 train.py
 ```
 
-### 6.3 Show-Only: ZeRO via DeepSpeed (requires GPUs)
+### Show-Only: ZeRO via DeepSpeed (requires GPUs)
 
 The DeepSpeed library exposes the same ZeRO stages through a JSON config, which is the most common way ZeRO is used in practice. The config selects the stage and optionally offloads partitioned state to CPU or NVMe to fit even larger models.
 
@@ -477,7 +477,7 @@ model_engine, optimizer, _, _ = deepspeed.initialize(
 
 The Hugging Face `accelerate` library wraps both FSDP and DeepSpeed behind a single `accelerator.prepare(...)` call and a YAML config, so the same training script can switch sharding backends without code changes. That is the mature, open-source path most teams take in 2025.
 
-## 7. FP8 and the Precision Frontier
+## FP8 and the Precision Frontier
 
 The newest accelerators (NVIDIA Hopper and Blackwell) add hardware support for **fp8**, an 8-bit float that comes in two variants: **E4M3** (4 exponent, 3 mantissa bits) for the forward pass where precision matters more, and **E5M2** (5 exponent, 2 mantissa bits) for gradients where range matters more. The promise is another near-halving of memory traffic and a large throughput gain on the tensor cores, but fp8's tiny mantissa makes per-tensor *scaling* essential: each tensor is multiplied by a scale factor chosen so its values land in the representable range, analogous to loss scaling but applied per tensor and tracked over time (delayed scaling). NVIDIA's open-source **Transformer Engine** library implements this and is the standard way to train in fp8 today (Micikevicius et al., 2022).
 
@@ -501,7 +501,7 @@ with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
 
 FP8 is the current production frontier rather than a universal default: it gives the largest wins on the biggest matmuls, requires recent hardware, and demands careful scaling to avoid divergence. For most training in 2025, bf16 plus checkpointing plus FSDP is the workhorse, with fp8 layered on top when the hardware and the scale justify it.
 
-## 8. Pitfalls and When to Use
+## Pitfalls and When to Use
 
 **Mixed precision.** Prefer bf16 when the hardware supports it; its fp32-equal exponent range avoids the loss-scaling machinery that fp16 requires. If you must use fp16, use dynamic loss scaling and watch for skipped steps (frequent overflow means the scale is too high or the run is unstable). Keep reductions, softmax, and loss computation in fp32, low precision in a sum over many terms accumulates error. Never store the optimizer master weights in half precision; that reintroduces the underflow that mixed precision exists to avoid.
 

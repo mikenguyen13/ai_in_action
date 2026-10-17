@@ -1,12 +1,12 @@
 # Reasoning Models and Test-Time Compute {#sec-700-reasoning-models-test-time-compute}
 
-## 1. Introduction {#sec-700-introduction}
+## Introduction {#sec-700-introduction}
 
 Between the original transformer and the instruction-tuned chat models of 2023, the dominant lever for improving large language models was *scale at training time*: more parameters, more data, more pre-training compute. In late 2024 a second lever appeared, and it changed the frontier. **Reasoning models** are trained to spend variable *inference-time* compute, generating an explicit, often long internal chain of thought before committing to an answer, trading latency and tokens for accuracy. This opened a second scaling axis, **test-time compute**, alongside pre-training scale, and essentially every frontier model shipped through 2025 sits on it.
 
 The shift matters enough that a treatment of LLMs that stops at instruction-tuned chat models is a generation behind. This chapter develops what reasoning models are, the mathematics that explains why spending compute at inference helps, the two roads to building them (OpenAI's o-series and DeepSeek's open R1), the test-time compute methods that operationalize thinking, the economics of a thinking budget, and the honest limits. It then turns to **production code**: runnable demonstrations of self-consistency majority voting and best-of-N selection that reproduce the compute-versus-accuracy tradeoff on a laptop, an executed GPU run of self-consistency on a real small reasoning model, plus show-only invocations for the methods that exceed a single consumer card (tree search, process reward models, multi-GPU serving) that a reader can run on appropriate hardware.
 
-## 2. The Core Idea: A Second Scaling Axis {#sec-700-core-idea}
+## The Core Idea: A Second Scaling Axis {#sec-700-core-idea}
 
 A standard chat model maps a prompt to an answer in a single decoding pass, emitting the answer directly. A reasoning model is trained instead to first produce a long *reasoning trace*, exploring approaches, checking intermediate steps, backtracking, and only then emit a final answer. Chain-of-thought prompting had shown since 2022 that *eliciting* such traces helps. The new idea is to make extended, self-correcting reasoning a *trained behaviour* reinforced by outcome rewards, rather than something coaxed out by prompt engineering.
 
@@ -25,11 +25,11 @@ xychart-beta
     line "Test-time compute" [30, 58, 78, 90]
 ```
 
-## 3. The Mathematics of Test-Time Compute {#sec-700-math}
+## The Mathematics of Test-Time Compute {#sec-700-math}
 
 Why should sampling more or thinking longer help at all? The methods divide into two families with distinct mathematics: **parallel** compute (draw many samples, then aggregate or select) and **sequential** compute (one long self-correcting trace). We derive the parallel case rigorously, because it is what we can execute on a laptop, then state the sequential case.
 
-### 3.1 Setup {#sec-700-setup}
+### Setup {#sec-700-setup}
 
 Fix a prompt $x$ and let a model $\pi$ induce a distribution over complete responses $y \sim \pi(\cdot \mid x)$. Each response carries a final answer $a(y)$ drawn from a (finite) answer set $\mathcal{A}$. Let $a^\star$ denote the correct answer. A *single sample* succeeds with probability
 
@@ -39,7 +39,7 @@ $$ {#eq-700-single}
 
 Test-time compute methods draw $N$ independent samples $y_1, \dots, y_N$ and combine their answers into one prediction $\hat a_N$. The two canonical combiners are **self-consistency** (majority vote over $a(y_i)$) and **best-of-N** (select the candidate a verifier scores highest).
 
-### 3.2 Best-of-N with a perfect verifier: the pass@N bound {#sec-700-passn}
+### Best-of-N with a perfect verifier: the pass@N bound {#sec-700-passn}
 
 Suppose we have an oracle verifier that recognizes a correct answer whenever one appears among the $N$ samples. Best-of-N then succeeds exactly when at least one sample is correct. With independent samples,
 
@@ -49,7 +49,7 @@ $$ {#eq-700-passn}
 
 This rises monotonically from $p$ toward $1$ and, for small $p$, climbs almost linearly at first ($\approx Np$ for $Np \ll 1$) before saturating. The expected number of samples to obtain a first success is $1/p$, the mean of a geometric distribution, which is the compute budget an oracle-verified pipeline must plan for. Equation @eq-700-passn is the optimistic ceiling: it assumes the verifier never selects a wrong answer over a right one. Real verifiers do not, and section @sec-700-imperfect makes that gap precise.
 
-### 3.3 Self-consistency: majority vote as a denoiser {#sec-700-majority}
+### Self-consistency: majority vote as a denoiser {#sec-700-majority}
 
 Self-consistency needs no external verifier. It marginalizes over reasoning paths by taking the most frequent final answer. Consider first the clean binary case: the correct answer competes against a single dominant distractor, each sample is correct with probability $p$, and we vote over $N$ (odd) samples. The vote is correct when the number of correct samples $K \sim \text{Binomial}(N, p)$ exceeds $N/2$:
 
@@ -65,13 +65,13 @@ $$ {#eq-700-hoeffding}
 
 The error decays exponentially in the number of samples, but the rate is governed by the squared margin $\Delta^2$. A model that is barely above chance ($\Delta$ small) needs many samples to realize the benefit, which is exactly the compute-versus-accuracy tradeoff we will plot. The realistic multi-distractor case (correct mass $p$, the rest spread over several wrong answers) behaves better than the two-way bound, because the wrong votes are split and the plurality threshold is easier to clear. We measure that case directly in code in section @sec-700-self-consistency.
 
-### 3.4 Best-of-N with an imperfect verifier {#sec-700-imperfect}
+### Best-of-N with an imperfect verifier {#sec-700-imperfect}
 
 In practice the selector is a learned **reward model** or **verifier** that scores candidates with noise, so it sometimes ranks a wrong answer above a right one. Model candidate $i$ by a latent quality $q_i \in [0,1]$ (probability-correct, say), and let the verifier observe a noisy score $s_i = q_i + \varepsilon_i$ with $\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$. Best-of-N selects $\hat\imath = \arg\max_i s_i$ and is judged correct when the selected candidate's true quality clears a threshold, $q_{\hat\imath} > \tau$.
 
 Two regimes emerge. When $\sigma \to 0$ (perfect verifier) the selector picks the genuinely best of $N$ draws, and accuracy approaches the pass@N ceiling of @eq-700-passn. As $\sigma$ grows, selection degrades toward picking at random among the $N$, and the curve *plateaus early*: beyond some $N$, additional samples mostly add verifier noise rather than signal. The practical lesson, which the code in section @sec-700-best-of-n makes quantitative, is that **the verifier, not the sampler, sets the ceiling on best-of-N.** Spending more compute on samples a weak verifier cannot rank is wasted.
 
-### 3.5 Sequential compute: depth instead of breadth {#sec-700-sequential}
+### Sequential compute: depth instead of breadth {#sec-700-sequential}
 
 Parallel methods explore breadth by drawing independent samples. Sequential test-time compute instead spends tokens *within one trajectory*: the model writes a long trace, checks intermediate results, and revises. Formally, a long chain of thought factorizes the answer through a latent sequence of steps $z_1, \dots, z_T$,
 
@@ -81,7 +81,7 @@ $$ {#eq-700-cot}
 
 and the value of depth is that intermediate steps can be *conditioned on and corrected*: a later step can detect that an earlier one was wrong and override it, something a single forward answer cannot do. This is the behaviour that outcome-reward reinforcement learning incentivizes directly (the subject of the reinforcement-learning chapter). The research consensus through 2025 is that breadth and depth **compose**, and the optimal split depends on the problem: easy problems waste compute under heavy search, while the hardest benefit from both.
 
-### 3.6 Verification as its own scaling axis {#sec-700-verification-axis}
+### Verification as its own scaling axis {#sec-700-verification-axis}
 
 Section @sec-700-imperfect left a sharp practical conclusion: on best-of-N, *the verifier, not the sampler, sets the ceiling*, because selection accuracy is governed by the verifier's noise scale $\sigma$ in @sec-700-imperfect. That reframes the question. If more samples are wasted compute once the verifier saturates, can we instead spend compute on *the verifier* to shrink $\sigma$? Kwok et al. (2026) argue yes, and treat **verification** as a third scaling axis alongside pre-training scale and generation-time sampling.
 
@@ -105,7 +105,7 @@ $$ {#eq-700-verifier-reward}
 
 and because $K$ and $C$ are literal averages, each added read or criterion shrinks $\sigma$ in the model of @sec-700-imperfect, lifting the best-of-N ceiling that plain resampling cannot move. To turn scores into a choice without the $O(N^2)$ cost of all-pairs comparison, the continuous scores feed a pivot-tournament ranker that runs in $O(Nk)$: a randomized ring pass cancels positional bias, the top-$k$ candidates become pivots, and the rest are compared only against the pivot set. Requiring no verifier training, this reaches state of the art on agentic selection, $86.5\%$ on Terminal-Bench V2 and $78.2\%$ on SWE-Bench Verified. The same continuous signal doubles as a *dense* reward for reinforcement learning, improving the sample efficiency of GRPO (the algorithm behind R1 in section @sec-700-r1) where a sparse outcome reward gives the policy almost nothing to learn from on long trajectories.
 
-## 4. The o-Series: Reasoning as a Product {#sec-700-o-series}
+## The o-Series: Reasoning as a Product {#sec-700-o-series}
 
 OpenAI's **o1**, released September 12, 2024, was the first widely deployed reasoning model. It was trained to think before answering, hid its raw chain of thought behind a summarized version, and demonstrated the inference-scaling curve on competition mathematics, coding, and science.
 
@@ -113,7 +113,7 @@ OpenAI's **o1**, released September 12, 2024, was the first widely deployed reas
 
 The o-series also crystallized the *thinking budget* as a product control: developers can request low, medium, or high reasoning effort, directly trading cost and latency for accuracy, the inference-time scaling law exposed as an API parameter.
 
-## 5. DeepSeek-R1: Reasoning from Reinforcement Learning, in the Open {#sec-700-r1}
+## DeepSeek-R1: Reasoning from Reinforcement Learning, in the Open {#sec-700-r1}
 
 The o-series demonstrated *that* reasoning worked but disclosed little about *how*. **DeepSeek-R1**, released in January 2025 and later peer-reviewed in *Nature* (September 2025), opened the recipe and delivered a striking scientific result: sophisticated reasoning can **emerge from reinforcement learning alone**.
 
@@ -121,7 +121,7 @@ The key artifact was **R1-Zero**, trained by applying reinforcement learning dir
 
 The full R1 added a small amount of cold-start data and a multi-stage pipeline to fix R1-Zero's readability and language-mixing issues, but the scientific headline stands. Because DeepSeek released open weights and a detailed report, R1 became the reference point for an entire wave of open reasoning models and reasoning research.
 
-## 6. Test-Time Compute Methods {#sec-700-methods}
+## Test-Time Compute Methods {#sec-700-methods}
 
 Let the model think longer can be realized in several distinct ways, worth separating because they have different cost and reliability profiles.
 
@@ -143,7 +143,7 @@ flowchart TD
     C --> H["Self critique and revision"]
 ```
 
-### 6.1 Fixing PRM's Reward-Hacking Problem: Hierarchical Reward Models {#sec-700-hrm}
+### Fixing PRM's Reward-Hacking Problem: Hierarchical Reward Models {#sec-700-hrm}
 
 Section @sec-700-imperfect showed that best-of-N is only as good as its verifier, and process reward models (PRMs) are the workhorse step-level verifier used in the "tree search with process reward model" branch of Figure @fig-700-methods. Wang et al. (2026) identify a specific, structural failure mode in that verifier, distinct from the Gaussian noise of section @sec-700-imperfect: a PRM is trained on *isolated* steps, so it has no way to know that a mistake at step $i$ can be repaired by step $i+2$. It penalizes the flawed step and never observes the recovery, so a policy trajectory that catches and fixes its own error scores no better than one that simply gets the step wrong and never recovers. Table @tbl-700-orm-prm-hrm summarizes how this differs from the two established reward designs.
 
@@ -222,21 +222,21 @@ On PRM800K, applying HNC to MCTS-generated trajectories (using Qwen2.5-7B-Math-I
 
 **The pattern generalizes past text.** Zhang et al. (2025) apply the same hierarchical-supervision idea outside mathematical text entirely, to *symbolic computer vision*: parsing a diagram (a geometry figure or chart) into geometric primitives, points, lines, shapes, and the relations between them, rather than into pixels. Their **Symbolic Hierarchical Process Reward Model** rewards a self-supervised symbolic auto-encoder at multiple levels of a parsing hierarchy, point-on-line consistency, line-on-shape consistency, and shape-on-relation consistency, exactly mirroring HRM's single-step versus multi-step split but with "step" now meaning one level of geometric structure instead of one line of arithmetic. The reward hacking problem is the same one section @sec-700-hrm diagnoses (a flat, single-level reward is easy to satisfy locally while getting the overall structure wrong) and the fix is the same shape (supervise coherence across levels, not just within one). On diagram-heavy benchmarks the reported gains are large: a 98.2% reduction in geometric reconstruction error, and double-digit accuracy improvements on MathGlance, MathVerse, and GeoQA over pixel-only baselines. The result worth taking away is architectural, not domain-specific: hierarchical process supervision is a general recipe for any reward model whose target has natural multi-level structure, text reasoning steps, geometric primitives, or otherwise, wherever a flat, single-level reward would be exploitable.
 
-## 7. Reasoning Distillation {#sec-700-distillation}
+## Reasoning Distillation {#sec-700-distillation}
 
 A practical finding from the R1 work: the long reasoning traces produced by a strong reasoning model can serve as supervised training data to teach *smaller, cheaper, dense* models to reason. DeepSeek distilled R1's traces into a range of small models that substantially outperformed same-size models trained conventionally. This **reasoning distillation** pushes capable reasoning down the model-size curve: the expensive reasoning reinforcement learning need only run once on a large model, and its behaviour transfers cheaply. It also reframes reasoning traces themselves as a valuable synthetic-data asset.
 
-## 8. The Economics of a Thinking Budget {#sec-700-economics}
+## The Economics of a Thinking Budget {#sec-700-economics}
 
 Reasoning is not free, and its cost structure differs from ordinary inference. A reasoning model may emit thousands of hidden thinking tokens per query (Qwen3, for instance, exposed thinking budgets of tens of thousands of tokens), and the user typically pays for those tokens and waits for them. The relevant unit is no longer tokens in the answer but tokens spent thinking to reach the answer, and the right amount varies by query.
 
 The operational implications are concrete. Latency-sensitive applications cannot afford maximum reasoning on every call; the discipline is to *route*, spending heavy reasoning only on queries that need it and answering easy queries directly. Overthinking, where a model burns budget on trivial questions, is a real failure mode and an active area of work (adaptive or budget-aware reasoning). The thinking budget is thus both a capability knob and a cost-control problem.
 
-## 9. Production Code {#sec-700-production-code}
+## Production Code {#sec-700-production-code}
 
 Most of this section is **executed at render time**. Every number printed below is computed by the code shown. The two core parallel methods, self-consistency and best-of-N, are implemented from first principles on CPU so the compute-versus-accuracy tradeoff of section @sec-700-math is reproduced rather than asserted. A short CPU block then exercises a tiny Hugging Face model to show the mechanics and per-sample latency of parallel sampling. Section @sec-700-gpu-executed then runs the *same* self-consistency pipeline on a real reasoning-capable instruct model on the local GPU, guarded so it falls back gracefully on a CPU-only host. A final show-only block holds the methods that exceed a single consumer card (multi-GPU serving, 7B to 8B reward models, process-reward tree search).
 
-### 9.1 Self-consistency: majority voting over sampled chains {#sec-700-self-consistency}
+### Self-consistency: majority voting over sampled chains {#sec-700-self-consistency}
 
 We simulate a model whose per-sample success probability on a problem is $p$, with the wrong mass spread over several distractors (the realistic multi-distractor case of section @sec-700-majority). Majority voting should amplify accuracy when $p$ is above the plurality threshold and degrade it otherwise. The simulation is deterministic given the seed.
 
@@ -285,7 +285,7 @@ for N in [1, 3, 5, 11, 21, 41]:
 
 Even with $p = 0.45$ (each individual chain is wrong more often than right), majority voting climbs well past the single-sample accuracy. The wrong mass is split across four distractors, so the *plurality* threshold sits below one half, and the correct answer wins the vote with rising probability as $N$ grows. This is the multi-distractor regime that real chain-of-thought self-consistency exploits.
 
-### 9.2 Best-of-N: selection is bounded by the verifier {#sec-700-best-of-n}
+### Best-of-N: selection is bounded by the verifier {#sec-700-best-of-n}
 
 Best-of-N samples $N$ candidates and keeps the one a verifier scores highest. Following section @sec-700-imperfect, each candidate has a latent quality $q$ and the verifier observes $q$ plus Gaussian noise of scale $\sigma$. We sweep $N$ for three verifier qualities to show that a weak verifier plateaus while a perfect one approaches the pass@N ceiling.
 
@@ -328,7 +328,7 @@ for sigma, label in verifiers:
 
 The perfect verifier keeps climbing toward the pass@N ceiling, the good verifier rises more slowly, and the weak verifier flattens out early. Doubling $N$ from 16 to 32 buys the weak verifier almost nothing, the extra samples are answers it cannot reliably rank. This is the single most important practical fact about best-of-N: **invest in the verifier before you invest in more samples.**
 
-### 9.3 The compute-versus-accuracy tradeoff curve {#sec-700-tradeoff-curve}
+### The compute-versus-accuracy tradeoff curve {#sec-700-tradeoff-curve}
 
 We now plot both methods on one axis: accuracy as a function of the sample budget $N$ (which is directly proportional to inference compute and cost). This is the figure that motivates the entire chapter.
 
@@ -368,7 +368,7 @@ print(f"  best-of-N perfect verif : {bo_perfect[0]:.3f} -> {bo_perfect[-1]:.3f}"
 print(f"  best-of-N weak verif    : {bo_weak[0]:.3f} -> {bo_weak[-1]:.3f}")
 ```
 
-### 9.4 Parallel sampling mechanics with a real model {#sec-700-real-model}
+### Parallel sampling mechanics with a real model {#sec-700-real-model}
 
 The simulations above isolate the *statistics* of test-time compute. To show the *mechanics* on a genuine language model, we run best-of-N sampling with a tiny open model from the Hugging Face hub, measuring per-candidate latency and the token budget that parallel sampling consumes. We score each candidate by its mean per-token log-probability under the model (its own confidence), the simplest verifier available without a separate reward model. The model is intentionally tiny so the cell runs in seconds on CPU; the *code path* is identical to a production best-of-N over a real reasoning model.
 
@@ -433,7 +433,7 @@ print(f"selected continuation: {tok.decode(best_ids[0], skip_special_tokens=True
 
 The numbers reported (parameter count, milliseconds per candidate, total tokens generated) are the operational quantities a production system tracks: latency scales linearly with $N$, and the token budget is what the user pays for. With a tiny random-initialized model the candidate scores are nearly indistinguishable, which is itself the point of section @sec-700-imperfect: **a weak scorer cannot separate candidates, so selection adds compute without adding accuracy.** Swapping `model_name` for a capable reasoning model (and the self-score for a trained reward model) is the only change needed for production. The next section does exactly that swap, on a GPU, with a model that actually reasons.
 
-### 9.5 Running it on a GPU (executed) {#sec-700-gpu-executed}
+### Running it on a GPU (executed) {#sec-700-gpu-executed}
 
 The tiny CPU model above shows the *mechanics* but cannot *reason*: its samples are gibberish, so the vote is meaningless. Here we run the same self-consistency pipeline on a small but genuinely pretrained instruct model, **Qwen/Qwen2.5-0.5B-Instruct**, on the local NVIDIA GPU. The model is about 0.5B parameters and loads in `float16` in roughly 1 GB of VRAM, well within a consumer card, yet it solves simple grade-school arithmetic well enough that majority voting over several sampled chains is observably better than a single greedy sample. Every number printed below (VRAM, latency, the voted answer, and the agreement fraction) is measured at render time.
 
@@ -560,7 +560,7 @@ else:
 
 This is the chapter's mathematics on a real reasoning-capable model rather than a simulation. Self-consistency over $N$ sampled chains should match or beat the single-sample baseline on the arithmetic set, and the per-question agreement fraction is the empirical analogue of the per-sample correctness $p$ of section @sec-700-majority: when the model is well above the plurality threshold the vote is near-unanimous and reliably correct, and when it is shaky the chains disagree and the vote can still recover the right answer by plurality. The peak VRAM line confirms a 0.5B model in `float16` fits comfortably on a consumer card, leaving room to raise $N$ or the model size. Swapping `model_name` for a larger open reasoning model such as `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` is the only change needed to scale this up on bigger hardware.
 
-### 9.6 Show-only: multi-GPU and large-model methods {#sec-700-show-only}
+### Show-only: multi-GPU and large-model methods {#sec-700-show-only}
 
 The executed cell above runs a real reasoning model on a single consumer GPU. The following blocks go further than a single 8 GB card can comfortably host: 7B to 8B reward models, vLLM serving, and process-reward tree search. They are **not executed** here. Each shows the real open-source library invocation so a reader can run it on appropriate hardware. None of these blocks fabricate output.
 
@@ -633,7 +633,7 @@ high_effort = SamplingParams(temperature=0.6, max_tokens=8192)  # think long
 # Route per query: cheap path for easy prompts, high_effort only when needed.
 ```
 
-### 9.7 Reproducing the HRM Mechanism (executed) {#sec-700-hrm-code}
+### Reproducing the HRM Mechanism (executed) {#sec-700-hrm-code}
 
 Training an actual reward model exceeds a laptop, so the two mechanisms behind HRM in section @sec-700-hrm are reproduced directly: the merge-labeling rule of Table @tbl-700-hrm-labels (a pure function, no model needed) and the HNC variance argument of @eq-700-hnc-before to @eq-700-hnc-after (a Monte Carlo simulation, no model needed). Both are exact, runnable demonstrations of the paper's mechanism, not a re-run of its GPU experiments.
 
@@ -942,7 +942,7 @@ for n in [2, 4, 6, 10, 20]:
     print(f"  N={n:>3}: {n / (n - 1):.3f}x")
 ```
 
-## 10. Pitfalls and When to Use {#sec-700-pitfalls}
+## Pitfalls and When to Use {#sec-700-pitfalls}
 
 **When reasoning helps.** Reasoning models shine on problems with **verifiable structure and multiple steps**: competition mathematics, algorithmic coding, formal logic, and scientific problems where intermediate work can be checked. The capability is sharpest exactly where answers are checkable, because reinforcement learning with verifiable rewards (the reinforcement-learning chapter) requires a checkable answer.
 
@@ -957,13 +957,13 @@ for n in [2, 4, 6, 10, 20]:
 - **Independence assumptions.** The pass@N and Hoeffding bounds assume independent samples. Low temperature collapses diversity and breaks independence, so the samples agree on the same (possibly wrong) answer and voting buys nothing. Maintain enough sampling temperature for genuine diversity.
 - **Treating the trace as an explanation.** The visible chain of thought is not guaranteed to faithfully describe the computation that produced the answer. Using it for audit or safety without separate faithfulness evidence is unsound. The trace is a *means to an answer*, not a certified justification.
 
-## 11. Evaluation and the Limits of Reasoning {#sec-700-evaluation}
+## Evaluation and the Limits of Reasoning {#sec-700-evaluation}
 
 The reasoning era forced new benchmarks because the old ones saturated. As models approached ceiling on MMLU and similar tests, evaluation migrated to harder, less saturable sets: **GPQA-Diamond** (graduate-level science), **FrontierMath** (research mathematics), **SWE-bench Verified** (real software issues), and **Humanity's Last Exam**.
 
 The most instructive case is **ARC-AGI**. o3's roughly 87.5% on ARC-AGI-1 was hailed as a breakthrough in fluid, on-the-fly abstraction. But when **ARC-AGI-2** was released in 2025, redesigned to defeat brute-force search and to require more compositional adaptation, the same class of models that saturated version 1 scored in the **low single digits** at moderate compute. The gap is the lesson: reasoning models made enormous progress on problems amenable to search and verification, yet a measurable *adaptation gap* to human-style generalization persists. High accuracy on a benchmark a model was effectively optimized against is not evidence of general intelligence, and ARC-AGI-2 is the cleanest demonstration that the frontier, however impressive, has not closed that gap.
 
-## 12. Distribution-Matching RL: GFlowRL and Preserving Reasoning Diversity {#sec-700-gflowrl}
+## Distribution-Matching RL: GFlowRL and Preserving Reasoning Diversity {#sec-700-gflowrl}
 
 The three sections that follow revisit the chapter's core assumptions in turn: that the training objective preserves the diversity parallel sampling feeds on (@sec-700-gflowrl), that a model knows when its own compute is worth spending (@sec-700-metacognition), and that the tokens it spends are a readable record of what it computed (@sec-700-invisible-reasoning).
 
@@ -1047,7 +1047,7 @@ for name, exponent in [("early  (R^0.3)", 0.3), ("mid    (R^0.7)", 0.7), ("conve
 
 At the converged policy the per-trajectory residual is constant, so even a tiny group recovers $\log Z$ essentially exactly: no separate network, no extra optimizer, and none of the gradient explosions that sink a learned $Z$ head. The distribution-matched policy is also the one that keeps @sec-700-passn and @sec-700-majority productive, because it hands parallel sampling a genuinely diverse pool of high-reward answers rather than $N$ near-copies of one mode.
 
-## 13. Metacognition: Knowing When to Think, Verify, and Abstain {#sec-700-metacognition}
+## Metacognition: Knowing When to Think, Verify, and Abstain {#sec-700-metacognition}
 
 The pitfalls in @sec-700-pitfalls share a hidden prerequisite: a reasoning model that spends test-time compute must know *when* to keep thinking, when to trust its own self-verification, and when to abstain instead of emitting a confident wrong answer. Voting below the plurality threshold (@sec-700-majority), paying for overthinking on an easy query (@sec-700-economics), and treating an unfaithful trace as an explanation are all, at bottom, failures of self-knowledge. @liu2026metacognition survey this capability under the heading of **metacognition**, framed as a *monitor and control* loop: a model's ability to monitor its own knowledge and to control its behavior accordingly.
 
@@ -1111,7 +1111,7 @@ print("confidence exceeds accuracy, so the model is overconfident (bars below th
 
 A model with an ECE this high cannot be trusted to gate its own test-time compute: its confidence overstates its accuracy, so a stopping rule keyed to confidence would halt reasoning too early and a deferral rule would abstain too rarely. Driving ECE down, through the improvement techniques @liu2026metacognition catalogue, is what turns a confidence signal into a usable controller for the "when to keep thinking, when to verify, when to abstain" decisions that every method in this chapter ultimately depends on.
 
-## 14. Invisible Reasoning: The Ceiling on Chain-of-Thought Monitoring {#sec-700-invisible-reasoning}
+## Invisible Reasoning: The Ceiling on Chain-of-Thought Monitoring {#sec-700-invisible-reasoning}
 
 Every method in this chapter has quietly assumed that the visible trace *is* the computation. Equation @eq-700-cot factorizes an answer through a latent step sequence $z_{1:T}$ and then reads those steps off as emitted tokens; self-consistency in @sec-700-majority votes over the answers those traces reach; the process reward models of @sec-700-hrm score the steps exactly as written. The last pitfall in @sec-700-pitfalls flags the danger in a single line, that a trace is not guaranteed to describe the computation that produced the answer. @baherwani2026invisible turn that caution into a measured failure mode.
 
@@ -1228,7 +1228,7 @@ The numbers trace the collapse. With every step of the side objective visible th
 
 The consequence is load-bearing for this chapter. Test-time compute buys accuracy by turning tokens into computation, and we have treated those tokens as simultaneously the mechanism and the audit log. @baherwani2026invisible show that frontier models already perform consequential computation with no interpretable trace in their output tokens, so the two roles come apart: the trace remains a *means to an answer*, as @sec-700-pitfalls insists, but it is not a certified record of the reasoning, and a safety argument that rests on reading it inherits a ceiling it cannot raise by reading harder.
 
-## 15. Latent Recurrent Reasoning: Test-Time Compute Without Tokens {#sec-700-latent-reasoning}
+## Latent Recurrent Reasoning: Test-Time Compute Without Tokens {#sec-700-latent-reasoning}
 
 Every mechanism in this chapter so far spends test-time compute the same way: it generates tokens. Parallel breadth (@sec-700-passn, @sec-700-majority) draws more complete traces, sequential depth (@sec-700-sequential) writes one longer trace, the process reward models of @sec-700-hrm score the written steps, and the economics of @sec-700-economics bill per token. Section @sec-700-invisible-reasoning then showed that those tokens are not a faithful record of the computation, and that a model can compute in a channel a monitor cannot read. @engdahl2026bdhcq take that observation to its structural conclusion and remove the tokens from the reasoning loop altogether.
 
@@ -1236,7 +1236,7 @@ Every mechanism in this chapter so far spends test-time compute the same way: it
 
 The number worth extracting is not the accuracy, which sits far below the roughly 87.5% that o3 reached on the same benchmark in @sec-700-o-series. It is the *axis*. Sections @sec-700-math and @sec-700-economics treat "more test-time compute" and "more tokens" as interchangeable. They are not, and the next two subsections make the difference quantitative: one is about how much a reasoning step can *carry*, the other about how much a reasoning step *costs*.
 
-### 15.1 The token bottleneck: how much one reasoning step can carry {#sec-700-token-bottleneck}
+### The token bottleneck: how much one reasoning step can carry {#sec-700-token-bottleneck}
 
 Fix a verbalized reasoner with vocabulary $\mathcal{V}$, $|\mathcal{V}| = V$. At step $t$ it holds an internal state, computes logits over $\mathcal{V}$, and samples a token $z_t \sim \pi(\cdot \mid x, z_{<t})$. The KV cache does carry a high dimensional state forward, so the model is not literally reduced to a scalar between steps. The bottleneck is sharper and more specific than that: whatever step $t$ *concluded* must be committed to a token before step $t+1$ can condition on it. Sampling is a hard quantization of the step's conclusion, and the marginal information that step $t$ adds to the context is exactly the information in $z_t$. That is bounded by the entropy of a distribution on $V$ symbols,
 
@@ -1268,7 +1268,7 @@ $$ {#eq-700-latent-snr}
 
 At $d = 2048$ and $V = 128{,}000$, $\rho^\star \approx 0.0116$, roughly $-19.4$ decibels: the latent state can be swamped by nearly a hundred times more noise than signal in every dimension and still carry as much between steps as one perfectly chosen token. Even the crude floor of one *effective* bit per dimension leaves the latent channel about $121$ times wider. The cell in @sec-700-latent-executed computes all four of these figures.
 
-### 15.2 The cost of a step: decoding versus iterating {#sec-700-latent-cost}
+### The cost of a step: decoding versus iterating {#sec-700-latent-cost}
 
 Bandwidth is only half the argument. The other half is that the two kinds of step have different cost curves. Let a dense verbalized model have $P$ parameters, $\ell$ layers, model width $d_m$, a prompt of $n_0$ tokens, and let it decode $L$ chain-of-thought tokens. Each decoded token costs about $2P$ floating point operations for the dense matrix multiplies, plus attention against a key-value cache whose length grows by one per token: the $QK^\top$ and $AV$ products cost about $2\ell d_m n$ each against a cache of length $n$. Summing over the decode,
 
@@ -1309,7 +1309,7 @@ flowchart LR
     end
 ```
 
-### 15.3 The ARC-AGI-1 operating point, and what pass@2 actually means {#sec-700-latent-arc}
+### The ARC-AGI-1 operating point, and what pass@2 actually means {#sec-700-latent-arc}
 
 The reported result is $29.5\%$ **pass@2**, which is @eq-700-passn at $N = 2$: the probability that at least one of two samples is correct. ARC-AGI's official protocol allows two attempts per task, so this is the benchmark's own scoring rule rather than a flattering choice of metric, but it is still not the same as per-sample accuracy and should not be read as such. Under the independence assumption of @sec-700-passn,
 
@@ -1329,7 +1329,7 @@ that is $p \in [0.1475,\, 0.2950]$ whatever the correlation between the two samp
 
 The cost side is where the result earns its headline. At a representative frontier price of ten dollars per million output tokens, the entire $\$0.0007$ inference budget for one ARC task buys about **70 output tokens**; at two dollars per million it buys about $350$. A single long chain of thought of the kind @sec-700-sequential describes is one to two orders of magnitude longer than that, before any of the parallel sampling of @sec-700-passn is layered on top. Against the high-compute o3 configuration of @sec-700-o-series, reported on the order of a thousand dollars per task for roughly $87.5\%$, the ratio is about $1.4$ million to one in cost. Normalizing by accuracy, BDH-CQ spends about $\$2.37 \times 10^{-5}$ per point of ARC-AGI-1 accuracy against roughly $\$11.43$ per point, a factor of about half a million. That gap, not the raw score, is what "breaking the cost-accuracy Pareto frontier" means: no previously reported system bought ARC-AGI-1 accuracy that cheaply, even though many bought much more of it.
 
-### 15.4 The latent recurrence step {#sec-700-latent-step-code}
+### The latent recurrence step {#sec-700-latent-step-code}
 
 The core of @eq-700-latent-recurrence is a few lines. Below, the latent state $h \in \mathbb{R}^{d}$ accumulates evidence written into it through a fixed projection $R \in \mathbb{R}^{d \times |\mathcal{H}|}$ with orthonormal columns, leaks by a factor $\gamma < 1$ each iteration (a fixed-size memory cannot hold everything), and absorbs update noise, which is what makes the *effective* bandwidth of @sec-700-token-bottleneck finite rather than the nominal $d \cdot b$. The readout projects the state back onto interpretable scores, but only the final readout is ever taken. The Python tab is executed and its definitions are used by @sec-700-latent-executed; the Julia and Rust tabs are illustrative.
 
@@ -1427,7 +1427,7 @@ fn main() {
 
 :::
 
-### 15.5 Latent iterations against a token budget (executed) {#sec-700-latent-executed}
+### Latent iterations against a token budget (executed) {#sec-700-latent-executed}
 
 Training a BDH-CQ-scale model is out of scope for a laptop, so the *mechanism* is reproduced instead, on a synthetic ARC-like rule-induction task. Each task draws a hidden transformation from a space of $|\mathcal{H}| = 64$ rules (eight dihedral symmetries composed with eight colour permutations), shows four demonstration input-output grid pairs, and asks for the output of a held-out query grid. Every reasoner sees the *same* evidence stream: one randomly chosen cell of one demonstration per step, scored against all $64$ hypotheses under a noisy observation model. The only thing that differs is **what survives between steps**.
 
@@ -1635,7 +1635,7 @@ The curves separate exactly where the bandwidth argument predicts. All three rea
 
 The cost table turns the same runs into money. Under @eq-700-verbalized-cost and @eq-700-latent-cost, the $32$-iteration latent run costs $9.600 \times 10^{9}$ operations, about $\$8.9 \times 10^{-9}$ per task, against $4.649 \times 10^{12}$ operations and $\$4.3 \times 10^{-6}$ for a $70$B model decoding the same number of steps, a factor of $484$ as @eq-700-exchange-rate predicted. The four-token variant, which is the only token baseline that reaches respectable accuracy, needs $128$ decoded tokens and costs $\$1.7 \times 10^{-5}$, roughly $1{,}900$ times the latent run and still lands at $0.475$ against its $0.835$. The right panel makes the structural point visible: the latent curve occupies a region of accuracy-versus-cost space that the verbalized curves never enter, which is what a Pareto-frontier claim looks like when you plot it. Note honestly what the simulation does and does not isolate. Both the $150$M and $70$B verbalized curves have the same accuracy, because the simulation holds *capability* fixed and varies only the channel; model size enters as a pure cost multiplier. Real systems entangle the two, and the paper's $150$M configuration is a real model, not a re-parameterization of a large one.
 
-### 15.6 What latent reasoning costs you {#sec-700-latent-limits}
+### What latent reasoning costs you {#sec-700-latent-limits}
 
 Three things are given up, and each connects to a section above.
 
@@ -1647,7 +1647,7 @@ Three things are given up, and each connects to a section above.
 
 Set against those costs, the result belongs in this chapter because it falsifies an assumption the rest of the chapter makes silently. Test-time compute is not token generation. It is *iterated computation*, and tokens are one implementation of it, chosen historically because language models already had a decoder loop and because a readable trace was a welcome side effect. @engdahl2026bdhcq show a different implementation reaching a place on the cost axis that the token implementation cannot reach, roughly $29.5\%$ on ARC-AGI-1 at seventy tokens' worth of compute per task, and the fact that it does so with $150$M parameters against frontier systems three orders of magnitude larger is the clearest available evidence that the token bottleneck of @eq-700-token-bandwidth is a real constraint rather than an accounting convention.
 
-## 16. Conclusion {#sec-700-conclusion}
+## Conclusion {#sec-700-conclusion}
 
 Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. Verifier quality is not just about noise: section @sec-700-hrm showed that even a noiseless-looking PRM has a structural blind spot for self-correction, one that hierarchical supervision fixes at no extra inference cost, and the same hierarchical-node-compression trick that fixes it also makes automatic, MCTS-based annotation cheaper. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Section @sec-700-latent-reasoning closes the loop by questioning the chapter's most basic assumption: test-time compute is iterated computation, not token generation, and a 150M parameter recurrent latent reasoner buying ARC-AGI-1 accuracy at a fraction of a cent per task shows that the token bottleneck is a real constraint rather than an accounting convention. Understanding that dimension is now prerequisite to understanding the field.
 
