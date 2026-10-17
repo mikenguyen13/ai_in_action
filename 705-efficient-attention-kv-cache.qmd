@@ -52,6 +52,8 @@ $$
 
 The factor of two is keys plus values. This number grows linearly with context length and batch size and, at long context, dominates the memory budget of a served model, often exceeding the size of the weights themselves. Everything in the next two sections is about shrinking it or streaming around it.
 
+One detail about *what* sits in those bytes matters operationally. Modern decoders position their tokens with rotary position embeddings (RoPE), introduced by Su et al. (2024) and derived in @sec-road-to-transformers: the query and key vectors are rotated by an angle proportional to the token's absolute position, so that the attention logit depends only on the relative offset between the two tokens. The rotation is applied *before* the key is written, which means the cache stores keys already bound to the absolute position they occupied at write time. Two consequences follow for everything below. Reusing a cached prefix across requests, as the paged allocator of Section 6 does through copy-on-write block sharing, is only sound when the shared blocks land at the same positions in both sequences. And the context-extension recipes that rescale the RoPE frequency base to stretch a model past its trained length change the rotation applied to every key, so a cache built under one base cannot be mixed with one built under another.
+
 ## 4. Grouped-Query and Multi-Query Attention: Shrinking the Cache
 
 Standard **multi-head attention (MHA)** gives every one of the $h$ query heads its own key and value head. The cache therefore scales with $h$. The insight of **multi-query attention (MQA)** is that keys and values can be shared: use $h$ query heads but a single key head and a single value head, broadcast across all queries. This cuts the KV-cache by a factor of $h$ at the cost of some representational capacity, and it noticeably degraded quality in practice.
@@ -131,6 +133,80 @@ $$
 where $Z_{i,c}$ is the ordinary softmax normalizer *within* chunk $c$, and $\hat Z_{i,c}$ is a learned surrogate mass for the chunk as a whole, built from the retrieval score $\hat s_{i,c}$ and normalized across the selected chunks by $\hat{\mathcal Z}_i$. Because the surrogate masses sit *inside* the forward attention weights, the plain next-token loss backpropagates into the landmark keys $\mathbf{k}'_c$, the biases $b'_c$, and the calibrated queries: chunk retrieval is trained by language modeling itself, with no auxiliary retrieval objective and no non-differentiable top-$K$ in the gradient path. The authors call this native sparse training, and it is what lets learned selection match full attention where heuristic selection could not.
 
 **What it buys.** Trained at a modest context length, HiLS extrapolates far beyond it, reported at over $64\times$ the training length while sustaining roughly $90\%$ needle-in-a-haystack retrieval accuracy, a regime where full attention's length generalization collapses. Because the factorization has the same intra-/inter-chunk form at any length, an existing full-attention model can be *converted* to HiLS with lightweight continued pretraining, keeping in-domain quality while gaining ultra-long-context reach. It also composes with the rest of this chapter: the KV of unselected chunks need not stay resident in fast memory, so HiLS cuts KV *traffic* (Section 3) the way GQA cuts KV *size* (Section 4), and the two are orthogonal.
+
+**A learned index, rather than a learned chunking.** HiLS makes selection differentiable by choosing *chunks* and factorizing the softmax around that choice. The other line of work now shipping in production frontier models keeps token-level granularity and simply trains a cheap scorer to decide which tokens matter. DeepSeek Sparse Attention (DSA), introduced with DeepSeek-V3.2 (DeepSeek-AI, 2025), is the reference design. Alongside the expensive main attention runs a **lightning indexer**: a small, separate attention-like module with $H^I$ heads and a narrow head width, whose score between query position $t$ and past position $s$ is
+
+$$
+I_{t,s} = \sum_{j=1}^{H^I} w^I_{t,j} \, \operatorname{ReLU}\!\big(q^I_{t,j} \cdot k^I_s\big).
+$$
+
+Two choices in that formula are deliberate. The nonlinearity is ReLU rather than a softmax, because the indexer never needs to produce a normalized distribution, only a ranking, and ReLU is far cheaper at high throughput. And the weights $w^I_{t,j}$ are produced from the query token, so the indexer can learn *per-query* how much to trust each of its heads. The main attention then runs only over the top-$k$ positions by $I_{t,s}$, with $k = 2048$ in the released configuration.
+
+**The complexity that actually results.** The headline is that DSA takes the main attention from $O(L^2)$ to $O(Lk)$ with $k \ll L$, and that is true. The part usually left out is that the indexer itself still scores every pair, so it remains $O(L^2)$. Sparse attention of this kind does not remove the quadratic term; it *moves* the quadratic term onto a much cheaper operator. Whether the trade wins is an arithmetic question about constants, not an asymptotic one, and it is worth doing explicitly. Writing $d$ for the main head width, $n_h$ for main heads, $H^I$ for indexer heads and $d_I$ for indexer head width, the per-query cost goes from roughly $2 n_h d L$ multiply-accumulates for dense attention to $2 n_h d k + 2 H^I d_I L$ for DSA. The second term is the one that never goes away, and the ratio $H^I d_I / (n_h d)$ is what decides where the crossover falls.
+
+**Sharing the index across layers.** The remaining redundancy is that every sparse layer runs its own indexer, and adjacent layers largely agree about which tokens matter. Bai et al. (2026) exploit this directly: partition the layers into a small set of *full* layers that compute their own top-$k$, and a majority of *shared* layers that simply reuse the nearest full layer's indices, choosing the partition greedily and optionally distilling across layers to recover the small quality loss. They report removing $75\%$ of indexer computation with negligible degradation, for up to $1.82\times$ prefill and $1.48\times$ decode speedup over standard DSA. GLM-5.2 ships this idea natively as **IndexShare**, reusing one indexer across each group of four sparse-attention layers, and the GLM-5 technical report describes adopting DSA specifically to cut training and inference cost while holding long-context fidelity (GLM-5 Team, 2026). The pattern is worth naming because it recurs: once a learned component is cheap enough to run everywhere, the next saving comes from noticing that its *output* is correlated across the places it runs.
+
+```{python}
+#| label: fig-705-dsa-crossover
+#| fig-cap: "Where learned sparse attention pays. Left: per-query multiply-accumulates against context length for dense attention, DSA with a top-2048 selection, and DSA with one indexer shared across four layers. The indexer keeps a quadratic term, so DSA does not beat dense attention until the context is long enough for the main-attention saving to outweigh it. Right: the resulting speedup over dense, with the break-even point marked."
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Main attention: DeepSeek-V3.2-scale head geometry. Indexer: a deliberately narrow module.
+n_h, d = 128, 128          # main attention heads and head width
+H_I, d_I = 4, 128          # lightning indexer heads and head width
+k = 2048                   # tokens selected per query
+share = 4                  # IndexShare: one indexer serves this many layers
+
+L = np.logspace(np.log10(2048), np.log10(4_000_000), 400)
+
+dense = 2 * n_h * d * L                      # every query scores every key
+main_sparse = 2 * n_h * d * np.minimum(k, L)  # main attention over the selection only
+indexer = 2 * H_I * d_I * L                   # the term that stays quadratic in aggregate
+
+dsa = main_sparse + indexer
+dsa_shared = main_sparse + indexer / share
+
+speedup = dense / dsa
+speedup_shared = dense / dsa_shared
+
+# Break-even: the shortest context at which DSA is cheaper than dense attention.
+crossings = np.where(speedup > 1.0)[0]
+break_even = L[crossings[0]] if len(crossings) else np.nan
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+axes[0].loglog(L, dense, label="dense attention")
+axes[0].loglog(L, dsa, label="DSA (indexer per layer)")
+axes[0].loglog(L, dsa_shared, label="DSA + IndexShare (1 per %d layers)" % share)
+axes[0].axvline(k, color="gray", ls=":", lw=0.8)
+axes[0].set_xlabel("context length L (tokens)")
+axes[0].set_ylabel("per-query multiply-accumulates")
+axes[0].set_title("Per-query attention cost")
+axes[0].legend(fontsize=8)
+
+axes[1].semilogx(L, speedup, label="DSA")
+axes[1].semilogx(L, speedup_shared, label="DSA + IndexShare")
+axes[1].axhline(1.0, color="black", ls="--", lw=0.8)
+axes[1].axvline(break_even, color="red", ls=":", lw=0.9,
+                label="break-even = %.0f tokens" % break_even)
+axes[1].set_xlabel("context length L (tokens)")
+axes[1].set_ylabel("speedup over dense attention")
+axes[1].set_title("Speedup, and where it starts")
+axes[1].legend(fontsize=8)
+fig.tight_layout()
+
+for length in (8192, 131_072, 1_000_000):
+    i = int(np.argmin(np.abs(L - length)))
+    print("L = %9d   DSA %5.1fx   +IndexShare %5.1fx   indexer share of DSA cost %4.0f%%"
+          % (length, speedup[i], speedup_shared[i], 100 * indexer[i] / dsa[i]))
+print("\nBreak-even context length for DSA: %.0f tokens" % break_even)
+print("Asymptotic ceiling (indexer-bound): %.1fx dense, %.1fx with IndexShare"
+      % (n_h * d / (H_I * d_I), share * n_h * d / (H_I * d_I)))
+plt.show()
+```
+
+The numbers make the shape of the trade concrete, and they are less flattering at both ends than the asymptotic claim suggests. Below the selection size $k$ there is nothing to select, and DSA is strictly worse than dense attention because it pays for an indexer and then attends to everything anyway. Break-even arrives almost immediately past $k$, at about $2{,}100$ tokens for $k = 2048$, since the main-attention term flattens the moment selection starts biting. But the gain is capped: as $L \to \infty$ both dense attention and the indexer are quadratic, so the speedup approaches the fixed ratio $n_h d / (H^I d_I)$, here $32\times$, set by how much narrower the indexer is than the main attention rather than by the sparsity. The indexer's share of DSA's own cost climbs from $11\%$ at $8$K tokens to $94\%$ at a million, which is the whole story in one number: at frontier context lengths a DSA model is not really running sparse attention any more, it is running a small dense attention that decides what a large sparse one should look at. Sharing the index across four layers multiplies that ceiling by four, which is exactly why the cross-layer reuse result matters more than it first appears: it lifts the asymptote rather than shifting a constant. This is the same accounting discipline as Section 4, where GQA's benefit was bounded by $h/g$, and it is the reason production long-context claims should always be read as claims about a specific context length rather than about complexity classes.
 
 ## 8. Native Memory States: When the Cache Becomes Part of the Model {#sec-705-native-memory-state}
 
@@ -655,15 +731,20 @@ The `use_cache=True` path is the production default and decodes each token in ro
 
 ## References
 
-1. Vaswani, A. et al. "Attention Is All You Need." 2017. https://arxiv.org/abs/1706.03762
-2. Shazeer, N. "Fast Transformer Decoding: One Write-Head is All You Need" (multi-query attention). 2019. https://arxiv.org/abs/1911.02150
-3. Ainslie, J. et al. "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." 2023. https://arxiv.org/abs/2305.13245
-4. Dao, T. et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." 2022. https://arxiv.org/abs/2205.14135
-5. Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023. https://arxiv.org/abs/2307.08691
-6. Shah, J. et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." 2024. https://arxiv.org/abs/2407.08608
-7. Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM). 2023. https://arxiv.org/abs/2309.06180
-8. Jiang, A. Q. et al. "Mistral 7B" (sliding-window attention). 2023. https://arxiv.org/abs/2310.06825
-9. Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867
-10. Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288
-11. Hu, X. et al. "Hierarchical Sparse Attention Done Right: Toward Infinite Context Modeling" (HiLS attention). 2026. https://arxiv.org/abs/2607.02980
-12. Zhang, Z. et al. "Metis: Memory Foundation Model" (native memory states and memory attention). 2026. https://arxiv.org/abs/2607.26760
+1. Vaswani, A. et al. "Attention Is All You Need." *Advances in Neural Information Processing Systems* 30, 2017. https://proceedings.neurips.cc/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html
+2. Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., and Liu, Y. "RoFormer: Enhanced Transformer with Rotary Position Embedding." *Neurocomputing* 568, 127063, 2024. https://doi.org/10.1016/j.neucom.2023.127063
+3. Shazeer, N. "Fast Transformer Decoding: One Write-Head is All You Need" (multi-query attention). arXiv:1911.02150, 2019 (preprint; no peer-reviewed version). https://arxiv.org/abs/1911.02150
+4. Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y., Lebron, F., and Sanghai, S. "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." *Proceedings of EMNLP 2023*, 4895--4901. https://doi.org/10.18653/v1/2023.emnlp-main.298
+5. Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Re, C. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." *Advances in Neural Information Processing Systems* 35, 2022. https://proceedings.neurips.cc/paper_files/paper/2022/hash/67d57c32e20fd0a7a302cb81d36e40d5-Abstract-Conference.html
+6. Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." *International Conference on Learning Representations (ICLR)*, 2024. https://arxiv.org/abs/2307.08691
+7. Shah, J. et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." *Advances in Neural Information Processing Systems* 37, 2024. https://arxiv.org/abs/2407.08608
+8. Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J., Zhang, H., and Stoica, I. "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM). *Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP '23)*, 611--626. https://doi.org/10.1145/3600006.3613165
+9. Jiang, A. Q. et al. "Mistral 7B" (sliding-window attention). 2023. https://arxiv.org/abs/2310.06825
+10. Milakov, M. and Gimelshein, N. "Online normalizer calculation for softmax." 2018. https://arxiv.org/abs/1805.02867
+11. Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models" (GQA at scale). 2023. https://arxiv.org/abs/2307.09288
+12. Hu, X. et al. "Hierarchical Sparse Attention Done Right: Toward Infinite Context Modeling" (HiLS attention). 2026. https://arxiv.org/abs/2607.02980
+13. Zhang, Z. et al. "Metis: Memory Foundation Model" (native memory states and memory attention). 2026. https://arxiv.org/abs/2607.26760
+14. DeepSeek-AI. "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model" (multi-head latent attention). 2024. https://arxiv.org/abs/2405.04434
+15. DeepSeek-AI. "DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models" (DeepSeek Sparse Attention and the lightning indexer). 2025. https://arxiv.org/abs/2512.02556
+16. GLM-5 Team. "GLM-5: From Vibe Coding to Agentic Engineering" (DSA at production scale). 2026. https://arxiv.org/abs/2602.15763
+17. Bai, Y., Dong, Q., Jiang, T., Lv, X., Du, Z., Zeng, A., Tang, J., and Li, J. "IndexCache: Accelerating Sparse Attention via Cross-Layer Index Reuse." 2026. https://arxiv.org/abs/2603.12201

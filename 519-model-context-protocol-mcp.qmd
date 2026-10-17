@@ -1784,6 +1784,8 @@ async def example_workflow():
 
 ### 7.3 Context Window Optimization
 
+The pattern below is the MCP-specific form of the programmatic tool calling convention analysed in @sec-485-programmatic-tool-calling: rather than exposing each MCP tool as a JSON schema the model invokes one call at a time, the server hands the agent a code module and a sandbox, and intermediate results are reduced inside the sandbox instead of being replayed through the context window. @patel2026bitter quantify what this buys across fourteen models on BFCL v4. The relevant results for an MCP deployment are three. Token cost crosses over at a fan-out of roughly 26 calls, below which the module source is pure overhead and above which the per-call JSON envelope dominates, so the pattern is worth adopting for servers whose tools are typically invoked in bulk and not for those answering one lookup per turn. Enumeration accuracy is where the larger effect sits, since JSON dispatch on a strong model was measured returning every item out to a fan-out of 70 and none at all by 100, while the code path stayed complete. And accuracy under a context flooded with irrelevant material improved by 5.5% under the code path while degrading by 2.3% under direct JSON dispatch, which is the mechanism this subsection is named for: payloads that never enter the window cannot be crowded out of it.
+
 As documented in Anthropic's engineering guidance, direct tool calling through MCP can consume excessive context tokens. The code execution pattern addresses this:
 
 ```{python}
@@ -2636,7 +2638,487 @@ def metrics_endpoint() -> bytes:
     return generate_latest()
 ```
 
-## 11. Conclusion
+## 11. Opaque Client-Side State as a Trust Boundary {#sec-519-opaque-state-trust}
+
+### 11.1 The Relayed-State Pattern MCP Inherits
+
+Sections 5 through 10 treated the MCP attack surface as a question of what a server is permitted to *do*: which tools it exposes, which OAuth scopes it holds, which inputs it will accept. There is a second surface that is easy to overlook precisely because it looks inert, and it is the state the host relays but cannot read.
+
+Contemporary reasoning models do not keep their chain of thought on the server. They return it to the caller as an opaque encrypted block, and the caller is expected to hand that same block back on every subsequent turn so the model can resume where it left off. The design is attractive for the provider: the serving tier stays stateless, and the client becomes the storage layer for reasoning continuity.
+
+MCP hosts sit squarely in that relay path. A host that maintains a multi-turn conversation while brokering tool calls will carry those blocks in its conversation buffer, persist them in session stores, emit them through the structured logging pipeline of Section 10.1, place them in the response cache of Section 9.2, and forward them to whatever analytics platform the enterprise integration of Section 7.1 targets. From the host's perspective the block is just a token: opaque, semantically empty, safe to copy anywhere.
+
+@panfilov2026stealing show that this reading is wrong, and wrong in a way that has a clean architectural fix. Their central observation is that the encrypted blocks issued by a provider are fully compatible and interchangeable across different sessions, different users, and different models inside that provider's ecosystem. Nothing in the ciphertext names the session, the user, or the model it was minted for. The authors turn that observation into a decryption technique: inject a block produced by a capable, heavily safeguarded model into a request aimed at a weaker, less safeguarded model in the same ecosystem, and the weaker model will decode and emit the trace verbatim in plaintext. The stronger model is never jailbroken at all. The result is demonstrated across Anthropic, OpenAI, and Google deployments, and was responsibly disclosed with proposed cryptographic and system-level mitigations.
+
+The rest of this section states the trust boundary formally, names the vulnerability class, derives the binding requirement that closes it, and then reduces the whole thing to a checklist for people building MCP integrations. The lesson generalizes well past reasoning traces: any opaque provider state that transits an untrusted client is part of your trust boundary whether or not you can read it.
+
+### 11.2 Stating the Trust Boundary
+
+Let $P$ be a provider operating a set of models $\mathcal{M}$, serving a set of users $\mathcal{U}$, across a set of live sessions $\mathcal{S}$. Let $r$ denote a reasoning trace in plaintext, and let $c$ denote the sealed block that $P$ returns to the caller in place of $r$. Write $\mathrm{ctx} = (s, u, m)$ for the context in which $c$ was minted, with $s \in \mathcal{S}$ the session identifier, $u \in \mathcal{U}$ the user or tenant identifier, and $m \in \mathcal{M}$ the model identifier.
+
+Two properties are wanted:
+
+**Confidentiality.** No principal other than $P$ and the authorized holder of $\mathrm{ctx}$ learns $r$ from $c$.
+
+**Context integrity.** Any block $c'$ presented to $P$ under a context $\mathrm{ctx}'$ was minted by $P$ for exactly $\mathrm{ctx}'$.
+
+The trust boundary is therefore *not* the network edge, and it is not the MCP transport. It is the pair consisting of the provider key domain and the named principal. Everything outside that pair, including the MCP host, its logs, its cache, its session store, and any repository into which a developer pastes a transcript, is hostile territory by construction.
+
+Now write $\mathrm{Valid}(c, \mathrm{ctx}) \in \{0, 1\}$ for the provider's acceptance predicate, the check performed before a submitted block is opened and fed back into a model. The vulnerability admits a one-line statement:
+
+$$
+\mathrm{Valid}_{\text{unbound}}(c, \mathrm{ctx}) \;=\; \mathrm{Valid}_{\text{unbound}}(c, \mathrm{ctx}') \quad \text{for all } \mathrm{ctx}, \mathrm{ctx}' \text{ in the key domain of } P .
+$$
+
+The acceptance predicate is *constant in the context*. Confidentiality is then enforced only by possession of the provider key, which every model in the ecosystem holds, and context integrity is not enforced at all.
+
+### 11.3 The Confused-Deputy Structure
+
+Section 5.1 listed confused deputy attacks in the MCP threat landscape, where a server acting as an intermediary is manipulated into using its own credentials on an attacker's behalf. The attack of @panfilov2026stealing has exactly that shape, except the deputy is a model.
+
+Formally, a confused deputy is an entity $D$ that holds an ambient authority $\mathcal{A}(D)$ and applies it to an object reference supplied by a requester, without checking that the requester is entitled to that object. Here:
+
+- The deputy is a weaker model $m_w \in \mathcal{M}$, together with its serving stack.
+- The ambient authority is decryption under the provider key, $\mathcal{A}(m_w) = \{\mathrm{Open}_{K}\}$, held by $m_w$ purely because $m_w$ lives in the same key domain as everything else $P$ operates.
+- The object reference is the ciphertext $c$, chosen entirely by the attacker.
+- The missing check is $\mathrm{ctx}(c) \stackrel{?}{=} \mathrm{ctx}(\text{request})$.
+
+The policy posture of $m_w$ is weaker than that of the strong model $m_s$ that minted $c$: fewer refusal behaviors, weaker anti-extraction training, and no notion that the trace it is decoding belongs to a different model at all. The attacker therefore never has to defeat $m_s$. The attacker asks $m_w$ to do something $m_w$ considers ordinary, namely repeat its own prior reasoning, and the serving stack supplies the plaintext because the key matched.
+
+```{mermaid}
+flowchart LR
+    subgraph Untrusted["Untrusted zone: client, MCP host, logs, public repos"]
+        H["MCP host session buffer"]
+        L["Structured logs and public repositories"]
+        ATK["Attacker"]
+    end
+    subgraph Provider["Provider key domain: one key for the whole ecosystem"]
+        MS["Strong model m_s"]
+        MW["Weak model m_w, the deputy"]
+        SEAL["Seal and Open under the provider key"]
+    end
+    MS -->|"emits sealed reasoning block c"| SEAL
+    SEAL -->|"c returned to the caller"| H
+    H -->|"c copied verbatim into logs"| L
+    L -->|"c scraped from a public repo"| ATK
+    ATK -->|"replays c in a request to a weaker model"| MW
+    MW --> SEAL
+    SEAL -->|"opens: key matches, context never checked"| MW
+    MW -->|"emits the trace in plaintext"| ATK
+```
+
+The dashed line an engineer usually draws around the provider is the box on the right. The actual boundary that matters runs between the two boxes, and the arrow from `L` to `ATK` is the one your logging configuration controls.
+
+### 11.4 Key Scope Without Binding Is the Root Cause
+
+It is tempting to read this as a cryptographic weakness. It is not. The cipher is fine. The defect is that the *scope of the key* is much larger than the *scope of the intended reader*, and nothing in the ciphertext narrows the gap.
+
+Define the **binding set** of a sealed block as the set of contexts under which it opens successfully:
+
+$$
+B(c) \;=\; \{\, \mathrm{ctx} \;:\; \mathrm{Valid}(c, \mathrm{ctx}) = 1 \,\} .
+$$
+
+For the current design, $B(c)$ is the entire product space,
+
+$$
+|B_{\text{unbound}}(c)| \;=\; |\mathcal{S}| \cdot |\mathcal{U}| \cdot |\mathcal{M}| ,
+$$
+
+whereas the intended semantics is the singleton $\{\mathrm{ctx}_0\}$ containing only the context of issuance. The exploitable surface is precisely the excess, $|B(c)|-1$, and it grows multiplicatively with the size of the provider's user base and model catalogue. A larger, more successful ecosystem is a *worse* one under this design, which is a reliable signature of a scope error rather than a cipher error.
+
+This failure mode is familiar to anyone who has debugged an authorization system. It is a bearer token with no audience claim. It is a JWT that omits `aud` and `sub`. It is a presigned URL that authenticates the signer but not the resource. Section 5.2 already places an `audience` field in the OAuth configuration for MCP servers for exactly this reason: a credential that does not name its intended relying party is replayable to every relying party that shares the issuer. Opaque provider state is a credential in this sense, and deserves the same discipline.
+
+### 11.5 The Fix: AEAD With an Explicit Associated-Data Tuple
+
+The mitigation is to make the acceptance predicate depend on the context, which is what authenticated encryption with associated data (AEAD) is for. The associated data is not encrypted, it is *authenticated*, so a receiver who presents different associated data cannot make the tag verify.
+
+Concretely, let $K \in \{0,1\}^{256}$ be the provider root key, $r$ the plaintext trace of length $\ell = |r|$ bytes, and $n \in \{0,1\}^{128}$ a fresh random nonce drawn per block. Write $\Vert$ for concatenation, $\oplus$ for bytewise exclusive or, and $\langle i \rangle$ for the 4 byte big-endian encoding of the integer $i$. Derive domain-separated subkeys,
+
+$$
+K_{\mathrm{enc}} = \mathrm{HMAC}(K, \texttt{"enc"}), \qquad
+K_{\mathrm{mac}} = \mathrm{HMAC}(K, \texttt{"mac"}),
+$$
+
+build a keystream by running HMAC-SHA256 in counter mode,
+
+$$
+Z(n, \ell) \;=\; \Big[\, \mathrm{HMAC}(K_{\mathrm{enc}}, n \Vert \langle 0 \rangle) \,\Vert\, \mathrm{HMAC}(K_{\mathrm{enc}}, n \Vert \langle 1 \rangle) \,\Vert\, \cdots \Big]_{1:\ell} ,
+$$
+
+and seal as encrypt-then-MAC:
+
+$$
+e \;=\; r \oplus Z(n, \ell), \qquad
+t \;=\; \big[\, \mathrm{HMAC}\big(K_{\mathrm{mac}},\; \langle |A| \rangle \Vert A \Vert n \Vert e \big) \,\big]_{1:16}, \qquad
+c \;=\; (n, e, t) .
+$$
+
+The whole security argument lives in the choice of $A$. Define the associated-data tuple as
+
+$$
+A \;=\; \mathrm{enc}(s, u, m, n) \;=\; \langle |s| \rangle \Vert s \;\Vert\; \langle |u| \rangle \Vert u \;\Vert\; \langle |m| \rangle \Vert m \;\Vert\; \langle |n| \rangle \Vert n ,
+$$
+
+where $s$ is the session identifier, $u$ the user or tenant identifier, $m$ the model identifier, and $n$ the per-request nonce reused here as a freshness token so a block cannot be replayed even within its own session after the turn it belongs to.
+
+Two details are load bearing.
+
+**The encoding must be injective.** Each field is preceded by its byte length, so the tuple can be parsed back out of $A$ uniquely. Plain concatenation would not be injective: the tuples $(\texttt{"ab"}, \texttt{"c"})$ and $(\texttt{"a"}, \texttt{"bc"})$ produce the same byte string, which silently reopens a slice of the binding hole the construction exists to close. Length prefixing is the cheapest way to guarantee that distinct contexts have distinct associated data.
+
+**The tag must cover $A$, not merely accompany it.** Shipping the context alongside the block as an unauthenticated field, which some systems do for debugging, provides no binding whatsoever, since the attacker simply edits the field.
+
+Under the standard assumption that HMAC-SHA256 is a secure pseudorandom function, an adversary who has observed a valid block $c$ for context $\mathrm{ctx}_0$ and makes $q$ verification attempts has probability at most
+
+$$
+\mathbf{Adv}^{\mathrm{prf}}_{\mathrm{HMAC}}(q) \;+\; q \cdot 2^{-128}
+$$
+
+of producing any $(c', \mathrm{ctx}')$ with $\mathrm{ctx}' \neq \mathrm{ctx}_0$ that verifies. In other words $|B(c)| = 1$ up to negligible forgery advantage, which is exactly the intended semantics from Section 11.4.
+
+#### 11.5.1 The Binding Helper
+
+The helper below is deliberately small: derive subkeys, encode the tuple injectively, seal, and open with a constant-time comparison. Production systems should use a vetted AEAD (AES-GCM or ChaCha20-Poly1305) rather than an HMAC composition, but the associated-data argument is identical and the composition here has the advantage of running on the standard library alone.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import hmac, hashlib, secrets
+
+TAG_LEN = 16
+
+
+def subkey(root: bytes, label: bytes) -> bytes:
+    """Domain-separated subkey derivation from one provider root key."""
+    return hmac.new(root, label, hashlib.sha256).digest()
+
+
+def keystream(k_enc: bytes, nonce: bytes, nbytes: int) -> bytes:
+    """HMAC-SHA256 in counter mode. Never reuse a (k_enc, nonce) pair."""
+    out = bytearray()
+    counter = 0
+    while len(out) < nbytes:
+        out.extend(hmac.new(
+            k_enc, nonce + counter.to_bytes(4, "big"), hashlib.sha256
+        ).digest())
+        counter += 1
+    return bytes(out[:nbytes])
+
+
+def encode_ad(*fields: str) -> bytes:
+    """Injective encoding: every field carries its own length prefix."""
+    parts = []
+    for f in fields:
+        raw = f.encode("utf-8")
+        parts.append(len(raw).to_bytes(4, "big"))
+        parts.append(raw)
+    return b"".join(parts)
+
+
+def seal(root: bytes, plaintext: bytes, ad: bytes):
+    """Encrypt-then-MAC over the associated-data tuple."""
+    k_enc, k_mac = subkey(root, b"state/enc"), subkey(root, b"state/mac")
+    nonce = secrets.token_bytes(16)
+    ct = bytes(a ^ b for a, b in
+               zip(plaintext, keystream(k_enc, nonce, len(plaintext))))
+    tag = hmac.new(k_mac, len(ad).to_bytes(4, "big") + ad + nonce + ct,
+                   hashlib.sha256).digest()[:TAG_LEN]
+    return nonce, ct, tag
+
+
+def unseal(root: bytes, block, ad: bytes):
+    """Verify then decrypt. Returns None on any authentication failure."""
+    nonce, ct, tag = block
+    k_enc, k_mac = subkey(root, b"state/enc"), subkey(root, b"state/mac")
+    expected = hmac.new(k_mac, len(ad).to_bytes(4, "big") + ad + nonce + ct,
+                        hashlib.sha256).digest()[:TAG_LEN]
+    if not hmac.compare_digest(expected, tag):
+        return None
+    return bytes(a ^ b for a, b in
+                 zip(ct, keystream(k_enc, nonce, len(ct))))
+```
+
+## Julia
+
+```julia
+using SHA, Random
+
+const TAG_LEN = 16
+
+subkey(root::Vector{UInt8}, label::String) = hmac_sha256(root, Vector{UInt8}(label))
+
+function keystream(k_enc::Vector{UInt8}, nonce::Vector{UInt8}, nbytes::Int)
+    out = UInt8[]
+    counter = UInt32(0)
+    while length(out) < nbytes
+        ctr = reinterpret(UInt8, [hton(counter)])
+        append!(out, hmac_sha256(k_enc, vcat(nonce, ctr)))
+        counter += UInt32(1)
+    end
+    return out[1:nbytes]
+end
+
+"Injective encoding: every field carries its own length prefix."
+function encode_ad(fields::String...)
+    parts = UInt8[]
+    for f in fields
+        raw = Vector{UInt8}(f)
+        append!(parts, reinterpret(UInt8, [hton(UInt32(length(raw)))]))
+        append!(parts, raw)
+    end
+    return parts
+end
+
+function seal(root::Vector{UInt8}, plaintext::Vector{UInt8}, ad::Vector{UInt8})
+    k_enc, k_mac = subkey(root, "state/enc"), subkey(root, "state/mac")
+    nonce = rand(RandomDevice(), UInt8, 16)
+    ct = plaintext .⊻ keystream(k_enc, nonce, length(plaintext))
+    prefix = reinterpret(UInt8, [hton(UInt32(length(ad)))])
+    tag = hmac_sha256(k_mac, vcat(prefix, ad, nonce, ct))[1:TAG_LEN]
+    return (nonce, ct, tag)
+end
+
+function unseal(root::Vector{UInt8}, block, ad::Vector{UInt8})
+    nonce, ct, tag = block
+    k_enc, k_mac = subkey(root, "state/enc"), subkey(root, "state/mac")
+    prefix = reinterpret(UInt8, [hton(UInt32(length(ad)))])
+    expected = hmac_sha256(k_mac, vcat(prefix, ad, nonce, ct))[1:TAG_LEN]
+    # Constant-time comparison: never short circuit on the first mismatch.
+    diff = reduce(|, expected .⊻ tag; init = UInt8(0))
+    diff == 0x00 || return nothing
+    return ct .⊻ keystream(k_enc, nonce, length(ct))
+end
+```
+
+## Rust
+
+```rust
+// Cargo.toml: aead = "0.5", chacha20poly1305 = "0.10", rand = "0.8"
+use aead::{Aead, AeadCore, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use rand::rngs::OsRng;
+
+/// Injective encoding: every field carries its own length prefix, so no two
+/// distinct context tuples can share an associated-data encoding.
+fn encode_ad(fields: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in fields {
+        out.extend_from_slice(&(f.len() as u32).to_be_bytes());
+        out.extend_from_slice(f.as_bytes());
+    }
+    out
+}
+
+pub struct StateBlock {
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+pub fn seal(root: &[u8; 32], plaintext: &[u8], ad: &[u8]) -> StateBlock {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(root));
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, Payload { msg: plaintext, aad: ad })
+        .expect("encryption failure");
+    StateBlock { nonce: nonce.to_vec(), ciphertext }
+}
+
+/// Returns `None` when the block was minted for a different context. The AEAD
+/// tag covers `ad`, so a block lifted into another session, user, or model
+/// fails authentication rather than decrypting into the wrong place.
+pub fn unseal(root: &[u8; 32], block: &StateBlock, ad: &[u8]) -> Option<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(root));
+    let nonce = Nonce::from_slice(&block.nonce);
+    cipher
+        .decrypt(nonce, Payload { msg: &block.ciphertext, aad: ad })
+        .ok()
+}
+```
+
+:::
+
+### 11.6 What Binding Actually Buys, Vector by Vector
+
+@panfilov2026stealing demonstrate four attack vectors. Context binding does not defeat all four equally, and it is worth being precise about which ones it closes outright and which ones it merely narrows.
+
+**Vector 1: circumventing anti-distillation protections.** Providers hide reasoning traces partly to protect intellectual property, since a trace is dense intermediate supervision and is far more valuable per token than a final answer. The knowledge distillation chapter of this book treats teacher-student transfer in the setting where the teacher's outputs are legitimately available; the concern here is the unauthorized extraction of a teacher's *hidden* intermediate supervision. Binding the model identifier $m$ into $A$ closes the cross-model oracle outright: a block minted under $m_s$ cannot be opened in a request routed to $m_w$. It does *not* stop an adversary who is willing to pay for legitimate queries to $m_s$ and distill from its visible outputs. Binding removes the cheap oracle, not the expensive one.
+
+**Vector 2: private data extraction from public logs.** This is the vector most directly under an MCP integrator's control, and the one where binding helps only partly. Binding makes a scraped block undecryptable by anyone who cannot reproduce $(s, u, m, n)$. But if the scraped artifact is a session log, the session and user identifiers are frequently sitting in the same JSON object as the block, so an attacker who scraped one scraped both. Honest engineering therefore requires a second ingredient: bind to something the client never sees. Deriving a per-user key $K_u = \mathrm{KDF}(K, u)$ that lives only server side, and attaching a short expiry to $n$, forces decryption to consult a live provider-side record rather than merely to parse the attacker's own input. Binding plus a server-side secret plus expiry is the full requirement; binding alone is not.
+
+**Vector 3: hazardous content hidden inside the reasoning channel.** The authors show cases where the visible answer safely refuses while the reasoning that produced it contains the hazardous material. Binding is essentially orthogonal here. It stops a third party from reading your trace, but the authorized user can still decode a trace within their own legitimate context. The real mitigation is that safety policy must be evaluated over the reasoning channel and not only over the visible channel. This is a model-side control, not a protocol-side one, and MCP integrators should assume the reasoning channel is at least as sensitive as the visible one until told otherwise.
+
+**Vector 4: invisible prompt injection into agentic rollouts.** An attacker embeds a payload entirely inside an encrypted block, publishes it as part of an apparently innocuous rollout, and waits for an agent to resume from it. Nothing in the visible text of the transcript reveals the payload, which defeats every text-level injection filter of the sort described in Section 5.3. Binding closes the cross-context case cleanly: a payload sealed for the attacker's own session fails authentication the moment a victim's agent presents it under a different $(s, u, m)$. The residual case is the shared or forked rollout, where the victim's agent deliberately continues a context the attacker legitimately owned. That case needs provenance checks on rollout adoption, not cryptography, and it deserves the same human-in-the-loop gate that Section 5.5 applies to consequential tool calls.
+
+The pattern across all four is worth naming. Binding converts a global capability, decryption anywhere in the ecosystem, into a local one. It does not make the underlying content less sensitive, and it does not substitute for not publishing the content in the first place.
+
+### 11.7 A Working Demonstration of the Defense
+
+The cell below runs the defense end to end. It seals a reasoning block for a mint context, then replays that block into a foreign session, a foreign user, a foreign model, and a tampered ciphertext, under two schemes: an unbound scheme whose associated data is empty, and the context-bound scheme of Section 11.5. It then computes the leakage rates from the disclosed corpus. Nothing here touches a real provider API.
+
+```{python}
+#| label: code-mcp-context-bound-state
+
+import hmac, hashlib, secrets
+
+TAG_LEN = 16
+ROOT = secrets.token_bytes(32)
+TRACE = b"step 1: fetch customer record acct 88431; key sk-live-REDACTED"
+MINT = {"session": "sess-a91f", "user": "user-7734", "model": "reasoner-pro"}
+
+
+def subkey(root, label):
+    return hmac.new(root, label, hashlib.sha256).digest()
+
+
+def keystream(k_enc, nonce, nbytes):
+    out, counter = bytearray(), 0
+    while len(out) < nbytes:
+        out.extend(hmac.new(k_enc, nonce + counter.to_bytes(4, "big"),
+                            hashlib.sha256).digest())
+        counter += 1
+    return bytes(out[:nbytes])
+
+
+def encode_ad(*fields):
+    """Injective: every field carries its own 4 byte length prefix."""
+    parts = []
+    for f in fields:
+        raw = f.encode("utf-8")
+        parts.append(len(raw).to_bytes(4, "big"))
+        parts.append(raw)
+    return b"".join(parts)
+
+
+def seal(root, plaintext, ad):
+    k_enc, k_mac = subkey(root, b"state/enc"), subkey(root, b"state/mac")
+    nonce = secrets.token_bytes(16)
+    ct = bytes(a ^ b for a, b in
+               zip(plaintext, keystream(k_enc, nonce, len(plaintext))))
+    tag = hmac.new(k_mac, len(ad).to_bytes(4, "big") + ad + nonce + ct,
+                   hashlib.sha256).digest()[:TAG_LEN]
+    return (nonce, ct, tag)
+
+
+def unseal(root, block, ad):
+    nonce, ct, tag = block
+    k_enc, k_mac = subkey(root, b"state/enc"), subkey(root, b"state/mac")
+    expected = hmac.new(k_mac, len(ad).to_bytes(4, "big") + ad + nonce + ct,
+                        hashlib.sha256).digest()[:TAG_LEN]
+    if not hmac.compare_digest(expected, tag):
+        return None
+    return bytes(a ^ b for a, b in zip(ct, keystream(k_enc, nonce, len(ct))))
+
+
+def ad_for(ctx, bound):
+    # The unbound scheme authenticates an empty tuple: the key is the only scope.
+    return encode_ad(ctx["session"], ctx["user"], ctx["model"]) if bound else b""
+
+
+def replay(ctx, bound, corrupt=False):
+    nonce, ct, tag = seal(ROOT, TRACE, ad_for(MINT, bound))
+    if corrupt:
+        flipped = bytearray(ct)
+        flipped[0] ^= 0x01
+        ct = bytes(flipped)
+    return unseal(ROOT, (nonce, ct, tag), ad_for(ctx, bound)) == TRACE
+
+
+CASES = [
+    ("legitimate replay", dict(MINT), False),
+    ("cross-session lift", {**MINT, "session": "sess-ffee"}, False),
+    ("cross-user lift", {**MINT, "user": "user-0001"}, False),
+    ("cross-model lift (oracle)", {**MINT, "model": "chat-mini"}, False),
+    ("ciphertext tampering", dict(MINT), True),
+]
+
+print("opaque state block replay matrix")
+print(f"{'case':<28}{'unbound':>10}{'context-bound':>16}")
+print("-" * 54)
+n_unbound, n_bound = 0, 0
+for label, ctx, corrupt in CASES:
+    u = replay(ctx, bound=False, corrupt=corrupt)
+    b = replay(ctx, bound=True, corrupt=corrupt)
+    n_unbound += u
+    n_bound += b
+    print(f"{label:<28}{'ACCEPT' if u else 'REJECT':>10}"
+          f"{'ACCEPT' if b else 'REJECT':>16}")
+print("-" * 54)
+print(f"accepted by unbound scheme : {n_unbound} / {len(CASES)}")
+print(f"accepted by bound scheme   : {n_bound} / {len(CASES)}")
+
+# Leakage arithmetic from the disclosed public-repository corpus.
+blocks, pii, creds = 315_320, 367, 182
+artifacts = pii + creds
+print()
+print("public-repository leakage corpus")
+print(f"blocks decoded             : {blocks:,}")
+print(f"PII artifacts              : {pii}  ({1e4 * pii / blocks:.2f} per 10k blocks)")
+print(f"credentials                : {creds}  ({1e4 * creds / blocks:.2f} per 10k blocks)")
+print(f"any sensitive artifact     : {artifacts}  ({1e2 * artifacts / blocks:.4f} percent)")
+print(f"blocks scanned per credential: {blocks / creds:,.0f}")
+```
+
+Running this produces:
+
+```
+opaque state block replay matrix
+case                           unbound   context-bound
+------------------------------------------------------
+legitimate replay               ACCEPT          ACCEPT
+cross-session lift              ACCEPT          REJECT
+cross-user lift                 ACCEPT          REJECT
+cross-model lift (oracle)       ACCEPT          REJECT
+ciphertext tampering            REJECT          REJECT
+------------------------------------------------------
+accepted by unbound scheme : 4 / 5
+accepted by bound scheme   : 1 / 5
+
+public-repository leakage corpus
+blocks decoded             : 315,320
+PII artifacts              : 367  (11.64 per 10k blocks)
+credentials                : 182  (5.77 per 10k blocks)
+any sensitive artifact     : 549  (0.1741 percent)
+blocks scanned per credential: 1,733
+```
+
+The unbound scheme accepts 4 of the 5 replays, rejecting only the case where the ciphertext bytes themselves were altered, because integrity of the *bytes* was the only property it ever promised. The context-bound scheme accepts 1 of 5, exactly the legitimate same-context replay. That gap is the entire vulnerability, and closing it costs one HMAC over a few dozen extra bytes.
+
+The second block quantifies why this matters operationally. Let $N = 315{,}320$ be the number of reasoning blocks the authors decoded after scraping public repositories, $n_{\mathrm{pii}} = 367$ the recovered personally identifiable information artifacts, and $n_{\mathrm{cred}} = 182$ the recovered credentials. The observed rates are
+
+$$
+\hat{p}_{\mathrm{pii}} = \frac{n_{\mathrm{pii}}}{N} = 1.164 \times 10^{-3}, \qquad
+\hat{p}_{\mathrm{cred}} = \frac{n_{\mathrm{cred}}}{N} = 5.77 \times 10^{-4},
+$$
+
+that is 11.64 PII artifacts and 5.77 credentials per ten thousand blocks, with 549 sensitive artifacts in total, or 0.1741 percent of all blocks. Equivalently, an attacker expects to scan roughly 1,733 blocks per recovered credential.
+
+Read that number the right way. It is small per block and enormous in aggregate: a rate of one credential per 1,733 blocks means that a moderately busy agentic deployment which logs a few hundred thousand blocks per month is leaking on the order of a hundred credentials per month if those logs ever become public. These are counts over one scraped corpus rather than a random sample of all deployments, so they characterize what public developer repositories happen to contain, not a universal base rate. The direction of the bias is worth noting too: developers who paste transcripts into public repositories are plausibly *less* careful than average, but they also plausibly redact the fields they can read, and the whole point of the finding is that they could not read these.
+
+### 11.8 Implications for MCP Implementations
+
+Most readers of this chapter are not building the provider side, so the actionable half of this finding is about what a host or server does with state it cannot read. The operating rule is short: **treat any opaque provider field as ciphertext of user content, not as an identifier.**
+
+The concrete consequences map onto sections already covered.
+
+1. **Logging (Section 10.1).** Add opaque state fields to the redaction list in your structured logging configuration, next to tokens and secrets. The default of serializing the whole request object is what produced the corpus above. Log a stable hash of the block if you need correlation, never the block itself.
+
+2. **Caching (Section 9.2).** Never use an opaque state block as a cache key, and never store one in a cache shared across tenants. A cache key is frequently logged, exported to metrics, or visible in a debug endpoint, all of which reintroduce the leak by a side door.
+
+3. **Enterprise data flows (Section 7.1).** Exclude these fields from analytics exports and warehouse loads. A field that your pipeline treats as an opaque string is still regulated personal data if it decrypts to a customer record, and your data governance classification should say so.
+
+4. **Multi-agent orchestration (Section 7.2).** Never hand one agent's opaque state to a model different from the one that produced it. Under a bound scheme this fails cleanly at authentication; under an unbound scheme it silently works, which is worse.
+
+5. **Inbound validation (Section 5.3).** Treat a returned state block as untrusted input on the way back in. A host that mints its own session state should verify that any block it is handed was minted for the current session, which is the client-side analogue of the same binding argument.
+
+6. **Metrics (Section 10.2).** Export a counter of state blocks rejected for context mismatch, labelled by rejection reason. Under normal operation that counter is zero. A nonzero rate is either a genuine bug in session handling or somebody probing you, and both are things you want to find out about from a dashboard rather than from a disclosure report.
+
+7. **Human-in-the-loop (Section 5.5).** When an agent resumes from state it did not itself produce, for example a rollout adopted from a shared repository or a colleague's transcript, route that adoption through the same approval gate as a consequential tool call. This is the only defense against the shared-rollout residual case from Section 11.6.
+
+The deeper point is architectural, and it long outlives the specific finding. MCP's design philosophy places the host in control of the trust boundary: the host decides which servers connect, which tools run, and which data flows where. That authority is only meaningful if the host knows what it is holding. Opaque state is the case where it does not, and the correct posture toward data you cannot inspect is not indifference but the maximum sensitivity classification consistent with its provenance.
+
+## 12. Conclusion
 
 The Model Context Protocol represents a significant architectural advancement in connecting AI systems with operational data and tools. This chapter has provided a comprehensive treatment spanning protocol specification, transport mechanisms, security architecture, implementation patterns, and enterprise deployment considerations.
 
@@ -2656,3 +3138,5 @@ For practitioners building data platforms like DataCore, MCP offers a standardiz
 6.  Anthropic. "Code execution with MCP: building more efficient AI agents." November 2025.
 7.  OWASP. "Top 10 for Large Language Model Applications."
 8.  OAuth 2.1 Authorization Framework. IETF Draft.
+9.  Panfilov, A., Schmotz, D., Shumailov, I., Beurer-Kellner, L., Schaeffer, J., Prabhu, A., Geiping, J., and Andriushchenko, M. "Stealing Reasoning Traces from Proprietary LLM APIs." arXiv:2608.09867, August 2026.
+10. Patel, I., Sen, S., Lumer, E., and Subbiah, V. K. "The Bitter Lesson of Tool Calling." arXiv:2608.06370, August 2026.

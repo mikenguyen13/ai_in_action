@@ -10,6 +10,8 @@ This architecture, while effective for many applications, exhibits systematic we
 
 Graph-based retrieval-augmented generation addresses these limitations by organizing knowledge into a graph structure that explicitly represents entities and their relationships. Rather than treating a corpus as an undifferentiated collection of text chunks, graph-based approaches extract structured knowledge, represent it as nodes and edges in a graph, and leverage graph algorithms and graph neural networks to perform retrieval that respects relational structure. The graph serves as both an index and a reasoning substrate, enabling the system to traverse multi-hop paths, aggregate information across related entities, and provide the language model with contextualized, structured evidence.
 
+The formulation that gave this family its name is due to @edge2024local, whose GraphRAG system is the reference point for most of what follows. Their framing turns on a distinction that flat retrieval cannot express. A **local** query names its own evidence: "what side effects were reported for drug X" is answered by finding the passages about drug X, and top-$k$ vector retrieval is a good instrument for that. A **global** query names none of it: "what are the main themes in this corpus" has no answer in any particular passage, because the answer is a property of the collection as a whole. No value of $k$ helps, since the relevant text is the entire corpus and the operation required is summarization rather than retrieval. GraphRAG answers global queries by building, at index time, a hierarchy of entity communities over an extracted knowledge graph and having a language model write a summary of each community; a query is then answered by mapping over community summaries at a chosen level of the hierarchy and reducing the partial answers into one. The rest of this chapter develops the machinery that construction requires, and returns to the global-versus-local distinction once the community-detection tools are in place.
+
 This chapter develops the theory, algorithms, and implementation of graph-based retrieval-augmented generation systems. We begin with the mathematical foundations of graphs and graph neural networks, proceed through knowledge graph construction and entity-relation extraction, develop retrieval algorithms that operate over graph structures, examine mechanisms for integrating graph-derived context into language model generation, and conclude with production considerations including scalability, evaluation, and deployment architecture.
 
 ## Mathematical Foundations
@@ -1463,6 +1465,18 @@ what this group of entities represents and how they relate to each other."""
         
         return summaries
 ```
+
+### From Communities to Global Queries {#sec-469-global-vs-local}
+
+The Louvain partition above is a clustering of a graph, and on its own it is only an indexing convenience. What @edge2024local add is an argument about *which questions it makes answerable*, and the argument is worth stating precisely because it is the strongest available justification for paying the cost of graph construction at all.
+
+Recall the two query regimes. Write $R_k(q)$ for the top-$k$ passages a dense retriever returns for query $q$, and let $A^\star(q)$ be the set of source passages a correct and complete answer must draw on. A query is **local** when $|A^\star(q)|$ is small and its members are individually similar to $q$, so that $A^\star(q) \subseteq R_k(q)$ for modest $k$; a query is **global** when $|A^\star(q)|$ grows with the corpus, or when its members bear no lexical or semantic resemblance to $q$ at all. "What are the top themes in this dataset" is global under both readings: the evidence is every document, and no document is similar to the question. Increasing $k$ cannot fix this, because the binding constraint is the context window, not the retriever. This is the failure mode that motivates the whole construction.
+
+The GraphRAG answer is to pay for summarization once, at index time, rather than per query. Run entity and relation extraction over the corpus to obtain the graph $G$ of the preceding sections. Partition it hierarchically, so that level $\ell = 0$ is a fine partition into many small communities and each successive level merges them into fewer, larger ones; @edge2024local use the Leiden algorithm, a refinement of Louvain that repairs the badly connected communities Louvain can produce, but the modularity objective is the one derived above. For each community $C$ at each level, have a language model write a self-contained summary $\sigma(C)$ from the descriptions of the entities and relations it contains, working bottom-up so that a large community's summary is composed from its children's summaries rather than from raw text. The index is then the set $\{\sigma(C)\}$ over all communities at all levels.
+
+A global query is answered by a map-reduce over one level of that hierarchy. In the map step, each community summary at the chosen level $\ell$ is placed in its own context window with the query, and the model produces a partial answer together with a self-reported helpfulness score in $[0, 100]$. In the reduce step, partial answers are sorted by score, filtered to drop the zeros, packed into a single context window, and synthesized into a final response. The structure matters more than the details: the map step is embarrassingly parallel and each of its calls sees a *summary* rather than raw passages, which is what lets the method reason over a corpus far larger than any context window. Choosing $\ell$ trades breadth against cost. Low levels give many small, specific summaries and a large number of map calls; high levels give few broad summaries and a cheap query. @edge2024local report that intermediate levels of the hierarchy already match root-level summaries on answer quality at substantially lower token cost, and that across their two corpora both GraphRAG and a naive full-corpus summarization baseline beat vector RAG on comprehensiveness and diversity, with GraphRAG reaching that quality at a fraction of the per-query tokens.
+
+The honest objection to all of this is the index-time bill. Summarizing every community at every level requires a language-model call per community, over a corpus that may not have been queried yet, and that up-front cost is what deters most teams from deploying graph RAG at all. Microsoft Research's follow-on, **LazyGraphRAG**, attacks exactly this: it performs only the cheap, deterministic part of indexing, that is, graph construction and community detection with no language model involved, and defers every summarization call to query time, doing the work only for the communities a given query actually touches [@msr2024lazygraphrag]. The reported effect is an indexing cost equal to that of plain vector RAG, roughly a thousandth of full GraphRAG's, while retaining comparable global-query quality. The design principle generalizes past this system: in a retrieval architecture, any expensive transformation of the corpus that is not query-dependent should be examined for whether it can be made lazy, because the fraction of an index that a real query workload ever touches is usually small. The compact-model result of @komarov2026ragu later in this chapter is the same economy pursued along the other axis, shrinking the cost of each extraction call rather than avoiding the call.
 
 ## Context Assembly and Generation
 
@@ -3082,6 +3096,666 @@ global_answer = asyncio.run(
     global_engine.a_search("What themes span the whole corpus?")
 )
 ```
+
+## Zero-Token Memory Operations for Agents {#sec-469-zero-token-memory}
+
+Every construction pipeline developed so far in this chapter spends language model calls on the graph itself. Entity and relation extraction runs a model over each chunk, coreference resolution and entity linking run further passes, and community summarization runs one more. That expenditure is justified when the corpus is written once and queried many times, because the extraction cost amortizes. It is much harder to justify for an agent whose memory grows with every interaction, since each new turn triggers a fresh write and the amortization never arrives. Zero-Mem takes the extreme position on this question and asks whether structured memory access requires generation at all [@xiao2026zeromem]. Its answer is that no step outside final question answering needs to invoke a language model or consume language model tokens, and that the entity graph machinery of this chapter is exactly what makes the deterministic alternative work.
+
+### A Token Accounting Model for Agent Memory
+
+Fix an agent that has recorded $N$ interaction traces $\mathcal{T} = \{t_1, \dots, t_N\}$ and must serve $Q$ queries against them. A generative memory system spends language model tokens in three places. The write path applies an operator $\mathcal{W}$ to each incoming trace, extracting entities, distilling facts, and merging them into whatever record structure the system maintains, at a cost of $c_w$ tokens per interaction. The read path applies a mediation operator $\mathcal{R}$ to each query, rewriting it, planning a retrieval, or judging candidate records, at a cost of $c_r$ tokens per query. The reader finally answers each query at a cost of $c_a$ tokens, counting both the retrieved context it consumes and the answer it emits. Total language model token consumption is therefore
+
+$$
+C_{\text{gen}}(N, Q) = N c_w + Q c_r + Q c_a .
+$$
+
+Zero-token memory operations mean that $\mathcal{W}$ and $\mathcal{R}$ are implemented without invoking a language model, so the first two terms vanish identically:
+
+$$
+C_{\text{zero}}(N, Q) = Q c_a .
+$$
+
+The relative saving is
+
+$$
+\rho(N, Q) = 1 - \frac{C_{\text{zero}}}{C_{\text{gen}}} = 1 - \frac{Q c_a}{N c_w + Q (c_r + c_a)} .
+$$
+
+Two regimes matter, and they behave differently. In the first, the query workload is fixed at $Q = Q_0$ while the interaction history keeps growing. Then
+
+$$
+1 - \rho(N, Q_0) = \frac{Q_0 c_a}{N c_w + Q_0 (c_r + c_a)} = \Theta\!\left(\frac{1}{N}\right),
+$$
+
+so $\rho \to 1$ and the saving approaches the whole token budget. This is the long-lived assistant that accumulates history far faster than it is interrogated, and it is the case where generative memory is worst off, because it pays $c_w$ for material that may never be read.
+
+In the second regime the workload scales with the history, $Q = \alpha N$ for a fixed query-to-interaction ratio $\alpha > 0$. The factors of $N$ cancel and the saving becomes a constant independent of history length,
+
+$$
+\rho_\infty(\alpha) = 1 - \frac{\alpha c_a}{c_w + \alpha (c_r + c_a)} .
+$$
+
+Differentiating, $\rho_\infty$ is strictly decreasing in $\alpha$, since a query-heavy workload dilutes the fixed per-interaction write saving. Taking $\alpha \to \infty$ gives the floor
+
+$$
+\lim_{\alpha \to \infty} \rho_\infty(\alpha) = 1 - \frac{c_a}{c_r + c_a} = \frac{c_r}{c_r + c_a} > 0 .
+$$
+
+This is the load-bearing structural result. Even for an agent queried far more often than it is written to, where the write saving is negligible, eliminating read mediation alone still removes a fixed fraction $c_r / (c_r + c_a)$ of the token budget. There is no workload at which zero-token memory operations stop paying, because $c_w > 0$ and $c_r > 0$ make $\rho > 0$ for every finite $N$ and $Q$. The crossover question is therefore not whether but by how much, and the answer depends only on the ratio of mediation cost to answering cost.
+
+### Encoder Compute Is Accounted Separately, Not Eliminated
+
+The claim above is about language model tokens, and it would be dishonest to present it as a claim about total arithmetic. Zero-Mem still embeds traces and queries with a text encoder, and it still builds and traverses an index. The paper is explicit that encoder computation is accounted for separately, and the model should be too. Let $\ell_x$ be the encoder tokens per stored trace, $\ell_q$ the encoder tokens per query, and $\ell_g$ the additional encoder tokens per trace charged to building the graph and hierarchy views. Write $\kappa$ for the cost of one encoder token expressed in language model token equivalents, a number well below one because encoders are small and run in a single forward pass with no autoregressive decode. The two systems then cost
+
+$$
+T_{\text{gen}} = N c_w + Q(c_r + c_a) + \kappa \left( N \ell_x + Q \ell_q \right),
+$$
+
+$$
+T_{\text{zero}} = Q c_a + \kappa \left( N \ell_x + Q \ell_q + N \ell_g \right).
+$$
+
+Both systems pay the base encoding term, so it cancels in the comparison, leaving
+
+$$
+T_{\text{gen}} - T_{\text{zero}} = N c_w + Q c_r - \kappa N \ell_g .
+$$
+
+Zero-token memory wins on total accounted cost exactly when
+
+$$
+c_w + \frac{Q}{N} c_r > \kappa \, \ell_g ,
+$$
+
+which is the honest crossover condition. It fails only if an encoder token were to cost more than a language model token by a wide margin, which inverts the actual hardware economics. The cell below instantiates this with concrete parameters and reports the break-even value of $\kappa$.
+
+### Preserving Traces as a Rate-Distortion Choice
+
+The second half of the argument concerns what generative memory throws away. A write operator $\mathcal{W}$ maps a trace $X$ to a record $M = \mathcal{W}(X)$ at rate $R = I(X; M)$ bits. Because $M$ is a deterministic function of $X$ and answering proceeds through $M$, the Markov chain $X \to M \to \hat{A}$ holds and the data processing inequality gives $I(A; M) \le I(A; X)$ for any answer variable $A$. Evidence dropped at write time cannot be recovered by any later retrieval, however clever. This is not a criticism of summarization as such, it is a statement that the compression is irreversible.
+
+The sharper point is when the compression is chosen. Let $d(x, q, \hat{a})$ be the distortion of answering query $q$ about trace content $x$. A generative memory system must commit to a single $\mathcal{W}$ before the query distribution is realized, so it solves
+
+$$
+D_{\text{write}} = \min_{\mathcal{W} : R(\mathcal{W}) \le R} \; \mathbb{E}_{q} \, \mathbb{E}_{x} \; d\big(x, q, \mathcal{W}(x)\big),
+$$
+
+a single compressor that must serve every query it will ever see. Preserving original traces sets $M = X$, paying the full rate $H(X)$ in storage, and defers compression to query time, where the context window budget is spent by a query-dependent selector $\mathcal{W}_q$:
+
+$$
+D_{\text{read}} = \mathbb{E}_{q} \; \min_{\mathcal{W}_q : R(\mathcal{W}_q) \le R} \; \mathbb{E}_{x} \; d\big(x, q, \mathcal{W}_q(x)\big).
+$$
+
+Since the minimum of an expectation is never below the expectation of the pointwise minimum, $D_{\text{read}} \le D_{\text{write}}$, with equality only in the degenerate case where one compressor is simultaneously optimal for every query. Deferring the compression is therefore never worse in expected distortion at the same context budget. What it costs is storage and index size, $H(X)$ rather than $R$ bits per trace, plus the encoder passes accounted above. That is the real tradeoff, and it is a favorable one whenever disk is cheaper than lost evidence.
+
+### Two Views over the Same Traces
+
+Zero-Mem organizes the preserved traces in two complementary ways and never rewrites them. The first view is an entity-context graph, which is the construction of the section on knowledge graph construction with the language model removed from the extraction step. Let $V_E$ be the entity vocabulary and let $\iota(t) \subseteq V_E$ be the entities appearing in trace $t$, obtained by deterministic surface matching against the vocabulary rather than by generation. Edge weights count co-mentions,
+
+$$
+A_{uv} = \big| \{ t \in \mathcal{T} : u, v \in \iota(t), \; u \ne v \} \big| ,
+$$
+
+giving the column-stochastic transition matrix $P = A D^{-1}$ with $D_{vv} = \sum_u A_{uv}$. For a query $q$ with anchor entities $Q_e \subseteq V_E$, personalized PageRank from each anchor $e$ solves the linear system introduced earlier in this chapter,
+
+$$
+\pi_e = \alpha r_e + (1 - \alpha) P \pi_e \quad \Longleftrightarrow \quad \pi_e = \alpha \left( I - (1 - \alpha) P \right)^{-1} r_e ,
+$$
+
+where $r_e$ is the indicator of $e$ and $\alpha$ is the restart probability. The relational score of a trace is the geometric mean over anchors of its best entity match,
+
+$$
+s_G(t \mid q) = \left( \prod_{e \in Q_e} \max_{u \in \iota(t)} \pi_e(u) \right)^{1 / |Q_e|} .
+$$
+
+The geometric mean is the essential choice. An arithmetic mean rewards a trace that sits adjacent to one anchor and nowhere near the others, which is precisely the failure mode on multi-hop questions, since almost every trace mentioning a popular anchor would score well. The geometric mean is zero unless the trace is close to every anchor, so it selects traces that lie on a connecting path, which is what "recovering supporting relations" means operationally.
+
+The second view is a temporal hierarchy over sessions and turns. Let $\sigma(t)$ be the session index of trace $t$ and $\tau(t)$ its turn index inside that session, and let $E_s = \bigcup_{\sigma(t) = s} \iota(t)$ be the entity set of session $s$. Session coverage is $c_s = |Q_e \cap E_s| / |Q_e|$, the anchor session is the most recent maximally covering one,
+
+$$
+\sigma^\star = \max \left\{ s : c_s = \max_{s'} c_{s'} \right\},
+$$
+
+and $\pi_s$ is the turn in session $s$ with the largest anchor overlap. The locality score multiplies coverage, session recency, and within-session proximity:
+
+$$
+s_T(t \mid q) = c_{\sigma(t)} \cdot \exp\!\left( - \frac{ | \sigma^\star - \sigma(t) | }{ \tau_0 } \right) \cdot \exp\!\left( - \frac{ ( \tau(t) - \pi_{\sigma(t)} )^2 }{ 2 \sigma_0^2 } \right) .
+$$
+
+The first exponential encodes session state and recency, the second encodes conversational locality inside a session. Both scores are normalized to unit maximum over $\mathcal{T}$ so that they are comparable, and the retrieval score is a convex combination
+
+$$
+s(t \mid q) = \lambda(q) \, \hat{s}_G(t \mid q) + \big( 1 - \lambda(q) \big) \, \hat{s}_T(t \mid q) .
+$$
+
+### Deriving the Query-Dependent View Weight
+
+The weight $\lambda(q)$ is where the coordination happens, and it can be derived rather than tuned. Model relevance as a two-component mixture: a latent variable $Z \in \{G, T\}$ selects which view is responsible for the evidence a query needs, and
+
+$$
+p(t \text{ relevant} \mid q) = \pi_G(q) \, p_G(t \mid q) + \big(1 - \pi_G(q)\big) \, p_T(t \mid q) .
+$$
+
+Ranking by this posterior is Bayes-optimal under the mixture model. If the two normalized scores are calibrated so that $\hat{s}_G \propto p_G$ and $\hat{s}_T \propto p_T$, then matching the convex combination to the mixture gives
+
+$$
+\lambda^\star(q) = \pi_G(q) = P(Z = G \mid q),
+$$
+
+so the optimal weight is not a hyperparameter at all, it is the posterior probability that the query is relational.
+
+Estimating that posterior without a language model requires an observable statistic that separates the two cases. The right one is joint coverage: whether any single stored trace already contains all the anchors. Define
+
+$$
+c^\star(q) = \max_{t \in \mathcal{T}} \frac{ | Q_e \cap \iota(t) | }{ | Q_e | }, \qquad \delta(q) = 1 - c^\star(q) .
+$$
+
+If $\delta(q) = 0$ then some single interaction already witnesses all the anchors together, the evidence is local, and the surrounding conversational context is what the reader needs, so $Z = T$. If $\delta(q) > 0$ then no single interaction witnesses them jointly, the answer must be assembled by following connections across interactions, so $Z = G$. Taking a logistic link on this deficit,
+
+$$
+\lambda^\star(q) = \sigma\big( \beta ( \delta(q) - \delta_0 ) \big), \qquad \sigma(z) = \frac{1}{1 + e^{-z}},
+$$
+
+with $\beta$ a sharpness and $\delta_0$ a threshold placed between the fully covered and partially covered cases. For two-anchor queries $\delta(q) \in \{0, 1/2\}$, and with $\beta = 8$, $\delta_0 = 1/4$ the weight takes the values $\sigma(-2) \approx 0.12$ and $\sigma(2) \approx 0.88$, a soft switch rather than a hard one. Computing $c^\star(q)$ costs a single pass over the inverted index from entities to traces, which is why the coordination step consumes no language model tokens.
+
+```{mermaid}
+flowchart TB
+    I["Interaction traces stored verbatim"]
+    E["Deterministic entity tagging by surface match"]
+    G["Entity context graph"]
+    H["Temporal hierarchy over sessions and turns"]
+    Q["Query with anchor entities"]
+    W["View weight from joint coverage deficit"]
+    SG["Relational score by personalized PageRank"]
+    ST["Locality score by recency and turn window"]
+    C["Weighted merge and top k selection"]
+    F["Consistency filter discards conflicting traces"]
+    R["Final QA reader is the only LLM call"]
+    I --> E
+    E --> G
+    I --> H
+    Q --> W
+    Q --> SG
+    Q --> ST
+    G --> SG
+    H --> ST
+    SG --> C
+    ST --> C
+    W --> C
+    C --> F
+    F --> R
+```
+
+### Deterministic Calibration as a Consistency Filter
+
+Preserving raw traces has a cost the summarizing systems partly avoid: contradictions survive. A trace recorded in session three may assert a status that a trace in session nine overturns, and both are retrieved. Zero-Mem resolves this deterministically before the reader sees anything, and the resolution has a clean combinatorial form.
+
+Let $\mathcal{S}_k$ be the top $k$ traces under $s(\cdot \mid q)$, and suppose each trace carries claims of the form (key, value). Define the conflict relation $t \sim t'$ when the two traces assert different values for the same key. The conflict graph $H = (\mathcal{S}_k, \sim)$ makes the calibration objective a maximum weight independent set,
+
+$$
+\mathcal{S}^\star = \arg\max_{\substack{U \subseteq \mathcal{S}_k \\ U \text{ independent in } H}} \; \sum_{t \in U} s(t \mid q) ,
+$$
+
+which is NP-hard on general graphs. It is not general here. Partition $\mathcal{S}_k$ by key, and within a key partition further by asserted value into parts $V_1, \dots, V_m$. Conflict edges join traces in different parts and never join traces in the same part, so the subgraph on each key is complete multipartite. An independent set in a complete multipartite graph is exactly a subset of a single part, and there are no edges between distinct keys, so the problem separates:
+
+$$
+\mathcal{S}^\star = \bigsqcup_{\text{keys } \kappa} \; \arg\max_{V \in \{V_1^\kappa, \dots, V_{m_\kappa}^\kappa\}} \; \sum_{t \in V} s(t \mid q) .
+$$
+
+The NP-hard objective collapses to one argmax per key, computable in $O(|\mathcal{S}_k|)$ time with a single dictionary pass and no model call. The retained set is internally consistent by construction, and because the reader is restricted to it, the answer is grounded in surviving traces rather than in an intermediate record that has already smoothed the disagreement away.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| label: zeromem-two-view-scoring
+import numpy as np
+
+
+def normalize(v):
+    m = float(np.max(v))
+    return v / m if m > 0 else v
+
+
+def view_weight(deficit, beta=8.0, delta0=0.25):
+    """Mixture prior P(Z = G | q) estimated from the joint coverage deficit."""
+    return 1.0 / (1.0 + np.exp(-beta * (deficit - delta0)))
+
+
+def two_view_score(s_graph, s_temporal, deficit):
+    lam = view_weight(deficit)
+    return lam * normalize(s_graph) + (1.0 - lam) * normalize(s_temporal), lam
+
+
+s_g = np.array([0.90, 0.20, 0.70, 0.10])   # relational proximity per trace
+s_t = np.array([0.10, 0.80, 0.20, 0.90])   # temporal locality per trace
+
+for deficit, name in [(0.0, "anchors share a trace"), (0.5, "anchors never co-occur")]:
+    s, lam = two_view_score(s_g, s_t, deficit)
+    print(f"{name:<24} lambda={lam:.3f}  ranking={np.argsort(-s).tolist()}")
+```
+
+## Julia
+
+```julia
+normalize(v) = maximum(v) > 0 ? v ./ maximum(v) : v
+
+view_weight(deficit; beta = 8.0, delta0 = 0.25) =
+    1.0 / (1.0 + exp(-beta * (deficit - delta0)))
+
+function two_view_score(s_graph, s_temporal, deficit)
+    lam = view_weight(deficit)
+    return lam .* normalize(s_graph) .+ (1.0 - lam) .* normalize(s_temporal), lam
+end
+
+s_g = [0.90, 0.20, 0.70, 0.10]
+s_t = [0.10, 0.80, 0.20, 0.90]
+
+for (deficit, name) in [(0.0, "anchors share a trace"),
+                        (0.5, "anchors never co-occur")]
+    s, lam = two_view_score(s_g, s_t, deficit)
+    println(rpad(name, 24), " lambda=", round(lam, digits = 3),
+            "  ranking=", sortperm(s, rev = true))
+end
+```
+
+## Rust
+
+```rust
+fn normalize(v: &[f64]) -> Vec<f64> {
+    let m = v.iter().cloned().fold(f64::MIN, f64::max);
+    if m > 0.0 { v.iter().map(|x| x / m).collect() } else { v.to_vec() }
+}
+
+fn view_weight(deficit: f64, beta: f64, delta0: f64) -> f64 {
+    1.0 / (1.0 + (-beta * (deficit - delta0)).exp())
+}
+
+fn two_view_score(s_graph: &[f64], s_temporal: &[f64], deficit: f64) -> (Vec<f64>, f64) {
+    let lam = view_weight(deficit, 8.0, 0.25);
+    let (g, t) = (normalize(s_graph), normalize(s_temporal));
+    let s = g.iter().zip(t.iter()).map(|(a, b)| lam * a + (1.0 - lam) * b).collect();
+    (s, lam)
+}
+
+fn main() {
+    let s_g = [0.90, 0.20, 0.70, 0.10];
+    let s_t = [0.10, 0.80, 0.20, 0.90];
+    for (deficit, name) in [(0.0, "anchors share a trace"),
+                            (0.5, "anchors never co-occur")] {
+        let (s, lam) = two_view_score(&s_g, &s_t, deficit);
+        let mut order: Vec<usize> = (0..s.len()).collect();
+        order.sort_by(|&i, &j| s[j].partial_cmp(&s[i]).unwrap());
+        println!("{:<24} lambda={:.3}  ranking={:?}", name, lam, order);
+    }
+}
+```
+
+:::
+
+### A Working Zero-Token Memory Index
+
+The cell below builds the whole apparatus over synthetic multi-session interaction traces without a single model call. Entities are tagged by surface matching, the entity-context graph is a co-mention matrix, the temporal hierarchy is a session and turn indexing, retrieval is the two-view combination derived above, and calibration is the per-key argmax. The corpus is generated with twelve topic clusters of four entities each, so that base sessions never mix clusters, and then a set of cross-session facts is planted: a rare bridge entity is inserted into two traces in different sessions, linking two entities that never co-occur anywhere. Relational questions ask how such a pair is connected, with the two planted traces as ground truth. Temporal questions ask what surrounded the last discussion of an anchor pair, with a three-turn window in the most recent covering session as ground truth. The two question families are constructed so that each single view is systematically wrong on the other family, which is what makes the ablation informative.
+
+```{python}
+#| label: fig-469-zero-token-memory
+#| fig-cap: "Zero-token memory operations. Left: cumulative language model tokens spent on memory under a generative write and read path versus a zero-token path, for a fixed query workload and for a workload proportional to the history. Center: the fraction of language model tokens eliminated, approaching one for a fixed workload and settling at a constant for a proportional workload. Right: two-view ablation, showing that the entity-context graph carries relational questions, the temporal hierarchy carries locality questions, and only the query-dependent weighting is competitive on both."
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+rng = np.random.default_rng(469)
+
+# ---------------------------------------------------------------- synthetic traces
+N_ENT, N_SESS, TURNS, N_CLUST = 48, 60, 8, 12
+entities = [f"e{i:02d}" for i in range(N_ENT)]
+clusters = [entities[c * 4:(c + 1) * 4] for c in range(N_CLUST)]
+clust_of = {e: c for c, cl in enumerate(clusters) for e in cl}
+
+traces = []
+for s in range(N_SESS):
+    cl = clusters[s % N_CLUST]
+    for t in range(TURNS):
+        k = int(rng.integers(2, 4))
+        ents = set(rng.choice(cl, size=k, replace=False).tolist())
+        traces.append({"sid": s, "tid": t, "ents": ents})
+
+n_traces = len(traces)
+
+# plant cross-session relational facts: a rare bridge entity r links a and b,
+# which never co-occur in any single trace, through two traces in different sessions
+N_BRIDGE = 24
+bridges = [f"r{i:02d}" for i in range(N_BRIDGE)]
+entities = entities + bridges
+planted = []
+
+
+def cooccur(a, b):
+    return any(a in tr["ents"] and b in tr["ents"] for tr in traces)
+
+
+base = [f"e{i:02d}" for i in range(N_ENT)]
+attempts = 0
+while len(planted) < N_BRIDGE and attempts < 5000:
+    attempts += 1
+    a, b = rng.choice(N_ENT, size=2, replace=False).tolist()
+    a, b = base[a], base[b]
+    if clust_of[a] == clust_of[b] or cooccur(a, b):
+        continue
+    i, j = rng.integers(0, n_traces), rng.integers(0, n_traces)
+    if traces[i]["sid"] == traces[j]["sid"]:
+        continue
+    if b in traces[i]["ents"] or a in traces[j]["ents"]:
+        continue
+    r = bridges[len(planted)]
+    traces[i]["ents"] |= {a, r}
+    traces[j]["ents"] |= {b, r}
+    planted.append({"a": a, "b": b, "r": r, "gold": {int(i), int(j)}})
+
+N_ENT = len(entities)
+sess_ents = defaultdict(set)
+for i, tr in enumerate(traces):
+    sess_ents[tr["sid"]] |= tr["ents"]
+
+# ---------------------------------------------------------------- entity-context graph
+idx = {e: i for i, e in enumerate(entities)}
+A = np.zeros((N_ENT, N_ENT))
+for tr in traces:
+    es = sorted(tr["ents"])
+    for a in es:
+        for b in es:
+            if a != b:
+                A[idx[a], idx[b]] += 1.0
+col = A.sum(axis=0)
+col[col == 0] = 1.0
+P = A / col  # column-stochastic transition matrix
+
+
+def ppr(seeds, alpha=0.50, iters=80):
+    """Personalized PageRank by power iteration, no model call involved."""
+    r = np.zeros(N_ENT)
+    for e in seeds:
+        r[idx[e]] = 1.0
+    r /= max(r.sum(), 1e-12)
+    x = r.copy()
+    for _ in range(iters):
+        x_new = (1 - alpha) * (P @ x) + alpha * r
+        if np.abs(x_new - x).sum() < 1e-10:
+            x = x_new
+            break
+        x = x_new
+    return x
+
+
+def relational_scores(qents):
+    # one personalized vector per anchor; a trace scores highly only if it is close
+    # to EVERY anchor, hence the geometric mean over anchors of its best entity match
+    vecs = [ppr([e]) for e in sorted(qents)]
+    s = np.zeros(n_traces)
+    for i, tr in enumerate(traces):
+        cols = [idx[e] for e in tr["ents"]]
+        s[i] = np.exp(np.mean([np.log(v[cols].max() + 1e-12) for v in vecs]))
+    return s / max(s.max(), 1e-12)
+
+
+# ---------------------------------------------------------------- temporal hierarchy
+TAU, SIGMA = 2.0, 1.0
+
+
+def coverage(qents):
+    return {s: len(qents & sess_ents[s]) / len(qents) for s in range(N_SESS)}
+
+
+def joint_coverage(qents):
+    """Largest fraction of the anchor set observed inside a SINGLE trace."""
+    return max(len(qents & tr["ents"]) / len(qents) for tr in traces)
+
+
+def temporal_scores(qents):
+    cov = coverage(qents)
+    c_max = max(cov.values())
+    anchor = max([s for s in cov if cov[s] >= c_max - 1e-9])
+    pivot = {}
+    for s in range(N_SESS):
+        best_t, best_o = 0, -1
+        for tr in traces:
+            if tr["sid"] != s:
+                continue
+            o = len(qents & tr["ents"])
+            if o > best_o:
+                best_o, best_t = o, tr["tid"]
+        pivot[s] = best_t
+    s_arr = np.zeros(n_traces)
+    for i, tr in enumerate(traces):
+        s = tr["sid"]
+        rec = np.exp(-abs(anchor - s) / TAU)
+        loc = np.exp(-((tr["tid"] - pivot[s]) ** 2) / (2 * SIGMA**2))
+        s_arr[i] = cov[s] * rec * loc
+    return s_arr / max(s_arr.max(), 1e-12), c_max
+
+
+BETA, DELTA0 = 8.0, 0.25
+
+
+def view_weight(c_max):
+    return 1.0 / (1.0 + np.exp(-BETA * ((1.0 - c_max) - DELTA0)))
+
+
+# ---------------------------------------------------------------- query construction
+trace_by_sid = defaultdict(list)
+for i, tr in enumerate(traces):
+    trace_by_sid[tr["sid"]].append(i)
+
+queries = []
+# relational: the two anchors never co-occur, so the answer must span sessions
+for p in planted:
+    if cooccur(p["a"], p["b"]):
+        continue
+    queries.append({"kind": "relational", "ents": {p["a"], p["b"]}, "gold": p["gold"]})
+
+# temporal: the turn window around the last session that fully covers the anchor set
+n_rel = len(queries)
+for i, tr in enumerate(traces):
+    ents_i = sorted(e for e in tr["ents"] if e.startswith("e"))
+    if len(ents_i) < 2:
+        continue
+    qents = set(ents_i[:2])
+    covering = [s for s in range(N_SESS) if qents <= sess_ents[s]]
+    if len(covering) < 3:
+        continue
+    anchor = max(covering)
+    best_t, best_o = 0, -1
+    for j in trace_by_sid[anchor]:
+        o = len(qents & traces[j]["ents"])
+        if o > best_o:
+            best_o, best_t = o, traces[j]["tid"]
+    gold = {j for j in trace_by_sid[anchor] if abs(traces[j]["tid"] - best_t) <= 1}
+    queries.append({"kind": "temporal", "ents": qents, "gold": gold})
+    if len(queries) - n_rel >= 40:
+        break
+
+n_tmp = len(queries) - n_rel
+
+# ---------------------------------------------------------------- ablation
+K = 5
+_cache = {}
+
+
+def views(qents):
+    key = frozenset(qents)
+    if key not in _cache:
+        _cache[key] = (relational_scores(qents), temporal_scores(qents)[0],
+                       view_weight(joint_coverage(qents)))
+    return _cache[key]
+
+
+def evaluate(mode):
+    out, lams = defaultdict(list), []
+    for q in queries:
+        sg, st, lam_star = views(q["ents"])
+        lam = {"graph": 1.0, "temporal": 0.0, "fixed": 0.5, "adaptive": lam_star}[mode]
+        lams.append(lam)
+        s = lam * sg + (1 - lam) * st
+        ranked = np.argsort(-s)
+        rec = len(set(ranked[:K].tolist()) & q["gold"]) / len(q["gold"])
+        rr = 0.0
+        for rank, i in enumerate(ranked[:50], start=1):
+            if i in q["gold"]:
+                rr = 1.0 / rank
+                break
+        out[q["kind"]].append((rec, rr))
+        out["all"].append((rec, rr))
+    return out, float(np.mean(lams))
+
+
+rows = []
+for mode in ["graph", "temporal", "fixed", "adaptive"]:
+    out, mlam = evaluate(mode)
+    rows.append({"mode": mode,
+                 "rel_rec": np.mean([r for r, _ in out["relational"]]),
+                 "tmp_rec": np.mean([r for r, _ in out["temporal"]]),
+                 "all_rec": np.mean([r for r, _ in out["all"]]),
+                 "all_mrr": np.mean([m for _, m in out["all"]]),
+                 "lam": mlam})
+
+label = {"graph": "entity-graph only (lam=1)", "temporal": "temporal only (lam=0)",
+         "fixed": "fixed blend (lam=0.5)", "adaptive": "two-view adaptive lam(q)"}
+print(f"queries: {n_rel} relational, {n_tmp} temporal, {n_traces} traces, "
+      f"{N_SESS} sessions")
+print()
+hdr = (f"{'retrieval view':<28}{'R@5 rel':>9}{'R@5 tmp':>9}"
+       f"{'R@5 all':>9}{'MRR':>8}{'mean lam':>10}")
+print(hdr)
+print("-" * len(hdr))
+for r in rows:
+    print(f"{label[r['mode']]:<28}{r['rel_rec']:>9.3f}{r['tmp_rec']:>9.3f}"
+          f"{r['all_rec']:>9.3f}{r['all_mrr']:>8.3f}{r['lam']:>10.3f}")
+
+# ---------------------------------------------------------------- calibration
+# every trace records a status claim about its most salient entity, and a fraction of
+# the records are stale, so the retrieved set can hold mutually contradictory traces
+P_STALE = 0.30
+truth, claims = {}, {}
+for i, tr in enumerate(traces):
+    e = sorted(x for x in tr["ents"] if x.startswith("e"))[0]
+    truth[e] = "active"
+    claims[i] = (e, "stale" if rng.random() < P_STALE else "active")
+
+
+def calibrate(cands, scores):
+    """The conflict graph is complete multipartite within each key and disconnected
+    across keys, so maximum weight independent set reduces to one argmax per key."""
+    support = defaultdict(lambda: defaultdict(float))
+    for i in cands:
+        k, v = claims[i]
+        support[k][v] += scores[i]
+    keep, drop = [], []
+    for i in cands:
+        k, v = claims[i]
+        best = max(support[k], key=lambda u: support[k][u])
+        (keep if v == best else drop).append(i)
+    return keep, drop, support
+
+
+raw_ok = cal_ok = n_drop = n_cand = n_conflict = 0
+for q in queries:
+    sg, st, lam = views(q["ents"])
+    s = lam * sg + (1 - lam) * st
+    cands = np.argsort(-s)[:8].tolist()
+    key, v_raw = claims[cands[0]]
+    raw_ok += int(v_raw == truth[key])
+    keep, drop, support = calibrate(cands, s)
+    n_drop += len(drop)
+    n_cand += len(cands)
+    n_conflict += int(len(support[key]) > 1)
+    v_cal = max(support[key], key=lambda u: support[key][u])
+    cal_ok += int(v_cal == truth[key])
+
+n_q = len(queries)
+print()
+print("deterministic calibration over the top-8 retrieved traces per query")
+print(f"  candidate traces examined:        {n_cand}")
+print(f"  queries with a conflicting key:   {n_conflict} of {n_q}")
+print(f"  traces discarded as conflicting:  {n_drop} ({100 * n_drop / n_cand:.1f}%)")
+print(f"  claim accuracy, top trace only:   {raw_ok / n_q:.3f}")
+print(f"  claim accuracy, after filtering:  {cal_ok / n_q:.3f}")
+
+# ---------------------------------------------------------------- token cost model
+c_w, c_r, c_a = 900.0, 700.0, 1500.0
+kappa, L_g = 0.02, 400.0
+Nv = np.arange(10, 2001, 10)
+Q_fixed, alpha = 200.0, 0.5
+gen_fixed = Nv * c_w + Q_fixed * (c_r + c_a)
+zero_fixed = np.full_like(Nv, Q_fixed * c_a, dtype=float)
+gen_prop = Nv * c_w + alpha * Nv * (c_r + c_a)
+zero_prop = alpha * Nv * c_a
+rho_fixed = 1 - zero_fixed / gen_fixed
+rho_prop = 1 - zero_prop / gen_prop
+rho_asym = 1 - alpha * c_a / (c_w + alpha * c_r + alpha * c_a)
+
+print()
+print("token cost model  (c_write=900, c_read=700, c_answer=1500 tokens)")
+print(f"{'N':>6}{'gen (Q=200)':>14}{'zero (Q=200)':>14}{'saving':>9}"
+      f"{'gen (Q=N/2)':>14}{'zero (Q=N/2)':>14}{'saving':>9}")
+for N in [50, 200, 1000, 2000]:
+    j = int(np.where(Nv == N)[0][0])
+    print(f"{N:>6}{gen_fixed[j]:>14,.0f}{zero_fixed[j]:>14,.0f}"
+          f"{100 * rho_fixed[j]:>8.1f}%{gen_prop[j]:>14,.0f}{zero_prop[j]:>14,.0f}"
+          f"{100 * rho_prop[j]:>8.1f}%")
+print(f"asymptotic saving at Q = N/2: {100 * rho_asym:.1f}%")
+print(f"saving floor as Q/N grows without bound: {100 * c_r / (c_r + c_a):.1f}%")
+print(f"encoder crossover: LLM-token-equivalents avoided per interaction = "
+      f"{c_w + alpha * c_r:.0f}, extra index encoding = {kappa * L_g:.1f}; "
+      f"break-even needs kappa > {(c_w + alpha * c_r) / L_g:.2f}")
+
+# ---------------------------------------------------------------- figure
+fig, ax = plt.subplots(1, 3, figsize=(15, 4.2))
+ax[0].plot(Nv, gen_fixed / 1e6, lw=2, label="generative memory (Q=200)")
+ax[0].plot(Nv, zero_fixed / 1e6, lw=2, label="zero-token memory (Q=200)")
+ax[0].plot(Nv, gen_prop / 1e6, lw=2, ls="--", label="generative memory (Q=N/2)")
+ax[0].plot(Nv, zero_prop / 1e6, lw=2, ls="--", label="zero-token memory (Q=N/2)")
+ax[0].set_xlabel("interactions N")
+ax[0].set_ylabel("cumulative LLM tokens (millions)")
+ax[0].set_title("Token cost of memory operations")
+ax[0].legend(fontsize=8)
+ax[0].grid(alpha=0.3)
+
+ax[1].plot(Nv, 100 * rho_fixed, lw=2, label="Q = 200 (fixed workload)")
+ax[1].plot(Nv, 100 * rho_prop, lw=2, label="Q = N/2 (proportional)")
+ax[1].axhline(100 * rho_asym, color="gray", ls=":", lw=1.5,
+              label=f"asymptote {100 * rho_asym:.1f}%")
+ax[1].set_xlabel("interactions N")
+ax[1].set_ylabel("token saving (percent)")
+ax[1].set_title("Fraction of LLM tokens eliminated")
+ax[1].set_ylim(0, 100)
+ax[1].legend(fontsize=8)
+ax[1].grid(alpha=0.3)
+
+xs, w = np.arange(4), 0.38
+ax[2].bar(xs - w / 2, [r["rel_rec"] for r in rows], w, label="relational queries")
+ax[2].bar(xs + w / 2, [r["tmp_rec"] for r in rows], w, label="temporal queries")
+ax[2].set_xticks(xs)
+ax[2].set_xticklabels(["graph\nonly", "temporal\nonly", "fixed\nlam=0.5",
+                       "adaptive\nlam(q)"], fontsize=8)
+ax[2].set_ylabel("Recall@5")
+ax[2].set_title("Two-view ablation")
+ax[2].set_ylim(0, 1.05)
+ax[2].legend(fontsize=8)
+ax[2].grid(alpha=0.3, axis="y")
+
+plt.tight_layout()
+plt.show()
+```
+
+The ablation reproduces the structure of the paper's own result. The entity-context graph alone reaches Recall@5 of 0.739 on relational questions but only 0.333 on locality questions, while the temporal hierarchy alone inverts that profile, reaching 1.000 on locality questions and collapsing to 0.130 on relational ones. Neither view is adequate on its own, with overall Recall@5 of 0.481 and 0.683 respectively. A fixed blend at $\lambda = 0.5$ improves on both, reaching 0.841 overall, which shows that the views are genuinely complementary rather than redundant. The query-dependent weight then adds a further gain that a fixed blend cannot reach, 0.921 overall Recall@5 and 0.861 MRR, because it recovers the full 1.000 on locality questions while also lifting relational recall to 0.783. The mean weight it selects across the mixed workload is 0.397, close to the 23 to 40 split between relational and locality questions in the query set. That last row is the ablation that matters: coordinating the two views per query beats using both views uniformly, and the coordination itself costs one index lookup.
+
+Calibration contributes independently of retrieval. Across 504 candidate traces, 37 of the 63 queries retrieved at least one key with contradictory values, and the filter discarded 99 traces, 19.6 percent of the candidates. Reading only the single top-ranked trace would have answered correctly on 0.524 of the queries; aggregating score-weighted support across the retrieved set and discarding the losing value raises that to 0.714. The filter is a dozen lines of dictionary arithmetic and it is the mechanism that makes trace preservation safe: contradictions are permitted to exist in storage precisely because they are resolved at read time, with the resolution visible and auditable rather than baked into a summary written months earlier.
+
+The cost model panel makes the accounting concrete. With $c_w = 900$, $c_r = 700$, and $c_a = 1500$ tokens, a fixed workload of 200 queries against a growing history costs a generative memory system 1,340,000 tokens at $N = 1000$ and 2,240,000 at $N = 2000$, against a flat 300,000 for the zero-token path, savings of 77.6 percent and 86.6 percent. When queries scale with the history at $Q = N/2$ the saving is a constant 62.5 percent at every $N$, and as the workload becomes arbitrarily query-heavy it never falls below the floor of 31.8 percent derived above. On the encoder side, the accounting avoids 1250 language model token equivalents per interaction while adding 8.0 token equivalents of index encoding, so the break-even would require an encoder token to cost more than 3.12 times a language model token. That is the sense in which the encoder is accounted separately rather than ignored: it is a real cost, it is simply two orders of magnitude smaller than what it displaces.
+
+The reported empirical result is consistent with this picture. Across long-memory and long-context question answering benchmarks, Zero-Mem is competitive with generative memory systems while eliminating language model calls and language model token consumption from memory operations entirely, and with the same final-QA reader and the same context budget it reduces memory-operation time cost by 57.6 percent relative to the fastest compared baseline [@xiao2026zeromem]. Two qualifications belong with that number. It measures memory-operation time, not end-to-end latency, so the reader call that both systems share is excluded, and it is measured against the fastest baseline in the comparison rather than against an average, which makes it a conservative rather than a flattering comparison.
+
+For practitioners the lesson generalizes past agent memory. The graph construction pipeline earlier in this chapter uses a language model because extraction over open-domain prose is genuinely hard, but the amount of that pipeline which truly requires generation is smaller than it appears. Entity tagging against a known vocabulary, co-mention graph assembly, personalized PageRank traversal, session and turn indexing, view weighting, and consistency filtering are all deterministic operations over structures the system already has. Zero-Mem is the demonstration that when the domain supplies a usable entity vocabulary, and it usually does in an agent setting where the entities are the user's projects, contacts, files, and tools, those pieces suffice to serve structured memory at competitive quality with no generation in the loop at all. The right design question is not whether to use a language model for retrieval but which retrieval steps actually need one, and the honest answer in many systems is the reader and nothing else.
 
 ## Summary
 

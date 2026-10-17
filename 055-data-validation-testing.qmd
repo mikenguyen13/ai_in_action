@@ -2,12 +2,12 @@
 
 Machine learning systems inherit the quality of the data that flows through them. A model trained on corrupted features, a feature store populated with stale records, or a serving pipeline fed malformed input will produce confident and wrong predictions. Unlike a software bug that throws an exception, a data quality defect often passes silently through every layer of a system until it surfaces as degraded business metrics weeks later. Data validation and testing exist to make these defects loud, early, and cheap to fix.
 
-This chapter treats data as a first class artifact that deserves the same engineering discipline applied to source code. We examine the spectrum of validation techniques, from rigid schema enforcement to probabilistic statistical checks, survey the dominant open source tooling, and discuss how validation behaves differently in batch and streaming production pipelines. Where the topic warrants precision, we state the underlying mathematics: the drift statistics in particular have exact definitions and properties that determine when each is appropriate.
+This chapter treats data as a first class artifact that deserves the same engineering discipline applied to source code. We examine the spectrum of validation techniques, from rigid schema enforcement to probabilistic statistical checks, run five open source validation libraries (Pandera, Patito, Pointblank, Validoopsie, and Dataframely) against one shared defective batch, and discuss how validation behaves differently in batch and streaming production pipelines. Where the topic warrants precision, we state the underlying mathematics: the drift statistics in particular have exact definitions and properties that determine when each is appropriate.
 
 ::: callout-note
 ## What this chapter covers
 
-A layered model of data testing. Schema validation pins down structure, constraint checks encode domain logic, statistical validation guards distributions, and data unit tests verify the transformation code itself. We then place these checks in a production pipeline, formalize the drift metrics that statistical validation relies on, and close with a pragmatic strategy for growing a validation suite without drowning in maintenance.
+A layered model of data testing. Schema validation pins down structure, constraint checks encode domain logic, statistical validation guards distributions, and data unit tests verify the transformation code itself. A hands on tooling section then expresses one contract in five libraries, executes each against the same batch of 1,000 records with seven planted defects, and compares what each one catches, isolates, and reports. We then place these checks in a production pipeline, formalize the drift metrics that statistical validation relies on, and close with a pragmatic strategy for growing a validation suite without drowning in maintenance.
 :::
 
 ## 1. Why Data Validation Matters
@@ -36,11 +36,11 @@ Schema validation is the cheapest and highest leverage form of data testing beca
 
 ### 2.2 Explicit Schemas with Pandera
 
-Pandera lets you express a schema as code over pandas, Polars, or PySpark frames. A `DataFrameSchema` declares columns with types and constraints, and validation either returns the validated frame or raises a `SchemaError` describing exactly which rows and checks failed.
+Pandera lets you express a schema as code over pandas, Polars, PySpark, and other dataframe engines, with one import path per engine (`pandera.pandas`, `pandera.polars`, and so on). A `DataFrameSchema` declares columns with types and constraints, and validation either returns the validated frame or raises a `SchemaError` describing exactly which rows and checks failed. Section 6 executes this style of schema, along with four alternative libraries, on a live batch.
 
 ```python
-import pandera as pa
-from pandera import Column, Check
+import pandera.pandas as pa
+from pandera.pandas import Column, Check
 
 schema = pa.DataFrameSchema({
     "user_id": Column(int, Check.gt(0), unique=True),
@@ -59,7 +59,8 @@ The `lazy=True` flag is important in practice. Without it, validation stops at t
 Pandera also offers a class based API using `DataFrameModel`, which reads like a dataclass and integrates with static type checkers. This style keeps the schema definition close to the rest of your typed code and supports inheritance for shared field definitions.
 
 ```python
-from pandera import DataFrameModel, Field
+import pandera.pandas as pa
+from pandera.pandas import DataFrameModel, Field
 
 class Transaction(DataFrameModel):
     amount: float = Field(ge=0, le=1_000_000)
@@ -203,7 +204,7 @@ This test pins the business rule that refunds do not count toward revenue. If a 
 
 Good data unit tests deliberately include edge cases: empty inputs, single row inputs, nulls in every nullable field, duplicate keys, and boundary values. Property based testing libraries such as Hypothesis generate many randomized inputs and check that invariants hold across all of them, which surfaces edge cases a human would not think to enumerate.
 
-A useful property to assert is that a transformation never introduces nulls into a non nullable output column, or that an aggregation never produces a count larger than its input row count. These structural invariants hold regardless of the specific input values.
+A useful property to assert is that a transformation never introduces nulls into a non nullable output column, or that an aggregation never produces a count larger than its input row count. These structural invariants hold regardless of the specific input values. Several validation libraries can generate such inputs directly from the schema, so fixtures stay in sync with the contract: Patito's `Model.examples` fills in valid defaults around the columns a test specifies, and Dataframely's `Schema.sample` draws extreme but valid frames that respect every rule, both demonstrated in Section 6.
 
 ### 5.3 The dbt Testing Model
 
@@ -225,38 +226,545 @@ models:
 
 This model blurs the line between unit testing and production validation. The same assertions run during development against sample data and in production against the full warehouse, which is one of dbt's most practical strengths.
 
-## 6. Tooling: Great Expectations and Pandera
+## 6. Tooling: Five Open Source Validators, Side by Side
 
-### 6.1 Great Expectations
+The ideas of Sections 2 through 5 pay off only once they are wired into code that runs on every batch. The Python ecosystem now offers several mature, MIT licensed libraries for this, and they make genuinely different design choices about how a contract is written, what happens when it is broken, and what evidence is left behind. This section runs five of them, **Pandera**, **Patito**, **Pointblank**, **Validoopsie**, and **Dataframely**, against one contract and one defective batch, so that their differences show up as differences in output rather than in feature lists. All five accept Polars frames. Patito and Dataframely are built directly on Polars; Pandera has a dedicated Polars backend alongside pandas, PySpark, and Ibis; Pointblank and Validoopsie reach Polars, pandas, and other engines through the Narwhals dataframe compatibility layer.
 
-Great Expectations is a validation framework built around the concept of an Expectation, a declarative assertion about data such as `expect_column_values_to_not_be_null` or `expect_column_mean_to_be_between`. Expectations are grouped into Expectation Suites, validated against data through Checkpoints, and the results render as readable Data Docs that serve as both documentation and a test report.
+### 6.1 A Shared Contract and a Defective Batch
 
-```python
-import great_expectations as gx
+Section 1.2 described a check as a predicate over a dataset. To compare libraries we need one more piece of notation. Let the batch be $D = (r_1, \dots, r_n)$ and the contract a set of $K$ checks, and write $F_k \subseteq \{1, \dots, n\}$ for the set of rows that violate check $k$. Most checks are *row local*: whether row $j$ violates "age lies in $[0, 120]$" depends on $r_j$ alone. Uniqueness is not. Row $j$ violates "user_id is unique" exactly when some other row $i \neq j$ carries the same key, so $F_{\text{uniq}}$ is either empty or has at least two elements, and it can only be computed by looking at the whole column. This distinction explains several of the differences between libraries below.
 
-context = gx.get_context()
-validator = context.sources.pandas_default.read_dataframe(df)
+A quarantine policy (Section 7.2) diverts the union of the failure sets and promotes the rest,
 
-validator.expect_column_values_to_not_be_null("user_id")
-validator.expect_column_values_to_be_between("age", 0, 120)
-validator.expect_column_values_to_be_in_set("country", ["US", "CA", "GB"])
+$$
+Q = \bigcup_{k=1}^{K} F_k, \qquad |Q| \le \sum_{k=1}^{K} |F_k|,
+$$
 
-results = validator.validate()
+with equality exactly when no row breaks two rules at once. A soft check with tolerance $\tau_k$ passes when its failure fraction stays at or below that tolerance, $|F_k| / n \le \tau_k$. This is how Pointblank and Validoopsie encode the hard versus soft distinction of Section 3.3: a hard check is simply one with $\tau_k = 0$.
+
+The batch is 1,000 synthetic user records. After generating a clean frame, the cell injects seven defects at known rows, one per rule: a duplicated key, an impossible age, a missing age, a malformed email, a country outside the allowed set, an activity date that precedes signup, and a negative spend.
+
+```{python}
+#| label: code-055-batch
+from datetime import date, timedelta
+
+import numpy as np
+import polars as pl
+
+rng = np.random.default_rng(55)
+n = 1_000
+EMAIL_RE = r"^[\w.+-]+@[\w-]+\.[\w.]+$"
+ALLOWED = ["US", "CA", "GB", "DE"]
+
+signup = [date(2024, 1, 1) + timedelta(days=int(d)) for d in rng.integers(0, 365, n)]
+clean = pl.DataFrame({
+    "user_id": np.arange(1, n + 1, dtype=np.int64),
+    "age": rng.integers(18, 90, n, dtype=np.int64),
+    "email": [f"user{i}@example.com" for i in range(1, n + 1)],
+    "country": rng.choice(ALLOWED, n).tolist(),
+    "signup_date": signup,
+    "last_active": [s + timedelta(days=int(d)) for s, d in zip(signup, rng.integers(0, 400, n))],
+    "spend": np.round(rng.gamma(shape=2.0, scale=40.0, size=n), 2),
+})
+
+# Inject one defect per rule at known row positions.
+row = pl.int_range(pl.len())
+batch = clean.with_columns(
+    user_id=pl.when(row == 10).then(pl.lit(10, pl.Int64)).otherwise("user_id"),
+    age=pl.when(row == 100).then(250).when(row == 200).then(None).otherwise("age"),
+    email=pl.when(row == 300).then(pl.lit("bob_at_example.com")).otherwise("email"),
+    country=pl.when(row == 400).then(pl.lit("FR")).otherwise("country"),
+    last_active=pl.when(row == 500)
+    .then(pl.col("signup_date") - pl.duration(days=30))
+    .otherwise("last_active"),
+    spend=pl.when(row == 600).then(-12.5).otherwise("spend"),
+)
+batch.slice(8, 4)
 ```
 
-Great Expectations excels at communication. Its Data Docs turn a validation run into a shareable artifact that non engineers can read, which makes data quality visible across an organization. A distinctive feature is automated profiling, which can inspect a reference dataset and suggest an initial suite of expectations, giving teams a starting point rather than a blank page.
+Rows 9 and 10 now share `user_id` 10, and the other six defects sit at rows 100 through 600. Before reaching for any library, it is worth writing the contract in the plainest form available: one Polars expression per rule that evaluates to true on a violation. This reference implementation is the ground truth against which the five libraries are checked, and because it uses nothing but expressions it ports directly to Julia and Rust.
 
-### 6.2 Pandera
+::: {.panel-tabset}
 
-Pandera, introduced earlier, takes a lighter and more code centric approach. It integrates directly into Python data code, validates pandas, Polars, and PySpark frames, and raises exceptions that fit naturally into existing error handling. Pandera is well suited to validation that lives inside a transformation function, where you want a schema check to run inline and fail fast.
+## Python
 
-### 6.3 Choosing Between Them
+```{python}
+#| label: code-055-reference
+# Library free reference: each rule is an expression that is True on a violation.
+RULES = {
+    "user_id unique": pl.col("user_id").is_duplicated(),
+    "age not null": pl.col("age").is_null(),
+    "age in [0, 120]": ~pl.col("age").is_between(0, 120),
+    "email format": ~pl.col("email").str.contains(EMAIL_RE),
+    "country allowed": ~pl.col("country").is_in(ALLOWED),
+    "active after signup": pl.col("last_active") < pl.col("signup_date"),
+    "spend >= 0": pl.col("spend") < 0,
+}
+HARD = {"user_id unique", "age not null", "active after signup"}
 
-The tools occupy different niches. Great Expectations favors organizational visibility, rich reporting, and a large catalog of prebuilt expectations, at the cost of more setup and a heavier conceptual footprint. Pandera favors developer ergonomics and tight integration into Python code, at the cost of less elaborate reporting. Many teams use both: Pandera for inline schema enforcement inside pipeline code, and Great Expectations for scheduled, reportable validation at dataset boundaries. The decision should follow the audience. If the primary consumers of validation results are engineers, lean toward Pandera. If they include analysts, data stewards, and managers, lean toward Great Expectations.
+flags = {name: expr.fill_null(False) for name, expr in RULES.items()}
+quarantine = batch.with_row_index("row").filter(pl.any_horizontal(list(flags.values())))
+truth = (
+    batch.select(**flags)
+    .sum()
+    .transpose(include_header=True, header_name="rule", column_names=["rows_failing"])
+    .with_columns(severity=pl.when(pl.col("rule").is_in(list(HARD))).then(pl.lit("hard")).otherwise(pl.lit("soft")))
+)
+print(f"{truth.height} rules violated; quarantine rows: {quarantine['row'].to_list()}")
+truth
+```
 
-### 6.4 Adjacent Tooling
+## Julia
 
-The ecosystem extends beyond these two. Soda offers a declarative checks language aimed at data reliability monitoring. Deequ, built on Spark, brings constraint verification and data profiling to large scale datasets and can suggest constraints automatically. Evidently focuses on drift and model monitoring with rich visual reports. The right combination depends on data scale, the prevailing language stack, and whether the emphasis is on batch validation or continuous monitoring.
+```julia
+# Illustrative: the same seven rules over DataFrames.jl.
+# `batch` exported from Python with batch.write_parquet("users_batch.parquet").
+using DataFrames, Dates, Parquet2
+
+const EMAIL_RE = r"^[\w.+-]+@[\w-]+\.[\w.]+$"
+const ALLOWED = Set(["US", "CA", "GB", "DE"])
+
+batch = DataFrame(Parquet2.Dataset("users_batch.parquet"); copycols = false)
+
+function violations(df::AbstractDataFrame)
+    DataFrame(
+        "user_id unique"      => nonunique(df, :user_id; keep = :noduplicates),
+        "age not null"        => ismissing.(df.age),
+        "age in [0, 120]"     => coalesce.((df.age .< 0) .| (df.age .> 120), false),
+        "email format"        => .!occursin.(Ref(EMAIL_RE), df.email),
+        "country allowed"     => .!in.(df.country, Ref(ALLOWED)),
+        "active after signup" => df.last_active .< df.signup_date,
+        "spend >= 0"          => df.spend .< 0,
+    )
+end
+
+v = violations(batch)
+truth = [String(name) => sum(col) for (name, col) in pairs(eachcol(v))]
+quarantine = findall(any.(eachrow(v))) .- 1   # zero based, to match Polars
+println(truth)
+println("quarantine rows: ", quarantine)
+```
+
+## Rust
+
+```rust
+// Illustrative: the same seven rules as Polars expressions in Rust.
+// Cargo.toml: polars = { version = "0.51", features = ["lazy", "parquet", "regex",
+//                        "strings", "is_unique", "dtype-date"] }
+use polars::prelude::*;
+
+const EMAIL_RE: &str = r"^[\w.+-]+@[\w-]+\.[\w.]+$";
+const ALLOWED: [&str; 4] = ["US", "CA", "GB", "DE"];
+
+fn rules() -> Vec<Expr> {
+    let allowed = ALLOWED
+        .iter()
+        .fold(lit(false), |acc, c| acc.or(col("country").eq(lit(*c))));
+    vec![
+        col("user_id").is_duplicated().alias("user_id unique"),
+        col("age").is_null().alias("age not null"),
+        col("age").lt(lit(0)).or(col("age").gt(lit(120))).alias("age in [0, 120]"),
+        col("email").str().contains(lit(EMAIL_RE), true).not().alias("email format"),
+        allowed.not().alias("country allowed"),
+        col("last_active").lt(col("signup_date")).alias("active after signup"),
+        col("spend").lt(lit(0.0)).alias("spend >= 0"),
+    ]
+}
+
+fn main() -> PolarsResult<()> {
+    let batch = LazyFrame::scan_parquet("users_batch.parquet", ScanArgsParquet::default())?;
+    let flags: Vec<Expr> = rules().into_iter().map(|e| e.fill_null(lit(false))).collect();
+
+    let truth = batch
+        .clone()
+        .select(flags.iter().cloned().map(|e| e.sum()).collect::<Vec<_>>())
+        .collect()?;
+    println!("{truth}");
+
+    let quarantine = batch
+        .with_row_index("row", None)
+        .filter(any_horizontal(&flags)?)
+        .select([col("row")])
+        .collect()?;
+    println!("quarantine rows: {quarantine}");
+    Ok(())
+}
+```
+
+:::
+
+Seven rules fail. The duplicated key contributes two rows to $F_{\text{uniq}}$ and every other rule contributes one, and since no row breaks two rules the quarantine set has $|Q| = \sum_k |F_k| = 8$ rows. A correct validator must find all seven violations; a validator that quarantines should isolate these eight rows. Following Section 3.3, the three rules marked hard (a duplicated key breaks joins, a missing age and a time reversal signal a corrupt record) should stop the pipeline, while the four soft rules should be recorded without necessarily blocking it.
+
+### 6.2 Pandera: Schemas as Typed Classes
+
+Pandera, introduced in Section 2 on pandas frames, provides a Polars backend under `pandera.polars` (Bantilan 2020). A `DataFrameModel` declares one typed attribute per column, `Field` arguments attach built in checks, and a method decorated with `@pa.dataframe_check` expresses the cross column rule. Setting `strict = True` makes an undeclared column a failure in its own right.
+
+```{python}
+#| label: code-055-pandera
+import pandera.polars as pa
+from pandera.errors import SchemaErrors
+
+
+class UserSchema(pa.DataFrameModel):
+    user_id: pl.Int64 = pa.Field(gt=0, unique=True)
+    age: pl.Int64 = pa.Field(in_range={"min_value": 0, "max_value": 120}, nullable=False)
+    email: pl.String = pa.Field(str_matches=EMAIL_RE)
+    country: pl.String = pa.Field(isin=ALLOWED)
+    signup_date: pl.Date
+    last_active: pl.Date
+    spend: pl.Float64 = pa.Field(ge=0)
+
+    @pa.dataframe_check
+    def active_after_signup(cls, data: pa.PolarsData) -> pl.LazyFrame:
+        return data.lazyframe.select(pl.col("last_active") >= pl.col("signup_date"))
+
+    class Config:
+        strict = True  # an unexpected column is itself a failure
+
+
+UserSchema.validate(clean)  # the clean frame passes silently
+
+try:
+    UserSchema.validate(batch, lazy=True)
+except SchemaErrors as exc:
+    pandera_failures = exc.failure_cases
+
+pandera_failures.select("column", "check", "index", "failure_case")
+```
+
+With `lazy=True`, Pandera collects every failure into a single `SchemaErrors` exception whose `failure_cases` attribute is itself a Polars frame: one row per failing value, with the check that failed and the row `index` where it failed. Both members of the duplicated key appear, rows 9 and 10, because uniqueness is a property of the whole column, and the cross column rule reports row 500 with the offending record serialized as its failure case. The eight distinct indices are exactly the reference quarantine set.
+
+The schema also doubles as a type annotation. Decorating a function with `@pa.check_types` validates its annotated arguments at call time, so a transformation cannot begin on a batch that breaks its input contract. This is the inline, fail fast placement that Section 7.1 recommends after each transformation.
+
+```{python}
+#| label: code-055-pandera-check-types
+from pandera.typing.polars import DataFrame
+
+
+@pa.check_types(lazy=True)
+def spend_by_country(users: DataFrame[UserSchema]) -> pl.DataFrame:
+    return users.group_by("country").agg(pl.col("spend").sum().round(2)).sort("country")
+
+
+print(spend_by_country(clean))
+try:
+    spend_by_country(batch)
+except SchemaErrors as exc:
+    print(f"rejected before aggregating: {exc.failure_cases.height} failure cases")
+```
+
+### 6.3 Patito: Pydantic Models for DataFrames
+
+Patito reaches the same contract from the other direction: it is written as a Pydantic model, so the class that validates a whole frame is also an ordinary row model that can validate an API payload or a configuration record. Nullability follows Python typing (an `int` field rejects nulls, an `int | None` field accepts them), a `Literal` type replaces an allowed set, and `pt.field` stands for the column being defined when a constraint needs an arbitrary Polars expression.
+
+```{python}
+#| label: code-055-patito
+from typing import Literal
+
+import patito as pt
+from patito.exceptions import DataFrameValidationError
+
+
+class User(pt.Model):
+    user_id: int = pt.Field(gt=0, unique=True)
+    age: int = pt.Field(ge=0, le=120)  # not Optional, so a null is an error
+    email: str = pt.Field(pattern=EMAIL_RE)
+    country: Literal["US", "CA", "GB", "DE"]
+    signup_date: date
+    last_active: date = pt.Field(constraints=pt.field >= pl.col("signup_date"))
+    spend: float = pt.Field(ge=0)
+
+
+User.validate(clean)
+
+try:
+    User.validate(batch)
+except DataFrameValidationError as exc:
+    patito_errors = exc.errors()
+    print(exc)
+```
+
+Patito reports all seven violations in the familiar Pydantic error format, grouped by column. The messages carry counts ("2 rows with duplicated values") and, for categorical violations, the offending values, but not row positions: Patito answers whether a frame conforms and leaves locating bad rows to the caller.
+
+Its distinctive extra is fixture generation for the data unit tests of Section 5. `Model.examples` builds a valid frame from only the columns a test cares about and fills every other column with a value that satisfies its type and constraints. It cannot invent strings that match a regular expression, so a pattern constrained column such as `email` must be supplied explicitly.
+
+```{python}
+#| label: code-055-patito-examples
+fixture = User.examples({
+    "user_id": [1, 2, 3],
+    "email": ["a@x.io", "b@y.io", "c@z.io"],
+    "spend": [0.0, 19.99, 1_000_000.0],  # boundary values the test cares about
+})
+User.validate(fixture)
+fixture.select(User.columns)
+```
+
+### 6.4 Pointblank: Validation Plans with Severity Thresholds
+
+Pointblank, from Posit, treats validation as a plan: a chain of named steps, each a check over one or more columns, interrogated together and summarized in a report. Its central idea is graded severity. Every step carries `Thresholds` for *warning*, *error*, and *critical* states, given either as absolute counts of failing rows (integers) or as failure fractions (floats), which is precisely the tolerance $\tau_k$ of Section 6.1. Below, the three hard rules get `critical=1`, so a single failing row is critical, while soft rules escalate from warning at one failing row to error at 1 percent and critical at 5 percent. The plan opens with a schema step whose expected column names and types are read from the clean reference frame.
+
+::: {html-table-processing="none"}
+
+```{python}
+#| label: code-055-pointblank
+import pointblank as pb
+
+HARD_T = pb.Thresholds(critical=1)  # one failing row is fatal
+SOFT_T = pb.Thresholds(warning=1, error=0.01, critical=0.05)  # escalate with the rate
+
+validation = (
+    pb.Validate(data=batch, tbl_name="users", label="Nightly signup batch", thresholds=SOFT_T)
+    .col_schema_match(schema=pb.Schema(tbl=clean), brief="schema")
+    .rows_distinct(columns_subset=["user_id"], thresholds=HARD_T, brief="user_id unique")
+    .col_vals_not_null(columns="age", thresholds=HARD_T, brief="age not null")
+    .col_vals_between(columns="age", left=0, right=120, na_pass=True, brief="age in [0, 120]")
+    .col_vals_regex(columns="email", pattern=EMAIL_RE, brief="email format")
+    .col_vals_in_set(columns="country", set=ALLOWED, brief="country allowed")
+    .col_vals_ge(
+        columns="last_active", value=pb.col("signup_date"),
+        thresholds=HARD_T, brief="active after signup",
+    )
+    .col_vals_ge(columns="spend", value=0, brief="spend >= 0")
+    .interrogate()
+)
+validation.get_tabular_report()
+```
+
+:::
+
+The report is a self contained HTML table, built with the Great Tables library, listing every step with its pass and fail counts, failure fractions, and threshold states. It is an artifact a data steward or analyst can read without opening Python, the communication role that Data Docs play in Great Expectations (Section 6.9).
+
+Two calls turn the plan into pipeline behavior. `assert_below_threshold` is the gate: asked about the critical level it fails on exactly the three hard rules, while the four soft violations, each one row in a thousand, sit at warning and do not block. `get_sundered_data` is the quarantine, splitting the batch into passing and failing partitions.
+
+```{python}
+#| label: code-055-pointblank-gate
+try:
+    validation.assert_below_threshold(level="critical")
+except AssertionError as exc:
+    print(exc)
+
+passed = validation.get_sundered_data(type="pass")
+failed = validation.get_sundered_data(type="fail")
+print(f"pass partition: {passed.height} rows, fail partition: {failed.height} rows")
+print(f"duplicated user_id rows left in the pass partition: {passed['user_id'].is_duplicated().sum()}")
+```
+
+Note what the split does with the duplicated key. `rows_distinct` is a judgment about the table rather than about any single row (the $F_{\text{uniq}}$ case of Section 6.1), so it does not take part in the row level split and both duplicate rows remain in the pass partition. When keys must be enforced at quarantine time, pair Pointblank's report with an explicit deduplication step, or with a library that treats key violations as row failures, such as Pandera or Dataframely.
+
+### 6.5 Validoopsie: Impact Levels and Tolerances on Any Backend
+
+Validoopsie is the lightest of the five. It is written against Narwhals, so one validation runs unchanged on pandas, Polars, PyArrow, and the other engines Narwhals supports, and its catalog is organized into themed groups (`NullValidation`, `ValuesValidation`, `StringValidation`, and so on) chained from a single `Validate` object. Each check takes an `impact` level and a fractional `threshold`. Impact sets the consequence when `validate()` runs: a failed high impact check raises, a medium one is logged as an error, and a low one as a warning. The threshold is the tolerance $\tau_k$, and a check whose failure fraction stays within it reports success.
+
+For the low impact rules the tolerance should come from the reasoning of Section 4.4 rather than a guess. If a healthy batch fails a soft rule at a benign rate $p_0$, the failure count is binomial with mean $n p_0$ and variance $n p_0 (1 - p_0)$, so a tolerance three standard errors above the benign rate is
+
+$$
+\tau = p_0 + 3 \sqrt{\frac{p_0 (1 - p_0)}{n}}.
+$$
+
+With $p_0 = 0.002$ and $n = 1000$ this gives $\tau \approx 0.0062$, about six failing rows per thousand before the check fails. Validoopsie has no built in check that orders two columns, so the date rule is written as a custom check by subclassing `BaseValidation`. Its `__call__` receives a Narwhals frame and returns the failing values grouped with their counts, which keeps the custom rule backend agnostic as well.
+
+```{python}
+#| label: code-055-validoopsie
+import math
+
+import narwhals as nw
+from validoopsie import Validate
+from validoopsie.base import BaseValidation
+
+
+class ColumnNotBefore(BaseValidation):
+    """Fail rows where `column` precedes `other`: a cross column ordering rule."""
+
+    def __init__(self, column, other, impact="low", threshold=0.0, **kwargs):
+        super().__init__(column, impact, threshold, **kwargs)
+        self.other = other
+
+    @property
+    def fail_message(self) -> str:
+        return f"'{self.column}' precedes '{self.other}' in some rows."
+
+    def __call__(self, frame):
+        return (
+            frame.filter(nw.col(self.column) < nw.col(self.other))
+            .group_by(self.column)
+            .agg(nw.col(self.column).count().alias(f"{self.column}-count"))
+        )
+
+
+p0 = 0.002
+tau = p0 + 3 * math.sqrt(p0 * (1 - p0) / batch.height)
+
+vd = (
+    Validate(batch)
+    .UniqueValidation.ColumnUniquePair(column_list=["user_id"], impact="high")
+    .NullValidation.ColumnNotBeNull(column="age", impact="high")
+    .add_validation(ColumnNotBefore(column="last_active", other="signup_date", impact="high"))
+    .ValuesValidation.ColumnValuesToBeBetween(column="age", min_value=0, max_value=120, impact="medium")
+    .StringValidation.PatternMatch(column="email", pattern=EMAIL_RE, impact="medium")
+    .UniqueValidation.ColumnUniqueValuesToBeInList(
+        column="country", values=ALLOWED, impact="low", threshold=tau
+    )
+    .ValuesValidation.ColumnValuesToBeBetween(column="spend", min_value=0, impact="low", threshold=tau)
+)
+
+print(f"tolerance for low impact rules: tau = {tau:.4f}")
+vd_summary = pl.DataFrame([
+    {
+        "check": key,
+        "impact": res["impact"],
+        "status": res["result"]["status"],
+        "failed": res["result"].get("failed_number", 0),
+        "fraction": res["result"].get("failed_percentage", 0.0),
+    }
+    for key, res in vd.results.items()
+    if key != "Summary"
+])
+vd_summary
+```
+
+The summary shows all three tiers at work. The two low impact checks each see one failing row, a fraction of 0.001 that falls inside $\tau$, so they report success while still recording the count for monitoring. The two medium checks fail with zero tolerance but are only logged. Validoopsie logs through Loguru, so routing that log to a compact sink at warning level and above makes the tiers visible: three critical lines for the high impact failures, two error lines for the medium ones, and nothing for the low impact checks that stayed within tolerance. Only the high impact failures stop the pipeline:
+
+```{python}
+#| label: code-055-validoopsie-gate
+import sys
+
+from loguru import logger
+
+logger.remove()
+logger.add(sys.stdout, level="WARNING", format="{level: <8} {message}", colorize=False)
+
+try:
+    vd.validate()
+except ValueError as exc:
+    print(f"\nraised: {exc}")
+```
+
+Because every check is expressed through Narwhals, the same validation runs on a pandas copy of the batch without modification:
+
+```{python}
+#| label: code-055-validoopsie-pandas
+on_pandas = Validate(batch.to_pandas()).ValuesValidation.ColumnValuesToBeBetween(
+    column="spend", min_value=0, impact="high"
+)
+on_pandas.results["ColumnValuesToBeBetween_spend"]["result"]
+```
+
+### 6.6 Dataframely: Polars Native Schemas, Quarantine, and Sampling
+
+Dataframely, from QuantCo, is Polars native and the most opinionated about types. Columns are non nullable unless declared otherwise, a `primary_key` flag replaces a separate uniqueness check, and cross column logic is a method decorated with `@dy.rule()` that returns a Polars expression evaluated per row. Its central operation is `filter`, which never raises: it returns the rows that satisfy every rule together with a `FailureInfo` object describing the rest. The quarantine pattern of Section 7.2 is built into the API.
+
+```{python}
+#| label: code-055-dataframely
+import dataframely as dy
+
+
+class UserTable(dy.Schema):
+    user_id = dy.Int64(primary_key=True, min=1)
+    age = dy.Int64(min=0, max=120)  # non nullable by default
+    email = dy.String(regex=EMAIL_RE)
+    country = dy.String(check=lambda c: c.is_in(ALLOWED))
+    signup_date = dy.Date()
+    last_active = dy.Date()
+    spend = dy.Float64(min=0)
+
+    @dy.rule()
+    def active_after_signup(cls) -> pl.Expr:
+        return pl.col("last_active") >= pl.col("signup_date")
+
+
+valid, failure = UserTable.filter(batch)
+print(f"{valid.height} rows promoted, {failure.invalid().height} rows quarantined")
+failure.counts()
+```
+
+The counts match the reference implementation rule for rule, including two rows for the primary key, and the eight quarantined rows are exactly the reference quarantine set. `FailureInfo` can also report which rules fail together (`cooccurrence_counts`) and be written to Parquet for later inspection. When fail fast behavior is wanted instead, `validate` raises with a summary of the same counts:
+
+```{python}
+#| label: code-055-dataframely-validate
+try:
+    UserTable.validate(batch)
+except dy.exc.ValidationError as exc:
+    print(exc)
+```
+
+Two further features set Dataframely apart. A validated frame is typed as `dy.DataFrame[UserTable]`, so a function signature can demand a frame that has already passed the schema and a static type checker flags code that passes an unvalidated one. And `sample` generates synthetic frames that satisfy the entire schema, including the cross column rule and the primary key, which turns the schema into a source of property based test fixtures (Section 5.2). The generator deliberately explores extreme but valid values, very large keys and amounts and dates centuries apart, because those are the inputs that break transformation code. Columns with a custom `check` cannot be sampled automatically, so `country` receives explicit values.
+
+```{python}
+#| label: code-055-dataframely-sample
+sample = UserTable.sample(
+    num_rows=5,
+    overrides={"country": ["US", "CA", "GB", "DE", "US"]},
+    generator=dy.random.Generator(seed=55),
+)
+print(f"sample satisfies the schema: {UserTable.is_valid(sample)}")
+sample.select("user_id", "age", "country", "signup_date", "last_active", "spend")
+```
+
+Beyond single tables, a `dy.Collection` groups several schemas and adds rules across them, such as requiring every order to reference an existing user, which brings the referential checks of Section 3.1 into the same declarative framework.
+
+### 6.7 Scorecard: One Contract, Five Verdicts
+
+The cell below gathers what each library reported on the defective batch.
+
+```{python}
+#| label: code-055-scorecard
+vo_results = [res for key, res in vd.results.items() if key != "Summary"]
+scorecard = pl.DataFrame({
+    "library": ["reference", "pandera", "patito", "pointblank", "validoopsie", "dataframely"],
+    "rules_flagged": [
+        truth.height,
+        pandera_failures.select("column", "check").n_unique(),
+        len(patito_errors),
+        sum(count > 0 for count in validation.n_failed().values()),
+        sum(res["result"].get("failed_number", 0) > 0 for res in vo_results),
+        len(failure.counts()),
+    ],
+    "rows_isolated": [
+        quarantine.height,
+        pandera_failures["index"].n_unique(),
+        None,
+        validation.get_sundered_data(type="fail").height,
+        None,
+        failure.invalid().height,
+    ],
+    "default_on_failure": [
+        "none (plain expressions)",
+        "raise (all failures with lazy=True)",
+        "raise",
+        "report; assert by severity level",
+        "raise on high impact only",
+        "filter splits; validate raises",
+    ],
+})
+scorecard
+```
+
+All five libraries flag the same seven rules as the reference. They differ in what they hand back. Pandera and Dataframely isolate exactly the eight rows of the reference quarantine set. Pointblank's row level split isolates six, because its uniqueness step judges the table rather than individual rows. Patito and Validoopsie report rule level verdicts and counts rather than row positions, which is enough for a gate and for monitoring but not, on its own, for quarantine. The broader differences are summarized below.
+
+::: {.table-responsive}
+
+| | Pandera | Patito | Pointblank | Validoopsie | Dataframely |
+|---|---|---|---|---|---|
+| Contract style | Class or object schema | Pydantic model | Chained validation plan | Chained validation plan | Class schema with rules |
+| Engines | pandas, Polars, PySpark, Ibis, and others | Polars | Polars, pandas, SQL databases via Ibis | Any Narwhals backend | Polars |
+| On failure | Raises; collects all with `lazy=True` | Raises with all errors | Reports; asserts by severity on request | Raises for high impact only | `filter` splits; `validate` raises |
+| Severity model | Error, or warning per check | Error only | Warning, error, critical thresholds | Impact level plus tolerance | Error only |
+| Row level output | Failure cases with row index | Counts and values | Pass and fail partitions | Failing values and counts | Valid frame plus `FailureInfo` |
+| Human facing report | Failure case frame | Pydantic style summary | HTML report table | Text summary table | Rule count summary |
+| Test data generation | Hypothesis strategies (pandas) | `Model.examples` | `generate_dataset` | None built in | `Schema.sample` |
+| Distinctive extra | `check_types` decorator | One model for rows and frames | YAML plans, step reports | Small custom check API | Multi table `Collection` |
+
+:::
+
+### 6.8 Choosing Among Them
+
+The choice follows the shape of the codebase and the audience for the results. Reach for **Pandera** when one validation vocabulary must span several engines (pandas in notebooks, Polars in pipelines, PySpark at scale) or when typed function boundaries matter, since `check_types` validates at every call. Reach for **Patito** when Pydantic models are already the lingua franca, for example when the same record shape arrives through an API and leaves through a dataframe, and one class should govern both. Reach for **Pointblank** when the people who must act on validation results are analysts, stewards, or managers, when graded severity matters more than pass or fail, or when the data lives in a SQL database. Reach for **Validoopsie** when the goal is a small dependency footprint, backend portability, and tiered severity in a few lines. Reach for **Dataframely** in Polars native pipelines that need quarantine, typed frames, multi table rules, or schema driven test data.
+
+The libraries also compose. A realistic arrangement for the zones of Section 7.1 places Dataframely or Pandera at the schema and constraint gates inside transformation code, where typed frames and row level quarantine matter, and Pointblank at the statistical and reporting gate, where results must be read and acted on by people. The cost of combining tools is that the contract is written more than once. Keep one authoritative definition, such as the reference expressions of Section 6.1, and test in continuous integration that every library's translation agrees with it on a fixture batch, exactly as the scorecard does.
+
+### 6.9 Adjacent Tooling
+
+Great Expectations remains the most widely deployed framework in this space. It is built around Expectations, declarative assertions such as `expect_column_values_to_not_be_null`, grouped into suites, run through checkpoints, and rendered as Data Docs, readable HTML reports that serve as both documentation and test results. It suits organizations where many teams share one catalog of expectations, at the cost of more configuration and a heavier conceptual footprint than the five libraries above. Soda offers a declarative checks language aimed at data reliability monitoring. Deequ, built on Spark, brings constraint verification and data profiling to very large datasets and can suggest constraints automatically (Schelter et al. 2018). Evidently focuses on drift and model monitoring with visual reports, the natural companion to the statistical validation of Section 4. The right combination depends on data scale, the prevailing language stack, and whether the emphasis is on batch validation or continuous monitoring.
 
 ## 7. Validating Data in Production Pipelines
 
@@ -286,7 +794,7 @@ The gates are ordered from cheapest and strictest to most expensive and most for
 
 When validation fails in production, the pipeline must decide what to do with the offending data. Two strategies dominate. The fail fast strategy halts the pipeline, alerts an operator, and prevents bad data from propagating, which is appropriate when downstream consumers cannot tolerate any corruption. The quarantine strategy diverts failing records to a separate location for later inspection while allowing valid records to proceed, which keeps the pipeline flowing when partial data is better than none.
 
-The right choice depends on the use case. A financial reconciliation pipeline should fail fast because a wrong number is worse than a late number. A recommendation feature pipeline might quarantine a small fraction of malformed events and continue, because serving slightly incomplete recommendations beats serving none. Encoding this policy explicitly, rather than letting it emerge from where exceptions happen to propagate, is a mark of a mature pipeline.
+The right choice depends on the use case. A financial reconciliation pipeline should fail fast because a wrong number is worse than a late number. A recommendation feature pipeline might quarantine a small fraction of malformed events and continue, because serving slightly incomplete recommendations beats serving none. Encoding this policy explicitly, rather than letting it emerge from where exceptions happen to propagate, is a mark of a mature pipeline. The libraries of Section 6 make the choice an API decision: Pandera's `validate`, Patito's `validate`, and Dataframely's `validate` fail fast, while Dataframely's `filter` and Pointblank's `get_sundered_data` quarantine, returning the passing rows and the failing rows separately.
 
 ### 7.3 Batch versus Streaming Validation
 
@@ -334,18 +842,26 @@ The deepest pitfall spans all four layers: a validation suite that fires constan
 
 ## References
 
-1. Great Expectations Documentation. https://docs.greatexpectations.io/
+1. Bantilan, N. "pandera: Statistical Data Validation of Pandas Dataframes." Proceedings of the 19th Python in Science Conference (SciPy 2020), 116-124. https://doi.org/10.25080/Majora-342d178e-010
 2. Pandera Documentation. https://pandera.readthedocs.io/
-3. dbt Tests Documentation. https://docs.getdbt.com/docs/build/data-tests
-4. Soda Core Documentation. https://docs.soda.io/
-5. Amazon Deequ: Unit Tests for Data. https://github.com/awslabs/deequ
-6. Evidently AI Documentation. https://docs.evidentlyai.com/
-7. Hypothesis Property Based Testing. https://hypothesis.readthedocs.io/
-8. Schelter et al., "Automating Large Scale Data Quality Verification," VLDB 2018. https://www.vldb.org/pvldb/vol11/p1781-schelter.pdf
-9. Polyzotis et al., "Data Validation for Machine Learning," MLSys 2019. https://mlsys.org/Conferences/2019/doc/2019/167.pdf
-10. Apache Avro Schema Specification. https://avro.apache.org/docs/current/specification/
-11. Confluent Schema Registry Documentation. https://docs.confluent.io/platform/current/schema-registry/index.html
-12. Great Expectations, "Data Docs." https://docs.greatexpectations.io/docs/reference/learn/terms/data_docs/
-13. Massey, F. J. "The Kolmogorov-Smirnov Test for Goodness of Fit." Journal of the American Statistical Association, 1951. https://doi.org/10.1080/01621459.1951.10500769
-14. Lin, J. "Divergence Measures Based on the Shannon Entropy." IEEE Transactions on Information Theory, 1991. https://doi.org/10.1109/18.61115
-15. Gama et al., "A Survey on Concept Drift Adaptation." ACM Computing Surveys, 2014. https://doi.org/10.1145/2523813
+3. Martinussen, J. G., and Aarholt, T. Patito: A Dataframe Modelling Library Built on Polars and Pydantic. https://github.com/JakobGM/patito
+4. Iannone, R. Pointblank for Python: Data Validation Made Beautiful and Powerful. Posit Software. https://github.com/posit-dev/pointblank
+5. Soliev, A. Validoopsie: A Simple and Light Data Validation Library. https://github.com/akmalsoliev/Validoopsie
+6. Albert, A., Elsner, D., and Borchert, O. Dataframely: A Declarative, Polars Native Data Frame Validation Library. QuantCo. https://github.com/quantco/dataframely
+7. Vink, R., et al. Polars. Zenodo. https://doi.org/10.5281/zenodo.7697217
+8. Gorelli, M., et al. Narwhals: A Lightweight Compatibility Layer Between Dataframe Libraries. https://github.com/narwhals-dev/narwhals
+9. Great Expectations Documentation. https://docs.greatexpectations.io/
+10. Great Expectations, "Data Docs." https://docs.greatexpectations.io/docs/reference/learn/terms/data_docs/
+11. dbt Tests Documentation. https://docs.getdbt.com/docs/build/data-tests
+12. Soda Core Documentation. https://docs.soda.io/
+13. Amazon Deequ: Unit Tests for Data. https://github.com/awslabs/deequ
+14. Evidently AI Documentation. https://docs.evidentlyai.com/
+15. MacIver, D. R., Hatfield-Dodds, Z., et al. "Hypothesis: A New Approach to Property-Based Testing." Journal of Open Source Software 4(43), 1891, 2019. https://doi.org/10.21105/joss.01891
+16. Schelter, S., Lange, D., Schmidt, P., Celikel, M., Biessmann, F., and Grafberger, A. "Automating Large-Scale Data Quality Verification." Proceedings of the VLDB Endowment 11(12), 1781-1794, 2018. https://doi.org/10.14778/3229863.3229867
+17. Breck, E., Polyzotis, N., Roy, S., Whang, S. E., and Zinkevich, M. "Data Validation for Machine Learning." Proceedings of Machine Learning and Systems (MLSys), 2019. https://mlsys.org/Conferences/2019/doc/2019/167.pdf
+18. Polyzotis, N., Roy, S., Whang, S. E., and Zinkevich, M. "Data Lifecycle Challenges in Production Machine Learning: A Survey." ACM SIGMOD Record 47(2), 17-28, 2018. https://doi.org/10.1145/3299887.3299891
+19. Apache Avro Schema Specification. https://avro.apache.org/docs/current/specification/
+20. Confluent Schema Registry Documentation. https://docs.confluent.io/platform/current/schema-registry/index.html
+21. Massey, F. J. "The Kolmogorov-Smirnov Test for Goodness of Fit." Journal of the American Statistical Association, 1951. https://doi.org/10.1080/01621459.1951.10500769
+22. Lin, J. "Divergence Measures Based on the Shannon Entropy." IEEE Transactions on Information Theory, 1991. https://doi.org/10.1109/18.61115
+23. Gama et al., "A Survey on Concept Drift Adaptation." ACM Computing Surveys, 2014. https://doi.org/10.1145/2523813

@@ -1228,9 +1228,428 @@ The numbers trace the collapse. With every step of the side objective visible th
 
 The consequence is load-bearing for this chapter. Test-time compute buys accuracy by turning tokens into computation, and we have treated those tokens as simultaneously the mechanism and the audit log. @baherwani2026invisible show that frontier models already perform consequential computation with no interpretable trace in their output tokens, so the two roles come apart: the trace remains a *means to an answer*, as @sec-700-pitfalls insists, but it is not a certified record of the reasoning, and a safety argument that rests on reading it inherits a ceiling it cannot raise by reading harder.
 
-## 15. Conclusion {#sec-700-conclusion}
+## 15. Latent Recurrent Reasoning: Test-Time Compute Without Tokens {#sec-700-latent-reasoning}
 
-Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. Verifier quality is not just about noise: section @sec-700-hrm showed that even a noiseless-looking PRM has a structural blind spot for self-correction, one that hierarchical supervision fixes at no extra inference cost, and the same hierarchical-node-compression trick that fixes it also makes automatic, MCTS-based annotation cheaper. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Understanding that dimension is now prerequisite to understanding the field.
+Every mechanism in this chapter so far spends test-time compute the same way: it generates tokens. Parallel breadth (@sec-700-passn, @sec-700-majority) draws more complete traces, sequential depth (@sec-700-sequential) writes one longer trace, the process reward models of @sec-700-hrm score the written steps, and the economics of @sec-700-economics bill per token. Section @sec-700-invisible-reasoning then showed that those tokens are not a faithful record of the computation, and that a model can compute in a channel a monitor cannot read. @engdahl2026bdhcq take that observation to its structural conclusion and remove the tokens from the reasoning loop altogether.
+
+**BDH-CQ** combines in-context learning with *recurrent latent reasoning*. Demonstrations and the query, presented at inference time, continuously update the model's recurrent memory; the model then solves the query by iterating in a high dimensional latent space, without verbalizing its intermediate reasoning. It is evaluated on the public ARC-AGI-1 evaluation set, the benchmark of @sec-700-o-series and @sec-700-evaluation, together with controlled ARC-like interventions that probe what the model learns from demonstrations, how consistently it applies an inferred transformation, and which concepts remain difficult. A 150M parameter configuration reaches **29.5% pass@2 at a computed inference cost of $0.0007 per task**, an operating point that breaks through the previously reported ARC-AGI-1 cost-accuracy Pareto frontier and sets a new state of the art in benchmark cost efficiency.
+
+The number worth extracting is not the accuracy, which sits far below the roughly 87.5% that o3 reached on the same benchmark in @sec-700-o-series. It is the *axis*. Sections @sec-700-math and @sec-700-economics treat "more test-time compute" and "more tokens" as interchangeable. They are not, and the next two subsections make the difference quantitative: one is about how much a reasoning step can *carry*, the other about how much a reasoning step *costs*.
+
+### 15.1 The token bottleneck: how much one reasoning step can carry {#sec-700-token-bottleneck}
+
+Fix a verbalized reasoner with vocabulary $\mathcal{V}$, $|\mathcal{V}| = V$. At step $t$ it holds an internal state, computes logits over $\mathcal{V}$, and samples a token $z_t \sim \pi(\cdot \mid x, z_{<t})$. The KV cache does carry a high dimensional state forward, so the model is not literally reduced to a scalar between steps. The bottleneck is sharper and more specific than that: whatever step $t$ *concluded* must be committed to a token before step $t+1$ can condition on it. Sampling is a hard quantization of the step's conclusion, and the marginal information that step $t$ adds to the context is exactly the information in $z_t$. That is bounded by the entropy of a distribution on $V$ symbols,
+
+$$
+I(z_t) \;=\; H(z_t) \;\le\; \log_2 V \quad \text{bits per reasoning step},
+$$ {#eq-700-token-bandwidth}
+
+with equality only for a uniform distribution over the whole vocabulary, which no useful reasoner ever produces. For a modern $V = 128{,}000$ vocabulary this ceiling is $\log_2 V \approx 16.97$ bits.
+
+Now take the latent alternative. A recurrent latent reasoner holds a state $h_t \in \mathbb{R}^{d}$ and iterates
+
+$$
+h_{t+1} \;=\; f_\theta\!\left(h_t,\, x\right), \qquad t = 0, 1, \dots, T-1, \qquad \hat a \;=\; g_\theta(h_T),
+$$ {#eq-700-latent-recurrence}
+
+where $x$ is the fixed inference-time context (the demonstrations plus the query), $f_\theta$ is the recurrent update, $T$ is the number of latent iterations, and the decoder $g_\theta$ runs **once**, at the end. Nothing is sampled between iterations, so nothing is quantized. Storing each component in $b$ bits, the step-to-step channel has nominal width
+
+$$
+C_{\text{latent}} \;=\; d \cdot b \quad \text{bits per reasoning step}.
+$$ {#eq-700-latent-bandwidth}
+
+With $d = 2048$ and $b = 16$ (bfloat16) that is $32{,}768$ nominal bits, about $1{,}931$ times @eq-700-token-bandwidth. Nominal bit-width is an upper bound, not realized information, so it is worth asking how badly it can degrade before the advantage disappears. Treat the latent channel as $d$ parallel Gaussian sub-channels each at signal-to-noise ratio $\rho$. Shannon's capacity for that channel is $\tfrac{d}{2}\log_2(1+\rho)$ bits, and setting it equal to a single token's ceiling gives the break-even noise level
+
+$$
+\frac{d}{2}\log_2\!\left(1 + \rho^\star\right) \;=\; \log_2 V
+\quad\Longrightarrow\quad
+\rho^\star \;=\; 2^{\,2\log_2 V / d} - 1 .
+$$ {#eq-700-latent-snr}
+
+At $d = 2048$ and $V = 128{,}000$, $\rho^\star \approx 0.0116$, roughly $-19.4$ decibels: the latent state can be swamped by nearly a hundred times more noise than signal in every dimension and still carry as much between steps as one perfectly chosen token. Even the crude floor of one *effective* bit per dimension leaves the latent channel about $121$ times wider. The cell in @sec-700-latent-executed computes all four of these figures.
+
+### 15.2 The cost of a step: decoding versus iterating {#sec-700-latent-cost}
+
+Bandwidth is only half the argument. The other half is that the two kinds of step have different cost curves. Let a dense verbalized model have $P$ parameters, $\ell$ layers, model width $d_m$, a prompt of $n_0$ tokens, and let it decode $L$ chain-of-thought tokens. Each decoded token costs about $2P$ floating point operations for the dense matrix multiplies, plus attention against a key-value cache whose length grows by one per token: the $QK^\top$ and $AV$ products cost about $2\ell d_m n$ each against a cache of length $n$. Summing over the decode,
+
+$$
+C_{\text{verb}}(L) \;=\; \underbrace{2PL}_{\text{dense}} \;+\; \underbrace{4\ell d_m \sum_{i=1}^{L}\left(n_0 + i\right)}_{\text{attention over a growing cache}} \;=\; 2PL \;+\; 4\ell d_m\left(n_0 L + \tfrac{L(L+1)}{2}\right).
+$$ {#eq-700-verbalized-cost}
+
+The first term is linear in $L$, the second is *quadratic*: every extra thinking token is attended to by every later thinking token, so the marginal cost of depth rises as the trace lengthens. The latent reasoner has neither problem. Its context never grows, because it appends nothing, so with a recurrent core of $P_{\text{rec}}$ parameters and a one-off encoding cost $C_{\text{enc}}$ for ingesting the demonstrations,
+
+$$
+C_{\text{latent}}(T) \;=\; C_{\text{enc}} \;+\; 2 P_{\text{rec}} T .
+$$ {#eq-700-latent-cost}
+
+Equation @eq-700-latent-cost is linear in $T$ with no quadratic term at all. Dividing @eq-700-verbalized-cost by the marginal part of @eq-700-latent-cost at a matched step count $L = T$ gives the exchange rate between the two currencies,
+
+$$
+\frac{C_{\text{verb}}(T)}{2P_{\text{rec}}T} \;=\; \frac{P}{P_{\text{rec}}} \;+\; \frac{2\ell d_m\left(n_0 + \tfrac{T+1}{2}\right)}{P_{\text{rec}}},
+$$ {#eq-700-exchange-rate}
+
+which splits the advantage into its two independent sources: a *model size* ratio $P/P_{\text{rec}}$, and a *context* term that a latent loop simply does not pay. For a 70B dense model with $\ell = 80$, $d_m = 8192$, $n_0 = 2000$ and $T = 32$, against a 150M recurrent core, @eq-700-exchange-rate evaluates to about $484$: one decoded token from the large model buys roughly $484$ latent iterations of the small one. That is the arithmetic behind a Pareto-frontier claim. A latent reasoner does not have to be *more accurate* than a verbalized one to move the frontier; it only has to reach a given accuracy for less than $1/484$ of the compute the verbalized path would spend reaching the same place.
+
+```{mermaid}
+%%| label: fig-700-latent-loop
+%%| fig-cap: "Two ways to spend a test-time step. The verbalized loop passes its conclusion through a sampled token and grows its KV cache each step. The latent loop iterates a fixed-width state at constant context and decodes once at the end."
+flowchart LR
+    subgraph VB["Verbalized loop, one token per step"]
+        direction TB
+        A1["internal state at step t"] --> A2["logits over vocabulary of size V"]
+        A2 --> A3["sample one token, at most log2 V bits"]
+        A3 --> A4["append token, KV cache grows by one"]
+        A4 --> A1
+    end
+    subgraph LT["Latent recurrent loop, no tokens emitted"]
+        direction TB
+        B1["latent state h of width d"] --> B2["recurrent update f of h and x"]
+        B2 --> B1
+        B1 --> B3["decode the answer once after T iterations"]
+    end
+```
+
+### 15.3 The ARC-AGI-1 operating point, and what pass@2 actually means {#sec-700-latent-arc}
+
+The reported result is $29.5\%$ **pass@2**, which is @eq-700-passn at $N = 2$: the probability that at least one of two samples is correct. ARC-AGI's official protocol allows two attempts per task, so this is the benchmark's own scoring rule rather than a flattering choice of metric, but it is still not the same as per-sample accuracy and should not be read as such. Under the independence assumption of @sec-700-passn,
+
+$$
+\text{pass@}2 \;=\; 1 - (1-p)^2 \;=\; 2p - p^2
+\quad\Longrightarrow\quad
+p \;=\; 1 - \sqrt{1 - \text{pass@}2}\, ,
+$$ {#eq-700-pass2-invert}
+
+so $29.5\%$ pass@2 corresponds to a per-sample accuracy of $p \approx 0.1604$, a little over sixteen percent. Independence is an assumption, so it is worth bracketing $p$ without it. Let $A_1, A_2$ be the events that the first and second sample are correct, each with probability $p$. The union bound gives $\text{pass@}2 = \Pr[A_1 \cup A_2] \le 2p$, and monotonicity gives $\text{pass@}2 \ge \Pr[A_1] = p$. Together,
+
+$$
+\tfrac{1}{2}\,\text{pass@}2 \;\le\; p \;\le\; \text{pass@}2 ,
+$$ {#eq-700-pass2-bracket}
+
+that is $p \in [0.1475,\, 0.2950]$ whatever the correlation between the two samples. The independent estimate $0.1604$ sits near the lower end of that interval, which is where it should sit: two samples from the same model on the same task are positively correlated in practice, and positive correlation pushes pass@2 *down* toward $p$, so a fixed pass@2 implies a *higher* $p$ than the independent inversion suggests. Reporting pass@2 is honest as long as the reader does the inversion.
+
+The cost side is where the result earns its headline. At a representative frontier price of ten dollars per million output tokens, the entire $\$0.0007$ inference budget for one ARC task buys about **70 output tokens**; at two dollars per million it buys about $350$. A single long chain of thought of the kind @sec-700-sequential describes is one to two orders of magnitude longer than that, before any of the parallel sampling of @sec-700-passn is layered on top. Against the high-compute o3 configuration of @sec-700-o-series, reported on the order of a thousand dollars per task for roughly $87.5\%$, the ratio is about $1.4$ million to one in cost. Normalizing by accuracy, BDH-CQ spends about $\$2.37 \times 10^{-5}$ per point of ARC-AGI-1 accuracy against roughly $\$11.43$ per point, a factor of about half a million. That gap, not the raw score, is what "breaking the cost-accuracy Pareto frontier" means: no previously reported system bought ARC-AGI-1 accuracy that cheaply, even though many bought much more of it.
+
+### 15.4 The latent recurrence step {#sec-700-latent-step-code}
+
+The core of @eq-700-latent-recurrence is a few lines. Below, the latent state $h \in \mathbb{R}^{d}$ accumulates evidence written into it through a fixed projection $R \in \mathbb{R}^{d \times |\mathcal{H}|}$ with orthonormal columns, leaks by a factor $\gamma < 1$ each iteration (a fixed-size memory cannot hold everything), and absorbs update noise, which is what makes the *effective* bandwidth of @sec-700-token-bottleneck finite rather than the nominal $d \cdot b$. The readout projects the state back onto interpretable scores, but only the final readout is ever taken. The Python tab is executed and its definitions are used by @sec-700-latent-executed; the Julia and Rust tabs are illustrative.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| label: code-700-latent-step
+#| code-fold: false
+import numpy as np
+
+
+def latent_step(h, R, delta_scores, gamma, noise):
+    """One recurrent latent iteration: h_{t+1} = gamma * h_t + R @ delta + noise."""
+    return gamma * h + R @ delta_scores + noise
+
+
+def readout(h, R):
+    """Project the latent state back onto scores (R has orthonormal columns)."""
+    return R.T @ h
+
+
+_rng = np.random.default_rng(0)
+_R = np.linalg.qr(_rng.normal(size=(256, 64)))[0]
+_h = np.zeros(256)
+_delta = np.zeros(64)
+_delta[7] = 1.0
+for _ in range(4):
+    _h = latent_step(_h, _R, _delta, gamma=0.9, noise=np.zeros(256))
+print(f"latent state lives in R^{_h.shape[0]}, readout has {readout(_h, _R).shape[0]} scores")
+print(f"score on the reinforced coordinate after 4 iterations = {readout(_h, _R)[7]:.4f}")
+print(f"geometric-series prediction 1 + 0.9 + 0.81 + 0.729 = {sum(0.9 ** k for k in range(4)):.4f}")
+```
+
+## Julia
+
+```julia
+using LinearAlgebra, Random
+
+"""One recurrent latent iteration: h_{t+1} = gamma * h_t + R * delta + noise."""
+latent_step(h::Vector{Float64}, R::Matrix{Float64}, delta::Vector{Float64},
+            gamma::Float64, noise::Vector{Float64}) = gamma .* h .+ R * delta .+ noise
+
+"""Project the latent state back onto scores (R has orthonormal columns)."""
+readout(h::Vector{Float64}, R::Matrix{Float64}) = R' * h
+
+rng = MersenneTwister(0)
+R = Matrix(qr(randn(rng, 256, 64)).Q)[:, 1:64]
+h = zeros(256)
+delta = zeros(64); delta[8] = 1.0
+
+for _ in 1:4
+    global h = latent_step(h, R, delta, 0.9, zeros(256))
+end
+println("score on the reinforced coordinate = ", readout(h, R)[8])
+```
+
+## Rust
+
+```rust
+/// One recurrent latent iteration: h_{t+1} = gamma * h_t + R * delta + noise.
+/// `r` is stored row-major with shape (d, n_scores).
+fn latent_step(h: &mut [f64], r: &[f64], delta: &[f64], gamma: f64, noise: &[f64]) {
+    let n = delta.len();
+    for (i, hi) in h.iter_mut().enumerate() {
+        let mut acc = 0.0;
+        for (j, dj) in delta.iter().enumerate() {
+            acc += r[i * n + j] * dj;
+        }
+        *hi = gamma * *hi + acc + noise[i];
+    }
+}
+
+/// Project the latent state back onto scores (columns of `r` are orthonormal).
+fn readout(h: &[f64], r: &[f64], n_scores: usize) -> Vec<f64> {
+    (0..n_scores)
+        .map(|j| h.iter().enumerate().map(|(i, hi)| r[i * n_scores + j] * hi).sum())
+        .collect()
+}
+
+fn main() {
+    let (d, n) = (256usize, 64usize);
+    let r = vec![0.0f64; d * n]; // in practice: an orthonormal projection
+    let mut h = vec![0.0f64; d];
+    let mut delta = vec![0.0f64; n];
+    delta[7] = 1.0;
+    let noise = vec![0.0f64; d];
+    for _ in 0..4 {
+        latent_step(&mut h, &r, &delta, 0.9, &noise);
+    }
+    println!("score = {:.4}", readout(&h, &r, n)[7]);
+}
+```
+
+:::
+
+### 15.5 Latent iterations against a token budget (executed) {#sec-700-latent-executed}
+
+Training a BDH-CQ-scale model is out of scope for a laptop, so the *mechanism* is reproduced instead, on a synthetic ARC-like rule-induction task. Each task draws a hidden transformation from a space of $|\mathcal{H}| = 64$ rules (eight dihedral symmetries composed with eight colour permutations), shows four demonstration input-output grid pairs, and asks for the output of a held-out query grid. Every reasoner sees the *same* evidence stream: one randomly chosen cell of one demonstration per step, scored against all $64$ hypotheses under a noisy observation model. The only thing that differs is **what survives between steps**.
+
+- **Latent recurrence** carries the full real-valued state $h \in \mathbb{R}^{256}$ forward through @eq-700-latent-recurrence, leaking at $\gamma = 0.9$ and absorbing Gaussian update noise, so its channel is wide but lossy.
+- **Verbalized, one token per step** must serialize its conclusion into a single symbol, the index of its current best hypothesis, and the next step starts from that commitment plus fresh evidence. Six bits survive, exactly, with no noise.
+- **Verbalized, four tokens per step** may emit a ranked top-four list, roughly twenty-four bits, which is the same bottleneck widened.
+
+Note that the comparison is deliberately generous to the token channel: the verbalized variants transmit their few bits *perfectly*, while the latent state is corrupted at every iteration. Any advantage the latent path shows is therefore bandwidth, not fidelity. The cost columns apply @eq-700-verbalized-cost and @eq-700-latent-cost at an explicitly stated price of $1.08 \times 10^{18}$ floating point operations per dollar, an accelerator-hour assumption stated in the code rather than a vendor quote.
+
+```{python}
+#| label: fig-700-latent-reasoning
+#| code-fold: false
+#| fig-cap: "Left: accuracy against test-time steps on a synthetic ARC-like rule-induction task, for a latent recurrent reasoner and two token-bottlenecked baselines fed the identical evidence stream. Right: the same runs placed in accuracy-versus-cost space under the FLOP model of Eq. 700-verbalized-cost and Eq. 700-latent-cost, showing why a small latent loop moves the cost-accuracy frontier."
+import numpy as np
+import matplotlib.pyplot as plt
+
+GRID, NCOL, NDEMO = 4, 4, 4
+D_LATENT = 256
+EPS = 0.45            # per-step observation noise the reasoner assumes
+CELLS_PER_STEP = 1    # bounded compute per latent iteration
+KAPPA = 1.0           # log-odds a single emitted token can assert
+GAMMA = 0.90          # leak of the fixed-size recurrent state
+SIGMA_H = 1.0         # noise injected by each lossy latent update
+
+DIHEDRAL = [
+    lambda g: g,
+    lambda g: np.rot90(g, 1),
+    lambda g: np.rot90(g, 2),
+    lambda g: np.rot90(g, 3),
+    lambda g: np.fliplr(g),
+    lambda g: np.flipud(g),
+    lambda g: g.T,
+    lambda g: np.rot90(g, 2).T,
+]
+rng0 = np.random.default_rng(0)
+COLOR_MAPS = [np.arange(NCOL)] + [rng0.permutation(NCOL) for _ in range(7)]
+HYPS = [(gi, ci) for gi in range(len(DIHEDRAL)) for ci in range(len(COLOR_MAPS))]
+NH = len(HYPS)
+
+LOG_MATCH = np.log(1.0 - EPS)
+LOG_MISS = np.log(EPS / (NCOL - 1))
+
+
+def apply_hyp(h_idx, grid):
+    gi, ci = HYPS[h_idx]
+    return COLOR_MAPS[ci][DIHEDRAL[gi](grid)]
+
+
+def make_task(rng):
+    """One ARC-like task: NDEMO demonstration pairs plus a query, all one hidden rule."""
+    true_h = int(rng.integers(NH))
+    xs = [rng.integers(0, NCOL, size=(GRID, GRID)) for _ in range(NDEMO)]
+    ys = [apply_hyp(true_h, x) for x in xs]
+    qx = rng.integers(0, NCOL, size=(GRID, GRID))
+    qy = apply_hyp(true_h, qx)
+    preds = np.stack([np.stack([apply_hyp(j, x).ravel() for j in range(NH)]) for x in xs])
+    obs = np.stack([y.ravel() for y in ys])
+    return preds, obs, qx, qy
+
+
+def evidence(preds, obs, k, cells):
+    """Per-hypothesis log-likelihood of the observed cells of demonstration k."""
+    match = preds[k][:, cells] == obs[k][cells]
+    return np.where(match, LOG_MATCH, LOG_MISS).sum(axis=1)
+
+
+def run(n_tasks, T_max, seed=1):
+    """Sweep the step budget for the latent loop and the two token-bottlenecked loops."""
+    rng = np.random.default_rng(seed)
+    R = np.linalg.qr(rng.normal(size=(D_LATENT, NH)))[0]
+    lat, vb1, vb4 = np.zeros(T_max), np.zeros(T_max), np.zeros(T_max)
+    for _ in range(n_tasks):
+        preds, obs, qx, qy = make_task(rng)
+        h = np.zeros(D_LATENT)
+        tok1 = int(rng.integers(NH))
+        tok4 = list(rng.integers(0, NH, size=4))
+        for t in range(T_max):
+            k = t % NDEMO
+            cells = rng.integers(0, GRID * GRID, size=CELLS_PER_STEP)
+            d = evidence(preds, obs, k, cells)
+
+            # latent: the full real-valued state survives to the next iteration
+            h = latent_step(h, R, d, GAMMA, SIGMA_H * rng.normal(size=D_LATENT))
+            if np.array_equal(apply_hyp(int(np.argmax(readout(h, R))), qx), qy):
+                lat[t] += 1
+
+            # verbalized: only the emitted token index survives
+            ell = d.copy()
+            ell[tok1] += KAPPA
+            tok1 = int(np.argmax(ell))
+            if np.array_equal(apply_hyp(tok1, qx), qy):
+                vb1[t] += 1
+
+            # verbalized with a wider channel: a ranked top-4 list survives
+            ell = d.copy()
+            for rank, j in enumerate(tok4):
+                ell[j] += KAPPA * (len(tok4) - rank) / len(tok4)
+            tok4 = list(np.argsort(-ell)[:4])
+            if np.array_equal(apply_hyp(int(tok4[0]), qx), qy):
+                vb4[t] += 1
+    return list(range(1, T_max + 1)), lat / n_tasks, vb1 / n_tasks, vb4 / n_tasks
+
+
+N_TASKS, T_MAX = 400, 32
+Ts, acc_lat, acc_vb1, acc_vb4 = run(N_TASKS, T_MAX)
+
+print(f"hypothesis space |H| = {NH}, latent dimension d = {D_LATENT}, tasks = {N_TASKS}")
+print(f"{'T':>3} | {'latent':>8} | {'verbalized 1 tok':>17} | {'verbalized 4 tok':>17}")
+print("-" * 55)
+for t in [1, 2, 4, 8, 16, 24, 32]:
+    i = t - 1
+    print(f"{t:>3} | {acc_lat[i]:>8.3f} | {acc_vb1[i]:>17.3f} | {acc_vb4[i]:>17.3f}")
+
+# ---- channel bandwidth, Eq. 700-token-bandwidth vs Eq. 700-latent-bandwidth ----
+V, d_model = 128_000, 2048
+bits_token = np.log2(V)
+bits_latent_bf16 = d_model * 16
+snr_star = 2 ** (2 * bits_token / d_model) - 1          # Eq. 700-latent-snr
+print()
+print(f"vocabulary V = {V}: log2(V) = {bits_token:.3f} bits per emitted step")
+print(f"latent state d = {d_model} in bfloat16: {bits_latent_bf16} nominal bits per step")
+print(f"nominal bandwidth ratio = {bits_latent_bf16 / bits_token:.0f}x")
+print(f"at only 1 effective bit per dimension the ratio is still {d_model / bits_token:.0f}x")
+print(f"break-even latent SNR = {snr_star:.4f} ({10 * np.log10(snr_star):.1f} dB)")
+
+# ---- pass@2, Eq. 700-pass2-invert and Eq. 700-pass2-bracket ----
+pass2 = 0.295
+p_ind = 1 - np.sqrt(1 - pass2)
+print()
+print(f"reported ARC-AGI-1 pass@2 = {pass2:.3f}")
+print(f"independent-sample per-sample accuracy p = 1 - sqrt(1 - pass@2) = {p_ind:.4f}")
+print(f"model-free bracket on p: [{pass2 / 2:.4f}, {pass2:.4f}]")
+
+# ---- reported economics ----
+cost_task = 0.0007
+for price in (10.0, 2.0):
+    print(f"${cost_task} buys {cost_task / price * 1e6:.0f} output tokens "
+          f"at ${price:.0f} per million")
+o3_cost, o3_acc = 1000.0, 0.875
+print(f"ratio to a $1000 per task frontier configuration = {o3_cost / cost_task:,.0f}x")
+print(f"cost per accuracy point: BDH-CQ ${cost_task / (pass2 * 100):.3e}, "
+      f"$1000-per-task config ${o3_cost / (o3_acc * 100):.3f}")
+
+# ---- FLOP cost model, Eq. 700-verbalized-cost and Eq. 700-latent-cost ----
+FLOPS_PER_DOLLAR = 1.08e18     # stated assumption, not a vendor quote
+P_REC, P_BIG = 150e6, 70e9
+N_LAYERS, D_MODEL_BIG, N_CTX0 = 80, 8192, 2000
+
+
+def cost_latent(T, P=P_REC):
+    return 2 * P * T / FLOPS_PER_DOLLAR
+
+
+def cost_verbal(L, P=P_BIG):
+    dense = 2 * P * L
+    attn = 4 * N_LAYERS * D_MODEL_BIG * (N_CTX0 * L + L * (L + 1) / 2)
+    return (dense + attn) / FLOPS_PER_DOLLAR
+
+
+print()
+print(f"{'method':<34} | {'steps':>5} | {'accuracy':>8} | {'FLOPs/task':>11} | {'$/task':>10}")
+print("-" * 82)
+rows = [
+    ("latent recurrence, 150M", T_MAX, acc_lat[-1], 2 * P_REC * T_MAX, cost_latent(T_MAX)),
+    ("verbalized 1 token/step, 150M", T_MAX, acc_vb1[-1], 2 * P_REC * T_MAX, cost_latent(T_MAX)),
+    ("verbalized 1 token/step, 70B", T_MAX, acc_vb1[-1],
+     cost_verbal(T_MAX) * FLOPS_PER_DOLLAR, cost_verbal(T_MAX)),
+    ("verbalized 4 tokens/step, 70B", 4 * T_MAX, acc_vb4[-1],
+     cost_verbal(4 * T_MAX) * FLOPS_PER_DOLLAR, cost_verbal(4 * T_MAX)),
+]
+for name, s, a, f, c in rows:
+    print(f"{name:<34} | {s:>5} | {a:>8.3f} | {f:>11.3e} | {c:>10.3e}")
+print(f"cost ratio, 70B verbalized over 150M latent at T={T_MAX}: "
+      f"{cost_verbal(T_MAX) / cost_latent(T_MAX):,.0f}x")
+print(f"one decoded 70B token buys {cost_verbal(1) / cost_latent(1):,.0f} latent iterations "
+      f"of the 150M recurrent core")
+ahead = acc_lat > acc_vb4
+print(f"latent stays ahead of the 4-token verbalized channel from "
+      f"T = {Ts[int(np.argmax(np.cumprod(ahead[::-1])[::-1]))]} onward")
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
+ax1.plot(Ts, acc_lat, "o-", label="latent recurrence (full state)")
+ax1.plot(Ts, acc_vb4, "^-", label="verbalized, 4 tokens per step")
+ax1.plot(Ts, acc_vb1, "s-", label="verbalized, 1 token per step")
+ax1.set_xlabel("iterations T (latent) or reasoning steps (verbalized)")
+ax1.set_ylabel("query-grid accuracy")
+ax1.set_title("Accuracy versus test-time steps")
+ax1.legend(fontsize=8, loc="upper left")
+ax1.grid(True, alpha=0.3)
+
+ax2.plot([cost_latent(t) for t in Ts], acc_lat, "o-", label="latent, 150M")
+ax2.plot([cost_latent(t) for t in Ts], acc_vb1, "s-", label="verbalized, 150M")
+ax2.plot([cost_verbal(t) for t in Ts], acc_vb1, "d-", label="verbalized, 70B")
+ax2.set_xscale("log")
+ax2.set_xlabel("modelled cost per task in dollars, log scale")
+ax2.set_ylabel("query-grid accuracy")
+ax2.set_title("The cost-accuracy frontier")
+ax2.legend(fontsize=8, loc="upper left")
+ax2.grid(True, alpha=0.3)
+fig.tight_layout()
+plt.show()
+```
+
+The curves separate exactly where the bandwidth argument predicts. All three reasoners start together near $0.06$ at $T = 1$, because one cell of evidence is one cell of evidence however you carry it. The one-token channel then dies immediately: it climbs from $0.060$ to $0.083$ and stops, because committing to a single hypothesis index each step destroys the accumulated uncertainty, and a later observation that contradicts the commitment cannot be weighed against the observations that produced it. Widening the channel to four ranked tokens recovers a great deal, to $0.475$, which is the point: the bottleneck is bandwidth, not the fact of writing something down. The latent loop passes it at $T = 6$ and keeps climbing to $0.835$ at $T = 32$, while both token channels have long since flattened. Its early disadvantage is real and worth stating plainly: at $T = 4$ the latent loop is at $0.253$ against the four-token channel's $0.292$, because the injected update noise costs it something before enough evidence has accumulated to dominate that noise. A lossy wide channel loses to an exact narrow one until the integration time is long enough, and only then wins decisively.
+
+The cost table turns the same runs into money. Under @eq-700-verbalized-cost and @eq-700-latent-cost, the $32$-iteration latent run costs $9.600 \times 10^{9}$ operations, about $\$8.9 \times 10^{-9}$ per task, against $4.649 \times 10^{12}$ operations and $\$4.3 \times 10^{-6}$ for a $70$B model decoding the same number of steps, a factor of $484$ as @eq-700-exchange-rate predicted. The four-token variant, which is the only token baseline that reaches respectable accuracy, needs $128$ decoded tokens and costs $\$1.7 \times 10^{-5}$, roughly $1{,}900$ times the latent run and still lands at $0.475$ against its $0.835$. The right panel makes the structural point visible: the latent curve occupies a region of accuracy-versus-cost space that the verbalized curves never enter, which is what a Pareto-frontier claim looks like when you plot it. Note honestly what the simulation does and does not isolate. Both the $150$M and $70$B verbalized curves have the same accuracy, because the simulation holds *capability* fixed and varies only the channel; model size enters as a pure cost multiplier. Real systems entangle the two, and the paper's $150$M configuration is a real model, not a re-parameterization of a large one.
+
+### 15.6 What latent reasoning costs you {#sec-700-latent-limits}
+
+Three things are given up, and each connects to a section above.
+
+**The trace is gone, not merely unfaithful.** Section @sec-700-invisible-reasoning bounded chain-of-thought monitoring by $\mathrm{Acc}^\star \le \tfrac12 + \tfrac12\sqrt{2 I(H;T)}$ in @eq-700-monitor-bound, and showed detection collapsing to chance as computation migrates off the page. @baherwani2026invisible measured models *choosing* to compute invisibly. A latent recurrent reasoner makes that the architecture: there is no intermediate token sequence at all, so $I(H;T) = 0$ identically for every reasoning step, and @eq-700-monitor-lecam gives $\mathrm{Acc}^\star = \tfrac12$ exactly, for every monitor, with no experiment required. This is not a criticism of the design, which is optimizing cost and never claimed auditability, but it does close off the entire safety story built on reading traces. Whatever interpretability such a system admits has to come from probing $h_t$ directly, which is the mechanistic-interpretability problem rather than the chain-of-thought-monitoring one.
+
+**Process supervision has nothing to score.** The hierarchical reward models of @sec-700-hrm, the process reward models of @sec-700-methods, and the tree search that depends on them all require step-level text to evaluate. None applies to @eq-700-latent-recurrence. What survives is *outcome*-level test-time compute: pass@2 is precisely best-of-$N$ at $N = 2$ from @eq-700-passn, self-consistency over final grids still works, and the verifier scaling of @sec-700-verification-axis could still rank final answers. Depth-based search inside the reasoning, however, is not available in the usual form.
+
+**A fixed-size state is a fixed-size state.** A KV cache grows with the problem, which is why @eq-700-verbalized-cost is quadratic; that quadratic term is the price of unbounded working memory. Equation @eq-700-latent-cost is linear because $h_t \in \mathbb{R}^d$ never grows, and the plateau at $0.835$ in @fig-700-latent-reasoning is the visible consequence: past some $T$, the leak $\gamma$ and the update noise consume new evidence as fast as it arrives, and more iterations stop buying accuracy. This is the same shape of ceiling as the verifier plateau in @sec-700-imperfect, arriving from a different direction, and it is the honest counterweight to the bandwidth arithmetic of @sec-700-token-bottleneck.
+
+Set against those costs, the result belongs in this chapter because it falsifies an assumption the rest of the chapter makes silently. Test-time compute is not token generation. It is *iterated computation*, and tokens are one implementation of it, chosen historically because language models already had a decoder loop and because a readable trace was a welcome side effect. @engdahl2026bdhcq show a different implementation reaching a place on the cost axis that the token implementation cannot reach, roughly $29.5\%$ on ARC-AGI-1 at seventy tokens' worth of compute per task, and the fact that it does so with $150$M parameters against frontier systems three orders of magnitude larger is the clearest available evidence that the token bottleneck of @eq-700-token-bandwidth is a real constraint rather than an accounting convention.
+
+## 16. Conclusion {#sec-700-conclusion}
+
+Reasoning models introduced the first genuinely new scaling axis since the transformer: test-time compute, the ability to make a fixed model more capable by letting it think longer. The mathematics is clean and consequential. Best-of-N is bounded by the pass@N ceiling and, in practice, by verifier quality; self-consistency is a majority-vote denoiser that helps only above the plurality threshold and at a rate set by the squared margin; sequential depth adds the power to self-correct. OpenAI's o-series proved the paradigm commercially and exposed the thinking budget as a control; DeepSeek-R1 opened the recipe and showed, in a peer-reviewed result, that reasoning can emerge from reinforcement learning alone. Verifier quality is not just about noise: section @sec-700-hrm showed that even a noiseless-looking PRM has a structural blind spot for self-correction, one that hierarchical supervision fixes at no extra inference cost, and the same hierarchical-node-compression trick that fixes it also makes automatic, MCTS-based annotation cheaper. The methods, the economics of paying to think and routing to avoid overthinking, and the honest limits (the ARC-AGI-2 adaptation gap, unfaithful traces) together define the regime in which all current frontier systems operate. Section @sec-700-latent-reasoning closes the loop by questioning the chapter's most basic assumption: test-time compute is iterated computation, not token generation, and a 150M parameter recurrent latent reasoner buying ARC-AGI-1 accuracy at a fraction of a cent per task shows that the token bottleneck is a real constraint rather than an accounting convention. Understanding that dimension is now prerequisite to understanding the field.
 
 ## References {#sec-700-references}
 
@@ -1244,7 +1663,7 @@ Reasoning models introduced the first genuinely new scaling axis since the trans
 8.  Lightman, H. et al. "Let's Verify Step by Step" (process reward models). 2023. <https://arxiv.org/abs/2305.20050>
 9.  Glazer, E. et al. "FrontierMath: A Benchmark for Evaluating Advanced Mathematical Reasoning in AI." 2024. <https://arxiv.org/abs/2411.04872>
 10. Qwen Team. "Qwen3 Technical Report" (thinking budgets). 2025. <https://github.com/QwenLM/Qwen3>
-11. Wei, J. et al. "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models." 2022. <https://arxiv.org/abs/2201.11903>
+11. Wei, J. et al. "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models." *Advances in Neural Information Processing Systems* 35, 2022. <https://proceedings.neurips.cc/paper/2022/hash/9d5609613524ecf4f15af0f7b31abca4-Abstract-Conference.html>
 12. Cobbe, K. et al. "Training Verifiers to Solve Math Word Problems" (GSM8K, best-of-N verification). 2021. <https://arxiv.org/abs/2110.14168>
 13. Yao, S. et al. "Tree of Thoughts: Deliberate Problem Solving with Large Language Models." 2023. <https://arxiv.org/abs/2305.10601>
 14. Wang, T. et al. "Towards Hierarchical Multi-Step Reward Models for Enhanced Reasoning in Large Language Models." Accepted, Findings of the Association for Computational Linguistics: ACL 2026. arXiv preprint (v5, April 2026): <https://arxiv.org/abs/2503.13551>. Code: <https://github.com/tengwang0318/hierarchial_reward_model>
@@ -1253,3 +1672,4 @@ Reasoning models introduced the first genuinely new scaling axis since the trans
 17. Liu, X., Xu, M., Stokes, J. W., Smolensky, P., Burger, D., Gao, J. "GFlowRL: Scaling Distribution-Matching RL to Large Language Models." arXiv preprint, 2026. <https://arxiv.org/abs/2607.13394>
 18. Liu, G. K.-M., Gani, A., Lu, J., Thomas, J., Steyvers, M., Cohan, A. "Metacognition in LLMs: Foundations, Progress, and Opportunities." arXiv preprint, 2026. <https://arxiv.org/abs/2607.11881>
 19. Baherwani, V., Goldstein, T., Panda, A. "Not All LLM Reasoning is Visible in the Chain-of-Thought." arXiv preprint, 2026. <https://arxiv.org/abs/2607.22925>
+20. Engdahl, B., Kosowski, A., Chorowski, J., Stamirowska, Z., Uznański, P., Jiang, J., Phadke, R., Kinas, R., Zhong, R. "BDH-CQ: In-Context Learning with Recurrent Latent Reasoning." arXiv preprint, 2026. <https://arxiv.org/abs/2608.09888>

@@ -123,6 +123,11 @@ pub mod ch202_layer_norm;
 pub mod ch204_dropout;
 pub mod ch207_densenet;
 pub mod ch525_oversight;
+pub mod ch_clickgraph;
+pub mod ch526_hitl_discovery;
+pub mod ch1058_drdl;
+pub mod ch945_suva;
+pub mod ch_migration_flows;
 
 #[cfg(test)]
 mod tests {

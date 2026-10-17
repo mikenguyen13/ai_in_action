@@ -414,8 +414,15 @@ pub fn fit_ica(
         }
         var[c] = ss / (n as f64 - 1.0);
     }
+    // Whitening makes these variances (nearly) equal, so quantize them at 1e-9
+    // relative: variances that agree to that tolerance are ties and keep their
+    // natural order (sort_by is stable). This keeps the permutation independent of
+    // floating-point noise, matching the Python and Julia implementations.
+    let max_var = var.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let scale = if max_var > 0.0 { max_var } else { 1.0 };
+    let key: Vec<f64> = var.iter().map(|v| (v / scale * 1e9 + 0.5).floor()).collect();
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|&a, &b| var[b].partial_cmp(&var[a]).unwrap());
+    order.sort_by(|&a, &b| key[b].partial_cmp(&key[a]).unwrap());
     let w = order.iter().map(|&c| w[c].clone()).collect::<Vec<_>>();
     let components = order
         .iter()

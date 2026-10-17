@@ -54,6 +54,153 @@ $$\text{system} \to \text{user} \to \text{assistant (tool\_call)} \to \text{tool
 
 For multi-step tasks this sequence may cycle through the tool-call/tool-result pair multiple times before a final answer is produced.
 
+### Tools as Code: The Programmatic Alternative {#sec-485-programmatic-tool-calling}
+
+The protocol above carries a constraint that is easy to miss, because it is baked into the transport rather than stated anywhere. Every argument bundle and every return value crosses the context window as JSON text, and every invocation costs an inference turn: the model emits a call, generation halts, the runtime replies, generation resumes. For a single weather lookup this is invisible. For a task requiring forty calls, or a chain of twelve in which each argument depends on the previous result, the transport becomes the binding constraint rather than the reasoning.
+
+A different arrangement is available to any model that can write code. Instead of publishing JSON Schemas and waiting for structured calls, the runtime publishes the tools as **typed function stubs**, a source module the model reads and imports, and gives the model a sandbox in which to run scripts. The model writes a program that calls the stubs, loops over them, branches on their results and prints a reduced answer; the runtime executes that program in a subprocess and returns stdout. @patel2026bitter name this **programmatic tool calling** (PTC) and give the first systematic comparison against native JSON calling on an established benchmark across model generations.
+
+The weather tool of the previous subsection becomes a signature rather than a schema:
+
+```python
+# tools.py, whose source is injected into the system prompt
+from typing import Literal
+
+def get_current_weather(
+    location: str,
+    unit: Literal["celsius", "fahrenheit"] = "celsius",
+) -> dict:
+    """Retrieve current weather conditions for a location.
+
+    Args:
+        location: City and country, e.g. 'Paris, France'
+        unit: Temperature unit to return
+    """
+```
+
+The annotations carry what `properties` carried, the default carries what `required` carried, and the docstring carries the `description` fields. Nothing in the contract is lost. It is restated in the notation the model has seen most often during training, which is the paper's title in miniature.
+
+The four components of the JSON protocol map across directly, and the third is where the difference lives.
+
+| JSON calling | Programmatic calling |
+|---|---|
+| Schema declaration: JSON Schema objects passed through the API `tools` parameter | Stub declaration: annotated function source placed in the system prompt |
+| Structured call generation: one `tool_calls` object per invocation | Script generation: one program containing all invocations, with loops and conditionals |
+| Execution and result injection: runtime dispatches each call and appends a tool message | Sandbox execution: runtime runs the script in a subprocess and appends captured stdout |
+| Continued reasoning: resumes after every call | Continued reasoning: resumes once, after the script terminates |
+
+: Correspondence between the two calling conventions. {#tbl-485-ptc-correspondence}
+
+The conversational shape collapses accordingly. Where JSON calling for an $N$-invocation task produces
+
+$$
+\text{system} \to \text{user} \to \big(\text{assistant (tool\_call)} \to \text{tool (result)}\big)^{N} \to \text{assistant (final)},
+$$
+
+the programmatic form produces
+
+$$
+\text{system (stubs)} \to \text{user} \to \text{assistant (script)} \to \text{tool (stdout)} \to \text{assistant (final)}
+$$
+
+for every $N$. The iteration has moved out of the conversation and into the script, where it costs no inference turns and no context.
+
+**Three structural consequences.** *Serial depth* becomes cheap: a twelve-step chain in which each call consumes the previous return value is twelve statements in one program rather than twelve round trips, so the compounding dependency that Section 6 identifies as the primary source of fragility is spanned by a single generation instead of twelve. *Fan-out width* stops being rationed by the model's willingness to emit many parallel call objects in one message, because a loop over fifty items is the same three lines as a loop over five. *Context pressure* falls, because the script filters and aggregates before printing, so intermediate payloads never enter the window at all. The first two are efficiency claims. The third is an accuracy claim, and it is the one that matters most under adversarial conditions.
+
+**A token model for fan-out.** Let a task require $N$ invocations. Under JSON calling the context accumulates a fixed schema block of $S$ tokens plus, for each invocation, an argument bundle $c_a$, a returned payload $c_r$, and per-message protocol overhead $c_o$ covering call identifiers, role wrappers and tool-message envelopes:
+
+$$
+C_{\mathrm{json}}(N) = S + N\,(c_a + c_r + c_o).
+$$ {#eq-485-json-tokens}
+
+Under programmatic calling the context accumulates the stub module source $P$, the script the model writes, and the text the script prints:
+
+$$
+C_{\mathrm{ptc}}(N) = P + \ell(N) + \rho(N).
+$$ {#eq-485-ptc-tokens}
+
+Two facts about the right-hand side do the work. When the $N$ invocations are homogeneous, the script is a loop whose source length does not grow with $N$, so $\ell(N) \approx \ell_0$. And because the script aggregates before printing, $\rho$ scales with the size of the answer rather than with the number of calls. Writing $\gamma$ for whatever residual marginal cost survives, $C_{\mathrm{ptc}}(N) \approx (P + \ell_0) + \gamma N$ with $\gamma \ll c_a + c_r + c_o$. Two lines with a positive intercept gap and a larger slope gap cross exactly once, at
+
+$$
+N^{*} = \frac{(P + \ell_0) - S}{(c_a + c_r + c_o) - \gamma}.
+$$ {#eq-485-crossover}
+
+The numerator is positive in practice, because stub source carrying full signatures, docstrings and the prose that teaches the calling convention is bulkier than the equivalent schemas. Programmatic calling is therefore strictly more expensive on narrow tasks and strictly cheaper on wide ones, and $N^{*}$ is the only quantity a practitioner needs in order to choose between them.
+
+@patel2026bitter measure both sides of @eq-485-crossover. The fixed penalty is real: programmatic calling consumes roughly $1.5\times$ the input tokens of the baseline on their chaining ablation, which is $P > S$ appearing exactly where @eq-485-ptc-tokens says it should, on tasks whose $N$ is small. The two slopes are recoverable from a pair of reported fan-out measurements, and the crossover they imply is then a check on the model rather than an assumption fed into it.
+
+```{python}
+#| label: fig-485-ptc-token-crossover
+#| fig-cap: "Left: input token cost against fan-out width, with each paradigm fitted as a straight line through the two measurements reported by Patel et al. (2026) at N = 30 and N = 48. The fixed stub-module preamble makes programmatic calling more expensive on narrow tasks while the per-call JSON overhead makes it cheaper on wide ones, producing a single crossover near N = 28 against the value of about 26 the authors report. Right: the enumeration accuracy cliff measured on Claude Sonnet 5, where JSON calling holds full accuracy out to a fan-out of 70 and then collapses within thirty further items, while the programmatic form is still complete at 100."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Reported input-token consumption at two fan-out widths (Patel et al., 2026).
+N_OBS = np.array([30.0, 48.0])
+JSON_OBS = np.array([3559.0, 5097.0])
+PTC_OBS = np.array([3380.0, 3535.0])
+
+def fit_line(x, y):
+    """Two points determine the affine token model of each paradigm."""
+    slope = (y[1] - y[0]) / (x[1] - x[0])
+    return slope, y[0] - slope * x[0]
+
+m_json, b_json = fit_line(N_OBS, JSON_OBS)      # (c_a + c_r + c_o), and S
+m_ptc, b_ptc = fit_line(N_OBS, PTC_OBS)         # gamma, and (P + l_0)
+n_star = (b_ptc - b_json) / (m_json - m_ptc)    # the crossover equation
+
+print(f"JSON  marginal {m_json:5.1f} tok/call, fixed block {b_json:6.0f} tok")
+print(f"PTC   marginal {m_ptc:5.1f} tok/call, fixed block {b_ptc:6.0f} tok")
+print(f"crossover N* = {n_star:.1f}  (authors report approximately 26)")
+
+# Reported enumeration accuracy for Claude Sonnet 5 under increasing fan-out.
+fanout = np.array([10.0, 40.0, 70.0, 72.0, 100.0])
+json_acc = np.array([100.0, 100.0, 100.0, 75.0, 0.0])
+ptc_acc = np.full_like(json_acc, 100.0)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+grid = np.linspace(0, 60, 200)
+ax1.plot(grid, b_json + m_json * grid, color="#c44e52", lw=2,
+         label="JSON tool calling")
+ax1.plot(grid, b_ptc + m_ptc * grid, color="#4c72b0", lw=2,
+         label="Programmatic tool calling")
+ax1.scatter(N_OBS, JSON_OBS, color="#c44e52", zorder=5, s=45)
+ax1.scatter(N_OBS, PTC_OBS, color="#4c72b0", zorder=5, s=45)
+ax1.axvline(n_star, color="0.4", ls=":", lw=1.4)
+ax1.annotate(f"$N^*\\approx{n_star:.0f}$", xy=(n_star, 0),
+             xytext=(n_star + 2.5, 1500), color="0.25")
+ax1.set_xlabel("fan-out width $N$ (tool invocations)")
+ax1.set_ylabel("input tokens consumed")
+ax1.set_title("Token cost crosses over once")
+ax1.set_ylim(0, 6400)
+ax1.legend(frameon=False, loc="upper left", fontsize=9)
+
+ax2.plot(fanout, json_acc, "o-", color="#c44e52", lw=2,
+         label="JSON tool calling")
+ax2.plot(fanout, ptc_acc, "s--", color="#4c72b0", lw=2,
+         label="Programmatic tool calling")
+ax2.set_xlabel("fan-out width $N$ (items to enumerate)")
+ax2.set_ylabel("enumeration accuracy (%)")
+ax2.set_title("The fan-out cliff (Claude Sonnet 5)")
+ax2.set_ylim(-5, 108)
+ax2.legend(frameon=False, loc="lower left", fontsize=9)
+
+for ax in (ax1, ax2):
+    ax.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+```
+
+**What the benchmark shows.** The evaluation covers fourteen models released between November 2024 and July 2026, on a 309-entry subset of BFCL v4 sampled proportionally across eight task categories. On the main subset, programmatic calling matches or exceeds JSON calling for eleven of the fourteen, with the strongest gains around ten percentage points. Chaining and fan-out, the two regimes the structural argument above predicts should favour it, are where the separation is widest: on chains of length two to twenty the leading models rise from roughly 81% to the mid-nineties, and on enumeration tasks programmatic calling matches or beats the baseline in thirteen of fourteen models. Latency tracks the turn count, with programmatic calling completing chaining entries in roughly half the wall-clock time for thirteen of the fourteen.
+
+The context-rot ablation is the most interesting result, because it probes the third consequence listed above rather than the first two. Flooding the context with irrelevant material degrades JSON calling by 2.3% on average, and a filesystem-discovery variant by 32.0%, while programmatic calling *improves* by 5.5%. The asymmetry follows from where intermediate results live. Under JSON calling every payload joins the same window the distractors are polluting; under programmatic calling those payloads stay in the sandbox, and only the script's summary is ever exposed to the pollution.
+
+**The bitter lesson.** The three models that lose badly, by roughly twenty to twenty-seven percentage points, are all older OpenAI releases, and the cause is not a reasoning failure. They emit literal `\n` escape sequences where a multiline script needs real newlines, so the subprocess raises a syntax error before any tool is reached. Newer releases in the same family do not do this. The gap therefore tracks model *generation* rather than model *family*, and it closes without anyone redesigning the scaffold. That is the argument the title makes: a calling convention engineered around the assumption that models cannot reliably write code is a convention with an expiry date, and the structural advantages of expressing tool use in a general-purpose language accrue automatically as the underlying models improve.
+
+**What the evaluation does not establish.** Three limits are worth carrying forward, two of them stated by the authors. BFCL v4 stubs are echo-return, so the benchmark scores argument serialization accuracy rather than end-to-end tool-use correctness; a script that constructs perfect arguments and then mishandles a real API's error response scores identically to one that does not. The ablations run on 31 to 52 entries, so the aggregate direction is informative while individual per-model deltas are not. And the work is a recent preprint without peer review. The structural claims about turn count and context isolation follow from the mechanics and would survive a change of benchmark; the specific accuracy figures should be read as a first measurement rather than a settled quantity.
+
 ## 3. ReAct: Interleaved Reasoning and Acting
 
 Yao et al. (2023) formalized the observation that language models produce better tool-augmented outputs when reasoning and action are explicitly interleaved rather than either separated or implicit. The **ReAct** (Reason + Act) framework structures agent traces as alternating thought and action steps.
@@ -138,6 +285,8 @@ Effective tool use depends as much on tool design as on model capability. Four p
 **Atomicity.** Tools should have a single, well-defined responsibility. A tool that "searches the web and summarizes results" conflates retrieval with summarization; if either step fails, the failure is opaque. Separate tools for "web search returning raw snippets" and "summarize text" give the model control over each step and produce interpretable error signals.
 
 **Parseable outputs.** Tool return values should be structured (JSON, typed dataclasses) rather than free text. Free-text returns require the model to parse natural language before reasoning over results, introducing an additional failure mode. Structured returns enable direct field access in subsequent reasoning.
+
+Two of these four principles bind harder under the programmatic convention of @sec-485-programmatic-tool-calling, and for the same underlying reason: the consumer of a tool's output changes from a language model reading a transcript to a program indexing a value. Atomicity stops being merely good hygiene and becomes compositional necessity, because the model is now writing control flow over the tools rather than selecting one per turn, and a tool that fuses retrieval with summarization cannot be placed inside a loop that needs the raw snippets. Parseable outputs stop being a convenience and become a hard requirement, because a free-text return that a model could have read charitably will instead be subscripted by a script and raise an exception. Documentation shifts rather than tightens, moving out of `description` strings and into type annotations, defaults and docstrings, where the same information is expressed in the notation the model has the most training exposure to.
 
 ### Context Management as a Tool Rather Than a Harness Policy {#sec-485-context-editing-tools}
 
@@ -505,7 +654,7 @@ This pattern implements Chain-of-Abstraction manually: the computation graph is 
 
 ## 9. Evaluation and Failure Modes
 
-Benchmarking tool-use agents requires metrics beyond end-task accuracy. Three dimensions matter.
+Benchmarking tool-use agents requires metrics beyond end-task accuracy. Four dimensions matter.
 
 **Call precision and recall.** Does the model invoke the correct tool for each sub-problem (precision), and does it invoke all necessary tools (recall)? APIBench measures this via Abstract Syntax Tree (AST) comparison of generated versus reference API calls.
 
@@ -513,13 +662,17 @@ Benchmarking tool-use agents requires metrics beyond end-task accuracy. Three di
 
 **Efficiency.** An agent that correctly answers a question in 10 tool calls when 2 suffice is expensive to run. Trajectory length is a proxy for reasoning efficiency and correlates with latency and API cost.
 
+**Saturation under fan-out.** All three dimensions above are measured at a task's natural width, which on most benchmark entries is a handful of calls. Holding the task fixed and sweeping the number of required invocations exposes a fourth dimension that fixed-width evaluation cannot see. @patel2026bitter run this sweep and find a cliff rather than a slope: on an enumeration task, JSON calling on Claude Sonnet 5 returns every item correctly out to a fan-out of 70, drops to 75% at 72, and reaches zero by 100, while the programmatic form of @sec-485-programmatic-tool-calling is still complete at 100. Any evaluation whose entries all sit to the left of an agent's cliff will report perfect enumeration and predict nothing about production traffic that occasionally sits to the right of it.
+
+The cliff also matters because of *how* it fails. A model that drops thirty of a hundred required calls does not announce an error; it emits a well-formed, plausible answer over the subset it did enumerate, and every downstream check on syntactic validity and argument correctness passes. Detecting silent truncation requires an expected-cardinality check against the request, which is a property of the harness rather than of the model, and which most tool-use scaffolds do not implement.
+
 Common failure modes include: invoking a tool when parametric knowledge suffices (over-reliance), failing to invoke a tool when external grounding is needed (under-reliance), generating syntactically valid but semantically incorrect argument bundles (hallucination), and entering cycles where repeated tool calls return the same observation without triggering a state change in reasoning.
 
 Mitigations include explicit stopping criteria in system prompts, tool-use training data that includes negative examples (situations where no tool call is correct), and structured output validation before dispatch.
 
 ## References
 
-1. Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y. (2023). ReAct: Synergizing Reasoning and Acting in Language Models. *ICLR 2023*. https://arxiv.org/abs/2210.03629
+1. Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y. (2023). ReAct: Synergizing Reasoning and Acting in Language Models. *International Conference on Learning Representations (ICLR)*. https://openreview.net/forum?id=WE_vluYUL-X
 
 2. Patil, S. G., Zhang, T., Wang, X., & Gonzalez, J. E. (2023). Gorilla: Large Language Model Connected with Massive APIs. *arXiv preprint*. https://arxiv.org/abs/2305.15334
 
@@ -528,3 +681,5 @@ Mitigations include explicit stopping criteria in system prompts, tool-use train
 4. Gao, J., Gu, L., Su, J., Guo, Y., Li, M., Li, J., Chen, W., & Bi, W. (2024). Efficient Tool Use with Chain-of-Abstraction Reasoning. *arXiv preprint*. https://arxiv.org/abs/2401.17464
 
 5. Li, X., Ming, R., Chu, M., Shao, S., Jin, R., & Xiong, C. (2026). ACM: Agentic Context Management for Long Horizon Tasks. *arXiv preprint*. https://arxiv.org/abs/2607.23809
+
+6. Patel, I., Sen, S., Lumer, E., & Subbiah, V. K. (2026). The Bitter Lesson of Tool Calling. *arXiv preprint*. https://arxiv.org/abs/2608.06370

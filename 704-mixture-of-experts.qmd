@@ -490,7 +490,614 @@ The 2-of-8 curve falls from 1.082 at 1,024 tokens to about 1.03 by 4,096, sits n
 
 This closes the loop on the tradeoff that opened the chapter. MoE decouples total capacity from per-token compute, and $\rho_{\text{route}}$ is the dial that sets how aggressively you exploit that decoupling. Turning it down toward two percent buys enormous capacity per unit of compute, which is precisely the scaling efficiency K3 reports. What you pay for it is not accuracy but engineering surface: a routing distribution whose noise floor grows like $\sqrt{E}$, a training step whose duration is set by the unluckiest expert, an inference regime that only reaches peak throughput at very large batch, and a memory footprint that still holds all 2.8 trillion parameters even though any one token touches under four percent of them. Sparsity is a compute discount financed by a systems debt, and the size of that debt is what separates a textbook MoE layer from a frontier one.
 
-## 8. Pitfalls and When to Use
+## 8. Motif 3: What Is Left to Optimize Once Routing Is Sparse {#sec-704-motif3}
+
+Section 7.7 read one frontier system and drew a single conclusion from it: sparsity is a compute discount financed by a systems debt. One data point cannot tell you whether the discount has a natural stopping place, and it cannot tell you where the engineering effort goes once you stop turning the routing dial. @lim2026motif3 supply the second point. Motif 3 is a decoder-only mixture of experts with 314 billion total parameters and 13.2 billion activated per token, built from sparse layers of 384 routed experts with 8 selected per token, pretrained on roughly 12.5 trillion tokens at context lengths up to 256K. It was released within weeks of @kimi2026k3 by an unrelated team, and the two reports converge on the same sparsity regime while spending their engineering budgets in almost entirely different places. That divergence is the useful part, and it is what this section unpacks.
+
+### 8.1 The Dense Floor
+
+Take the two ratios of Section 7.7 at face value. For Motif 3,
+
+$$
+\rho_{\text{route}} = \frac{k}{E} = \frac{8}{384} = \frac{1}{48} \approx 2.083\%,
+\qquad
+\rho_{\text{param}} = \frac{P_{\text{act}}}{P_{\text{total}}} = \frac{13.2 \times 10^{9}}{314 \times 10^{9}} \approx 4.204\%,
+$$
+
+against K3's $1.786\%$ and $3.714\%$, Mixtral's $25\%$ and $27.66\%$, and the toy layer's $25\%$. Motif 3 is twelve times sparser at the router than the 2-of-8 layer the code cells above simulate, and about six and a half times sparser in parameters than Mixtral. So far this is the same story as before. The interesting question is why two independent teams landed within three tenths of a percentage point of each other on $\rho_{\text{route}}$.
+
+The answer falls out of the gap between the two ratios. Split the total parameter count into an always-on part and a routed part,
+
+$$
+P_{\text{total}} = P_{\text{dense}} + P_{\text{exp}},
+$$
+
+where $P_{\text{dense}}$ collects attention projections, embeddings, normalization, any shared experts, and the output head, all of which every token pays in full, and $P_{\text{exp}}$ is the routed expert bank, of which a token touches the fraction $k/E$. Then
+
+$$
+P_{\text{act}} = P_{\text{dense}} + \frac{k}{E}\,P_{\text{exp}}.
+$$
+
+Divide both lines by $P_{\text{total}}$ and write $f = P_{\text{dense}}/P_{\text{total}}$ for the always-on parameter fraction:
+
+$$
+\rho_{\text{param}} = f + (1 - f)\,\rho_{\text{route}}.
+$$
+
+This is a straight line in $\rho_{\text{route}}$ with intercept $f$ and slope $1 - f$, and it inverts to give $f$ from the two published numbers alone:
+
+$$
+f = \frac{\rho_{\text{param}} - \rho_{\text{route}}}{1 - \rho_{\text{route}}}.
+$$
+
+For Motif 3 this gives $f \approx 2.166\%$ and for K3 $f \approx 1.964\%$, against $3.546\%$ for Mixtral. Two frontier models built by different teams put almost exactly the same share of their weight budget into the always-on stack. The consequence is the number worth remembering. The always-on share of what a single token actually costs is $f/\rho_{\text{param}}$, which is $51.5\%$ for Motif 3 and $52.9\%$ for K3, against $12.8\%$ for Mixtral. At the textbook sparsity the expert bank dominates the per-token bill and attention is a rounding error, which is exactly why tutorial treatments of MoE never discuss attention. At two percent routing, half of every token's compute is attention and embeddings.
+
+That reframes the optimization problem. Taking $\rho_{\text{route}} \to 0$ in the line above sends $\rho_{\text{param}} \to f$, so $f$ is a hard floor: no amount of further sparsification can push the active fraction below the always-on stack. The headroom remaining to the router is
+
+$$
+\rho_{\text{param}} - f = \rho_{\text{route}}\,(1 - f) \approx 2.038\%,
+$$
+
+which is $48.5\%$ of Motif 3's current per-token cost. Even driving the routing ratio to zero, an obvious impossibility, buys less than a factor of two. Everything beyond that has to come out of the dense half, and the dense half is dominated by attention. This is why a technical report about a mixture of experts spends most of its architecture section on an attention mechanism, and it is the single most useful thing the second data point tells us.
+
+```{mermaid}
+flowchart TB
+    X["hidden state streams"] --> HC["manifold constrained hyper connections"]
+    HC --> DKV["down projection to latent c of width 512"]
+    HC --> KR["decoupled rope key of width 64"]
+    DKV --> CACHE["kv cache holds the latent plus the rope key only"]
+    KR --> CACHE
+    CACHE --> S1["signal attention map, first softmax"]
+    CACHE --> S2["noise attention map, second softmax, shared per head group"]
+    S1 --> DIFF["differential score is map one minus lambda times map two"]
+    S2 --> DIFF
+    DIFF --> RES["written back into the residual streams"]
+    RES --> ROUTER["router over 384 experts, top 8 per token"]
+    ROUTER --> EXP["expert ffn with expert specific polynorm"]
+    EXP --> A2A["all to all dispatch and combine in mxfp8"]
+    A2A --> MTP["multi token prediction heads"]
+```
+
+### 8.2 Grouped Differential Latent Attention, the Latent Half
+
+Grouped Differential Latent Attention (GDLA) is two independent ideas composed. Take the compression first, because it is where the 256K context length comes from.
+
+In standard multi-head attention, decoding step $t$ needs every previous key and value, so the cache holds, per layer and per token, $n_h$ keys and $n_h$ values of width $d_h$. At $b$ bytes per scalar the cache for a sequence of length $L$ across $n_L$ layers is
+
+$$
+M_{\text{MHA}} = 2\,n_L\,n_h\,d_h\,b\,L .
+$$
+
+Grouped-query attention shrinks this by sharing key and value heads: with $n_g$ key-value groups instead of $n_h$, $M_{\text{GQA}} = 2\,n_L\,n_g\,d_h\,b\,L$, a saving of exactly $n_h/n_g$. The saving is real but bounded, because $n_g$ cannot go below one without destroying the head structure entirely.
+
+Multi-head latent attention (MLA), introduced with DeepSeek-V2 (DeepSeek-AI, 2024), takes a different route. Instead of caching keys and values, cache a single low-rank summary of the token and rebuild the heads on demand. Define a down-projection $W^{DKV} \in \mathbb{R}^{d_c \times d}$ producing a latent $c_t = W^{DKV} x_t \in \mathbb{R}^{d_c}$ with $d_c \ll n_h d_h$, and per-head up-projections $W_{UK}^{(h)}, W_{UV}^{(h)} \in \mathbb{R}^{d_h \times d_c}$ giving $k_t^{(h)} = W_{UK}^{(h)} c_t$ and $v_t^{(h)} = W_{UV}^{(h)} c_t$. Rotary position embedding cannot be folded into this cleanly, because a position-dependent rotation applied after the up-projection does not commute with it, so the latent scheme carries a small decoupled rotary key $k_t^R \in \mathbb{R}^{d_r}$ shared across all heads. The cache then holds $d_c + d_r$ scalars per layer per token:
+
+$$
+M_{\text{MLA}} = n_L\,(d_c + d_r)\,b\,L,
+\qquad
+R = \frac{M_{\text{MHA}}}{M_{\text{MLA}}} = \frac{2\,n_h\,d_h}{d_c + d_r}.
+$$
+
+The compression is a pure ratio of widths, independent of context length, layer count, and precision. At $n_h = 64$, $d_h = 128$, $d_c = 512$, $d_r = 64$ it is $16384/576 \approx 28.4$.
+
+The obvious objection is that rebuilding $k_t^{(h)}$ for every cached position at every decode step costs more arithmetic than it saves in memory. It does not, because the up-projection can be absorbed into the query. The score between query head $h$ at the current step and cached position $s$ is
+
+$$
+z_{h,s}
+= \big(q_h^{C}\big)^{\!\top} k_s^{(h)} + \big(q_h^{R}\big)^{\!\top} k_s^{R}
+= \big(q_h^{C}\big)^{\!\top} W_{UK}^{(h)} c_s + \big(q_h^{R}\big)^{\!\top} k_s^{R}
+= \tilde{q}_h^{\top} c_s + \big(q_h^{R}\big)^{\!\top} k_s^{R},
+$$
+
+where $q_h^C \in \mathbb{R}^{d_h}$ and $q_h^R \in \mathbb{R}^{d_r}$ are the content and rotary parts of the query and
+
+$$
+\tilde{q}_h = \big(W_{UK}^{(h)}\big)^{\!\top} q_h^{C} \in \mathbb{R}^{d_c}
+$$
+
+is computed once per decode step, not once per cached position. Counting multiply-accumulates per head per step, the rebuild path costs $L\,d_h\,d_c$ to materialize the keys plus $L\,d_h$ to score them, while the absorbed path costs $d_h\,d_c$ once plus $L\,d_c$ to score. The term that grows with context falls from $L\,d_h\,d_c$ to $L\,d_c$, a factor of $d_h = 128$. Latent attention is therefore cheaper in both memory and length-dependent arithmetic than the reconstruction it appears to require, and the scores are normalized by $\sqrt{d_h + d_r}$ because the content and rotary parts contribute to the same dot product.
+
+The cell below prints the sparsity ledger of Section 8.1 and then the cache arithmetic for a Motif-3-scale decoder: 62 layers, 64 query heads of width 128, bfloat16 cache.
+
+```{python}
+#| label: fig-704-motif3-latent-kv
+#| fig-cap: "KV cache for a single sequence in a 62-layer, 64-head decoder under multi-head, grouped-query, and latent attention. The dashed line marks the capacity of one 80 GiB accelerator; only the latent cache leaves room for anything else at a 256K context."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---- Where Motif 3 sits on the sparsity axis, against the chapter's baselines.
+# (name, experts E, active k, total params, active params); None where undefined.
+MODELS = [("2 of 8 (toy layer)", 8, 2, None, None),
+          ("Mixtral 8x7B", 8, 2, 47e9, 13e9),
+          ("Kimi K3", 896, 16, 2.8e12, 104e9),
+          ("Motif 3", 384, 8, 314e9, 13.2e9)]
+
+print(f"{'model':>20} {'k/E':>9} {'P_act/P_tot':>12} {'dense frac':>11} "
+      f"{'dense share':>12} {'N* (300 E/k)':>13}")
+for name, E, k, ptot, pact in MODELS:
+    rr = k / E
+    line = f"{name:>20} {100 * rr:8.3f}%"
+    if ptot is None:
+        line += f" {'-':>12} {'-':>11} {'-':>12}"
+    else:
+        rp = pact / ptot
+        dense = (rp - rr) / (1 - rr)      # always-on share of total parameters
+        line += f" {100 * rp:11.3f}% {100 * dense:10.3f}% {100 * dense / rp:11.1f}%"
+    print(line + f" {int(300 * E / k):13,}")
+
+# A Motif-3-scale decoder: 62 blocks, 64 query heads of width 128.
+N_LAYERS, N_HEADS, D_HEAD = 62, 64, 128
+GQA_GROUPS = 8                  # KV heads shared across query heads
+D_C, D_ROPE = 512, 64           # MLA latent width and decoupled RoPE key width
+BYTES = 2                       # bf16 cache
+CONTEXTS = [4_096, 32_768, 131_072, 262_144]
+REF = 262_144                   # the 256K context Motif 3 trains at
+
+per_tok_layer = {
+    "MHA (64 kv heads)": 2 * N_HEADS * D_HEAD * BYTES,
+    "GQA (8 kv groups)": 2 * GQA_GROUPS * D_HEAD * BYTES,
+    "MLA latent (d_c=512, d_r=64)": (D_C + D_ROPE) * BYTES,
+}
+mha = per_tok_layer["MHA (64 kv heads)"]
+
+print(f"KV cache, {N_LAYERS} layers, {N_HEADS} heads x {D_HEAD} dims, bf16")
+hdr = (f"{'scheme':>30} {'B/tok/layer':>12} {'KiB/tok':>9} {'GiB @ 256K':>11} "
+       f"{'vs MHA':>8}")
+print(hdr)
+for name, b in per_tok_layer.items():
+    tot = b * N_LAYERS
+    gib = tot * REF / 2**30
+    print(f"{name:>30} {b:12,d} {tot / 1024:9.1f} {gib:11.2f} {mha / b:7.1f}x")
+
+mla = per_tok_layer["MLA latent (d_c=512, d_r=64)"]
+print(f"\nMHA -> MLA compression ratio: {mha / mla:.2f}x")
+print(f"GQA -> MLA compression ratio: "
+      f"{per_tok_layer['GQA (8 kv groups)'] / mla:.3f}x")
+for L in CONTEXTS:
+    row = "  ".join(f"{name.split()[0]} {b * N_LAYERS * L / 2**30:8.2f} GiB"
+                    for name, b in per_tok_layer.items())
+    print(f"context {L:>7,}:  {row}")
+
+fig, ax = plt.subplots(figsize=(7.0, 4.2))
+xs = np.array(CONTEXTS)
+for name, b in per_tok_layer.items():
+    ax.plot(xs, b * N_LAYERS * xs / 2**30, marker="o", label=name)
+ax.axhline(80, ls="dashed", lw=1, color="gray")
+ax.text(xs[0], 88, "80 GiB accelerator", fontsize=8, color="gray")
+ax.set_xscale("log", base=2)
+ax.set_yscale("log")
+ax.set_xlabel("context length (tokens)")
+ax.set_ylabel("KV cache for one sequence (GiB, bf16)")
+ax.set_title("Latent KV compression at frontier context lengths")
+ax.legend(frameon=False)
+fig.tight_layout()
+plt.show()
+```
+
+At the 256K context Motif 3 trains at, one sequence needs 496.00 GiB of multi-head cache, 62.00 GiB of grouped-query cache at eight groups, and 17.44 GiB of latent cache. The first number is more than six 80 GiB accelerators for a single user's history, which is why nobody ships full multi-head attention at this scale and why the honest comparison is the second against the third: latent attention is $3.556\times$ smaller than an already-tuned grouped-query baseline, and it is the difference between a 256K sequence that fits alongside the model shards and one that does not. Note also that the curves are straight lines on a log-log plot with slope one, so the ranking never changes with context length; the compression ratio is fixed at $28.44\times$ against multi-head attention for every $L$.
+
+The absorption identity is the part most worth writing out in code, because it is easy to state and easy to get wrong. The tab below verifies numerically that scoring against the rebuilt keys and scoring against the cached latent give the same answer.
+
+::: {.panel-tabset}
+
+### Python
+
+```{python}
+#| code-fold: false
+import numpy as np
+
+rng = np.random.default_rng(7)
+D_MODEL, N_H, D_H, D_C, D_R, L = 1024, 8, 64, 128, 16, 256
+
+W_DKV = rng.standard_normal((D_C, D_MODEL)) / np.sqrt(D_MODEL)     # down-project
+W_UK = rng.standard_normal((N_H, D_H, D_C)) / np.sqrt(D_C)         # up-project K
+W_UV = rng.standard_normal((N_H, D_H, D_C)) / np.sqrt(D_C)         # up-project V
+W_KR = rng.standard_normal((D_R, D_MODEL)) / np.sqrt(D_MODEL)      # decoupled RoPE
+
+X = rng.standard_normal((L, D_MODEL))
+q_c = rng.standard_normal((N_H, D_H))          # one decode step, content part
+q_r = rng.standard_normal((D_R,))              # one decode step, RoPE part
+
+C = X @ W_DKV.T                                # (L, d_c)  cached
+K_R = X @ W_KR.T                               # (L, d_r)  cached, shared by heads
+
+# Path A: rebuild every head's keys from the latent, then score.
+K = np.einsum("hdc,lc->hld", W_UK, C)                       # (H, L, d_h)
+score_a = np.einsum("hd,hld->hl", q_c, K) + K_R @ q_r
+
+# Path B: absorb W_UK into the query once, then score against the latent directly.
+q_abs = np.einsum("hdc,hd->hc", W_UK, q_c)                  # (H, d_c)
+score_b = q_abs @ C.T + K_R @ q_r
+
+print(f"max |score_A - score_B| = {np.abs(score_a - score_b).max():.3e}")
+
+w = np.exp(score_a / np.sqrt(D_H + D_R))
+w /= w.sum(axis=1, keepdims=True)
+ctx = np.einsum("hl,hld->hd", w, np.einsum("hdc,lc->hld", W_UV, C))
+print(f"context shape {ctx.shape}, norm {np.linalg.norm(ctx):.4f}")
+
+mha_floats = 2 * N_H * D_H
+mla_floats = D_C + D_R
+print(f"cache floats per token per layer: MHA {mha_floats}, MLA {mla_floats} "
+      f"({mha_floats / mla_floats:.2f}x smaller)")
+print(f"at L = {L:,} tokens: MHA {mha_floats * L * 2 / 1024:.1f} KiB, "
+      f"MLA {mla_floats * L * 2 / 1024:.1f} KiB (bf16)")
+```
+
+### Julia
+
+```julia
+using LinearAlgebra, Random
+
+Random.seed!(7)
+d_model, n_h, d_h, d_c, d_r, L = 1024, 8, 64, 128, 16, 256
+
+W_dkv = randn(d_c, d_model) ./ sqrt(d_model)
+W_uk  = [randn(d_h, d_c) ./ sqrt(d_c) for _ in 1:n_h]
+W_kr  = randn(d_r, d_model) ./ sqrt(d_model)
+
+X   = randn(L, d_model)
+q_c = [randn(d_h) for _ in 1:n_h]
+q_r = randn(d_r)
+
+C   = X * W_dkv'          # (L, d_c) the only per-token state that is cached
+K_R = X * W_kr'           # (L, d_r) one decoupled rotary key, shared by heads
+
+# Path A: rebuild each head's keys from the latent, then score.
+score_a = hcat([(C * W_uk[h]') * q_c[h] .+ K_R * q_r for h in 1:n_h]...)
+# Path B: absorb W_uk into the query once per decode step.
+score_b = hcat([C * (W_uk[h]' * q_c[h]) .+ K_R * q_r for h in 1:n_h]...)
+
+println("max deviation: ", maximum(abs.(score_a .- score_b)))
+println("cache floats per token: MHA ", 2 * n_h * d_h, ", MLA ", d_c + d_r)
+```
+
+### Rust
+
+```rust
+use ndarray::{Array1, Array2};
+
+/// Path A: materialize this head's keys from the cached latent, then score.
+/// Cost grows as L * d_h * d_c multiply-accumulates per decode step.
+fn scores_rebuild(c: &Array2<f32>, w_uk: &Array2<f32>, q: &Array1<f32>) -> Array1<f32> {
+    let keys = c.dot(&w_uk.t());   // (L, d_c) x (d_c, d_h) -> (L, d_h)
+    keys.dot(q)                    // (L, d_h) x (d_h,)     -> (L,)
+}
+
+/// Path B: absorb the up-projection into the query once, then score against
+/// the latent directly. Cost grows as L * d_c, a factor of d_h cheaper.
+fn scores_absorbed(c: &Array2<f32>, w_uk: &Array2<f32>, q: &Array1<f32>) -> Array1<f32> {
+    let q_tilde = w_uk.t().dot(q); // (d_c, d_h) x (d_h,) -> (d_c,), once per step
+    c.dot(&q_tilde)                // (L, d_c)  x (d_c,)  -> (L,)
+}
+
+fn main() {
+    let (l, d_h, d_c) = (256usize, 64usize, 128usize);
+    let c = Array2::<f32>::from_shape_fn((l, d_c), |(i, j)| ((i + 3 * j) as f32).sin());
+    let w_uk = Array2::<f32>::from_shape_fn((d_h, d_c), |(i, j)| ((2 * i + j) as f32).cos());
+    let q = Array1::<f32>::from_shape_fn(d_h, |i| (i as f32).sin());
+
+    let a = scores_rebuild(&c, &w_uk, &q);
+    let b = scores_absorbed(&c, &w_uk, &q);
+    let dev = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    println!("max deviation: {dev:.3e}");
+    println!("length-dependent MACs: rebuild {}, absorbed {}", l * d_h * d_c, l * d_c);
+}
+```
+
+:::
+
+### 8.3 Grouped Differential Latent Attention, the Differential Half
+
+The second idea attacks a different failure. A softmax attention row is a probability vector over $L$ positions, and because it must sum to one it necessarily places mass on positions that carry no information. At $L = 262{,}144$ that leaked mass is spread over a quarter of a million slots and does not go away with training, which is the mechanism behind attention sinks and the reason long-context retrieval degrades even when the relevant span is present.
+
+Differential attention removes it by subtraction. Project the query and key into two halves, $q = [q_1; q_2]$ and $k = [k_1; k_2]$ with each half in $\mathbb{R}^{d'}$, $d' = d_h/2$, form two independent attention maps, and take a scaled difference:
+
+$$
+A_{\text{diff}}
+= \mathrm{softmax}\!\left(\frac{Q_1 K_1^{\top}}{\sqrt{d'}}\right)
+- \lambda \, \mathrm{softmax}\!\left(\frac{Q_2 K_2^{\top}}{\sqrt{d'}}\right),
+\qquad
+\mathrm{out} = \mathrm{GroupNorm}\big(A_{\text{diff}} V\big) \cdot (1 - \lambda_{\text{init}}),
+$$
+
+where $\lambda > 0$ is learned per head and re-parameterized as $\lambda = \exp(\lambda_{q_1} \!\cdot\! \lambda_{k_1}) - \exp(\lambda_{q_2} \!\cdot\! \lambda_{k_2}) + \lambda_{\text{init}}$ to keep the gradient well conditioned, and the normalization restores the output scale that subtraction removes. Note that $A_{\text{diff}}$ is no longer a probability vector: its rows sum to $1 - \lambda$ and its entries may be negative, which is the point.
+
+Why this cancels anything is worth deriving rather than asserting. Fix one query and model each of the two rows as a signal plus two kinds of contamination:
+
+$$
+a^{(1)} = s + \gamma u + \varepsilon^{(1)},
+\qquad
+a^{(2)} = \gamma u + \varepsilon^{(2)} .
+$$
+
+Here $s \in \mathbb{R}^{L}$ is the genuine relevance pattern, $u$ is a unit-norm **common-mode** direction with amplitude $\gamma$, and $\varepsilon^{(i)}$ are independent zero-mean perturbations with per-entry variance $\sigma^2$. The common mode is shared between the two maps because both read the same positions through the same rotary phases and the same token-frequency statistics, so whatever positional or frequency bias one map picks up, the other picks up too. The $\varepsilon^{(i)}$ are independent because the two maps come from different projections of the same input. Write $N_c = \gamma^2$ for the common-mode power and $N_i = L\sigma^2$ for the independent noise power. The differential row is
+
+$$
+a = a^{(1)} - \lambda a^{(2)} = s + (1 - \lambda)\gamma u + \varepsilon^{(1)} - \lambda \varepsilon^{(2)},
+$$
+
+so, using $\|u\| = 1$ and independence of the two perturbations,
+
+$$
+\mathbb{E}\big\|a - s\big\|^2 = (1 - \lambda)^2 N_c + (1 + \lambda^2)\,N_i .
+$$
+
+This is a quadratic in $\lambda$ with a unique minimum. Differentiating and setting to zero,
+
+$$
+-2(1-\lambda)N_c + 2\lambda N_i = 0
+\qquad\Longrightarrow\qquad
+\lambda^{*} = \frac{N_c}{N_c + N_i},
+$$
+
+which is a Wiener shrinkage: subtract in proportion to how much of the contamination is actually shared. Substituting back,
+
+$$
+\mathbb{E}\big\|a - s\big\|^2\Big|_{\lambda^{*}}
+= N_i + \frac{N_c N_i}{N_c + N_i}
+\; < \; N_c + N_i,
+$$
+
+the last inequality holding for any $N_c > 0$ because $N_i/(N_c + N_i) < 1$. The right-hand side $N_c + N_i$ is exactly the error of a single ordinary attention map, so a differential head with a well-chosen $\lambda$ is never worse and is strictly better whenever any contamination is shared at all. Two limits make the behaviour concrete. As $N_c/N_i \to \infty$ the optimum goes to $\lambda^* \to 1$ and the error to $N_i$, meaning the common mode is annihilated completely. As $N_c/N_i \to 0$ the optimum goes to $\lambda^* \to 0$ and the mechanism switches itself off, degenerating to ordinary attention. Naive full subtraction at $\lambda = 1$ gives error $2N_i$, which beats the baseline only when $N_i < N_c$; this is why $\lambda$ must be learned per head and per depth rather than fixed, since the ratio $N_c/N_i$ is not the same in a local syntactic head as in a long-range retrieval head.
+
+The cost is the obvious one: two softmax maps per output head doubles attention FLOPs and key-value work. This is where **grouped** enters. Rather than pairing every signal map with its own noise map, partition the signal heads into groups of size $r$ and let each group share a single subtracted map. The head budget goes from $2n_s$ to $n_s(1 + 1/r)$, so the multiplier over vanilla attention is
+
+$$
+\frac{n_s(1 + 1/r)}{n_s} = 1 + \frac{1}{r},
+$$
+
+which is $1.25$ at $r = 4$ instead of $2.0$. Sharing is not a compromise forced by budget: it is licensed by the derivation. The quantity being subtracted is by construction the component $\gamma u$ that is *not* head-specific, so estimating it once per group is the statistically natural thing to do, and pooling $r$ heads' worth of evidence into one estimate of $u$ reduces the variance of that estimate rather than increasing it. Composed with the latent cache of Section 8.2, this is GDLA: the differential mechanism buys the long-context precision, the grouping keeps its cost near a quarter rather than a double, and the latent compression keeps the memory affordable. Given the $51.5\%$ dense share computed in Section 8.1, a $1.25\times$ attention multiplier adds at most $0.25 \times 51.5\% \approx 13\%$ to the per-token budget, and less than that in practice because embeddings and the output head are part of the dense share too. That is the kind of trade only a very sparse model can justify.
+
+### 8.4 Selective MXFP8, and the All-to-All Bill
+
+Section 7.7 established that the binding constraint in expert-parallel training is not FLOPs but the all-to-all shuffle, and Section 7.6 showed where it sits in the layer. The straggler factor $S$ inflates the compute leg; the communication leg is a separate bill, and it is the one low precision pays down.
+
+Ordinary fp8 attaches one scale to an entire tensor. **MXFP8** is a block, or microscaling, format: a run of $B$ consecutive values along the reduction axis shares a single scale $X$ stored as E8M0, an eight-bit unsigned power-of-two exponent with no sign and no mantissa, while each element is stored in E4M3, one sign bit, four exponent bits, three mantissa bits. Storage per block is $8B + 8$ bits, so the effective width per value is
+
+$$
+b_{\text{eff}} = 8 + \frac{8}{B} = 8.25 \text{ bits at } B = 32,
+$$
+
+against 16 for bfloat16. The compression is $16/8.25 = 1.9394\times$, and the microscaling overhead over a hypothetical scale-free fp8 is $8/(8 \cdot 32) = 3.125\%$. The scale is chosen per block as the smallest power of two that brings the block maximum inside the representable range,
+
+$$
+X = 2^{\left\lceil \log_2 (\max_i |v_i| / 448) \right\rceil},
+$$
+
+with $448$ the largest finite E4M3 magnitude, $2^8 \cdot (1 + 6/8)$, the top codepoint of the exponent-8 binade being reserved for NaN. Because $X$ is a power of two it is exact in E8M0 and applying it introduces no rounding of its own.
+
+The reason for blocking is dynamic range. E4M3 spans from $448$ down to the smallest subnormal $2^{-9}$, a range of $229{,}376$, or about eighteen binades. With one scale for the whole tensor, any value smaller than $\max/229{,}376$ flushes to zero. That sounds like a generous margin until you remember what an MoE dispatch buffer actually contains: activations from tokens whose norms differ by orders of magnitude, plus the massive-activation channels that transformers reliably develop. A block scale gives every 32 values their own eighteen binades, so precision is preserved locally rather than globally.
+
+The experiment below makes the failure visible, and the choice of metric is the whole point. It quantizes three activation populations and reports both the global relative Frobenius error and the worst per-token relative error, then repeats the comparison on an expert GEMM with both operands quantized, and finally converts the width saving into all-to-all bandwidth for one MoE layer.
+
+```{python}
+#| label: fig-704-motif3-mxfp8
+#| fig-cap: "Worst per-token relative error after quantization. On a well-conditioned Gaussian tensor per-tensor fp8 and MXFP8 are indistinguishable; once token norms span six orders of magnitude the single shared scale flushes the quiet tokens to zero and the error saturates at 1.0, while block scaling holds its accuracy."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+# ---- E4M3: 1 sign, 4 exponent, 3 mantissa bits. Enumerate the magnitudes.
+E_MIN, E_MAX, M_BITS = -6, 8, 3
+_norm = [2.0**e * (1 + m / 2**M_BITS)
+         for e in range(E_MIN, E_MAX + 1) for m in range(2**M_BITS)
+         if not (e == E_MAX and m == 2**M_BITS - 1)]   # top codepoint is NaN
+_sub = [2.0**E_MIN * m / 2**M_BITS for m in range(2**M_BITS)]
+GRID = np.unique(np.concatenate([_sub, _norm]))     # ascending, includes 0
+FP8_MAX, FP8_MIN = GRID[-1], GRID[1]                # 448.0 and 2^-9
+
+
+def e4m3(x):
+    """Round-to-nearest onto the E4M3 magnitude grid, saturating at 448."""
+    a = np.abs(x)
+    i = np.searchsorted(GRID, a).clip(0, len(GRID) - 1)
+    lo, hi = GRID[(i - 1).clip(0)], GRID[i]
+    return np.sign(x) * np.where(a - lo <= hi - a, lo, hi)
+
+
+def bf16(x):
+    """Round-to-nearest-even truncation of float32 to bfloat16 (8 bit mantissa)."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    return ((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000).view(np.float32)
+
+
+def fp8_tensor(x):
+    """Per-tensor fp8: one scale for the whole tensor, no microscaling."""
+    return e4m3(x / (np.abs(x).max() / FP8_MAX)) * (np.abs(x).max() / FP8_MAX)
+
+
+def mxfp8(x, block=32):
+    """MXFP8: an E8M0 power-of-two scale shared by each block of 32 E4M3 values."""
+    flat = x.reshape(-1, block)
+    amax = np.abs(flat).max(axis=1, keepdims=True)
+    # Smallest power of two that brings the block maximum inside the E4M3 range.
+    e = np.where(amax > 0, np.ceil(np.log2(np.maximum(amax, 1e-38) / FP8_MAX)), 0.0)
+    scale = 2.0**e                                     # the E8M0 shared scale
+    return (e4m3(flat / scale) * scale).reshape(x.shape)
+
+
+def rel(a, b):
+    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+
+def worst_row(a, b):
+    """Largest per-token relative error: the number an aggregate norm hides."""
+    num = np.linalg.norm(a - b, axis=1)
+    den = np.linalg.norm(b, axis=1)
+    return float(np.max(num / np.maximum(den, 1e-30)))
+
+
+# ---- Three activation populations shaped like an MoE dispatch buffer.
+D_MODEL, N_TOK, SPREAD = 4096, 256, 1e6
+base = rng.standard_normal((N_TOK, D_MODEL)).astype(np.float32)
+chan = base.copy()
+chan[:, rng.choice(D_MODEL, 30, replace=False)] *= 60.0
+row_scale = 10.0 ** rng.uniform(-np.log10(SPREAD), 0.0,
+                                (N_TOK, 1)).astype(np.float32)
+wide = (base * row_scale).astype(np.float32)
+
+FMT = {"bf16": bf16, "fp8 per-tensor": fp8_tensor, "MXFP8 (block 32)": mxfp8}
+POP = {"gaussian": base, "outlier channels": chan, "token norms span 1e6": wide}
+
+for label, metric in (("global relative Frobenius error", rel),
+                      ("worst per-token relative error", worst_row)):
+    print(label)
+    print(f"{'format':>18} " + " ".join(f"{p:>22}" for p in POP))
+    for fname, f in FMT.items():
+        print(f"{fname:>18} " +
+              " ".join(f"{metric(f(t), t):22.3e}" for t in POP.values()))
+    print()
+
+# ---- The error that matters: a quantized expert GEMM against an fp32 reference.
+W = (rng.standard_normal((D_MODEL, 512)) / np.sqrt(D_MODEL)).astype(np.float32)
+ref = wide @ W
+print("expert GEMM on the wide-dynamic-range activations (weights also quantized)")
+for fname, f in FMT.items():
+    out = f(wide) @ f(W)
+    print(f"{fname:>18}  global {rel(out, ref):.3e}   "
+          f"worst token {worst_row(out, ref):.3e}")
+
+# ---- Effective width and the all-to-all bandwidth it buys.
+BLOCK, K, N_BATCH, D_HID = 32, 8, 8192, 7168
+bits = {"bf16": 16.0, "fp8 per-tensor": 8.0, "MXFP8 (block 32)": 8.0 + 8.0 / BLOCK}
+print("\neffective bits per value: " +
+      ", ".join(f"{k} {v:g}" for k, v in bits.items()))
+print(f"MXFP8 vs bf16 compression: {bits['bf16'] / bits['MXFP8 (block 32)']:.4f}x  "
+      f"(overhead over pure fp8: {100 * (bits['MXFP8 (block 32)'] / 8 - 1):.3f}%)")
+print(f"E4M3 dynamic range: {FP8_MAX / FP8_MIN:,.0f} "
+      f"({np.log2(FP8_MAX / FP8_MIN):.0f} binades), so a per-tensor scale loses "
+      f"any value below max/{FP8_MAX / FP8_MIN:,.0f}")
+
+vals = 2 * K * D_HID * N_BATCH            # dispatch plus combine, one MoE layer
+print(f"\nall-to-all traffic, one MoE layer, N={N_BATCH:,} tokens, k={K}, "
+      f"d_model={D_HID:,}: {vals:,} values")
+for k, v in bits.items():
+    gb = vals * v / 8 / 1e9
+    print(f"{k:>18} {gb:7.3f} GB   {1000 * gb / 400:6.2f} ms on a 400 GB/s fabric")
+print(f"MXFP8 removes {100 * (1 - bits['MXFP8 (block 32)'] / bits['bf16']):.1f}% "
+      f"of the bf16 volume, "
+      f"{vals * (16 - bits['MXFP8 (block 32)']) / 8 / 1e9:.3f} GB per layer per step")
+
+# ---- What multi-token prediction buys in the same bandwidth-bound regime.
+E_MOE, K_MOE, SEQ = 384, 8, 64        # concurrent decode sequences
+print("\nmulti-token prediction as speculation: expected accepted tokens per pass")
+for alpha in (0.70, 0.85, 0.95):
+    row = [(1 - alpha**(g + 1)) / (1 - alpha) for g in (1, 2, 3)]
+    print(f"  acceptance {alpha:.2f}: " +
+          "  ".join(f"gamma={g} {v:.3f}" for g, v in zip((1, 2, 3), row)))
+base_ai = SEQ * K_MOE / E_MOE
+print(f"arithmetic intensity at {SEQ} decode sequences, {K_MOE} of {E_MOE}: "
+      f"{base_ai:.2f} FLOP/byte; with gamma=2 speculation {3 * base_ai:.2f}; "
+      f"compute-bound needs {int(300 * E_MOE / K_MOE):,}")
+
+fig, ax = plt.subplots(figsize=(7.0, 4.2))
+x = np.arange(len(POP))
+for j, (fname, f) in enumerate(FMT.items()):
+    ax.bar(x + (j - 1) * 0.26, [worst_row(f(t), t) for t in POP.values()],
+           width=0.26, label=fname)
+ax.set_xticks(x, list(POP))
+ax.set_yscale("log")
+ax.set_ylabel("worst per-token relative error")
+ax.set_xlabel("activation population")
+ax.set_title("Microscaling keeps fp8 usable when dynamic range is wide")
+ax.legend(frameon=False, loc="lower right")
+fig.tight_layout()
+plt.show()
+```
+
+Read the two tables against each other. On the global metric the two fp8 variants are indistinguishable across all three populations: $2.655 \times 10^{-2}$ for per-tensor against $2.639 \times 10^{-2}$ for MXFP8 on the wide-dynamic-range tensor, a difference well inside the noise. Anyone validating a quantization scheme with a Frobenius norm would conclude the shared scale is free. The per-token metric says otherwise. On the same tensor, per-tensor fp8 reaches a worst-token relative error of exactly $1.000$, which is the signature of complete annihilation: the quiet tokens are gone, the reconstruction is zero, and the error equals the signal. MXFP8 holds at $2.777 \times 10^{-2}$ and bfloat16 at $1.720 \times 10^{-3}$. The expert GEMM repeats the pattern with both operands quantized: global errors of $3.756 \times 10^{-2}$ and $3.699 \times 10^{-2}$ are effectively tied, while the worst-token errors are $1.000$ and $4.178 \times 10^{-2}$. A training run in which a fraction of tokens receives pure noise from the expert layer does not diverge loudly; it quietly loses those tokens' gradient signal, which is precisely the sort of failure that shows up as a mysterious few-percent quality gap months later.
+
+That is what the $3.125\%$ microscaling overhead is buying. The bandwidth arithmetic is the reason to pay it. Per MoE layer per step, each token is copied to its $k$ selected experts on the dispatch and each expert's output is returned on the combine, so the fabric carries $2 k d_{\text{model}}$ values per token. At $N = 8192$ tokens, $k = 8$ and $d_{\text{model}} = 7168$ that is $939{,}524{,}096$ values, which is $1.879$ GB in bfloat16 and $0.969$ GB in MXFP8. On a 400 GB/s interconnect the leg falls from $4.70$ ms to $2.42$ ms, removing $48.4\%$ of the volume and $0.910$ GB of traffic per layer per step. Multiply by the number of MoE layers and by the step count of a 12.5 trillion token pretraining run and the saving stops being a footnote. This is why the report says computation *and* communication: quantizing the GEMMs alone leaves the actual bottleneck untouched.
+
+The word doing the most work in the phrase is **selective**. Not every tensor tolerates 8.25 bits. Router logits decide which experts a token visits, and an 8-bit perturbation there can flip a top-$k$ selection, discontinuously changing the function computed and injecting gradient noise that the auxiliary loss then chases. The load-balancing statistics of Section 4 are sums over the batch and need the accumulation range. Normalization reductions and the master weight copy in the optimizer are the classic places where low precision silently kills training. The GEMMs and the all-to-all payload go to MXFP8; the small, decision-carrying tensors stay wide. The rule of thumb is that a tensor can be narrowed when its error averages out over many terms and must stay wide when a single value determines a discrete choice.
+
+### 8.5 Multi-Token Prediction, and Why a Sparse Model Wants It
+
+The standard objective predicts one position ahead. Multi-token prediction adds $D$ auxiliary heads that predict further, giving a weighted sum
+
+$$
+\mathcal{L} = \sum_{d=0}^{D} w_d \,\mathcal{L}_d,
+\qquad
+\mathcal{L}_d = -\sum_{t} \log p_\theta^{(d)}\!\big(x_{t+1+d} \mid x_{\le t}\big),
+$$
+
+with $d = 0$ the ordinary next-token term. During training this densifies the learning signal: each position now contributes $D+1$ gradient terms instead of one, and the deeper heads force the shared trunk to carry information about the next several tokens rather than just the immediate one. At inference the same heads become a draft model with no extra network to train or serve.
+
+The speculative payoff is a short calculation. Draft $\gamma$ tokens, verify them in a single forward pass, and accept a prefix. Under the standard first-order model where each drafted token is accepted independently with probability $\alpha$, the expected number of tokens committed per verification pass is
+
+$$
+\mathbb{E}[\text{accepted}]
+= \sum_{i=0}^{\gamma} \Pr(\text{first } i \text{ all accepted})
+= \sum_{i=0}^{\gamma} \alpha^{i}
+= \frac{1 - \alpha^{\gamma + 1}}{1 - \alpha},
+$$
+
+the final term counting the token the verifier itself emits when the draft is rejected or exhausted. At $\alpha = 0.85$ this gives $1.850$, $2.573$ and $3.187$ for $\gamma = 1, 2, 3$, and at $\alpha = 0.95$ it gives $1.950$, $2.852$ and $3.710$.
+
+The reason this appears in a report about a sparse model rather than a dense one comes straight from the arithmetic intensity argument of Section 7.7. There the intensity of an expert GEMM was $m = Nk/E$ FLOPs per byte, with a ridge point near 300. For Motif 3 the batch needed to stay compute bound is $300 E/k = 14{,}400$ tokens per expert-parallel group. Decoding does not remotely reach it: with 64 concurrent sequences the intensity is $64 \cdot 8 / 384 = 1.33$ FLOPs per byte, three orders of magnitude below the ridge. Speculation with $\gamma = 2$ verifies three positions per sequence in one pass, raising the intensity to $4.00$ at unchanged latency. That is still nowhere near 14,400, so speculation does not make the layer compute bound and it would be wrong to claim it does. What it does is amortize the weight read. The 13.2 billion active parameters are streamed from memory once per pass regardless, and MTP makes that single read produce up to $2.573$ accepted tokens instead of one. In a regime where the layer is unambiguously memory bound, multiplying the useful work per byte read *is* the speedup. The sparser the model, the lower $m$, and the more a bandwidth-amortizing trick is worth: this is a technique whose value is created by the same design decision that created the problem.
+
+### 8.6 Two Stabilizers Aimed at Depth and at Specialization
+
+**Manifold-constrained hyper-connections.** Replace the single residual stream with $n$ parallel streams $H^{\ell} \in \mathbb{R}^{n \times d}$. A block reads a learned combination, writes its output back through a learned distribution, and mixes the streams:
+
+$$
+H^{\ell+1} = A^{\ell} H^{\ell} + b^{\ell} \otimes F^{\ell}\!\big((\alpha^{\ell})^{\top} H^{\ell}\big),
+$$
+
+with $A^{\ell} \in \mathbb{R}^{n \times n}$ the mixing matrix, $\alpha^{\ell} \in \mathbb{R}^{n}$ selecting the block input and $b^{\ell} \in \mathbb{R}^{n}$ distributing its output. The ordinary residual connection is the case $n = 1$, $A^{\ell} = 1$. The danger is immediate: iterating the identity path across depth gives a gain of $\prod_{\ell} \|A^{\ell}\|$, so an unconstrained $A^{\ell}$ reintroduces exponential growth or decay in depth, the exact pathology residual connections were invented to remove, one level up the hierarchy. Constraining each $A^{\ell}$ to a manifold on which the spectral radius is pinned fixes this by construction rather than by initialization luck. Two natural choices are the orthogonal group, where $\|A^{\ell} x\| = \|x\|$ exactly, and the doubly stochastic matrices, where row and column sums are one so $\rho(A^{\ell}) = 1$ and the uniform stream mixture is preserved. Either way $\prod_{\ell} \|A^{\ell}\| = 1$ at every depth, and the multi-stream residual is as safe as the single-stream one it generalizes.
+
+**Expert-specific PolyNorm.** PolyNorm replaces a fixed pointwise activation with a learned low-degree polynomial of normalized elementwise powers,
+
+$$
+\mathrm{PolyNorm}(x) = \sum_{i=1}^{3} a_i \, \frac{x^{i}}{\|x^{i}\|_{\text{RMS}}} + b,
+$$
+
+where $x^i$ is taken elementwise and the RMS normalization keeps each power on the same scale so the coefficients $a_i$ are comparable. Making $(a_1, a_2, a_3, b)$ expert-specific costs four scalars per expert, or $4 \times 384 = 1536$ extra scalars per MoE layer, which is nothing against the expert weights. The reason it belongs in an MoE and not in a dense model is a tension this chapter has already set up. The auxiliary loss of Section 4 pushes the router toward equal load, and equal load pushes experts toward interchangeability, which is the opposite of the specialization that motivated the architecture. But the balancing loss constrains routing *statistics* only; it says nothing about the functional form of the experts. Giving each expert its own nonlinearity restores an axis of differentiation that the balancer cannot flatten, at a parameter cost of essentially zero. It is a cheap answer to a problem the balancing machinery creates.
+
+### 8.7 Multi-Teacher On-Policy Distillation as the Consolidation Step
+
+Motif 3's post-training is general supervised fine-tuning, then six specialist teachers trained with reinforcement learning plus one software-engineering teacher trained with supervised fine-tuning, then a consolidation of all seven into a single student by Multi-teacher On-Policy Distillation. The on-policy part is the subject of Chapter 702 and its prefix-trap analysis in @sec-702-reopd-prefix-trap: sampling the trajectory from the student rather than the teacher makes the training distribution equal to the deployment distribution by construction, eliminating the exposure bias that off-policy sequence distillation carries. The multi-teacher part introduces a design choice with a clean and consequential answer.
+
+With teachers $\pi_1, \dots, \pi_J$ and non-negative weights $w_j$ summing to one, write the per-context objective over the vocabulary $\mathcal{V}$, abbreviating $p = \pi_\theta(\cdot \mid y_{<t})$ and $q_j = \pi_j(\cdot \mid y_{<t})$:
+
+$$
+F(p) = \sum_{j} w_j \, D_{\mathrm{KL}}\big(p \,\|\, q_j\big)
+= \sum_{v \in \mathcal{V}} p(v)\Big[\log p(v) - \sum_j w_j \log q_j(v)\Big].
+$$
+
+Minimize under $\sum_v p(v) = 1$ with a multiplier $\nu$. Differentiating the Lagrangian with respect to $p(v)$,
+
+$$
+\log p(v) + 1 - \sum_j w_j \log q_j(v) + \nu = 0
+\qquad\Longrightarrow\qquad
+p^{*}(v) \;\propto\; \exp\Big(\sum_j w_j \log q_j(v)\Big) = \prod_j q_j(v)^{w_j}.
+$$
+
+The reverse-KL multi-teacher target is the normalized weighted **geometric** mean of the teachers, a product of experts. It is conjunctive: since $p^*(v) = 0$ whenever any $q_j(v) = 0$ with $w_j > 0$, the support of the target is $\bigcap_j \mathrm{supp}(q_j)$, so a token that any weighted teacher considers implausible is suppressed no matter how confident the others are.
+
+Contrast the forward direction. For $\sum_j w_j D_{\mathrm{KL}}(q_j \| p)$ the $p$-dependent part is $-\sum_v \big(\sum_j w_j q_j(v)\big)\log p(v)$, a cross-entropy against the mixture, minimized at
+
+$$
+p^{*} = \sum_j w_j q_j,
+$$
+
+the **arithmetic** mean. That target is disjunctive: its support is the union of the teachers' supports, so it inherits every teacher's errors alongside every teacher's strengths.
+
+With seven teachers of narrow and only partly overlapping competence, the difference is not cosmetic. The geometric target refuses to average a mathematics specialist's confident answer with a coding specialist's uninformed guess on the same token, because the uninformed teacher's near-zero probability drags the product down. The arithmetic target would happily average them. The plausible reading of Motif 3's reported strength on hallucination-sensitive evaluation is structural rather than incidental: a product-of-experts target is biased against exactly the confident-but-unsupported token that a mixture target would wave through. The price is that the geometric mean is mode-seeking and can collapse output diversity, which is the other reason the on-policy part matters. Sampling from the student keeps it exploring its own distribution instead of being pinned to a single mode of the product.
+
+It is worth noticing, without over-reading it, that the architecture and the training procedure share a shape. At inference a token consults 8 of 384 experts and their outputs are combined; at consolidation the student is pulled toward the intersection of seven specialists rather than their average. Sparse specialization with conjunctive combination, twice.
+
+### 8.8 What the Second Data Point Says
+
+Put the two reports side by side. @kimi2026k3 and @lim2026motif3 arrive at $\rho_{\text{route}}$ of $1.786\%$ and $2.083\%$ and at always-on parameter fractions of $1.964\%$ and $2.166\%$, from different teams, different corpora, and different training stacks. The convergence is the finding. It says the routing dial has been turned about as far as it usefully goes, and Section 8.1 explains why: at these ratios roughly half the per-token cost is already the dense floor, so the remaining headroom from routing alone is under a factor of two.
+
+Where the two reports diverge is instructive. K3's contribution is on the routing and scaling axis, and Section 7.7 read it that way. Motif 3 spends its budget on the other half of the token: attention that both compresses its cache by $28.44\times$ against multi-head and cancels common-mode noise with a provably-never-worse subtraction, a numeric format that halves the all-to-all bill while keeping quiet tokens alive, an auxiliary objective that amortizes the weight read that sparse decoding cannot escape, and a post-training procedure whose target is a product rather than a mixture. Not one of those is a routing idea. Together they are the argument that once a model is sparse enough, the interesting engineering is no longer about the experts.
+
+## 9. Pitfalls and When to Use
 
 **Routing collapse is the failure mode to watch.** Without an effective load-balancing loss the router concentrates tokens on a few experts and the rest never train. Monitor per-expert utilization during training, not just the loss curve; a healthy run keeps every expert busy. The auxiliary coefficient $\alpha$ is the main knob: too small and load drifts toward collapse, too large and balancing fights the language-modeling objective and degrades quality. The Switch value of $10^{-2}$ is a reasonable starting point.
 
@@ -504,13 +1111,15 @@ This closes the loop on the tradeoff that opened the chapter. MoE decouples tota
 
 ## References
 
-1. Shazeer, N. et al. "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer." 2017. https://arxiv.org/abs/1701.06538
+1. Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., and Dean, J. "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer." *International Conference on Learning Representations (ICLR)*, 2017. https://openreview.net/forum?id=B1ckMDqlg
 2. Fedus, W., Zoph, B., and Shazeer, N. "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity." Journal of Machine Learning Research, 2022. https://arxiv.org/abs/2101.03961
 3. Lepikhin, D. et al. "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding." 2020. https://arxiv.org/abs/2006.16668
 4. Jiang, A. Q. et al. "Mixtral of Experts." 2024. https://arxiv.org/abs/2401.04088
-5. DeepSeek-AI. "DeepSeek-V3 Technical Report." 2024. https://arxiv.org/abs/2412.19437
-6. Zoph, B. et al. "ST-MoE: Designing Stable and Transferable Sparse Expert Models." 2022. https://arxiv.org/abs/2202.08906
-7. Rajbhandari, S. et al. "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale." 2022. https://arxiv.org/abs/2201.05596
-8. Zhou, Y. et al. "Mixture-of-Experts with Expert Choice Routing." Advances in Neural Information Processing Systems, 2022. https://arxiv.org/abs/2202.09368
-9. Bercovich, A. et al. "Nemotron-Labs-3-Puzzle-75B-A9B: Compressing Hybrid MoE LLMs." 2026. https://arxiv.org/abs/2607.04371
-10. Kimi Team. "Kimi K3: Open Frontier Intelligence." 2026. https://arxiv.org/abs/2607.24653
+5. DeepSeek-AI. "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model" (introduces multi-head latent attention). 2024. https://arxiv.org/abs/2405.04434
+6. DeepSeek-AI. "DeepSeek-V3 Technical Report." 2024. https://arxiv.org/abs/2412.19437
+7. Zoph, B. et al. "ST-MoE: Designing Stable and Transferable Sparse Expert Models." 2022. https://arxiv.org/abs/2202.08906
+8. Rajbhandari, S. et al. "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale." 2022. https://arxiv.org/abs/2201.05596
+9. Zhou, Y. et al. "Mixture-of-Experts with Expert Choice Routing." *Advances in Neural Information Processing Systems* 35, 2022. https://arxiv.org/abs/2202.09368
+10. Bercovich, A. et al. "Nemotron-Labs-3-Puzzle-75B-A9B: Compressing Hybrid MoE LLMs." 2026. https://arxiv.org/abs/2607.04371
+11. Kimi Team. "Kimi K3: Open Frontier Intelligence." 2026. https://arxiv.org/abs/2607.24653
+12. Lim, J. et al. "Motif 3: Technical Report." 2026. https://arxiv.org/abs/2608.09119

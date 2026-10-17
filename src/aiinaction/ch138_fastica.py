@@ -256,10 +256,16 @@ def fit_ica(
     W = _fix_signs(W)
     components = W @ K  # (k, d): full unmixing operator
     # Order components by descending recovered-source variance for a stable
-    # deterministic permutation.
+    # deterministic permutation. Whitening makes these variances (nearly) equal,
+    # so they are quantized at 1e-9 relative before sorting: variances that agree
+    # to that tolerance are ties and keep their natural order. Without this, the
+    # permutation is decided by floating-point noise and differs across BLAS and
+    # language versions.
     S = Xc @ components.T  # (n, k)
     var = S.var(axis=0, ddof=1)
-    order = np.argsort(-var, kind="stable")
+    scale = float(var.max()) if var.max() > 0 else 1.0
+    key = np.floor(var / scale * 1e9 + 0.5)
+    order = np.argsort(-key, kind="stable")
     W = W[order]
     components = components[order]
 

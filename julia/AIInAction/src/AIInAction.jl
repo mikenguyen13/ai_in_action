@@ -99,5 +99,10 @@ include("ch202_layer_norm.jl")
 include("ch204_dropout.jl")
 include("ch207_densenet.jl")
 include("ch525_oversight.jl")
+include("ch_clickgraph.jl")
+include("ch526_hitl_discovery.jl")
+include("ch1058_drdl.jl")
+include("ch945_suva.jl")
+include("ch_migration_flows.jl")
 
 end # module AIInAction

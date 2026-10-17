@@ -1,0 +1,204 @@
+---
+title: "Collaborative Intelligence in Sequential Experiments: A Human-in-the-Loop Framework for Drug Discovery"
+subtitle: "Bayesian uncertainty as meta-knowledge, an expert who keeps the final say, and a replication on 16,000 therapeutic peptides"
+---
+
+# Collaborative Intelligence in Sequential Experiments {#sec-hitl-discovery}
+
+@sec-human-in-the-loop asked how to keep people capable of overseeing an agent. This chapter asks the complementary, more optimistic question: when does a human in the loop make the *system* better, not merely safer? The setting is drug discovery, where the answer can be measured in molecules found per dollar of lab work.
+
+The anchor is He, Hua, Wang, and Zheng (2026), *Collaborative Intelligence in Sequential Experiments: A Human-in-the-Loop Framework for Drug Discovery*, published in *Information Systems Research* (@he2026collaborative). Their problem has a structure that recurs far beyond chemistry: a huge search space, a rare target, an expensive experiment, a small budget, and two imperfect sources of knowledge. The algorithm has no pre-labelled training data and must learn from the experiments it chooses to run. The human expert has real but partial domain knowledge, and cannot screen millions of candidates by hand. Neither can do the job alone. The paper's contribution is a protocol in which the algorithm tells the expert not only *what* it recommends but *how sure it is*, and the expert keeps the final decision.
+
+This chapter does four things.
+
+1. It states the sequential-experiment problem precisely and derives the pieces of the framework: the uncertainty decomposition, the search score, and the hit-rate arithmetic that explains why the problem is hard.
+2. It implements the framework as a tested library in Python, Julia, and Rust, with shared test fixtures.
+3. It **replicates** the paper's central comparison on the same public database (SATPdb), with a simulated expert, a smaller protein language model, and 20 independent runs per condition. We report where the replication agrees with the paper and where it does not.
+4. It places the result next to the oversight arguments of @sec-human-in-the-loop: here the human adds value precisely because the algorithm exposes its own ignorance.
+
+::: {.callout-note appearance="simple"}
+**What is and is not reproduced.** The authors' code and their expert's decisions are not public. We reimplement the method from the paper, use the same database and the same task definitions, and replace the human expert with a transparent model of partial knowledge (the same device the paper itself uses in its knowledge-disclosure experiment). Our numbers are therefore a *replication of the qualitative claims under a stated simulation*, not a reproduction of the paper's tables.
+:::
+
+## The Problem: Sequential Experiments with Rare Targets {#sec-hitl-discovery-problem}
+
+A candidate molecule is a string $\mathbf{x} = (x_1, \dots, x_\ell)$ over an alphabet $\mathcal{V}$ of size $C$. For peptides $C = 20$ amino acids. Counting all strings of length 1 to $L$ gives the size of the space,
+
+$$
+|\mathcal{X}| = \sum_{\ell=1}^{L} C^{\ell} = \frac{C^{L+1} - C}{C - 1}.
+$$ {#eq-hitl-space}
+
+For $C = 20$ and the maximum SATPdb length $L = 50$ this is about $10^{65}$, so enumeration is out of the question. Each molecule has $K$ properties $\mathbf{y} = \mathbf{f}(\mathbf{x})$, and it is a **target** when every one of them clears its threshold,
+
+$$
+\text{target}(\mathbf{x}) \iff f_k(\mathbf{x}) \ge h_k \quad \text{for all } k = 1, \dots, K.
+$$ {#eq-hitl-target}
+
+Learning $\mathbf{f}$ is not the goal. The goal is to *find targets*. With a per-round budget of $B$ lab tests over $R$ rounds, a policy $\pi$ that finds $S_\pi$ targets is judged by its **hit rate**,
+
+$$
+\pi^\star = \arg\max_\pi \frac{S_\pi}{B R}.
+$$ {#eq-hitl-objective}
+
+### Why the problem is hard {#sec-hitl-discovery-hard}
+
+Three facts compound. Targets are rare: in the paper's three tasks they are 1.06, 0.78, and 0.24 percent of a pool of 14,000 peptides. There are no labels at the start, so there is nothing to train on. And the budget is small: $BR = 2{,}500$ tests, about 18 percent of the pool.
+
+Random search has a hit rate equal to the prevalence $\rho$ of targets. Under random sampling without replacement the expected number of hits in $n$ tests is exactly $n\rho$, so a budget of 2,500 against a prevalence of 0.24 percent yields six targets out of 33. Any method has to beat that baseline using only the labels it pays for. A learner trained on a random initial batch of 50 sees, in expectation, $50 \times 0.0024 \approx 0.12$ positives. It has nothing to learn from for many rounds, and a surrogate fitted to that data predicts "not a target" for everything. This **cold-start under extreme imbalance** is where a human with even partial knowledge is worth the most.
+
+## The Framework {#sec-hitl-discovery-framework}
+
+@fig-hitl-loop shows one round. The algorithm trains a Bayesian surrogate on every label gathered so far and builds two shortlists. The expert sees both lists *and the algorithm's uncertainty*, picks the $B$ molecules to send to the lab, and the labels return to the training set.
+
+```{mermaid}
+%%| label: fig-hitl-loop
+%%| fig-cap: "One round of the human-in-the-loop sequential experiment. The surrogate produces a search list and an uncertainty list, together with its own uncertainty as meta-knowledge. The expert chooses the batch, the lab returns labels, and the surrogate is retrained."
+flowchart LR
+    PO["Candidate pool"] --> EM["Protein language model embedding"]
+    EM --> BN["Bayesian surrogate trained on labels so far"]
+    BN --> UN["Uncertainty list: top q by model uncertainty"]
+    BN --> SE["Search list: top h by upper confidence bound"]
+    BN --> MK["Meta-knowledge: mean, data and model uncertainty"]
+    UN --> EX{"Expert"}
+    SE --> EX
+    MK --> EX
+    DK["Private domain knowledge"] --> EX
+    EX -->|"selects B"| LAB["Lab tests"]
+    LAB -->|"labels"| BN
+```
+
+### Encoding molecules {#sec-hitl-discovery-encode}
+
+Sequences are mapped into a continuous space with a protein language model, ESM2 (@lin2023evolutionary). ESM2 is a transformer trained with the masked language modelling loss
+
+$$
+\mathcal{L}_{\text{MLM}} = \mathbb{E}_{\mathbf{x}\sim\mathcal{X}}\;\mathbb{E}_{M}\sum_{i \in M} -\log p\left(x_i \mid \mathbf{x}_{\setminus M}\right),
+$$ {#eq-hitl-mlm}
+
+where $M$ is a random subset of masked positions. Because predicting a masked residue requires knowing which residues fit together, similar sequences land close together in embedding space. The surrogate then works on a fixed-dimensional vector $\mathbf{z} \in \mathbb{R}^{d}$ and never sees raw strings. The paper uses the 15-billion-parameter model with $d = 1280$. We use the 35-million-parameter model with $d = 480$ so that the 700 simulations below fit on one laptop GPU and a CPU pool.
+
+### A Bayesian surrogate and two kinds of ignorance {#sec-hitl-discovery-uncertainty}
+
+The surrogate is a Bayesian neural network with a posterior over its weights $\theta$ given the labelled set $\mathcal{D}_t$. Predictions average over that posterior,
+
+$$
+p(y \mid \mathbf{x}, \mathcal{D}_t) = \int p(y \mid \mathbf{x}, \theta)\, p(\theta \mid \mathcal{D}_t)\, d\theta,
+$$ {#eq-hitl-predictive}
+
+approximated by variational inference (Bayes by backprop): a factorised Gaussian $q_\phi(\theta)$ is fitted by maximising the evidence lower bound. What makes the framework work is that the predictive uncertainty splits into two parts with very different meanings (@hullermeier2021aleatoric). For a binary property with posterior draws $p_s = p(y=1 \mid \mathbf{x}, \theta_s)$, $s = 1, \dots, S$ and mean $\bar p = \frac{1}{S}\sum_s p_s$, let $H(p) = -p\ln p - (1-p)\ln(1-p)$. Then
+
+$$
+\underbrace{H(\bar p)}_{\text{total}} \;=\; \underbrace{\frac{1}{S}\sum_{s} H(p_s)}_{\text{data (aleatoric)}} \;+\; \underbrace{H(\bar p) - \frac{1}{S}\sum_{s} H(p_s)}_{\text{model (epistemic)}}.
+$$ {#eq-hitl-decomp}
+
+The identity is trivial algebra (add and subtract the second term), but the interpretation is the point. The data term is the expected entropy of the label given the parameters: noise that survives even if we knew the parameters exactly, so more experiments will not remove it. The model term is the mutual information $I(y;\theta \mid \mathbf{x}, \mathcal{D}_t)$ between the label and the parameters: it is zero when all posterior draws agree and large when they disagree, which happens exactly where the model has not seen enough data. By Jensen's inequality $H$ is concave, so $H(\bar p) \ge \frac{1}{S}\sum_s H(p_s)$ and the model term is never negative.
+
+### Two scores, two shortlists {#sec-hitl-discovery-scores}
+
+The two kinds of ignorance drive two different scores. The **uncertainty score** is the summed model uncertainty over properties,
+
+$$
+r_{\text{un}}(\mathbf{x}) = \sum_{k=1}^{K} \sigma_{m,k}(\mathbf{x}),
+$$ {#eq-hitl-un}
+
+where $\sigma_{m,k}$ is the epistemic term of @eq-hitl-decomp. The top $q$ molecules by $r_{\text{un}}$ are the ones from which the surrogate would learn the most: classic active learning. The **search score** is an upper confidence bound (@auer2002finite),
+
+$$
+\text{UCB}_k(\mathbf{x}) = \mu_k(\mathbf{x}) + \sqrt{\beta_t}\,\sigma_{d,k}(\mathbf{x}), \qquad r_{\text{se}}(\mathbf{x}) = \sum_{k=1}^{K} \text{UCB}_k(\mathbf{x}),
+$$ {#eq-hitl-ucb}
+
+and the top $h$ molecules by $r_{\text{se}}$ are the best bets for a target. The detail that distinguishes this from textbook UCB is the **bonus**: it is built from *data* uncertainty $\sigma_d$, not model uncertainty. The reason is that model uncertainty is large for any molecule in an unexplored region, so using it as a bonus rewards remoteness rather than promise, and with $K$ properties and a rare target most unexplored regions contain nothing. Data uncertainty is high where the property is intrinsically borderline, which is where a molecule can plausibly clear the threshold. In our implementation $\sigma_d = \sqrt{\mu(1-\mu)}$ for a Bernoulli head.
+
+### The expert and the meta-knowledge {#sec-hitl-discovery-expert}
+
+The expert receives up to $q + h$ molecules (fewer after the lists overlap) and chooses $B$ of them. Three things go into that choice.
+
+* **Private domain knowledge** the algorithm cannot have: that a motif is toxic, that a sequence resembles a known inactive family, that a molecule cannot be synthesised.
+* **The algorithm's scores**, which tell the expert how much to trust each recommendation.
+* **A budget split** between exploiting current beliefs and buying information, which depends on how far along the campaign is and how costly a miss is.
+
+The expert has *final authority*: the algorithm proposes, the human disposes. This is the opposite of the setting in @sec-human-in-the-loop, where the human is a bottleneck on an agent that acts. Here the human is a source of information the model lacks, and the scores are what let the human use that information efficiently. The paper calls the algorithm's quantified awareness of its own limits *meta-knowledge*, and its main managerial claim is that sharing it, rather than only the recommendations, is what makes the collaboration complementary.
+
+::: {.callout-tip appearance="simple"}
+**A design rule.** Give the person who holds the final decision the model's *uncertainty*, not only its answer. A bare ranking invites either blind acceptance or blanket distrust. A ranking with its confidence tells the human which recommendations to accept, which to override, and where their own knowledge is worth more than the model's.
+:::
+
+## A Tested Library in Three Languages {#sec-hitl-discovery-library}
+
+The numeric core is implemented in Python, Julia, and Rust with the same names and semantics, and the three test suites assert the same fixtures. A hand-checkable example: three posterior draws for two molecules with two properties.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| code-fold: false
+import numpy as np
+from aiinaction.ch526_hitl_discovery import (
+    decompose_uncertainty, ucb_scores, top_k, merge_shortlists, hit_rate, recall_rate,
+)
+
+draws = np.array([                      # (S=3 draws, N=2 molecules, K=2 properties)
+    [[0.9, 0.2], [0.5, 0.5]],
+    [[0.1, 0.2], [0.5, 0.5]],
+    [[0.5, 0.2], [0.9, 0.1]],
+])
+mu, data_unc, model_unc = decompose_uncertainty(draws)
+print("mean        ", mu.round(4).tolist())
+print("data unc.   ", data_unc.round(4).tolist())
+print("model unc.  ", model_unc.round(4).tolist())
+print("UCB (beta=2)", ucb_scores(mu, np.sqrt(mu * (1 - mu)), 2.0).round(4).tolist())
+print("top-3 of [.3,.9,.9,.1,.5]:", top_k(np.array([.3, .9, .9, .1, .5]), 3).tolist())
+print("merged shortlists:", merge_shortlists([5, 2, 7], [2, 9, 5]).tolist())
+print("hit rate 30/2500:", hit_rate(30, 50, 50), " recall 30/148:", round(recall_rate(30, 148), 4))
+```
+
+## Julia
+
+```julia
+using AIInAction.Ch526HitlDiscovery
+
+draws = zeros(3, 2, 2)                  # (S, N, K)
+draws[1, :, :] = [0.9 0.2; 0.5 0.5]
+draws[2, :, :] = [0.1 0.2; 0.5 0.5]
+draws[3, :, :] = [0.5 0.2; 0.9 0.1]
+mu, data_unc, model_unc = decompose_uncertainty(draws)
+println("mean         ", round.(mu, digits=4))
+println("data unc.    ", round.(data_unc, digits=4))
+println("model unc.   ", round.(model_unc, digits=4))
+println("UCB (beta=2) ", round.(ucb_scores(mu, sqrt.(mu .* (1 .- mu)), 2.0), digits=4))
+println("top-3: ", top_k([0.3, 0.9, 0.9, 0.1, 0.5], 3), " (1-based)")
+println("merged: ", merge_shortlists([6, 3, 8], [3, 10, 6]), " (1-based)")
+println("hit rate 30/2500: ", hit_rate(30, 50, 50), "  recall 30/148: ", round(recall_rate(30, 148), digits=4))
+```
+
+## Rust
+
+```rust
+use aiinaction::ch526_hitl_discovery::{decompose_uncertainty, hit_rate, merge_shortlists, recall_rate, top_k, ucb_scores};
+
+fn main() -> Result<(), String> {
+    // (S=3 draws, N=2 molecules, K=2 properties)
+    let draws = vec![
+        vec![vec![0.9, 0.2], vec![0.5, 0.5]],
+        vec![vec![0.1, 0.2], vec![0.5, 0.5]],
+        vec![vec![0.5, 0.2], vec![0.9, 0.1]],
+    ];
+    let (mu, data_unc, model_unc) = decompose_uncertainty(&draws)?;
+    println!("mean        {:?}", mu);
+    println!("data unc.   {:?}", data_unc);
+    println!("model unc.  {:?}", model_unc);
+    let sd: Vec<Vec<f64>> = mu.iter().map(|r| r.iter().map(|m| (m * (1.0 - m)).sqrt()).collect()).collect();
+    println!("UCB (beta=2) {:?}", ucb_scores(&mu, &sd, 2.0)?);
+    println!("top-3: {:?}", top_k(&[0.3, 0.9, 0.9, 0.1, 0.5], 3, None));
+    println!("merged: {:?}", merge_shortlists(&[5, 2, 7], &[2, 9, 5]));
+    println!("hit rate 30/2500: {}  recall 30/148: {:.4}", hit_rate(30, 50, 50)?, recall_rate(30, 148)?);
+    Ok(())
+}
+```
+
+:::
+
+The mean of the first molecule's first property is 0.5, but the three draws are 0.9, 0.1, and 0.5, so the model term is large (0.245) and the data term small. The second molecule's second property sits at 0.5 in two draws and 0.1 in a third: the model is unsure, and uncertainty-driven search would send it to the lab before a molecule whose draws all say 0.2.
+
+RESULTS_PLACEHOLDER

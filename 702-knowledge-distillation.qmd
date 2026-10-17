@@ -73,7 +73,7 @@ $$
 
 where $t_{<n}$ is the teacher's conditioning on the student-generated prefix. A tempting way to sharpen the teacher's signal is to feed *privileged* information (a hint, or the reference answer) to the teacher or the student. Yu et al. (2026) show this creates a failure mode they call the **privilege illusion**: the student now chases two different gaps at once, a *transferable capability gap* it can actually close, and an *information-asymmetry gap* it can only mimic, because at test time it will not have the privileged input. Conflating the two teaches the student to imitate a shortcut it cannot reproduce, and the problem is amplified by the non-uniformity of token-level supervision, where only a handful of tokens per sequence carry the decisive signal.
 
-Their method, **DOPD (dual on-policy distillation)**, routes each token's supervision between a *privileged teacher* and a *privileged student* according to the log-probability advantage gap $\big|\log \Pi_T(y_n) - \log \Pi_S(y_n)\big|$ and the two models' relative confidence, yielding four regimes: light teacher distillation when the gap is small and both are confident; a weak stop-gradient self-regularizer when the gap is small but both are unsure; full-vocabulary Jensen-Shannon supervision (the strongest) when the gap is large and the teacher is confident; and a lighter, more self-referential update when the gap is large but it is the student, not the teacher, that is the more confident of the two. Each token thus receives supervision of a strength and source matched to what it can actually learn. Across eight language-model benchmarks DOPD recovers about $89.8\%$ of the teacher-student capability gap, beating vanilla on-policy distillation by roughly 6 to 12 points depending on setting, with comparable gains carrying over to vision-language models.
+Their method, **DOPD (dual on-policy distillation)**, routes each token's supervision between a *privileged teacher* and a *privileged student* according to the log-probability advantage gap $\big|\log \Pi_T(y_n) - \log \Pi_S(y_n)\big|$ and the two models' relative confidence, yielding four regimes: light teacher distillation when the gap is small and both are confident; a weak stop-gradient self-regularizer when the gap is small but both are unsure; full-vocabulary Jensen-Shannon supervision (the strongest) when the gap is large and the teacher is confident; and a lighter, more self-referential update when the gap is large but it is the student, not the teacher, that is the more confident of the two. Each token thus receives supervision of a strength and source matched to what it can actually learn. Across eight language-model benchmarks DOPD recovers about $89.8\%$ of the teacher-student capability gap, beating vanilla on-policy distillation by roughly 6 to 12 points depending on setting, with comparable gains carrying over to vision-language models. A second line of attack on the same failure mode changes *what the target is* rather than which target each token receives, and is developed in @sec-702-dapd.
 
 ## Production Code
 
@@ -575,6 +575,392 @@ The printed table is the argument in miniature. Pushing all the mass to the full
 
 This lands squarely on the chapter's running question of what distillation costs and what it buys. The earlier sections priced distillation in teacher forward passes over a transfer set, which is why caching soft targets is standard. Agentic distillation adds a second and far more punishing bill: sequential, non-cacheable, latency-bound interactions with a real environment. ReOPD's contribution is to notice that this bill is not intrinsic. Because teacher trajectories are reusable and the reliable supervision lives in the shallow part of the history anyway, the environment can be paid for once and then amortized indefinitely. What began as a per-update cost becomes a fixed asset, and the transfer set of the earlier sections reappears in agentic form as a bank of replayable prefixes.
 
+## DAPD: Anchoring Against Information Asymmetry {#sec-702-dapd}
+
+The privilege illusion introduced earlier has two known cures, and they disagree about where the problem lives. DOPD treats the privileged target as fundamentally sound and the *supervision schedule* as the thing to fix: keep the privileged teacher, then decide token by token how much of its signal to pass through, using the log-probability advantage gap as a proxy for which tokens carry transferable content. It is a triage of a mixed signal. @wu2026dapd take the opposite view. In **DAPD (Dual-Anchored Policy Distillation)** the schedule is not the problem, the target is: a privileged target presented to an inference-time student is malformed no matter how carefully it is metered out, so the fix is to construct paths whose information content already matches on both sides. Privilege-dependent behavior is then never transferred in the first place, and there is nothing left to route. Routing is an estimate applied after the fact; anchoring is a construction applied before it.
+
+### Information Asymmetry, Stated Exactly
+
+Fix a prompt or an interaction state. Let $c$ be the **inference-time context**, meaning everything the deployed model will actually have in its window. Let $z$ be the **privileged information** that exists during post-training and not at inference: a hint, a gold rationale, a reference solution, the answer itself. Let $y$ be the response, which may be read as a single token or a whole continuation without changing anything below. Let $p(z \mid c)$ be the distribution the privileged information is drawn from given the context. The privileged teacher is the conditional $\pi_T(y \mid c, z)$, while the deployed student can only ever realize $\pi_\theta(y \mid c)$, with $\theta$ its parameters.
+
+Naive on-policy self-distillation fits the second to the first:
+
+$$
+J_{\text{naive}}(\theta) \;=\; \mathbb{E}_{c}\,\mathbb{E}_{z \sim p(\cdot \mid c)}\Big[\, \mathrm{KL}\big(\pi_T(\cdot \mid c, z)\;\big\|\;\pi_\theta(\cdot \mid c)\big)\Big].
+$$
+
+This targets a conditional the student cannot represent, and the cost of that mismatch separates cleanly. Define the **information-matched target**, the privileged teacher with the privileged variable integrated out:
+
+$$
+\bar{p}(y \mid c) \;=\; \mathbb{E}_{z \sim p(\cdot \mid c)}\big[\pi_T(y \mid c, z)\big] \;=\; \sum_{z} p(z \mid c)\, \pi_T(y \mid c, z).
+$$
+
+Fix $c$ and expand the inner expectation. Writing the divergence out,
+
+$$
+\mathbb{E}_{z}\Big[\mathrm{KL}\big(\pi_T \,\|\, \pi_\theta\big)\Big]
+\;=\; \mathbb{E}_{z} \sum_{y} \pi_T(y \mid c, z)\, \log \frac{\pi_T(y \mid c, z)}{\pi_\theta(y \mid c)}.
+$$
+
+Insert $\bar{p}(y \mid c)$ into the logarithm, multiplying and dividing by it, and split the sum:
+
+$$
+\;=\; \underbrace{\mathbb{E}_{z} \sum_{y} \pi_T(y \mid c, z)\, \log \frac{\pi_T(y \mid c, z)}{\bar{p}(y \mid c)}}_{(\mathrm{i})}
+\;+\; \underbrace{\mathbb{E}_{z} \sum_{y} \pi_T(y \mid c, z)\, \log \frac{\bar{p}(y \mid c)}{\pi_\theta(y \mid c)}}_{(\mathrm{ii})}.
+$$
+
+In term $(\mathrm{ii})$ the logarithm no longer depends on $z$, so the expectation passes through to the leading factor alone, and by the definition of the bridge $\mathbb{E}_{z}[\pi_T(y \mid c, z)] = \bar{p}(y \mid c)$. Hence
+
+$$
+(\mathrm{ii}) \;=\; \sum_{y} \bar{p}(y \mid c)\, \log \frac{\bar{p}(y \mid c)}{\pi_\theta(y \mid c)} \;=\; \mathrm{KL}\big(\bar{p}(\cdot \mid c) \,\|\, \pi_\theta(\cdot \mid c)\big).
+$$
+
+Term $(\mathrm{i})$ is $\mathbb{E}_{z}\big[\mathrm{KL}(\pi_T(\cdot \mid c, z) \,\|\, \bar{p}(\cdot \mid c))\big]$, which is exactly the conditional mutual information $I(Y; Z \mid C = c)$ under the joint $p(z \mid c)\,\pi_T(y \mid c, z)$: the average divergence between the privileged conditional and its own marginal. Taking the outer expectation over $c$ gives the decomposition
+
+$$
+J_{\text{naive}}(\theta) \;=\; \underbrace{I(Y; Z \mid C)}_{\text{information asymmetry}} \;+\; \underbrace{\mathbb{E}_{c}\Big[\mathrm{KL}\big(\bar{p}(\cdot \mid c) \,\|\, \pi_\theta(\cdot \mid c)\big)\Big]}_{\text{transferable capability}} .
+$$
+
+The first term does not contain $\theta$. It is a property of the training setup, a floor that no amount of student optimization can lower, and it is zero if and only if the privileged information tells the teacher nothing it did not already know from $c$. The second term is the only one the gradient can move, and it is the honest measure of how much of the teacher's *realizable* behavior the student has absorbed. Every method in this section is an argument about how to keep the optimizer's attention on the second term.
+
+### Why the Naive Objective Escapes Its Own Floor
+
+The decomposition assumes the student is architecturally confined to $\pi_\theta(y \mid c)$. On-policy self-distillation does not confine it. There is one network, and during training it is run on a context that literally contains $z$, because that is what "strengthen the teacher with privileged information" means when teacher and student are the same model. What is actually minimized is therefore
+
+$$
+\tilde{J}(\theta) \;=\; \mathbb{E}_{c}\,\mathbb{E}_{z}\Big[\mathrm{KL}\big(\pi_T(\cdot \mid c, z) \,\|\, \pi_\theta(\cdot \mid c, z)\big)\Big],
+$$
+
+whose floor is not $I(Y; Z \mid C)$ but zero, since matching a privileged target while holding the same privileged input is easy. Deployment, however, evaluates the **rollout conditional** $\pi_\theta(\cdot \mid c, \varnothing)$, where $\varnothing$ denotes the absent privileged slot. That conditional appears nowhere in $\tilde{J}$ and is therefore entirely unconstrained by training. The privilege illusion reduces to a single sentence: the objective and the deployment metric are evaluated on different conditionals, so the training curve can fall to zero while the quantity anyone cares about drifts wherever the shortcut happens to leave it.
+
+### Dual-Path Anchoring and Dual-Source Anchoring
+
+DAPD's response is to define two forward passes explicitly and to control what information each of them carries. Write
+
+$$
+q_{\text{roll}}(\cdot \mid c) = \pi_\theta(\cdot \mid c, \varnothing), \qquad q_{\text{ref}}(\cdot \mid c) = \pi_\theta(\cdot \mid c, z)
+$$
+
+for the **rollout path**, which sees only what inference will provide, and the **reference path**, which additionally sees the privileged information. The bridge $\bar{p}$ requires $p(z \mid c)$, which is not available. The **self-conditioned bridge** estimates it from the model's own unprivileged predictive rather than from any privileged source,
+
+$$
+\hat{p}(z \mid c) = \pi_T(z \mid c, \varnothing), \qquad
+\hat{\bar{p}}(y \mid c) = \sum_{z} \pi_T(z \mid c, \varnothing)\,\pi_T(y \mid c, z),
+$$
+
+so that the target is assembled entirely out of quantities a deployed model could in principle produce. **Dual-Path Anchoring** then aligns the two matched-information sides:
+
+$$
+\mathcal{L}_{\text{DPA}}(\theta) \;=\; \mathbb{E}_{c}\Big[\mathrm{KL}\big(\hat{\bar{p}}(\cdot \mid c) \,\big\|\, q_{\text{roll}}(\cdot \mid c)\big)\Big].
+$$
+
+Both arguments condition on $c$ and nothing else. Running the earlier decomposition on this objective, the privileged variable has already been marginalized, so term $(\mathrm{i})$ is identically absent and
+
+$$
+\nabla_\theta \, \mathcal{L}_{\text{DPA}} \;=\; \nabla_\theta \, \mathbb{E}_{c}\Big[\mathrm{KL}\big(\bar{p} \,\|\, \pi_\theta(\cdot \mid c)\big)\Big],
+$$
+
+which is to say every unit of gradient pushes on the transferable term and none of it on the asymmetry. That is the whole structural claim.
+
+**Dual-Source Anchoring** symmetrizes the alignment by applying it in the reverse direction as well, from rollout to reference:
+
+$$
+\mathcal{L}_{\text{DSA}}(\theta) \;=\; \mathbb{E}_{c}\Big[\mathrm{KL}\big(\mathrm{sg}[q_{\text{roll}}] \,\big\|\, q_{\text{ref}}\big) \;+\; \mathrm{KL}\big(\hat{\bar{p}} \,\big\|\, q_{\text{ref}}\big)\Big],
+\qquad
+\mathcal{L}_{\text{DAPD}} = \mathcal{L}_{\text{DPA}} + \lambda\,\mathcal{L}_{\text{DSA}},
+$$
+
+where $\mathrm{sg}[\cdot]$ is a stop-gradient and $\lambda > 0$ sets the strength of the symmetrization. The first DSA term drags the privileged path toward behavior the unprivileged path can actually produce, which is what "reducing reliance on privileged reference guidance" means operationally. The second keeps the correctness supervision on the reference path, so that symmetrizing does not simply delete the teacher's signal along with its privilege. Between them, neither path is allowed to become the sole authority: the reference path cannot dictate privilege-dependent behavior to the rollout, and the rollout cannot drift free of correctness.
+
+```{mermaid}
+flowchart LR
+  C["inference-time context c"]
+  Z["privileged information z, training only"]
+  T["privileged teacher pi_T(y given c and z)"]
+  B["self-conditioned bridge: marginalize z"]
+  P["information-matched target p_bar(y given c)"]
+  REF["reference path q_ref: student on c and z"]
+  ROLL["rollout path q_roll: student on c alone"]
+  D["deployment: only c is available"]
+  C --> T
+  Z --> T
+  T --> B
+  B --> P
+  C --> REF
+  Z --> REF
+  C --> ROLL
+  P -- "DPA: reference to rollout" --> ROLL
+  ROLL -- "DSA: rollout to reference" --> REF
+  P -- "DSA: correctness supervision" --> REF
+  ROLL --> D
+```
+
+### Making the Illusion Visible
+
+The simulation below is the smallest setting in which the failure is real rather than asserted. The privileged information is a hint token that equals the correct answer 99 percent of the time and is replaced by a dedicated null token at inference. The inference-time context $c$ predicts the label through a genuinely nonlinear map, so learning $c \mapsto y$ is real work that a copy-the-hint shortcut can starve. Three objectives are trained from identical initialization: naive OPSD on the privileged path, DPA alone, and full DAPD. The reported test accuracy is always measured with the hint absent, because that is the only measurement deployment makes.
+
+```{python}
+#| label: fig-702-dapd-privilege-illusion
+#| code-fold: false
+#| fig-cap: "Left: the naive OPSD training objective collapses toward zero, the picture of a healthy run. Right: the same student's accuracy on the inference-time context, where the privileged hint is gone, falls to roughly half of what the anchored objectives reach. The dashed line is the teacher's own accuracy on the inference-time context."
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+SEED = 0
+torch.manual_seed(SEED); np.random.seed(SEED)
+
+D_C, K, NULL = 10, 4, 4      # context dims, classes, index of the NULL hint slot
+N_TR, N_TE, EPOCHS = 4000, 2000, 400
+P_CORRECT = 0.99             # how often the privileged hint is the right answer
+
+# Labels depend NONLINEARLY on the inference-time context c, so learning c -> y is
+# real work that a copy-the-hint shortcut can starve.
+W_1 = torch.randn(D_C, 6); W_2 = torch.randn(D_C, 6)
+W_c = torch.randn(6, K) * 1.1
+
+def sample(n, g):
+    c = torch.randn(n, D_C, generator=g)
+    h = torch.tanh(c @ W_1) * torch.tanh(c @ W_2)
+    y = torch.multinomial(F.softmax(3.0 * h @ W_c, -1), 1, generator=g).squeeze(1)
+    good = torch.rand(n, generator=g) < P_CORRECT
+    rnd = torch.randint(0, K, (n,), generator=g)
+    z = torch.where(good, y, rnd)          # privileged hint z, training time only
+    return c, y, z
+
+g = torch.Generator().manual_seed(SEED)
+c_tr, y_tr, z_tr = sample(N_TR, g)
+c_te, y_te, z_te = sample(N_TE, g)
+
+def ctx(c, z):
+    return torch.cat([c, F.one_hot(z, K + 1).float()], -1)
+
+null_tr = torch.full((N_TR,), NULL)
+null_te = torch.full((N_TE,), NULL)
+X_ref = ctx(c_tr, z_tr)        # reference path: privileged hint present
+X_roll = ctx(c_tr, null_tr)    # rollout path: inference-time information only
+X_te_null = ctx(c_te, null_te) # deployment: the hint is gone
+
+class MLP(nn.Module):
+    def __init__(self, h):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(D_C + K + 1, h), nn.Tanh(),
+                                 nn.Linear(h, h), nn.Tanh(), nn.Linear(h, K))
+    def forward(self, x):
+        return self.net(x)
+
+# Privileged teacher pi_T(y | c, z), trained on a mix of hinted and NULL contexts
+# so that it is well defined on both paths.
+torch.manual_seed(SEED)
+teacher = MLP(96)
+opt = torch.optim.Adam(teacher.parameters(), lr=6e-3)
+mix = torch.where(torch.rand(N_TR, generator=g) < 0.5, z_tr, null_tr)
+X_mix = ctx(c_tr, mix)
+for _ in range(900):
+    opt.zero_grad(); F.cross_entropy(teacher(X_mix), y_tr).backward(); opt.step()
+teacher.eval()
+for p in teacher.parameters():
+    p.requires_grad_(False)
+
+with torch.no_grad():
+    p_T = F.softmax(teacher(X_ref), -1)          # privileged target pi_T(y | c, z)
+    p_null = F.softmax(teacher(X_roll), -1)      # self-conditioned bridge p^(z | c)
+    p_bar = torch.zeros(N_TR, K)                 # information-matched target
+    for v in range(K):
+        p_bar += p_null[:, v:v+1] * F.softmax(
+            teacher(ctx(c_tr, torch.full((N_TR,), v))), -1)
+    # Irreducible term of the decomposition: E_z KL(pi_T(.|c,z) || p_bar(.|c)).
+    I_YZ_C = (p_T * (p_T.clamp_min(1e-12).log()
+                     - p_bar.clamp_min(1e-12).log())).sum(-1).mean().item()
+    acc_T_priv = (teacher(ctx(c_te, z_te)).argmax(-1) == y_te).float().mean().item()
+    acc_ceiling = (teacher(X_te_null).argmax(-1) == y_te).float().mean().item()
+
+def kl(p, logq):
+    return (p * (p.clamp_min(1e-12).log() - logq)).sum(-1).mean()
+
+def train(mode, lam=0.5, lr=5e-3):
+    torch.manual_seed(SEED)
+    s = MLP(48); o = torch.optim.Adam(s.parameters(), lr=lr)
+    L, A = [], []
+    for _ in range(EPOCHS):
+        o.zero_grad()
+        if mode == "opsd":
+            # Naive OPSD: fit the privileged teacher on the privileged path.
+            loss = kl(p_T, F.log_softmax(s(X_ref), -1))
+        else:
+            # DPA: the rollout path carries only inference-time information and
+            # its target is matched to exactly that information.
+            logq_roll = F.log_softmax(s(X_roll), -1)
+            loss = kl(p_bar, logq_roll)
+            if mode == "dapd":
+                # DSA: also anchor rollout-to-reference, so the privileged path is
+                # pulled toward realizable behavior while correctness is preserved.
+                logq_ref = F.log_softmax(s(X_ref), -1)
+                loss = loss + lam * (kl(logq_roll.exp().detach(), logq_ref)
+                                     + kl(p_bar, logq_ref))
+        loss.backward(); o.step()
+        L.append(loss.item())
+        with torch.no_grad():
+            A.append((s(X_te_null).argmax(-1) == y_te).float().mean().item())
+    return s, np.array(L), np.array(A)
+
+runs = {m: train(m) for m in ["opsd", "dpa", "dapd"]}
+
+print(f"privileged teacher, hint present : {acc_T_priv:.4f}")
+print(f"teacher on inference context     : {acc_ceiling:.4f}  (matched-information ceiling)")
+print(f"irreducible term I(Y;Z|C)        : {I_YZ_C:.4f} nats\n")
+
+names = {"opsd": "naive OPSD", "dpa": "DPA only", "dapd": "DAPD (DPA+DSA)"}
+hdr = f"{'objective':<18}{'train loss':>11}{'train acc':>11}{'test acc':>10}{'illusion':>10}"
+print(hdr); print("-" * len(hdr))
+rows = {}
+for m in ["opsd", "dpa", "dapd"]:
+    s, L, A = runs[m]
+    Xtr = X_ref if m == "opsd" else X_roll
+    with torch.no_grad():
+        a_tr = (s(Xtr).argmax(-1) == y_tr).float().mean().item()
+        a_te = (s(X_te_null).argmax(-1) == y_te).float().mean().item()
+    rows[m] = (L[-1], a_tr, a_te)
+    print(f"{names[m]:<18}{L[-1]:>11.4f}{a_tr:>11.4f}{a_te:>10.4f}{a_tr-a_te:>10.4f}")
+
+print()
+with torch.no_grad():
+    for m in ["opsd", "dapd"]:
+        t = kl(p_bar, F.log_softmax(runs[m][0](X_roll), -1)).item()
+        print(f"{names[m]:<18} transferable KL(p_bar||pi_S) = {t:.4f}, "
+              f"total E_z KL = {t + I_YZ_C:.4f} nats")
+
+b = rows["opsd"][2]
+print(f"\nDAPD over naive OPSD : {100*(rows['dapd'][2]-b):+.2f} points test accuracy")
+print(f"DPA  over naive OPSD : {100*(rows['dpa'][2]-b):+.2f} points test accuracy")
+print(f"DAPD reaches {100*rows['dapd'][2]:.2f}% against a {100*acc_ceiling:.2f}% ceiling")
+
+fig, axes = plt.subplots(1, 2, figsize=(10.5, 4))
+cols = {"opsd": "#c1554d", "dpa": "#8d8d8d", "dapd": "#3d7ea6"}
+for m in ["opsd", "dpa", "dapd"]:
+    axes[0].plot(runs[m][1], color=cols[m], lw=1.8, label=names[m])
+    axes[1].plot(runs[m][2], color=cols[m], lw=1.8, label=names[m])
+axes[0].set_xlabel("epoch"); axes[0].set_ylabel("training objective (nats)")
+axes[0].set_title("Training loss: the naive curve looks healthy")
+axes[1].axhline(acc_ceiling, ls="--", c="k", alpha=0.6)
+axes[1].set_xlabel("epoch"); axes[1].set_ylabel("test accuracy, privileged hint absent")
+axes[1].set_title("Inference time: the privilege illusion made visible")
+for a in axes:
+    a.legend(fontsize=8, frameon=False); a.grid(True, alpha=0.3)
+fig.tight_layout(); plt.show()
+```
+
+Read the printed table against the left panel and the illusion is complete. Naive OPSD ends at a training objective of $0.0041$ nats and $0.9960$ training accuracy, numbers that would pass any dashboard review, and then scores $0.3845$ on the inference-time context: an illusion gap of $0.6115$ between the accuracy it displays where it was trained and the accuracy it delivers where it is used. Both anchored objectives land near $0.72$ instead, DPA alone at $0.7185$ and full DAPD at $0.7205$, worth $+33.40$ and $+33.60$ points over naive OPSD. The teacher itself scores $0.9855$ with the hint present and $0.7100$ without it, and that $0.7100$ is the matched-information ceiling: the best any policy restricted to $c$ can be expected to do here. DAPD's $72.05$ percent slightly exceeds the $71.00$ percent ceiling, which is not a paradox but a small ensembling effect, since the bridge $\hat{\bar{p}}$ averages several teacher evaluations and is marginally better calibrated than a single unprivileged forward pass.
+
+The decomposition can be read off the same run. The irreducible asymmetry is $I(Y; Z \mid C) = 1.1079$ nats, and it is identical for every method because no method can change it. What differs is the transferable term $\mathrm{KL}(\bar{p} \,\|\, \pi_S)$ evaluated on the rollout path: $2.4649$ nats for naive OPSD against $0.0474$ nats for DAPD, giving total expected divergences of $3.5728$ and $1.1553$ nats respectively. The naive objective drove its own privileged-path loss to nearly zero while leaving the term that actually matters more than fifty times worse. DAPD lands within $0.05$ nats of the floor, which is the numerical statement of "the gradient only ever pushed on the transferable part."
+
+One caveat about the simulation's honesty: the bridge here is computed by enumerating all four values of $z$, which is possible because $K = 4$. No language model can enumerate its privileged variable, so the real self-conditioned bridge is a construction rather than an exact marginalization, and the toy demonstrates the mechanism rather than the estimator.
+
+### Implementing the Anchored Objective
+
+The full objective is short once the two paths are named. The Python tab is executed against the tensors built above; the Julia and Rust tabs are idiomatic translations shown for reference.
+
+::: {.panel-tabset}
+
+#### Python
+
+```{python}
+#| code-fold: false
+def dapd_loss(student, x_ref, x_roll, p_bar, lam=0.5):
+    """Dual-Anchored Policy Distillation on one batch.
+
+    x_roll carries only inference-time context; x_ref additionally carries the
+    privileged information. p_bar is the information-matched bridge target.
+    """
+    logq_roll = F.log_softmax(student(x_roll), -1)   # rollout path
+    logq_ref = F.log_softmax(student(x_ref), -1)     # reference path
+    dpa = kl(p_bar, logq_roll)                              # reference -> rollout
+    dsa = kl(logq_roll.exp().detach(), logq_ref) + kl(p_bar, logq_ref)
+    return dpa + lam * dsa, dpa, dsa
+
+total, dpa, dsa = dapd_loss(runs["dapd"][0], X_ref, X_roll, p_bar)
+print(f"DPA term {dpa.item():.4f} | DSA term {dsa.item():.4f} | total {total.item():.4f} nats")
+```
+
+#### Julia
+
+```julia
+using Flux, NNlib, Statistics
+
+logsoftmax_rows(z) = z .- log.(sum(exp.(z .- maximum(z, dims=2)), dims=2)) .-
+                     maximum(z, dims=2)
+
+kl(p, logq) = mean(sum(p .* (log.(max.(p, 1f-12)) .- logq), dims=2))
+
+"""
+    dapd_loss(student, x_ref, x_roll, p_bar; lam = 0.5f0)
+
+Dual-Anchored Policy Distillation. `x_roll` carries only the inference-time
+context, `x_ref` additionally carries the privileged information, and `p_bar`
+is the information-matched bridge target.
+"""
+function dapd_loss(student, x_ref, x_roll, p_bar; lam = 0.5f0)
+    logq_roll = logsoftmax_rows(student(x_roll))          # rollout path
+    logq_ref  = logsoftmax_rows(student(x_ref))           # reference path
+    dpa = kl(p_bar, logq_roll)                            # reference -> rollout
+    q_roll = Flux.ignore_derivatives(exp.(logq_roll))     # stop-gradient
+    dsa = kl(q_roll, logq_ref) + kl(p_bar, logq_ref)      # rollout -> reference
+    return dpa + lam * dsa, dpa, dsa
+end
+```
+
+#### Rust
+
+```rust
+use candle_core::{Result, Tensor};
+use candle_nn::ops::log_softmax;
+
+/// KL(p || q) averaged over the batch, given `p` and `log q`.
+fn kl(p: &Tensor, log_q: &Tensor) -> Result<Tensor> {
+    let log_p = p.clamp(1e-12f64, 1.0)?.log()?;
+    p.mul(&log_p.sub(log_q)?)?.sum(1)?.mean(0)
+}
+
+/// Dual-Anchored Policy Distillation on one batch.
+///
+/// `x_roll` carries only the inference-time context, `x_ref` additionally
+/// carries the privileged information, `p_bar` is the bridge target.
+pub fn dapd_loss<F>(
+    student: F,
+    x_ref: &Tensor,
+    x_roll: &Tensor,
+    p_bar: &Tensor,
+    lam: f64,
+) -> Result<(Tensor, Tensor, Tensor)>
+where
+    F: Fn(&Tensor) -> Result<Tensor>,
+{
+    let log_q_roll = log_softmax(&student(x_roll)?, 1)?; // rollout path
+    let log_q_ref = log_softmax(&student(x_ref)?, 1)?;   // reference path
+
+    let dpa = kl(p_bar, &log_q_roll)?;                   // reference -> rollout
+    let q_roll = log_q_roll.exp()?.detach();             // stop-gradient
+    let dsa = kl(&q_roll, &log_q_ref)?.add(&kl(p_bar, &log_q_ref)?)?;
+
+    let total = dpa.add(&dsa.affine(lam, 0.0)?)?;
+    Ok((total, dpa, dsa))
+}
+```
+
+:::
+
+The executed Python tab prints a DPA term of $0.0474$ nats and a DSA term of $0.0405$ nats, for a total of $0.0676$ nats at $\lambda = 0.5$. Both terms are small at convergence, which is the point: the rollout path has been matched to the bridge, and the reference path has been pulled to within a few hundredths of a nat of behavior the rollout path can reproduce.
+
+### Why Persistence Across Scale Is the Interesting Claim
+
+@wu2026dapd report that DAPD outperforms OPSD on Qwen3-4B by $+2.00$ points on average across tasks, and that the gains persist across model scales, reaching $+2.69$ at 4B and $+2.78$ at 32B. The averaged number is the headline, but the scale behavior is the claim worth interrogating, because post-training corrections usually do the opposite. Most such tricks patch a capability deficiency, and a larger base model has less of the deficiency to patch, so the measured delta erodes as the student gets stronger. A technique reported at 4B and never re-measured at 32B is, by default, suspected of washing out.
+
+The decomposition above suggests why this one should not. The quantity DAPD attacks is $I(Y; Z \mid C)$, the information the privileged variable carries beyond the inference-time context. That is a property of the *training setup*, of what $z$ is and how much it reveals, and it does not shrink because the student has more parameters. A 32B student conditioned on a gold rationale during training and deprived of it at inference faces exactly the same asymmetry as a 4B one. If anything a stronger student fits the privileged shortcut more thoroughly, so a correction aimed at the asymmetry rather than at the capability has no obvious reason to fade. The reported $+2.69$ at 4B and $+2.78$ at 32B are consistent with that reading, and mildly better than consistent, since the effect grew slightly rather than merely holding. Two points across roughly an eightfold parameter increase are consistent with the mechanism, not proof of it, and the reader should treat them as such.
+
+Set against DOPD, the trade is legible. DOPD keeps the privileged teacher's full sharpness wherever its routing statistic judges the signal transferable, and a well-routed token there receives the strongest supervision available (full-vocabulary Jensen-Shannon), with no marginalization machinery required. DAPD gives up that sharpness, since the bridge target is necessarily softer than the privileged conditional it was built from, and pays for extra forward passes, but in exchange it obtains a structural property rather than a per-token estimate: its guarantee does not depend on the log-probability advantage gap being a good proxy for transferability, because it never presents the inference-time path with a privileged target at all. The two sets of reported gains are not comparable, being measured against different baselines on different benchmark suites, so the choice between them is an argument about mechanism rather than about numbers. Where the privileged variable is weakly informative, routing is cheap and adequate. Where it is strong enough that fitting it is the path of least resistance, as in the simulation above, anchoring is the safer construction.
+
 ## Pitfalls and When to Use
 
 **The teacher caps the student.** Distillation transfers the teacher's knowledge, including its biases and errors. A student cannot reliably exceed a weak teacher on the distilled task, and a teacher that is systematically wrong will teach the student to be confidently wrong in the same way. Keep the hard-label term (a nonzero $1 - \alpha$) so the student stays anchored to ground truth where it exists.
@@ -602,3 +988,4 @@ This lands squarely on the chapter's running question of what distillation costs
 9. Yu, X. et al. "DOPD: Dual On-policy Distillation." 2026. https://arxiv.org/abs/2606.30626
 10. Wu, J. et al. "SEED: Self-Evolving On-Policy Distillation for Agentic Reinforcement Learning." 2026. https://arxiv.org/abs/2607.14777
 11. Liao, B., Dong, H., Monz, C., Xu, X., Dong, L., and Wei, F. "Multi-Turn On-Policy Distillation with Prefix Replay." 2026. https://arxiv.org/abs/2607.04763
+12. Wu, J., Wang, Y., Su, E., Tang, C., and Tang, S. "DAPD: Dual-Anchored Policy Distillation." 2026. https://arxiv.org/abs/2608.01735

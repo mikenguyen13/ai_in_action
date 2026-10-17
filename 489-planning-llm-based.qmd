@@ -270,7 +270,452 @@ demo_replanning()
 
 This second block illustrates graceful degradation: when a step raises an exception, the system captures the error in the history and invokes the re-planner, which generates a fallback plan using the accumulated context. In production systems, the re-planner would be an LLM call conditioned on the task description and the full execution history.
 
-## 8. Synthesis and Practical Considerations
+## 8. Externalized Task State: The Manage-Execute-Audit Loop {#sec-489-mea-loop}
+
+The minimal system of Section 7 holds everything in one place. The plan lives in the planner's prompt, the intermediate results $\{r_i\}$ accumulate in the executor's context, and the judgement that a step succeeded is whatever the executor said about its own output. That arrangement is the standard agent harness, and @ma2026longhorizon argues it has two structural defects that only become visible when the horizon gets long. Task execution, task state, and completion assessment all share a single growing context, so state is hard to track; and because the completion assessment is produced by the same process that did the work, an incorrect self-assessment is written into the state that every later step conditions on.
+
+**LongHorizon-Harness** reformulates long-horizon execution as a *task-state management* problem. The task state is maintained explicitly outside the execution loop, and it is updated only with facts independently verified against the environment. The **Manage-Execute-Audit (MEA)** loop implements this with three separated roles: a manager that owns the task state and decides the next subtask, a **fresh-context** executor that performs that subtask and nothing else, and a **read-only** auditor that inspects the environment to verify the resulting state before the next round begins. A lightweight component the authors call **AgentAdapter** lets models and harness backends be swapped underneath this loop without modifying their native agent loops, which is what makes the same MEA wrapper measurable across very different agents.
+
+Everything in this section is an argument about error propagation, so it is worth deriving that propagation carefully before looking at the architecture.
+
+### 8.1 Why Long Horizons Are Brutal Even Without Self-Assessment Error
+
+Let a task decompose into $n$ interdependent subtasks that must all be completed correctly, and let each subtask be executed correctly with probability $p$, independently across subtasks. Because the subtasks are interdependent, a single incorrect step invalidates the whole chain, so end-to-end success is
+
+$$P_{\text{chain}}(n) = p^{n}.$$
+
+Taking logarithms makes the shape explicit:
+
+$$\log P_{\text{chain}}(n) = n \log p \approx -n(1 - p) \quad \text{for } p \to 1,$$
+
+using $\log p = \log(1 - (1-p)) \approx -(1-p)$. Success decays geometrically in the horizon with rate $1-p$, so the natural scale of the problem is the **half-life** horizon $n_{1/2}$ at which success drops to one half:
+
+$$n_{1/2} = \frac{\ln 2}{-\ln p} \approx \frac{0.693}{1 - p}.$$
+
+Work the numbers. At a per-step accuracy of $p = 0.95$, which would be an excellent tool-calling agent, $n_{1/2} \approx 13.5$ steps, and a fifty-step task succeeds with probability $0.95^{50} = 0.0769$, under eight percent. The per-step number sounds fine and the end-to-end number is a disaster. This is the arithmetic that makes long-horizon agents hard, and it is entirely independent of any claim about self-assessment: it is what you get even if the agent's beliefs about its own progress are perfectly calibrated.
+
+### 8.2 Self-Assessment Error Turns Errors Into an Absorbing State
+
+The failure mode @ma2026longhorizon targets is worse than geometric decay, because it changes what a failure *is*. Write $\sigma$ for the true state of the environment and $\hat{\sigma}$ for the task state the harness tracks. Define two conditions:
+
+- $G$ (grounded): $\hat{\sigma}$ agrees with $\sigma$ on everything later subtasks depend on.
+- $C$ (corrupted): $\hat{\sigma}$ has diverged from $\sigma$.
+
+In a harness with no independent verification, the executor's own report is the state update. When a step is executed incorrectly but reported as complete, the harness enters $C$, and from there every subsequent subtask is planned against, and evaluated against, a fiction. Nothing in the loop can restore agreement, because the only channel by which $\hat{\sigma}$ is ever revised is the executor's self-report, which has no privileged access to $\sigma$. In Markov terms, $C$ is an **absorbing state**.
+
+Now introduce the auditor. Let $q \in [0,1]$ be the probability that an incorrect step is detected by an independent read-only inspection of the environment before it is written into $\hat{\sigma}$. On detection the round is spent on repair rather than on progress, and $\hat{\sigma}$ is re-grounded from the environment.
+
+Model the process over $n$ subtasks with a round budget $B$. The state space is
+
+$$\mathcal{S} = \{(0), (1), \ldots, (n)\} \cup \{C\},$$
+
+where $(i)$ means "$i$ subtasks verifiably complete and the harness is grounded", and $C$ is the corrupted sink. From $(i)$ with $i < n$, one round transitions as
+
+$$
+\Pr[(i) \to (i+1)] = p, \qquad
+\Pr[(i) \to (i)] = (1-p)\,q, \qquad
+\Pr[(i) \to C] = (1-p)(1-q),
+$$
+
+with $(n)$ and $C$ absorbing. Reading the three branches: the executor gets the subtask right and progress advances; the executor errs, the auditor catches it against the environment, and the round is burned on repair with progress unchanged; or the executor errs and the error passes the audit, entering $\hat{\sigma}$ permanently. Writing $P$ for the resulting $(n+2) \times (n+2)$ matrix and $e_0$ for the indicator of $(0)$, end-to-end success within budget is the mass on the success state,
+
+$$P_{\text{MEA}}(n, q, B) = \left(e_0^{\top} P^{B}\right)_{n}.$$
+
+**The two limits recover the intuition.** At $q = 0$ there is no self-loop, so reaching $(n)$ requires $n$ consecutive correct rounds and any extra budget is worthless: $P_{\text{MEA}}(n, 0, B) = p^{n}$ for every $B \ge n$, exactly the chain of Section 3. At $q = 1$ the state $C$ is unreachable, progress becomes a simple binomial counter, and success is $\Pr[\mathrm{Bin}(B, p) \ge n]$.
+
+**Absorption behaviour.** Lump away the progress coordinate and track only whether the run is still grounded. From every non-terminal $(i)$ the escape probability into $C$ is the same constant
+
+$$\lambda = (1-p)(1-q),$$
+
+independent of $i$, so the probability of still being grounded after $t$ rounds obeys a pure geometric survival law:
+
+$$g_t = \Pr[\text{grounded after } t \text{ rounds}] = (1 - \lambda)^{t}.$$
+
+This is the formal core of the argument, and it deserves a careful reading. For any $q < 1$ we have $\lambda > 0$, so $\{C\}$ is the unique closed communicating class of the chain, the stationary distribution is the point mass $\pi = \delta_C$, and $g_t \to 0$: given enough rounds, corruption is certain. Verification with $q < 1$ does **not** remove the absorbing state. What it does is rescale the absorption rate by the factor $(1-q)$, stretching the grounded half-life
+
+$$t_{1/2} = \frac{\ln 2}{-\ln\!\big(1 - (1-p)(1-q)\big)} \approx \frac{\ln 2}{(1-p)(1-q)}.$$
+
+At $q = 1$ the behaviour changes in kind rather than in degree. Now $\lambda = 0$, the set $\{(0), \ldots, (n)\}$ is closed, $C$ is unreachable, and $(n)$ is the unique absorbing state reachable from $(0)$. Absorption into success becomes certain given unbounded budget. The auditor has converted an error from an event that destroys the run into an event that consumes a round.
+
+That exchange rate is the real economics of MEA, and it is easy to price. Under full verification the expected number of rounds to advance one subtask is $1/p$, so the expected rounds to finish is $n/p$ and the budget factor $\gamma = B/n$ must satisfy $\gamma > 1/p$, which is $1.053$ at $p = 0.95$. Audited execution buys a qualitative change in the failure mode for a small multiple of the round count, plus the cost of the auditor call itself.
+
+### 8.3 Simulating the Collapse
+
+The cell below builds $P$ explicitly and solves for absorption by repeated squaring, sweeping both the horizon $n$ and the audit probability $q$. It then confirms the exact answer against a vectorised Monte Carlo simulation of the same process, so the linear algebra and the sampled dynamics have to agree.
+
+```{python}
+#| label: fig-489-mea-audit-absorption
+#| fig-cap: "Long-horizon execution as an absorbing Markov chain, with per-subtask accuracy p = 0.95 and a round budget B = 2n. Left: end-to-end success against horizon length for four audit coverages, with the dotted line marking the 50 percent collapse threshold. Right: the audit sweep at a fixed horizon of 50 subtasks, with the exact absorption probability from matrix powers overlaid by Monte Carlo estimates from 20k independent runs per point."
+#| code-fold: false
+import numpy as np
+import matplotlib.pyplot as plt
+
+SEED = 20260803
+P_STEP = 0.95          # per-subtask probability the executor gets it right
+BUDGET_FACTOR = 2.0    # rounds available per required subtask
+N_GRID = np.arange(5, 205, 5)
+Q_LEVELS = [0.0, 0.5, 0.9, 1.0]
+N_FIXED = 50
+MC_TRIALS = 20_000
+
+def exact_success(n, p, q, budget_factor=BUDGET_FACTOR):
+    """Absorption probability for the (progress, corrupted) chain, solved by
+    repeated squaring of the transition matrix over B = budget_factor * n rounds."""
+    B = int(round(budget_factor * n))
+    m = n + 2                      # states 0..n (progress) plus one corrupted sink
+    P = np.zeros((m, m))
+    corrupt = n + 1
+    for i in range(n):
+        P[i, i + 1] = p                        # subtask done correctly
+        P[i, i] = (1.0 - p) * q                # error caught by the auditor, round burned
+        P[i, corrupt] = (1.0 - p) * (1.0 - q)  # error accepted into task state
+    P[n, n] = 1.0
+    P[corrupt, corrupt] = 1.0
+    v = np.zeros(m); v[0] = 1.0
+    M = P.copy(); e = B
+    while e:
+        if e & 1:
+            v = v @ M
+        M = M @ M
+        e >>= 1
+    return float(v[n])
+
+def mc_success(n, p, q, trials=MC_TRIALS, seed=0, budget_factor=BUDGET_FACTOR):
+    """Monte Carlo confirmation of the same process, vectorised over trials."""
+    rng = np.random.default_rng(seed)
+    B = int(round(budget_factor * n))
+    prog = np.zeros(trials, dtype=np.int32)
+    alive = np.ones(trials, dtype=bool)
+    for _ in range(B):
+        active = alive & (prog < n)
+        if not active.any():
+            break
+        u = rng.random(trials)
+        ok = active & (u < p)
+        bad = active & (u >= p)
+        caught = bad & (rng.random(trials) < q)
+        prog[ok] += 1
+        alive[bad & ~caught] = False      # unaudited error: absorbed into C
+    return float(np.mean(alive & (prog >= n)))
+
+def collapse_horizon(p, q, threshold=0.5, grid=N_GRID):
+    for n in grid:
+        if exact_success(int(n), p, q) < threshold:
+            return int(n)
+    return None
+
+def half_life(p, q):
+    """Rounds until the lumped two-state chain has lost half its mass to C."""
+    lam = (1.0 - p) * (1.0 - q)
+    if lam <= 0.0:
+        return float("inf")
+    return np.log(2.0) / (-np.log(1.0 - lam))
+
+curves = {q: np.array([exact_success(int(n), P_STEP, q) for n in N_GRID])
+          for q in Q_LEVELS}
+
+q_grid = np.linspace(0.0, 1.0, 21)
+exact_q = np.array([exact_success(N_FIXED, P_STEP, q) for q in q_grid])
+mc_q_grid = np.linspace(0.0, 1.0, 11)
+mc_q = np.array([mc_success(N_FIXED, P_STEP, q, seed=int(1000 + 7 * i))
+                 for i, q in enumerate(mc_q_grid)])
+mc_exact_at = np.array([exact_success(N_FIXED, P_STEP, q) for q in mc_q_grid])
+max_gap = float(np.max(np.abs(mc_q - mc_exact_at)))
+
+print(f"{'audit q':>9}{'n=10':>9}{'n=25':>9}{'n=50':>9}{'n=100':>9}"
+      f"{'n=200':>9}{'collapse n':>12}{'half-life':>11}")
+print("=" * 77)
+for q in Q_LEVELS:
+    row = [exact_success(n, P_STEP, q) for n in (10, 25, 50, 100, 200)]
+    ch = collapse_horizon(P_STEP, q)
+    ch_s = f"{ch}" if ch is not None else ">200"
+    hl = half_life(P_STEP, q)
+    hl_s = "inf" if np.isinf(hl) else f"{hl:.1f}"
+    print(f"{q:>9.2f}" + "".join(f"{v:>9.3f}" for v in row)
+          + f"{ch_s:>12}{hl_s:>11}")
+print()
+print(f"p = {P_STEP}, round budget B = {BUDGET_FACTOR:.0f}n, collapse n = smallest n on the")
+print("grid with end-to-end success below 0.5")
+print(f"unaudited closed form p^n at n=50: {P_STEP ** 50:.4f}  "
+      f"(chain: {exact_success(50, P_STEP, 0.0):.4f})")
+print(f"max |Monte Carlo - exact| over the q sweep at n={N_FIXED}: {max_gap:.4f} "
+      f"({MC_TRIALS} trials per point)")
+
+fig, ax = plt.subplots(1, 2, figsize=(9.0, 3.6))
+COLORS = ["#b5651d", "#a0761a", "#3f8f5a", "#1f6f8b"]
+for c, q in zip(COLORS, Q_LEVELS):
+    ax[0].plot(N_GRID, curves[q], color=c, lw=2, label=f"q = {q:.2f}")
+ax[0].axhline(0.5, color="#999999", ls=":", lw=1)
+ax[0].set_xlabel("horizon n (interdependent subtasks)")
+ax[0].set_ylabel("end-to-end success")
+ax[0].set_title("Audit coverage moves the collapse point")
+ax[0].legend(frameon=False, fontsize=8)
+ax[0].set_ylim(-0.03, 1.03)
+
+ax[1].plot(q_grid, exact_q, color="#1f6f8b", lw=2, label="exact (linear algebra)")
+ax[1].plot(mc_q_grid, mc_q, "o", ms=5, mfc="none", color="#b5651d",
+           label=f"Monte Carlo ({MC_TRIALS // 1000}k trials)")
+ax[1].set_xlabel("audit detection probability q")
+ax[1].set_ylabel("end-to-end success")
+ax[1].set_title(f"Verification sweep at n = {N_FIXED}")
+ax[1].legend(frameon=False, fontsize=8)
+ax[1].set_ylim(-0.03, 1.03)
+
+for a in ax:
+    a.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+```
+
+The printed table reports the collapse horizon, defined as the smallest $n$ on the grid at which end-to-end success falls below one half. Unaudited execution collapses at $n = 15$. Halving the error rate with $q = 0.5$ pushes that only to $n = 30$, which is the $(1-q)$ rescaling of $\lambda$ showing up as a doubling and nothing more. At $q = 0.9$ the collapse horizon moves to $n = 135$, and at $q = 1.0$ there is no collapse anywhere on the grid, with success still $1.000$ at $n = 200$. The half-life column tracks the collapse column closely (13.5, 27.4, 138.3, and infinity), which is the geometric survival law $g_t = (1-\lambda)^t$ asserting itself: the horizon at which a run dies is set by the corruption rate, not by the per-step accuracy alone.
+
+At the fifty-subtask horizon the numbers are stark. Unaudited execution succeeds $0.077$ of the time, matching the closed form $0.95^{50} = 0.0769$ exactly, since $q = 0$ makes the chain degenerate to $p^n$. Perfect verification succeeds $1.000$ of the time on the same task with the same executor and the same per-step accuracy. Nothing about the executor changed. The largest discrepancy between the exact absorption probability and the Monte Carlo estimate across the whole $q$ sweep is $0.0035$, comfortably inside the sampling noise of 20,000 trials, so the matrix algebra and the simulated dynamics describe the same process.
+
+Two honest caveats about the model. It assumes per-step errors are independent, whereas real executor errors cluster around hard subtasks and ambiguous instructions. And it assumes the auditor's detections are independent of the executor's errors, which is exactly the assumption that fails if the auditor sees the executor's reasoning trace: an auditor that inherits the executor's context inherits its misconception, and $q$ collapses toward zero. This is precisely why @ma2026longhorizon specifies the auditor as read-only over the environment rather than as a critic over the transcript. The independence is not an incidental design detail, it is the entire mechanism.
+
+### 8.4 The Context-Growth Argument
+
+The second defect is about cost and attention rather than correctness. Suppose the harness appends roughly $a$ tokens of transcript per round and runs for $T$ rounds, so at round $t$ the context has length $L_t = L_0 + a t$. A forward pass over a length-$L$ prefix costs $\Theta(L^2)$ in the attention layers, so cumulative attention cost over the episode is
+
+$$\sum_{t=1}^{T} \Theta(L_t^2) = \Theta\!\left(a^2 \sum_{t=1}^{T} t^2\right) = \Theta(a^2 T^3),$$
+
+cubic in the horizon. A fresh-context executor receives a compact rendering of the externalized task state plus the current subtask description, so its context is bounded by some constant $L_{\star}$ regardless of how many rounds have elapsed, and the cumulative cost is $\Theta(L_{\star}^2 T)$, linear in the horizon.
+
+Dilution is the sharper problem. Suppose the decision at round $t$ genuinely depends on $m$ tokens of relevant state. In a growing context those tokens occupy a fraction
+
+$$\frac{m}{L_0 + a t} = \Theta\!\left(\frac{1}{t}\right)$$
+
+of the window, decaying to zero as the episode runs, while attention mass must be spread over an ever larger pool of stale observations, superseded plans, and tool output that was consumed two hundred rounds ago. In a fresh context that fraction is $m / L_{\star}$, a constant. Externalizing the task state is what makes the constant possible: the manager hands the executor a summary of what is true, not the transcript that established it.
+
+### 8.5 The Loop
+
+```{mermaid}
+flowchart TB
+    S[("Task state, external and durable")]
+    M["Manager: read state, choose next subtask"]
+    E["Executor: fresh context per subtask, tools"]
+    A["Auditor: read-only inspection of environment"]
+    V{"Verified against environment?"}
+    ENV[("Environment: files, shell, OS, services")]
+    DONE["Task complete"]
+
+    S --> M
+    M -->|"subtask spec only"| E
+    E -->|"mutating actions"| ENV
+    E -->|"claimed outcome"| A
+    ENV -->|"observed ground truth"| A
+    A --> V
+    V -->|"yes: commit verified facts"| S
+    V -->|"no: record discrepancy, re-ground"| S
+    S -->|"goal satisfied"| DONE
+```
+
+Read the diagram against the plan-and-execute architecture of Section 3 and four differences stand out.
+
+**State is an object, not a transcript.** In plan-and-execute the state is implicit in the accumulated results $\{r_i\}$ sitting in the executor's window. Here it is a durable external store that the manager reads and writes. Its size is a function of the task, not of how long the episode has run.
+
+**The state update rule is restricted.** Plan-and-execute admits $r_i$ into the working context verbatim, whatever the executor reported. MEA admits only facts the auditor confirmed against the environment. This is the mechanism behind $q$ in the model above, and it is the difference between an absorbing corruption state and a recoverable one.
+
+**Assessment is separated from execution.** The auditor is a distinct read-only role, not the executor grading its own homework and not a critic reasoning over the executor's trace. Reflection and refinement in the taxonomy of Section 5 is self-critique, which improves plans but cannot establish ground truth, because the critic and the actor share a model of the world. An auditor with environment access can.
+
+**The executor is stateless across subtasks.** Plan-and-execute keeps one executor context alive across the whole plan. MEA gives each subtask a fresh context seeded from the task state, which bounds $L_{\star}$ and removes the dilution term. It also means the executor cannot be misled by its own earlier mistaken narration, only by whatever the manager put into the state, which the auditor has already checked.
+
+The re-planning of Section 3.2 survives, but its input changes. Instead of conditioning on $(T, \text{history})$ where history grows without bound, the manager conditions on $(T, \hat{\sigma})$ where $\hat{\sigma}$ is bounded and verified.
+
+Here is the loop skeleton. The Python version is illustrative rather than executable, in the style of the code in Section 7, because the manager, executor, and auditor are model calls; the Julia and Rust versions show the same control flow in their respective idioms.
+
+::: {.panel-tabset}
+
+## Python
+
+```python
+from dataclasses import dataclass, field
+from typing import Protocol
+
+@dataclass
+class TaskState:
+    """Durable state, external to every model context."""
+    goal: str
+    verified_facts: list[str] = field(default_factory=list)
+    completed: list[str] = field(default_factory=list)
+    open_discrepancies: list[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        """Compact rendering handed to the manager and the executor."""
+        return (
+            f"GOAL: {self.goal}\n"
+            f"VERIFIED: {'; '.join(self.verified_facts) or 'none'}\n"
+            f"DONE: {'; '.join(self.completed) or 'none'}\n"
+            f"OPEN: {'; '.join(self.open_discrepancies) or 'none'}"
+        )
+
+@dataclass
+class Subtask:
+    description: str
+    success_criteria: str      # what the auditor will check in the environment
+
+@dataclass
+class AuditResult:
+    verified: bool
+    facts: list[str]           # only these may enter the task state
+    discrepancy: str | None
+
+class Manager(Protocol):
+    def next_subtask(self, state_view: str) -> Subtask | None: ...
+
+class Executor(Protocol):
+    def run(self, state_view: str, subtask: Subtask) -> str: ...
+
+class Auditor(Protocol):
+    def audit(self, subtask: Subtask, claim: str) -> AuditResult: ...
+
+def mea_loop(state: TaskState, manager: Manager, executor: Executor,
+             auditor: Auditor, budget: int) -> TaskState:
+    for _ in range(budget):
+        view = state.render()          # bounded: never the transcript
+        subtask = manager.next_subtask(view)
+        if subtask is None:
+            break                      # manager judges the goal satisfied
+
+        claim = executor.run(view, subtask)   # fresh context, discarded after
+        result = auditor.audit(subtask, claim)  # read-only, environment grounded
+
+        if result.verified:
+            state.verified_facts.extend(result.facts)
+            state.completed.append(subtask.description)
+            state.open_discrepancies.clear()
+        elif result.discrepancy is not None:
+            state.open_discrepancies.append(result.discrepancy)
+    return state
+```
+
+## Julia
+
+```julia
+Base.@kwdef mutable struct TaskState
+    goal::String
+    verified_facts::Vector{String} = String[]
+    completed::Vector{String} = String[]
+    open_discrepancies::Vector{String} = String[]
+end
+
+struct Subtask
+    description::String
+    success_criteria::String
+end
+
+struct AuditResult
+    verified::Bool
+    facts::Vector{String}
+    discrepancy::Union{String,Nothing}
+end
+
+function render(s::TaskState)
+    fmt(v) = isempty(v) ? "none" : join(v, "; ")
+    return "GOAL: $(s.goal)\nVERIFIED: $(fmt(s.verified_facts))\n" *
+           "DONE: $(fmt(s.completed))\nOPEN: $(fmt(s.open_discrepancies))"
+end
+
+function mea_loop(state::TaskState, manager, executor, auditor; budget::Int)
+    for _ in 1:budget
+        view = render(state)                  # bounded state view
+        subtask = manager(view)
+        subtask === nothing && break
+
+        claim = executor(view, subtask)       # fresh context per subtask
+        result = auditor(subtask, claim)      # read-only environment check
+
+        if result.verified
+            append!(state.verified_facts, result.facts)
+            push!(state.completed, subtask.description)
+            empty!(state.open_discrepancies)
+        elseif result.discrepancy !== nothing
+            push!(state.open_discrepancies, result.discrepancy)
+        end
+    end
+    return state
+end
+```
+
+## Rust
+
+```rust
+#[derive(Default)]
+struct TaskState {
+    goal: String,
+    verified_facts: Vec<String>,
+    completed: Vec<String>,
+    open_discrepancies: Vec<String>,
+}
+
+struct Subtask {
+    description: String,
+    success_criteria: String,
+}
+
+struct AuditResult {
+    verified: bool,
+    facts: Vec<String>,
+    discrepancy: Option<String>,
+}
+
+impl TaskState {
+    fn render(&self) -> String {
+        let fmt = |v: &Vec<String>| {
+            if v.is_empty() { "none".to_string() } else { v.join("; ") }
+        };
+        format!(
+            "GOAL: {}\nVERIFIED: {}\nDONE: {}\nOPEN: {}",
+            self.goal, fmt(&self.verified_facts),
+            fmt(&self.completed), fmt(&self.open_discrepancies)
+        )
+    }
+}
+
+trait Manager { fn next_subtask(&self, view: &str) -> Option<Subtask>; }
+trait Executor { fn run(&self, view: &str, task: &Subtask) -> String; }
+trait Auditor { fn audit(&self, task: &Subtask, claim: &str) -> AuditResult; }
+
+fn mea_loop(
+    state: &mut TaskState,
+    manager: &dyn Manager,
+    executor: &dyn Executor,
+    auditor: &dyn Auditor,
+    budget: usize,
+) {
+    for _ in 0..budget {
+        let view = state.render();            // bounded state view
+        let subtask = match manager.next_subtask(&view) {
+            Some(s) => s,
+            None => break,
+        };
+
+        let claim = executor.run(&view, &subtask);   // fresh context
+        let result = auditor.audit(&subtask, &claim); // read-only check
+
+        if result.verified {
+            state.verified_facts.extend(result.facts);
+            state.completed.push(subtask.description);
+            state.open_discrepancies.clear();
+        } else if let Some(d) = result.discrepancy {
+            state.open_discrepancies.push(d);
+        }
+    }
+}
+```
+
+:::
+
+Note the single load-bearing line in all three: only `result.facts` from a verified audit may enter `verified_facts`. Relax that to admit the executor's `claim` directly and you have rebuilt the growing-context harness, absorbing state and all.
+
+### 8.6 Reported Results
+
+@ma2026longhorizon evaluate the harness by wrapping existing agents through AgentAdapter, which isolates the contribution of the loop from the contribution of the model. With Qwen 3.7-Plus as the underlying model, WeaveBench improves from 51.8 percent to 80.7 percent, Terminal-Bench 2.1 from 69.7 percent to 77.2 percent, and OSWorld 2.0 from 2.8 percent to 8.3 percent. With Claude Opus 4.7, performance on **a subset of** OSWorld 2.0 rises from 20.0 percent to 34.3 percent; note that this figure is a subset result and is therefore not comparable to the full-benchmark Qwen numbers above it. The paper was the most upvoted agent paper of its week on HuggingFace.
+
+The spread across benchmarks is itself informative and lines up with the model derived above. WeaveBench, with the largest absolute gain, is the longest-horizon and most state-heavy of the three, which is where the $p^n$ term dominates and where converting corruption into consumed rounds pays most. Terminal-Bench 2.1 starts from a strong baseline, so the headroom is smaller. OSWorld 2.0 remains in the single digits for Qwen even after a roughly threefold relative improvement, a reminder that the harness raises $q$ but does nothing for $p$: if the underlying model cannot reliably drive a GUI, no amount of auditing will make it drive one. Verification changes the shape of the failure curve. It does not manufacture per-step competence.
+
+The practical costs are worth naming. The auditor is an extra model call per round, and repaired rounds consume budget, so a fixed accuracy target costs more tokens and more wall-clock than an unaudited loop that would have failed silently. Externalized state also requires the environment to be inspectable: MEA is natural for filesystems, shells, and operating systems where the auditor can read the result of an action, and much harder where actions are irreversible or their effects are not observable. Where audits are impossible, $q$ is structurally zero and the geometric collapse of Section 8.1 applies with full force.
+
+## 9. Synthesis and Practical Considerations
 
 The progression from chain-of-thought to plan-and-execute to Tree of Thoughts reflects increasing formalization of the search structure latent in complex task solving. Chain-of-thought makes reasoning explicit but commits to a single linear path. Plan-and-execute separates the planning and execution concerns and enables structured re-planning. Tree of Thoughts makes the branching and evaluation structure explicit, enabling near-optimal search at the cost of multiplicative compute.
 
@@ -280,7 +725,7 @@ The fundamental limitation across all paradigms is the **grounding gap**: the LL
 
 ## References
 
-1. Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., and Zhou, D. (2022). Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2201.11903
+1. Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., and Zhou, D. (2022). Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. *Advances in Neural Information Processing Systems*, 35. https://proceedings.neurips.cc/paper/2022/hash/9d5609613524ecf4f15af0f7b31abca4-Abstract-Conference.html
 
 2. Wang, L., Xu, W., Lan, Y., Hu, Z., Lan, Y., Lee, R. K.-W., and Lim, E.-P. (2023). Plan-and-Solve Prompting: Improving Zero-Shot Chain-of-Thought Reasoning by Large Language Models. *Proceedings of ACL 2023*. https://arxiv.org/abs/2305.04091
 
@@ -293,3 +738,5 @@ The fundamental limitation across all paradigms is the **grounding gap**: the LL
 6. Kojima, T., Gu, S. S., Reid, M., Matsuo, Y., and Iwasawa, Y. (2022). Large Language Models are Zero-Shot Reasoners. *Advances in Neural Information Processing Systems*, 35. https://arxiv.org/abs/2205.11916
 
 7. Shinn, N., Cassano, F., Berman, E., Gopinath, A., Narasimhan, K., and Yao, S. (2023). Reflexion: Language Agents with Verbal Reinforcement Learning. *Advances in Neural Information Processing Systems*, 36. https://arxiv.org/abs/2303.11366
+
+8. Ma, Z., Huang, H., Zou, S., Wang, Y., Yang, S., Hu, Y., Wei, F., and Chu, X. (2026). LongHorizon-Harness: Advancing Long-Horizon Agents for Real-World Tasks. https://arxiv.org/abs/2608.01964
