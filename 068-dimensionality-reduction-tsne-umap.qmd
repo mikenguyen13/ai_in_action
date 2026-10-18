@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Nonlinear Dimensionality Reduction with t-SNE and UMAP
+
+{{< include _julia-setup.qmd >}}
+
 
 High dimensional data is the normal condition in modern machine learning. Word embeddings live in 300 to 4096 dimensions, single cell RNA sequencing produces expression vectors over 20000 genes, and the penultimate layer of a vision model emits feature vectors with thousands of components. We cannot see these spaces directly, and our geometric intuition, calibrated for two and three dimensions, fails badly above them. Nonlinear dimensionality reduction methods such as t-SNE and UMAP exist to bridge this gap. They take points in a high dimensional space and produce a two or three dimensional layout that a human can inspect. This chapter explains the manifold assumption that justifies these methods, the mechanics of t-SNE and UMAP, the hyperparameters that govern their behavior, the systematic ways their plots mislead, and the practical question of when to reach for them at all.
 
@@ -182,7 +191,7 @@ X, y = make_blobs(
 print(f"data: {X.shape[0]} points in {X.shape[1]}-D, {len(np.unique(y))} clusters")
 
 def local_overlap(X_high, X_low, k=10):
-    """Mean fraction of each point's k nearest neighbors preserved by embedding."""
+    '''Mean fraction of each point's k nearest neighbors preserved by embedding.'''
     idx_hi = NearestNeighbors(n_neighbors=k + 1).fit(X_high) \
         .kneighbors(return_distance=False)[:, 1:]
     idx_lo = NearestNeighbors(n_neighbors=k + 1).fit(X_low) \
@@ -219,29 +228,46 @@ Both methods drive the silhouette near one, confirming that the five blobs separ
 
 ## Julia
 
-```julia
-# ] add TSne UMAP Distances Clustering
-using TSne, UMAP, Random
+```{julia}
+using TSne, UMAP, Clustering, Distances, Random, Statistics, Printf
 
 Random.seed!(0)
-# Five blobs in 50-D: stack Gaussian clusters around random centers.
-centers = [randn(50) .* 6 for _ in 1:5]
-X = reduce(vcat, [hcat([c .+ 2.5 .* randn(50) for _ in 1:120]...)' for c in centers])
-y = repeat(1:5, inner = 120)
+# Five Gaussian blobs in 50-D, 120 points each (columns = points), like make_blobs:
+# centers uniform in [-10, 10]^50 and cluster standard deviation 2.5.
+n_per, d, k = 120, 50, 5
+centers = 20 .* rand(d, k) .- 10
+X = hcat([centers[:, c] .+ 2.5 .* randn(d, n_per) for c in 1:k]...)   # 50 x 600
+y = repeat(1:k, inner = n_per)
+println("data: $(size(X, 2)) points in $(size(X, 1))-D, $(k) clusters")
 
-# t-SNE: TSne.tsne(X, out_dims, reduce_dims, max_iter, perplexity)
-Z_tsne = tsne(X, 2, 0, 1000, 30.0)
+# Mean fraction of each point's k nearest neighbors preserved by the embedding.
+function local_overlap(Xhi, Xlo; k = 10)
+    nn(Z) = [partialsortperm(col, 2:k+1) for col in eachcol(pairwise(Euclidean(), Z, dims = 2))]
+    hi, lo = nn(Xhi), nn(Xlo)
+    return mean(length(intersect(a, b)) / k for (a, b) in zip(hi, lo))
+end
+silhouette(Z, y) = mean(silhouettes(y, pairwise(Euclidean(), Z, dims = 2)))
 
-# UMAP: umap returns a (n_components x n_samples) matrix, so transpose.
-Z_umap = umap(permutedims(X), 2; n_neighbors = 15, min_dist = 0.1)'
+# t-SNE: TSne.tsne takes rows = points. Barnes-Hut gradient with PCA init,
+# the same recipe scikit-learn uses; extended_output also returns the final KL.
+Z_tsne, _, kl = tsne(permutedims(X), 2, 0, 1000, 30.0; method = :barneshut,
+                     pca_init = true, progress = false, extended_output = true,
+                     rng = Xoshiro(42))
+Z_tsne = permutedims(Z_tsne)                                         # 2 x 600
 
-println("t-SNE embedding size: ", size(Z_tsne))
-println("UMAP  embedding size: ", size(Z_umap))
+# UMAP.jl takes columns = points and returns a fitted result object.
+umap_res = UMAP.fit(X, 2; n_neighbors = 15, min_dist = 0.1)
+Z_umap = Float64.(umap_res.embedding)                                # 2 x 600
 
-# UMAP.jl exposes a model object whose transform places new points:
-model = UMAP_(permutedims(X), 2; n_neighbors = 15, min_dist = 0.1)
-Z_new = UMAP.transform(model, permutedims(X[1:5, :]))'
-println("UMAP placed ", size(Z_new, 1), " new points via transform")
+@printf("t-SNE embedding %s, final KL divergence = %.4f\n", size(Z_tsne'), kl)
+println("UMAP  embedding ", size(Z_umap'))
+@printf("silhouette    t-SNE=%.3f  UMAP=%.3f\n", silhouette(Z_tsne, y), silhouette(Z_umap, y))
+@printf("10-NN overlap t-SNE=%.3f  UMAP=%.3f\n", local_overlap(X, Z_tsne), local_overlap(X, Z_umap))
+
+# Out-of-sample: UMAP.transform places new points; standard t-SNE cannot.
+X_new = hcat([centers[:, c] .+ 2.5 .* randn(d) for c in 1:k]...)       # 50 x 5
+Z_new = UMAP.transform(umap_res, X_new).embedding
+println("UMAP placed $(size(Z_new, 2)) new points via transform (t-SNE has no out-of-sample map)")
 ```
 
 ## Rust

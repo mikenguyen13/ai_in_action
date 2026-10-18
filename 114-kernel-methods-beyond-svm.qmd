@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Kernel Methods Beyond SVM
+
+{{< include _julia-setup.qmd >}}
+
 
 Support vector machines made kernels famous, but the kernel idea is far more general than max margin classification. Any learning algorithm that can be written purely in terms of inner products between data points can be lifted into a rich, possibly infinite dimensional feature space by replacing those inner products with a kernel function. This chapter develops the kernel machinery that surrounds and outlives the SVM, with a sharp focus on the three tools that matter most in practice today: kernel ridge regression as the canonical kernel learner, and the two approximations, the Nystrom method and random Fourier features, that make kernels usable on large data. The representer theorem ties them together and explains why every one of them is tractable.
 
@@ -232,29 +241,84 @@ The exact RBF kernel reaches the highest test $R^2$ but takes the longest to fit
 
 ## Julia
 
-```julia
-# Julia: KernelFunctions.jl builds the kernel; MLJ wires up the pipeline.
-# Equivalent exact kernel ridge regression on the same idea.
-using MLJ, KernelFunctions, Random
-Random.seed!(0)
+```{julia}
+# Julia: KernelFunctions.jl builds the RBF kernel; the three estimators are
+# a few lines of LinearAlgebra each, on the same Friedman #1 problem.
+using KernelFunctions, LinearAlgebra, Random, Statistics, Printf
+rng = Random.Xoshiro(0)
 
-# A Friedman-1-style target (see the Python cell for the exact form).
+# Friedman #1: 5 informative features plus 5 pure-noise features.
 n, d = 6000, 10
-X = rand(n, d)
-y = 10 .* sin.(pi .* X[:,1] .* X[:,2]) .+ 20 .* (X[:,3] .- 0.5).^2 .+
-    10 .* X[:,4] .+ 5 .* X[:,5] .+ randn(n)
+X = rand(rng, n, d)
+y = 10 .* sin.(pi .* X[:, 1] .* X[:, 2]) .+ 20 .* (X[:, 3] .- 0.5) .^ 2 .+
+    10 .* X[:, 4] .+ 5 .* X[:, 5] .+ randn(rng, n)
 
-(Xtr, Xte), (ytr, yte) = partition((MLJ.table(X), y), 0.8,
-                                    multi=true, rng=0)
+perm = randperm(rng, n)
+tr, te = perm[1:4800], perm[4801:end]
+mu, sd = mean(X[tr, :]; dims=1), std(X[tr, :]; dims=1)
+Xtr, Xte = (X[tr, :] .- mu) ./ sd, (X[te, :] .- mu) ./ sd   # standardize
+ytr, yte = y[tr], y[te]
 
-# Exact kernel ridge: form the RBF Gram matrix and solve (K + lambda I) a = y.
-gamma, lambda = 0.1, 1.0
-k = with_lengthscale(SqExponentialKernel(), sqrt(1 / (2 * gamma)))
-Ktr = kernelmatrix(k, RowVecs(X[1:4800, :]))
-alpha = (Ktr + lambda * I) \ y[1:4800]
+GAMMA, LAMBDA, D = 0.1, 1.0, 300
+k = with_lengthscale(SqExponentialKernel(), sqrt(1 / (2 * GAMMA)))
+r2(yhat) = 1 - sum(abs2, yte .- yhat) / sum(abs2, yte .- mean(yte))
 
-# For Nystroem / random features at scale, see ApproximateGPs.jl, which
-# provides inducing-point (Nystroem-style) and Fourier-feature kernels.
+# Ridge with an unpenalized intercept on an explicit feature matrix Z.
+function ridge(Z, yv, lam)
+    zm, ym = mean(Z; dims=1), mean(yv)
+    Zc = Z .- zm
+    w = (Zc' * Zc + lam * I) \ (Zc' * (yv .- ym))
+    return w, ym - (zm * w)[1]
+end
+
+# 1. Exact kernel ridge: solve (K + lambda I) a = y on the n x n Gram matrix.
+function exact_krr(Xa, ya, Xb)
+    K = kernelmatrix(k, RowVecs(Xa))
+    a = (K + LAMBDA * I) \ ya
+    return kernelmatrix(k, RowVecs(Xb), RowVecs(Xa)) * a
+end
+
+# 2. Nystroem: m landmarks, features Z = K_nm K_mm^(-1/2), then ridge.
+function nystroem(Xa, ya, Xb)
+    L = Xa[randperm(Random.Xoshiro(0), size(Xa, 1))[1:D], :]
+    E = eigen(Symmetric(kernelmatrix(k, RowVecs(L))))
+    M = E.vectors * Diagonal(1 ./ sqrt.(max.(E.values, 1e-12))) * E.vectors'
+    feat(A) = kernelmatrix(k, RowVecs(A), RowVecs(L)) * M
+    w, b = ridge(feat(Xa), ya, LAMBDA)
+    return feat(Xb) * w .+ b
+end
+
+# 3. Random Fourier features: z(x) = sqrt(2/D) cos(W'x + b), W ~ N(0, 2 gamma I).
+function rff(Xa, ya, Xb)
+    r = Random.Xoshiro(0)
+    W = sqrt(2 * GAMMA) .* randn(r, size(Xa, 2), D)
+    b0 = 2pi .* rand(r, 1, D)
+    feat(A) = sqrt(2 / D) .* cos.(A * W .+ b0)
+    w, b = ridge(feat(Xa), ya, LAMBDA)
+    return feat(Xb) * w .+ b
+end
+
+# 4. Plain linear ridge: the baseline the kernel must beat.
+function linear(Xa, ya, Xb)
+    w, b = ridge(Xa, ya, LAMBDA)
+    return Xb * w .+ b
+end
+
+println("train shape ", size(Xtr), ", test shape ", size(Xte), "\n")
+for (name, f) in [("Exact kernel ridge (RBF)", exact_krr),
+                  ("Nystroem + Ridge", nystroem),
+                  ("RandomFourier + Ridge", rff),
+                  ("Linear Ridge (baseline)", linear)]
+    f(Xtr[1:400, :], ytr[1:400], Xte[1:5, :])          # compile first
+    t = @elapsed yhat = f(Xtr, ytr, Xte)
+    @printf("%-26s test R2 = %6.3f   fit+predict = %5.2fs\n", name, r2(yhat), t)
+end
+
+# The approximation replaces the n x n Gram matrix by a tall n x D matrix.
+L = Xtr[randperm(Random.Xoshiro(0), size(Xtr, 1))[1:D], :]
+Z = kernelmatrix(k, RowVecs(Xtr), RowVecs(L))
+println("\nNystroem kernel block K_nm: ", size(Z),
+        "  (vs a ", size(Xtr, 1), " x ", size(Xtr, 1), " Gram matrix)")
 ```
 
 ## Rust

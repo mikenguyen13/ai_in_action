@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Density-Based Clustering with HDBSCAN and OPTICS
+
+{{< include _julia-setup.qmd >}}
+
 
 Density-based clustering treats clusters as regions of high observation density separated by regions of low density. This view, made popular by DBSCAN, frees the analyst from specifying the number of clusters in advance and allows clusters of arbitrary shape. Yet plain DBSCAN carries a fragile assumption: a single global density threshold governs the entire dataset. When clusters occur at genuinely different densities, no single threshold recovers all of them. OPTICS and HDBSCAN are the two principled answers to this problem. Both replace the flat threshold with a hierarchical, multi-scale notion of density. This chapter develops the reachability formalism behind OPTICS, the condensed-tree and stability formalism behind HDBSCAN, and the practical judgment needed to deploy them. It then demonstrates both algorithms with mature open-source tooling rather than a hand-rolled reimplementation, because for density clustering the correctness of the spatial-index and minimum-spanning-tree machinery is exactly what you do not want to get subtly wrong.
 
@@ -204,30 +213,70 @@ HDBSCAN recovers all three blobs at their differing densities and scores a high 
 
 ## Julia
 
-```julia
-# Clustering.jl provides DBSCAN and OPTICS over a precomputed distance
-# matrix or coordinates. It has no native HDBSCAN, so OPTICS plus an
-# eps-cut is the closest equivalent in the Julia ecosystem.
-using Clustering, Distances, Random
+```{julia}
+# Clustering.jl provides DBSCAN but neither OPTICS nor HDBSCAN. Below we run its
+# DBSCAN and build the OPTICS reachability ordering natively in a few lines,
+# then read a DBSCAN-style eps-cut off that ordering, as scikit-learn's
+# cluster_optics_dbscan does.
+using Clustering, Distances, Random, Statistics, Printf
 
-Random.seed!(42)
+rng = Xoshiro(42)
 
 # Three blobs of differing spread plus uniform noise (columns = points).
-c1 = 0.30 .* randn(2, 150) .+ [0.0, 0.0]
-c2 = 1.40 .* randn(2, 150) .+ [6.0, 6.0]
-c3 = 0.70 .* randn(2, 150) .+ [-6.0, 6.0]
-noise = rand(2, 60) .* [21.0, 21.0] .+ [-9.0, -9.0]
+c1 = 0.30 .* randn(rng, 2, 150) .+ [0.0, 0.0]
+c2 = 1.40 .* randn(rng, 2, 150) .+ [6.0, 6.0]
+c3 = 0.70 .* randn(rng, 2, 150) .+ [-6.0, 6.0]
+noise = rand(rng, 2, 60) .* 21.0 .- 9.0
 X = hcat(c1, c2, c3, noise)
+y_true = vcat(fill(1, 150), fill(2, 150), fill(3, 150), fill(0, 60))  # 0 = noise
+println("dataset: X=", size(X'), ", true clusters=3 + 60 noise points")
 
-# OPTICS: build the ordering, then extract clusters with an eps-cut.
-optres = optics(X, 10; metric=Euclidean())   # min_cluster_size = 10
-clusts = extract_dbscan_clustering(optres, 2.0)  # eps = 2.0
-println("OPTICS+eps clusters: ", nclusters(clusts))
-println("assignments (first 10): ", assignments(clusts)[1:10])
+ari(a, b) = randindex(a, b)[1]          # adjusted Rand index (noise is its own label)
 
-# A direct DBSCAN for comparison on the same data.
-dbres = dbscan(X, 2.0; min_neighbors=10, min_cluster_size=25)
-println("DBSCAN clusters: ", nclusters(dbres))
+# OPTICS ordering with min_samples = 10 and no eps bound.
+function optics_order(X; min_samples = 10)
+    D = pairwise(Euclidean(), X, dims = 2)
+    n = size(D, 1)
+    core = [partialsort(D[:, i], min_samples) for i in 1:n]  # self counts as one
+    reach = fill(Inf, n)
+    done = falses(n)
+    order = Int[]
+    for _ in 1:n
+        cand = findall(!, done)
+        p = cand[argmin(reach[cand])]       # next point: smallest reachability
+        done[p] = true
+        push!(order, p)
+        for o in findall(!, done)           # update reachability of the rest
+            reach[o] = min(reach[o], max(core[p], D[p, o]))
+        end
+    end
+    return order, reach, core
+end
+
+# DBSCAN-style extraction at a single eps from the OPTICS ordering.
+function eps_cut(order, reach, core, eps)
+    far, near = reach .> eps, core .<= eps
+    labels = zeros(Int, length(reach))
+    labels[order] = cumsum(far[order] .& near[order])
+    labels[far .& .!near] .= 0              # 0 = noise
+    return labels
+end
+
+order, reach, core = optics_order(X; min_samples = 10)
+fin = filter(isfinite, reach[order])
+println("\n[OPTICS ordering]")
+@printf("  reachability (ordered): min=%.2f, median=%.2f, max=%.2f\n",
+        minimum(fin), median(fin), maximum(fin))
+opt_labels = eps_cut(order, reach, core, 2.0)
+@printf("  eps-cut at eps=2.0:     %d clusters, ARI=%.3f\n",
+        maximum(opt_labels), ari(y_true, opt_labels))
+
+# A direct DBSCAN for comparison on the same data (Clustering.jl).
+dbres = dbscan(X, 2.0; min_neighbors = 10, min_cluster_size = 25)
+db_labels = assignments(dbres)          # 0 marks noise
+println("\n[DBSCAN, Clustering.jl]")
+@printf("  clusters: %d, points labeled noise: %d, ARI=%.3f\n",
+        nclusters(dbres), count(==(0), db_labels), ari(y_true, db_labels))
 ```
 
 ## Rust
@@ -271,7 +320,7 @@ fn main() {
 
 :::
 
-Only the Python tab executes in this book; the Julia and Rust tabs are illustrative and show the closest mature equivalents in those ecosystems. The practical takeaway across all three is the same. DBSCAN and OPTICS are widely implemented, but HDBSCAN's full machinery (condensed tree, stability extraction, soft memberships, GLOSH) lives almost entirely in the Python ecosystem through scikit-learn and the standalone `hdbscan` package. If you need HDBSCAN specifically and your stack is Julia or Rust, the pragmatic path is to call the Python implementation; if you only need a density-aware flat clustering, the native OPTICS plus an $\varepsilon$-cut in Clustering.jl or linfa-clustering is a sound choice.
+The Python and Julia tabs execute; the Rust tab is illustrative and shows the closest mature equivalent in that ecosystem. Clustering.jl ships DBSCAN but neither OPTICS nor HDBSCAN, so the Julia tab runs its DBSCAN and builds the OPTICS reachability ordering natively in a few lines, which closely reproduces the Python reachability summary and $\varepsilon$-cut on its own seeded draw of the same scene. The practical takeaway across all three is the same. DBSCAN and OPTICS are widely implemented, but HDBSCAN's full machinery (condensed tree, stability extraction, soft memberships, GLOSH) lives almost entirely in the Python ecosystem through scikit-learn and the standalone `hdbscan` package. If you need HDBSCAN specifically and your stack is Julia or Rust, the pragmatic path is to call the Python implementation; if you only need a density-aware flat clustering, DBSCAN in Clustering.jl, a short native OPTICS ordering with an $\varepsilon$-cut in Julia, or OPTICS in linfa-clustering is a sound choice.
 
 ## 7. Summary
 

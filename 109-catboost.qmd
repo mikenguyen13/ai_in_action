@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # CatBoost: Ordered Boosting and Categorical Features Done Right
+
+{{< include _julia-setup.qmd >}}
+
 
 CatBoost is a gradient boosting library developed at Yandex that addresses two problems most gradient boosting toolkits handle poorly: the statistical leakage introduced when categorical features are encoded with target information, and a subtler prediction shift that affects gradient boosted models in general. Its two signature ideas, ordered target statistics and ordered boosting, both rest on the same principle of using only the past to estimate the present. Combined with a fast oblivious tree learner and strong default hyperparameters, CatBoost is often the strongest out of the box choice on tabular data with high cardinality categorical columns.
 
@@ -198,7 +207,7 @@ CatBoost provides feature importances through `model.get_feature_importance`, in
 
 The example below builds a small, self contained fraud style classification problem: 4000 transactions with a high cardinality `merchant` column (200 levels, each carrying its own latent risk), two low cardinality categoricals (`country`, `device`), two numeric features (`amount`, `age_days`), and a planted `country` by `device` interaction. This is exactly the shape of data CatBoost is built for, and it lets the high cardinality categorical do real work without any manual encoding. Everything is generated inline with NumPy and a fixed seed, so the run is deterministic.
 
-The Python tab executes. The Julia and Rust tabs show the equivalent calls in those ecosystems and are not run here.
+The Python and Julia tabs execute (the Julia tab simulates the same data with its own random generator, so its numbers differ slightly). The Rust tab shows the equivalent calls and is not run here.
 
 ::: {.panel-tabset}
 
@@ -295,12 +304,14 @@ The high cardinality `merchant` column dominates the importance ranking, which i
 
 ## Julia
 
-```julia
-# CatBoost.jl wraps the same native CatBoost library used by Python.
-# Pkg.add("CatBoost"); Pkg.add("DataFrames")
+```{julia}
+# CatBoost.jl wraps the same native CatBoost library used by Python
+# (through PythonCall), so the Pool / fit! / predict_proba calls mirror it,
+# and other model methods are reached directly on the returned object.
 using CatBoost
+using PythonCall: pylist, pyconvert
 using DataFrames
-using Random
+using Random, Statistics, Printf
 
 Random.seed!(0)
 n = 4000
@@ -332,22 +343,38 @@ df = DataFrame(merchant = string.(merchant), country = country,
                device = device, amount = amount, age_days = age_days)
 cat_features = ["merchant", "country", "device"]
 
-# Hold out the last 25% as a test set.
-ntr = Int(round(0.75 * n))
-train_pool = Pool(df[1:ntr, :], label = y[1:ntr], cat_features = cat_features)
-test_pool  = Pool(df[ntr+1:n, :], label = y[ntr+1:n], cat_features = cat_features)
+# Rows are i.i.d., so holding out the last 25% is a random test split.
+ntr = round(Int, 0.75 * n)
+train_pool = Pool(df[1:ntr, :]; label = pylist(y[1:ntr]), cat_features = cat_features)
+test_pool  = Pool(df[ntr+1:n, :]; label = pylist(y[ntr+1:n]), cat_features = cat_features)
 
 model = CatBoostClassifier(iterations = 400, learning_rate = 0.05,
                            depth = 6, l2_leaf_reg = 3.0,
                            loss_function = "Logloss", eval_metric = "AUC",
                            boosting_type = "Ordered", random_seed = 42,
                            verbose = false)
-fit!(model, train_pool, eval_set = test_pool, use_best_model = true)
+fit!(model, train_pool; eval_set = test_pool, use_best_model = true)
 
 proba = predict_proba(model, test_pool)[:, 2]
-println("best iteration: ", get_best_iteration(model))
-println("test AUC:       ", eval_metrics(model, test_pool, ["AUC"]))
-println("importances:    ", get_feature_importance(model))
+y_te = y[ntr+1:n]
+function auc(y, s)
+    r = invperm(sortperm(s))
+    n1, n0 = count(==(1), y), count(==(0), y)
+    (sum(r[y .== 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+end
+
+println("train rows: ", ntr, ", test rows: ", n - ntr, ", features: ", ncol(df))
+@printf("positive rate (train): %.3f\n", mean(y[1:ntr]))
+println("best iteration:        ", pyconvert(Int, model.get_best_iteration()))
+@printf("test AUC:              %.4f\n", auc(y_te, proba))
+@printf("test accuracy:         %.4f\n", mean((proba .>= 0.5) .== y_te))
+
+imp = pyconvert(Vector{Float64},
+                model.get_feature_importance(test_pool; type = "PredictionValuesChange"))
+println("feature importance (PredictionValuesChange):")
+for i in sortperm(imp, rev = true)
+    @printf("  %-10s %6.2f\n", names(df)[i], imp[i])
+end
 ```
 
 ## Rust

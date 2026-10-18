@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Bayesian Hyperparameter Tuning
+
+{{< include _julia-setup.qmd >}}
+
 
 Hyperparameter optimization is the outer loop that wraps every machine learning model. Learning rates, tree depths, regularization strengths, layer widths, and dropout probabilities are not learned from data by the training procedure itself. They are chosen by the practitioner, and the quality of that choice often matters more than the choice of model family. The central difficulty is that evaluating a single hyperparameter configuration requires training a model to completion, which can take minutes, hours, or days. The objective is therefore expensive, noisy, and a black box with no usable gradient. Bayesian optimization is the dominant principled response to this setting. It builds a cheap probabilistic surrogate of the expensive objective, uses that surrogate to decide where to evaluate next, and refines the surrogate as evidence accumulates. This chapter develops the theory of surrogate-based optimization, contrasts the two surrogate families that dominate practice, derives the acquisition functions that drive the search, and grounds everything in the tools practitioners actually use.
 
@@ -171,7 +180,7 @@ A practical rule of thumb is to use a GP surrogate when the search space is cont
 
 ## 7. A Worked Bayesian Optimization Loop
 
-The right way to use Bayesian optimization in production is to reach for a mature library, not to reimplement the loop. The reference code below is therefore deliberately split. The Python tab builds the loop explicitly on top of scikit-learn's `GaussianProcessRegressor` so that every step from Sections 2 through 5, fitting the GP surrogate, evaluating expected improvement, and selecting the next point, is visible and runnable in a few dozen lines. This is the version to read when you want to understand the machinery. For real work you would instead drive [Optuna](https://optuna.org), [scikit-optimize](https://scikit-optimize.github.io), or [BoTorch](https://botorch.org), which add pruning, parallelism, robust kernel handling, and persistence; the call into Optuna shown in Section 6.1 is all the user code those libraries require.
+The right way to use Bayesian optimization in production is to reach for a mature library, not to reimplement the loop. The reference code below is therefore deliberately split. The Python tab builds the loop explicitly on top of scikit-learn's `GaussianProcessRegressor` (and the Julia tab builds the same loop by hand) so that every step from Sections 2 through 5, fitting the GP surrogate, evaluating expected improvement, and selecting the next point, is visible and runnable in a few dozen lines. This is the version to read when you want to understand the machinery. For real work you would instead drive [Optuna](https://optuna.org), [scikit-optimize](https://scikit-optimize.github.io), or [BoTorch](https://botorch.org), which add pruning, parallelism, robust kernel handling, and persistence; the call into Optuna shown in Section 6.1 is all the user code those libraries require.
 
 The task is a small, self-contained tuning problem with everything generated inline. We synthesize a moderately hard binary classification dataset with scikit-learn's `make_classification`, then tune two hyperparameters of a gradient-boosted tree: the learning rate on a log scale and the maximum tree depth. The objective is the negative five-fold cross-validated accuracy, which is exactly the expensive, noisy, gradient-free black box the chapter has been describing. We optimize over the unit square and map each coordinate to its raw range inside the objective, which is the standard trick for keeping a stationary kernel well conditioned across heterogeneous axes. To make the value of the surrogate concrete, the loop reports the best configuration found and compares it against pure random search given the identical evaluation budget.
 
@@ -210,7 +219,7 @@ def to_raw(u):
     return SPACE_LO + u * (SPACE_HI - SPACE_LO)
 
 def objective(u):
-    """Expensive, noisy, gradient-free black box: negative CV accuracy."""
+    '''Expensive, noisy, gradient-free black box: negative CV accuracy.'''
     log_lr, depth = to_raw(u)
     clf = GradientBoostingClassifier(
         learning_rate=10.0 ** log_lr,
@@ -221,7 +230,7 @@ def objective(u):
     return -cross_val_score(clf, X, y, cv=5, scoring="accuracy").mean()
 
 def expected_improvement(mu, sigma, f_best, xi=0.01):
-    """EI for minimization; see Section 5.2."""
+    '''EI for minimization; see Section 5.2.'''
     sigma = np.maximum(sigma, 1e-9)
     z = (f_best - mu - xi) / sigma
     return sigma * (z * norm.cdf(z) + norm.pdf(z))
@@ -270,40 +279,122 @@ trace = -np.minimum.accumulate(Y)
 print("Best-so-far accuracy: " + " ".join(f"{v:.3f}" for v in trace))
 ```
 
-The GP-guided search reaches its best configuration within the first couple of informed iterations and edges out random search at the same budget, which is the expected payoff in this low dimensional, expensive regime. The printed length scales make the surrogate's reasoning legible: a short length scale on an axis means the GP believes the objective changes quickly there and so it samples that axis more carefully. The `WhiteKernel` term is doing real work too: the learned noise variance is the slice of score variation the surrogate attributes to cross-validation jitter rather than to the mean surface, and modeling it is what stops the GP from overfitting the noise, the single most common mistake when hand-rolling a GP loop. In anything beyond a teaching example, replace this entire cell with the few lines of Optuna or scikit-optimize from Section 6, which manage the surrogate, the acquisition optimization, and trial bookkeeping for you.
+In the Python run, the GP-guided search reaches its best configuration within the first couple of informed iterations and edges out random search at the same budget, which is the expected payoff in this low dimensional, expensive regime. The Julia tab, which builds the same loop by hand with XGBoost.jl and a small Gaussian process because the BayesianOptimization.jl package cannot be installed alongside the book's other packages, lands within cross-validation noise of random search instead. Both outcomes are honest: at a budget this small the gap between the two methods is often no larger than the noise in the cross-validated scores, which is a reason to repeat such comparisons over several seeds before trusting them. The printed length scales make the surrogate's reasoning legible: a short length scale on an axis means the GP believes the objective changes quickly there and so it samples that axis more carefully. The `WhiteKernel` term is doing real work too: the learned noise variance is the slice of score variation the surrogate attributes to cross-validation jitter rather than to the mean surface, and modeling it is what stops the GP from overfitting the noise, the single most common mistake when hand-rolling a GP loop. In anything beyond a teaching example, replace this entire cell with the few lines of Optuna or scikit-optimize from Section 6, which manage the surrogate, the acquisition optimization, and trial bookkeeping for you.
 
 ## Julia
 
-```julia
-# ] add BayesianOptimization GaussianProcesses Distributions
-using BayesianOptimization, GaussianProcesses, Distributions
+```{julia}
+# The same explicit loop in Julia: XGBoost.jl is the gradient-boosted tree,
+# and the GP surrogate plus expected improvement are a few dozen lines of
+# LinearAlgebra and Optim, so every step stays visible.
+using XGBoost, Distributions, LinearAlgebra, Optim, Random, Statistics, Printf
 
-# Same objective shape: map the unit square to (log10 lr, max_depth) and
-# return the cross-validated loss from your training routine.
+# A self-contained, moderately hard binary task in the spirit of
+# make_classification: 8 informative features with a nonlinear decision
+# rule, 4 redundant linear mixtures of them, and 8 pure-noise features.
+rng = Random.Xoshiro(42)
+n = 600
+Xinf = randn(rng, n, 8)
+score = Xinf[:, 1] .* Xinf[:, 2] .+ sin.(2 .* Xinf[:, 3]) .+ Xinf[:, 4] .-
+        0.5 .* Xinf[:, 5] .^ 2 .+ 0.7 .* Xinf[:, 6] .* Xinf[:, 7] .+
+        0.5 .* Xinf[:, 8] .+ 0.8 .* randn(rng, n)
+y = Float64.(score .> median(score))
+X = hcat(Xinf, Xinf * randn(rng, 8, 4), randn(rng, n, 8))
+folds = mod1.(randperm(rng, n), 5)                # fixed 5-fold assignment
+
+# Search the unit square, mapped to raw ranges inside the objective:
+#   u1 -> log10(learning_rate) in [-3, 0],  u2 -> max_depth in [1, 6]
+to_raw(u) = (-3.0 + 3.0 * u[1], 1.0 + 5.0 * u[2])
+
 function objective(u)
-    log_lr = -3.0 + u[1] * 3.0          # log10(lr) in [-3, 0]
-    depth  = round(Int, 1.0 + u[2] * 5) # max_depth in [1, 6]
-    return train_and_cv_loss(10.0^log_lr, depth)   # your model, returns a loss
+    # Expensive, noisy, gradient-free black box: negative CV accuracy.
+    log_lr, depth = to_raw(u)
+    acc = map(1:5) do k
+        tr, te = folds .!= k, folds .== k
+        bst = xgboost((X[tr, :], y[tr]); num_round=60, eta=10.0^log_lr,
+                      max_depth=round(Int, depth), objective="binary:logistic",
+                      watchlist=Dict(), nthread=1)
+        mean((XGBoost.predict(bst, X[te, :]) .> 0.5) .== y[te])
+    end
+    return -mean(acc)
 end
 
-# Matern 5/2 GP surrogate with a learned mean and noise term.
-model = ElasticGPE(2;
-    mean = MeanConst(0.0),
-    kernel = Mat52Ard([0.0, 0.0], 0.0),
-    logNoise = -2.0)
-set_priors!(model.mean, [Normal(0, 1)])
+# EI for minimization; see Section 5.2.
+function expected_improvement(mu, sigma, f_best; xi=0.01)
+    sigma = max.(sigma, 1e-9)
+    z = (f_best .- mu .- xi) ./ sigma
+    sigma .* (z .* cdf.(Normal(), z) .+ pdf.(Normal(), z))
+end
 
-# Expected-improvement acquisition, optimized over [0,1]^2.
-opt = BOpt(objective, model,
-    ExpectedImprovement(),
-    MAPGPOptimizer(every = 5),
-    [0.0, 0.0], [1.0, 1.0];
-    maxiterations = 17, sense = Min,
-    initializer = ScaledSobolIterator([0.0, 0.0], [1.0, 1.0], 5))
+# Matern 5/2 ARD kernel on rows of A and B (length scales ell, variance s2)
+function mat52(A, B, s2, ell)
+    D2 = sum(((reshape(A[:, j], :, 1) .- reshape(B[:, j], 1, :)) ./ ell[j]) .^ 2
+             for j in 1:size(A, 2))
+    r = sqrt.(max.(D2, 0.0))
+    s2 .* (1 .+ sqrt(5) .* r .+ (5 / 3) .* r .^ 2) .* exp.(-sqrt(5) .* r)
+end
 
-result = boptimize!(opt)
-println("Best loss:    ", result.observed_optimum)
-println("Best config:  ", result.observed_optimizer)
+# GP surrogate with a learned noise term (the analogue of scikit-learn's
+# WhiteKernel) so it does not treat the noisy CV scores as exact.
+# Hyperparameters maximize the log marginal likelihood within box bounds.
+squash(u, a, b) = exp(log(a) + (log(b) - log(a)) / (1 + exp(-u)))
+hyp(u) = (s2 = squash(u[1], 1e-2, 1e2), ell = squash.(u[2:3], 1e-2, 1e1),
+          noise = squash(u[4], 1e-4, 1e-1))
+function fit_gp(U, Y)
+    m, s = mean(Y), std(Y)
+    z = (Y .- m) ./ s
+    function nlml(u)
+        h = hyp(u)
+        C = cholesky(Symmetric(mat52(U, U, h.s2, h.ell) + (h.noise + 1e-8) * I))
+        0.5 * dot(z, C \ z) + sum(log, diag(C.U))
+    end
+    runs = [optimize(nlml, u0, NelderMead())
+            for u0 in ([0.0, 0.0, 0.0, 0.0], [0.0, -1.0, -1.0, -1.0], [1.0, 1.0, 1.0, 1.0])]
+    h = hyp(Optim.minimizer(argmin(Optim.minimum, runs)))
+    C = cholesky(Symmetric(mat52(U, U, h.s2, h.ell) + (h.noise + 1e-8) * I))
+    predict(Q) = begin
+        Kq = mat52(Q, U, h.s2, h.ell)
+        mu = Kq * (C \ z)
+        var = h.s2 .- vec(sum(Kq .* (C \ Kq')', dims=2))
+        m .+ s .* mu, s .* sqrt.(max.(var, 0.0))
+    end
+    return h, predict
+end
+
+# Space-filling warm start: a seeded Latin hypercube in [0, 1]^d.
+lhs(r, k, d) = hcat([(randperm(r, k) .- rand(r, k)) ./ k for _ in 1:d]...)
+
+n_init, n_iter = 5, 12
+U = lhs(Random.Xoshiro(1), n_init, 2)
+Y = [objective(U[i, :]) for i in 1:n_init]
+cand = rand(Random.Xoshiro(7), 2048, 2)            # cheap candidate pool
+
+h = nothing
+for _ in 1:n_iter
+    global h, U, Y
+    h, gp_predict = fit_gp(U, Y)
+    mu, sd = gp_predict(cand)
+    u_next = cand[argmax(expected_improvement(mu, sd, minimum(Y))), :]
+    U = vcat(U, u_next')
+    Y = vcat(Y, objective(u_next))
+end
+
+best = argmin(Y)
+log_lr, depth = to_raw(U[best, :])
+println("Observations U,Y shapes: ", size(U), ", ", size(Y))
+println("Evaluations: ", length(Y), "  (init $n_init + BO $n_iter)")
+@printf("Best CV accuracy: %.4f\n", -Y[best])
+@printf("  learning_rate = %.4f\n", 10.0^log_lr)
+println("  max_depth     = ", round(Int, depth))
+@printf("Learned length scales: log10(lr)=%.3f, depth=%.3f\n", h.ell...)
+@printf("Learned CV-noise variance: %.5f\n", h.noise)
+
+# Same total budget spent on pure random search, for reference.
+Ur = lhs(Random.Xoshiro(99), length(Y), 2)
+rand_best = -minimum(objective(Ur[i, :]) for i in 1:size(Ur, 1))
+@printf("Random search best (same budget): %.4f\n", rand_best)
+trace = -accumulate(min, Y)
+println("Best-so-far accuracy: ", join([@sprintf("%.3f", v) for v in trace], " "))
 ```
 
 ## Rust

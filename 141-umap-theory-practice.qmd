@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # UMAP: Theory and Practice
+
+{{< include _julia-setup.qmd >}}
+
 
 Uniform Manifold Approximation and Projection (UMAP) has become a default tool for visualizing and reducing the dimension of high dimensional data, from single cell transcriptomes to neural network embeddings. Its popularity rests on a combination of speed, scalability, and a strong tendency to preserve the coarse arrangement of clusters in a dataset. Yet UMAP is often used as a black box, with its hyperparameters tuned by trial and error and its outputs over interpreted. This chapter develops the theory that underlies UMAP, derives its objective, examines its central hyperparameters, contrasts it with t-SNE, and discusses what it does and does not preserve about global structure. It then demonstrates the method with the mature open-source `umap-learn` library rather than reimplementing the algorithm, because a from-scratch UMAP would reproduce thousands of lines of carefully optimized nearest-neighbor and stochastic-gradient code without teaching anything the theory does not already cover.
 
@@ -171,7 +180,7 @@ Reach for UMAP when you need a fast, scalable, nonlinear projection of high dime
 
 The reference implementation is the open-source `umap-learn` library by the original authors. It exposes a scikit-learn compatible estimator: `UMAP(...).fit_transform(X)` returns the embedding, and a fitted reducer offers `transform` for new points. Under the hood it uses `pynndescent` for approximate nearest neighbors and Numba-compiled stochastic gradient descent, so it is both mature and fast; reimplementing it from scratch would add no pedagogical value beyond Sections 2 and 3. The example below uses the classic 8-by-8 handwritten digits dataset bundled with scikit-learn, which has $1797$ samples, $64$ features, and $10$ classes, small enough to run in seconds yet rich enough to show real cluster structure. We standardize the features, reduce $64$ dimensions to $2$, and then validate the result two ways: a trustworthiness score, and a check that a $k$ nearest neighbor classifier trained on the two-dimensional embedding is at least as accurate as one trained on the raw input. Setting `random_state` makes the run deterministic.
 
-The Julia equivalent uses `UMAP.jl`, a mature pure-Julia implementation. Rust has no production-grade UMAP crate at the time of writing, so the Rust tab shows the closest mature option, a t-SNE crate, with an honest note.
+The Julia equivalent uses `UMAP.jl`, a mature pure-Julia implementation. Because the digits images ship with scikit-learn rather than with a Julia package, the Julia tab runs the same pipeline on a synthetic digits-shaped dataset generated in place (1797 samples, 64 features, 10 overlapping classes), so its numbers differ from the Python ones. Rust has no production-grade UMAP crate at the time of writing, so the Rust tab shows the closest mature option, a t-SNE crate, with an honest note.
 
 ::: {.panel-tabset}
 
@@ -226,24 +235,70 @@ new = reducer.transform(X[:5])
 print(f"transform() of 5 held-out rows -> shape {new.shape}")
 ```
 
-The embedding compresses $64$ features into $2$ while a trustworthiness near $0.97$ confirms that local neighborhoods are largely preserved. Strikingly, the $k$ nearest neighbor classifier is slightly more accurate on the two-dimensional UMAP coordinates than on the raw $64$-dimensional input: the nonlinear projection has concentrated the class-relevant structure and discarded noise, which is exactly why UMAP is often used as a preprocessing step and not only for plots.
+The embedding compresses $64$ features into $2$ while a trustworthiness near $0.97$ confirms that local neighborhoods are largely preserved. Strikingly, in this run the $k$ nearest neighbor classifier is slightly more accurate on the two-dimensional UMAP coordinates than on the raw $64$-dimensional input: the nonlinear projection has concentrated the class-relevant structure and discarded noise, which is exactly why UMAP is often used as a preprocessing step and not only for plots. The gain is data dependent rather than guaranteed: on the synthetic digits-shaped data of the Julia tab, the same comparison comes out slightly the other way, with the raw input ahead of the embedding.
 
 ## Julia
 
-```julia
-using UMAP                 # the UMAP.jl package
-using MLDatasets           # for a digits-like dataset
-using Statistics
+```{julia}
+using UMAP                 # the UMAP.jl package (UMAP.fit / UMAP.transform)
+using Distances, Random, Statistics, StatsBase, Printf
 
-# Load and standardize features (columns are samples in UMAP.jl convention).
-X = rand(64, 1797)         # replace with real data, e.g. MNIST.traindata()
-X = (X .- mean(X, dims=2)) ./ (std(X, dims=2) .+ 1e-9)
+# A synthetic, digits-shaped dataset generated in place (no download): 1797
+# samples, 64 features (an 8x8 "image"), 10 classes. Each class prototype
+# shares about 70% of its pixels with a common base pattern, so classes
+# overlap; samples vary the intensity, drop pixels, and add noise.
+rng = Xoshiro(42)
+n, p, K = 1797, 64, 10
+base = 16.0 .* (rand(rng, p) .< 0.35)
+protos = [ifelse.(rand(rng, p) .< 0.7, base, 16.0 .* (rand(rng, p) .< 0.35)) for _ in 1:K]
+y = [mod1(i, K) for i in 1:n]
+X = hcat([clamp.((0.6 + 0.6rand(rng)) .* protos[c] .* (rand(rng, p) .> 0.25) .+
+                 3.0 .* randn(rng, p), 0, 16) for c in y]...)          # 64 x 1797
+# Standardize features (columns are samples in the UMAP.jl convention).
+X = (X .- mean(X, dims=2)) ./ (std(X, dims=2, corrected=false) .+ 1e-9)
+println("input: $(size(X, 2)) samples, $(size(X, 1)) features, $(K) classes")
 
-# Reduce 64 -> 2 dimensions. UMAP.jl returns a (n_components, n_samples) array.
-embedding = umap(X, 2; n_neighbors=15, min_dist=0.1, metric=:euclidean)
+# Reduce 64 -> 2 dimensions. Seeding the global RNG makes the run reproducible.
+Random.seed!(42)
+res = UMAP.fit(X, 2; n_neighbors=15, min_dist=0.1, metric=Euclidean())
+emb = Float64.(res.embedding)                                           # 2 x 1797
+println("embedding shape: ", size(emb'))
+println("first 3 embedded points:")
+show(stdout, "text/plain", round.(emb[:, 1:3]', digits=3)); println()
 
-println("embedding size: ", size(embedding))   # (2, 1797)
-println("first embedded point: ", embedding[:, 1])
+# Trustworthiness (Venna and Kaski): penalize embedding neighbors that were
+# far away in the input, by how far down the input ranking they sat.
+function trustworthiness(Xhi, Xlo; k=15)
+    Dhi, Dlo = pairwise(Euclidean(), Xhi, dims=2), pairwise(Euclidean(), Xlo, dims=2)
+    m = size(Dhi, 1)
+    pen = 0.0
+    for i in 1:m
+        Dhi[i, i] = Dlo[i, i] = Inf                  # exclude the point itself
+        rank = invperm(sortperm(Dhi[:, i]))          # input-space rank of each j
+        for j in partialsortperm(Dlo[:, i], 1:k)
+            pen += max(rank[j] - k, 0)
+        end
+    end
+    return 1 - 2pen / (m * k * (2m - 3k - 1))
+end
+@printf("trustworthiness (k=15): %.4f\n", trustworthiness(X, emb))
+
+# Does the 2-D layout still carry class structure? 10-NN majority vote on a
+# seeded 70/30 split, embedding versus raw 64-D input.
+function knn_acc(F; k=10)
+    idx = shuffle(Xoshiro(0), 1:n)
+    cut = floor(Int, 0.7n)
+    tr, te = idx[1:cut], idx[cut+1:end]
+    D = pairwise(Euclidean(), F[:, te], F[:, tr], dims=2)
+    pred = [mode(y[tr][partialsortperm(D[i, :], 1:k)]) for i in eachindex(te)]
+    return mean(pred .== y[te])
+end
+@printf("kNN accuracy on 2-D embedding: %.4f\n", knn_acc(emb))
+@printf("kNN accuracy on 64-D input:    %.4f\n", knn_acc(X))
+
+# UMAP.transform maps points into the SAME embedding (t-SNE cannot).
+new = UMAP.transform(res, X[:, 1:5]).embedding
+println("transform() of 5 rows -> shape ", size(new'))
 ```
 
 ## Rust

@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Bayesian Optimization
+
+{{< include _julia-setup.qmd >}}
+
 
 ## 1. Motivation: Optimizing Expensive Black-Box Functions
 
@@ -326,13 +335,48 @@ plt.show()
 
 ## Julia
 
-```julia
-using GaussianProcesses, Distributions, Random, Printf
+```{julia}
+using Distributions, LinearAlgebra, Optim, Random, Printf, Statistics, DataFrames
 Random.seed!(0)
 
 objective(x) = sin(3x) + 0.5sin(7x) - 0.1(x - 0.7)^2
 lo, hi = -1.0, 2.0
 grid = collect(range(lo, hi; length=600))
+noise = 1e-3                       # fixed observation-noise variance (jitter)
+
+# Matern 5/2 kernel with signal variance s2 and length scale ell
+function matern52(a, b, s2, ell)
+    r = abs.(a .- b') ./ ell
+    s2 .* (1 .+ sqrt(5) .* r .+ (5 / 3) .* r .^ 2) .* exp.(-sqrt(5) .* r)
+end
+
+# A small hand-written GP. Standardize y, then choose (s2, ell) by maximizing
+# the log marginal likelihood inside box bounds, with a few restarts.
+squash(u, a, b) = a + (b - a) / (1 + exp(-u))       # unconstrained u -> [a, b]
+hyp(u) = (exp(squash(u[1], log(1e-2), log(1e2))),   # s2  in [1e-2, 1e2]
+          exp(squash(u[2], log(1e-2), log(1e1))))   # ell in [1e-2, 10]
+function fit_gp(X, y)
+    m, s = mean(y), std(y)
+    z = (y .- m) ./ s
+    function nlml(u)
+        s2, ell = hyp(u)
+        C = cholesky(Symmetric(matern52(X, X, s2, ell) + noise * I))
+        0.5 * dot(z, C \ z) + sum(log, diag(C.U))
+    end
+    runs = [optimize(nlml, u0, NelderMead())
+            for u0 in ([0.0, 0.0], [0.0, -1.5], [0.0, 1.5], [1.0, -0.5])]
+    s2, ell = hyp(Optim.minimizer(argmin(Optim.minimum, runs)))
+    C = cholesky(Symmetric(matern52(X, X, s2, ell) + noise * I))
+    return (; X, m, s, s2, ell, C, alpha = C \ z)
+end
+
+# Posterior mean and covariance at query points, in the original y units
+function posterior(g, xq)
+    Kq = matern52(xq, g.X, g.s2, g.ell)
+    mu = g.m .+ g.s .* (Kq * g.alpha)
+    Sigma = g.s^2 .* (matern52(xq, xq, g.s2, g.ell) - Kq * (g.C \ Kq'))
+    return mu, Symmetric(Sigma)
+end
 
 # Expected improvement (maximization), threshold f_plus + xi
 function ei(mu, sd, fplus; xi=0.01)
@@ -343,21 +387,36 @@ end
 
 X = lo .+ (hi - lo) .* rand(3)
 y = objective.(X)
-
+history = DataFrame(iter=Int[], n_obs=Int[], x_next=Float64[],
+                    y_next=Float64[], best_y=Float64[], max_EI=Float64[])
 for it in 1:6
-    gp = GP(reshape(X, 1, :), y, MeanZero(), Matern(5//2, 0.0, 0.0), -3.0)
-    mu, var = predict_y(gp, reshape(grid, 1, :))
-    sd = sqrt.(max.(var, 0.0))
-    a = ei(mu, sd, maximum(y))
+    mu, Sigma = posterior(fit_gp(X, y), grid)
+    a = ei(mu, sqrt.(max.(diag(Sigma), 0.0)), maximum(y))
     xn = grid[argmax(a)]
     yn = objective(xn)
-    @printf("iter %d  x_next=%.4f  y_next=%.4f  best=%.4f\n",
-            it, xn, yn, max(maximum(y), yn))
+    push!(history, (it, length(X), xn, yn, max(maximum(y), yn), maximum(a)))
     push!(X, xn); push!(y, yn)
 end
+println("Bayesian optimization trace (Expected Improvement):")
+println(history)
 
+# UCB and Thompson sampling on the final posterior
+g = fit_gp(X, y)
+mu, Sigma = posterior(g, grid)
+@printf("\nFinal GP: signal variance %.3f, length scale %.3f\n", g.s2, g.ell)
+ucb = mu .+ sqrt(2.0) .* sqrt.(max.(diag(Sigma), 0.0))
+@printf("UCB (beta=2) next point:        x = %.4f\n", grid[argmax(ucb)])
+L = cholesky(Symmetric(Sigma + 1e-6 * I)).L        # jitter for a stable draw
+for j in 1:3
+    f = mu .+ L * randn(length(grid))               # one posterior function draw
+    @printf("Thompson draw %d next point:     x = %.4f\n", j, grid[argmax(f)])
+end
+
+fgrid = objective.(grid)
 xs = argmax(y)
-@printf("Best found: x=%.4f  y=%.4f\n", X[xs], y[xs])
+@printf("\nTrue optimum on grid:  x* = %.4f, f* = %.4f\n", grid[argmax(fgrid)], maximum(fgrid))
+@printf("BO best found:         x  = %.4f, y  = %.4f\n", X[xs], y[xs])
+@printf("Optimality gap:        %.4e\n", maximum(fgrid) - y[xs])
 ```
 
 ## Rust

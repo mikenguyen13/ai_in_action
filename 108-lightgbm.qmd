@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # LightGBM: Fast Gradient Boosting at Scale
+
+{{< include _julia-setup.qmd >}}
+
 
 LightGBM is a gradient boosting framework engineered for speed and memory efficiency on large, high dimensional datasets. It implements the same statistical model as other gradient boosted decision tree (GBDT) systems, yet it reaches comparable or better accuracy with a fraction of the training time. Three ideas drive this advantage: a histogram based representation of feature values, a leaf-wise tree growth policy, and two sampling techniques named gradient-based one-side sampling (GOSS) and exclusive feature bundling (EFB). This chapter develops each idea from first principles, situates LightGBM against XGBoost and CatBoost, and shows how to wield the mature open-source library in practice rather than reimplementing a boosting engine from scratch.
 
@@ -242,38 +251,76 @@ Early stopping halts well before the 500-round budget, which is exactly the beha
 
 ## Julia
 
-```julia
-# Two mature options exist in Julia. LightGBM.jl wraps the same C engine
-# used above; EvoTrees.jl is a pure-Julia GBDT that is often easier to install.
-using LightGBM
-using MLJ: make_blobs   # or build X, y however you like
+```{julia}
+# LightGBM.jl wraps the same C engine used above. (EvoTrees.jl is a
+# pure-Julia GBDT with a similar histogram design, not installed here.)
+using Logging, Random, Statistics, Printf
+with_logger(NullLogger()) do   # mute the library-path notice printed on load
+    @eval using LightGBM
+end
+rng = MersenneTwister(42)
 
-# X :: Matrix{Float64} (n x d), y :: Vector{Int} of 0/1 labels
+# Self-contained tabular problem in the spirit of make_classification:
+# 6 informative + 4 redundant + 10 noise columns, about 70/30 class
+# imbalance, two Gaussian clusters per class, 3 percent label noise.
+n, p = 6000, 20
+y = Int.(rand(rng, n) .< 0.3)
+centers = [rand(rng, [-1.5, 1.5], 6) for _ in 1:4]
+X = randn(rng, n, p)
+for i in 1:n
+    X[i, 1:6] .+= centers[2y[i] + rand(rng, 1:2)]
+end
+X[:, 7:10] = X[:, 1:6] * randn(rng, 6, 4) ./ 2
+flip = rand(rng, n) .< 0.03
+y[flip] .= 1 .- y[flip]
+
+idx = shuffle(rng, 1:n)
+cut = round(Int, 0.75n)
+X_tr, y_tr = X[idx[1:cut], :], y[idx[1:cut]]
+X_val, y_val = X[idx[cut+1:end], :], y[idx[cut+1:end]]
+
 estimator = LGBMClassification(
     objective = "binary",
+    num_class = 1,            # one logit for binary objectives
     metric = ["auc"],
     num_iterations = 500,
-    num_leaves = 31,
+    num_leaves = 31,          # main capacity knob for leaf-wise growth
     learning_rate = 0.05,
-    feature_fraction = 0.8,
-    bagging_fraction = 0.8,
+    feature_fraction = 0.8,   # column subsampling per tree
+    bagging_fraction = 0.8,   # row subsampling per iteration
     bagging_freq = 1,
-    min_data_in_leaf = 50,
+    min_data_in_leaf = 50,    # regularizes the unbalanced leaf-wise tree
     lambda_l2 = 1.0,
     early_stopping_round = 30,
+    seed = 42,
+    deterministic = true,
+    force_row_wise = true,
+    verbosity = -1,           # silence the C library log
 )
 
-# LightGBM.jl trains and validates in one call; the last split is the eval set.
-LightGBM.fit!(estimator, X_tr, y_tr, (X_val, y_val))
-prob = LightGBM.predict(estimator, X_val)          # P(class = 1)
-pred = vec(prob) .>= 0.5
+# LightGBM.jl trains and validates in one call; the trailing tuple is the
+# eval set used for early stopping, and the booster is cut back to the best round.
+results = LightGBM.fit!(estimator, X_tr, y_tr, (X_val, y_val); verbosity = -1)
+prob = vec(LightGBM.predict(estimator, X_val; verbosity = -1))   # P(class = 1)
+pred = Int.(prob .>= 0.5)
 
-# A pure-Julia alternative with the same leaf-wise / histogram design:
-#   using EvoTrees
-#   model = fit_evotree(EvoTreeClassifier(nrounds=500, max_depth=6,
-#                                         eta=0.05, lambda=1.0); x_train=X_tr,
-#                       y_train=y_tr, x_eval=X_val, y_eval=y_val)
-#   prob = EvoTrees.predict(model, X_val)
+function auc(y, s)
+    r = invperm(sortperm(s))
+    n1, n0 = count(==(1), y), count(==(0), y)
+    (sum(r[y .== 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+end
+
+println("data shape:          train ", size(X_tr), ", val ", size(X_val))
+@printf("positive rate:       %.3f\n", mean(y))
+println("best iteration:      ", results["best_iter"], " of 500")
+@printf("validation AUC:      %.4f\n", auc(y_val, prob))
+@printf("validation accuracy: %.4f\n", mean(pred .== y_val))
+
+gain = LightGBM.gain_importance(estimator)
+println("top-5 features by gain (1-based index, gain):")
+for j in sortperm(gain, rev = true)[1:5]
+    @printf("  feature %2d: %10.1f\n", j, gain[j])
+end
 ```
 
 ## Rust

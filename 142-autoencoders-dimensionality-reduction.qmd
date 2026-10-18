@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Autoencoders for Dimensionality Reduction
+
+{{< include _julia-setup.qmd >}}
+
 
 Dimensionality reduction is the practice of mapping high dimensional data into a lower dimensional space while preserving as much of the structure that matters as possible. Classical methods such as principal component analysis (PCA) accomplish this with linear algebra. Autoencoders generalize the idea to nonlinear maps learned by neural networks. This chapter develops the encoder-decoder architecture, explains why the bottleneck forces compression, establishes the precise relationship between linear autoencoders and PCA, surveys undercomplete and regularized variants, analyzes cost and failure modes, and closes with a bridge to representation learning, where the learned code becomes the central object of interest rather than a byproduct of reconstruction. A worked example near the end trains a small autoencoder with the mature open-source PyTorch library and pits it head to head against PCA on a curved manifold, with parallel Julia (Flux.jl) and Rust (candle) versions.
 
@@ -252,34 +261,66 @@ The autoencoder reaches a far lower reconstruction error than PCA on the same tw
 
 ## Julia
 
-```julia
-# Equivalent undercomplete autoencoder with Flux.jl (not executed here).
-using Flux, MLJ, Random, Statistics
-using Flux: mse, train!
+```{julia}
+# The same undercomplete autoencoder with Flux.jl, against PCA on a Swiss roll.
+using Flux, MLJ, LinearAlgebra, Random, Statistics, Printf
+using Flux: mse
 
+rng = Random.Xoshiro(0)
 Random.seed!(0)
 
-# Assume X (3 x n, standardized) and labels y are available, e.g. from a
-# Swiss-roll generator; Flux expects features in columns.
-d, k = 3, 2
+# A 3D Swiss roll generated inline (the make_swiss_roll recipe): a curved
+# 2D sheet in R^3. t is the intrinsic coordinate along the roll.
+n = 2000
+t = 1.5pi .* (1 .+ 2 .* rand(rng, n))
+X = hcat(t .* cos.(t), 21 .* rand(rng, n), t .* sin.(t)) .+ 0.05 .* randn(rng, n, 3)
+y = Int.(sin.(t ./ 3) .> 0)            # label tracks position ALONG the roll
 
-encoder = Chain(Dense(d, 32, relu), Dense(32, 16, relu), Dense(16, k))
-decoder = Chain(Dense(k, 16, relu), Dense(16, 32, relu), Dense(32, d))
+perm = randperm(rng, n)
+tr, te = perm[1:1500], perm[1501:end]
+mu, sd = mean(X[tr, :]; dims=1), std(X[tr, :]; dims=1)
+# Flux expects features in rows and samples in columns
+Xtr = Float32.(permutedims((X[tr, :] .- mu) ./ sd))
+Xte = Float32.(permutedims((X[te, :] .- mu) ./ sd))
+ytr, yte = y[tr], y[te]
+
+d, k = 3, 2                            # reduce R^3 -> R^2
+encoder = Chain(Dense(d => 32, relu), Dense(32 => 16, relu), Dense(16 => k))
+decoder = Chain(Dense(k => 16, relu), Dense(16 => 32, relu), Dense(32 => d))
 model   = Chain(encoder, decoder)
 
-opt   = Flux.setup(Adam(1e-2), model)
-loss(m, x) = mse(m(x), x)
-
-for epoch in 1:600
-    grads = Flux.gradient(m -> loss(m, Xtr), model)
+opt = Flux.setup(Adam(1e-2), model)
+for epoch in 1:600                     # full-batch training, as in PyTorch
+    grads = Flux.gradient(m -> mse(m(Xtr), Xtr), model)
     Flux.update!(opt, model, grads[1])
 end
 
-# Encode to the 2D code and report test reconstruction error.
-H       = encoder(Xte)
-ae_mse  = mse(decoder(H), Xte)
-println("AE test reconstruction MSE: ", ae_mse)
-println("AE code shape: ", size(H))
+Htr, Hte = encoder(Xtr), encoder(Xte)
+ae_mse = mse(decoder(Hte), Xte)
+
+# Linear baseline: PCA to the same 2 dimensions via the SVD
+xbar = mean(Xtr; dims=2)
+W = svd(Xtr .- xbar).U[:, 1:k]         # top-2 principal directions
+pca(A) = W' * (A .- xbar)
+pca_mse = mean(abs2, Xte .- (W * pca(Xte) .+ xbar))
+
+# Downstream probe: how linearly separable is the label in each 2D code?
+LogisticClassifier = @load LogisticClassifier pkg=MLJLinearModels verbosity=0
+function probe(Ztr, Zte)
+    mach = machine(LogisticClassifier(), MLJ.table(permutedims(Ztr)),
+                   categorical(ytr))
+    fit!(mach; verbosity=0)
+    mean(predict_mode(mach, MLJ.table(permutedims(Zte))) .== yte)
+end
+ae_acc, pca_acc = probe(Htr, Hte), probe(pca(Xtr), pca(Xte))
+
+println("input dim d = $d, code dim k = $k")
+@printf("AE  test reconstruction MSE: %.4f\n", ae_mse)
+@printf("PCA test reconstruction MSE: %.4f\n", pca_mse)
+println("AE  code shape (k x n_test): ", size(Hte))
+println("AE  first three codes:")
+display(round.(permutedims(Hte[:, 1:3]); digits=3))
+@printf("downstream logistic-probe accuracy  AE: %.3f  PCA: %.3f\n", ae_acc, pca_acc)
 ```
 
 ## Rust

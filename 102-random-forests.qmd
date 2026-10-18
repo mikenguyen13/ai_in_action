@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Random Forests
+
+{{< include _julia-setup.qmd >}}
+
 
 Random forests are among the most reliable off the shelf predictors in supervised learning. They take a high variance base learner, the decision tree, and tame it through two complementary forms of randomization: bootstrap resampling of the training data and random restriction of the candidate features at each split. The result is an ensemble that is accurate, robust to noise, nearly free of tuning, and equipped with built in tools for error estimation and variable assessment. This chapter develops the method from the bias variance perspective, explains why decorrelation is the central idea, derives the out of bag error estimate, scrutinizes two notions of feature importance, lays out the cost model, and closes with a runnable demonstration in three languages using mature open-source libraries rather than a hand-rolled implementation.
 
@@ -219,36 +228,75 @@ The forest reaches high accuracy with no tuning beyond sensible defaults, and th
 
 ## Julia
 
-```julia
-# Pkg.add(["DecisionTree", "MLJ", "StableRNGs"])
-using DecisionTree
-using Random
+```{julia}
+using DecisionTree, Random, Statistics, Printf
 
 rng = MersenneTwister(0)
 
-# Stand-in for make_classification: a small synthetic tabular set.
+# Stand-in for make_classification: 1000 rows, 12 columns. Columns 1 to 5
+# carry signal, 6 and 7 are redundant linear combinations of them, and
+# columns 8 to 12 are pure noise; 3 percent of labels are flipped.
 n, p = 1000, 12
 X = randn(rng, n, p)
-# Signal lives in the first five columns; the rest are noise.
+X[:, 6] = 0.6 .* X[:, 1] .- 0.4 .* X[:, 3]
+X[:, 7] = 0.5 .* X[:, 2] .+ 0.5 .* X[:, 4]
 w = [1.4, -1.1, 0.9, 0.8, -0.7]
 logits = X[:, 1:5] * w
 y = Int.(logits .+ 0.3 .* randn(rng, n) .> 0)
+flip = rand(rng, n) .< 0.03
+y[flip] .= 1 .- y[flip]
 
 idx = shuffle(rng, 1:n)
 cut = round(Int, 0.75n)
 tr, te = idx[1:cut], idx[cut+1:end]
+Xtr, ytr, Xte, yte = X[tr, :], y[tr], X[te, :], y[te]
 
-# n_trees=400, m = floor(sqrt(p)) features per split, full-depth trees.
-n_subfeatures = floor(Int, sqrt(p))
-forest = build_forest(y[tr], X[tr, :], n_subfeatures, 400)
+# 400 full-depth trees, m = floor(sqrt(p)) features per split,
+# bootstrap samples of the full training size (partial_sampling = 1.0).
+m = floor(Int, sqrt(p))
+forest = build_forest(ytr, Xtr, m, 400, 1.0; rng = 0)
 
-pred = apply_forest(forest, X[te, :])
-acc  = sum(pred .== y[te]) / length(te)
-println("features per split: ", n_subfeatures, " of ", p)
-println("test accuracy:      ", round(acc, digits=3))
+# ROC AUC by the rank (Mann-Whitney) formula.
+function auc(y, s)
+    r = invperm(sortperm(s))
+    n1, n0 = count(==(1), y), count(==(0), y)
+    (sum(r[y .== 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+end
 
-# DecisionTree.jl also exposes built-in OOB error and integrates with
-# MLJ via the RandomForestClassifier model for tuning and evaluation.
+pred  = apply_forest(forest, Xte)
+proba = apply_forest_proba(forest, Xte, [0, 1])[:, 2]
+
+# build_forest does not return its bootstrap indices, so the OOB estimate is
+# computed with the same recipe by hand: each tree votes only on the
+# training rows it never saw.
+oob_votes = zeros(Int, cut, 2)
+brng = MersenneTwister(1)
+for b in 1:400
+    bag = rand(brng, 1:cut, cut)
+    oob = setdiff(1:cut, bag)
+    t = build_tree(ytr[bag], Xtr[bag, :], m; rng = brng)
+    for (i, c) in zip(oob, apply_tree(t, Xtr[oob, :]))
+        oob_votes[i, c + 1] += 1
+    end
+end
+scored = vec(sum(oob_votes, dims = 2)) .> 0
+oob_pred = [argmax(oob_votes[i, :]) - 1 for i in 1:cut]
+oob_acc = mean(oob_pred[scored] .== ytr[scored])
+
+println("shapes: Xtr=", size(Xtr), ", Xte=", size(Xte))
+println("sqrt(p) features per split: ", m, " of ", p)
+@printf("OOB accuracy (training):    %.3f\n", oob_acc)
+@printf("test accuracy:              %.3f\n", mean(pred .== yte))
+@printf("test ROC AUC:               %.3f\n", auc(yte, proba))
+
+# Permutation importance on the held-out split (drop in accuracy).
+score(model, y, X) = mean(apply_forest(model, X) .== y)
+perm = permutation_importance(forest, yte, copy(Xte), score, 20; rng = 0)
+order = sortperm(perm.mean, rev = true)
+println("\ntop 5 features by permutation importance (drop in accuracy):")
+for j in order[1:5]
+    @printf("  feature %2d: %.3f +/- %.3f\n", j, perm.mean[j], perm.std[j])
+end
 ```
 
 ## Rust

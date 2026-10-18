@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Discriminant Analysis
+
+{{< include _julia-setup.qmd >}}
+
 
 Discriminant analysis is a family of classification methods built on a simple generative premise: model how each class generates its features, then invert that model with Bayes rule to decide which class a new observation belongs to. The two canonical members, linear discriminant analysis (LDA) and quadratic discriminant analysis (QDA), arise from assuming that each class follows a multivariate Gaussian distribution. Despite their age, these methods remain workhorses in modern practice. They are fast, interpretable, require no iterative optimization, behave well in small samples, and double as a principled tool for supervised dimensionality reduction. This chapter develops the theory from the Gaussian class-conditional model, derives LDA both as a classifier and as a projection method, treats QDA and its bias variance tradeoff, and surveys regularized variants that make the methods usable in high dimensions.
 
@@ -299,8 +308,8 @@ results = pd.DataFrame(
             accuracy_score(yte, qda.predict(Xte)),
         ],
         "n_params_cov": [
-            covs[0].size // 2 + covs[0].shape[0],  # one shared covariance
-            3 * (covs[0].size // 2 + covs[0].shape[0]),  # three covariances
+            covs[0].shape[0] * (covs[0].shape[0] + 1) // 2,  # one shared covariance, p(p+1)/2
+            3 * (covs[0].shape[0] * (covs[0].shape[0] + 1) // 2),  # three covariances
         ],
     }
 )
@@ -399,29 +408,68 @@ print("  QDA boundary degree in x1:", sp.Poly(num_q, x1).degree(), "(quadratic e
 
 ## Julia
 
-```julia
-using MultivariateStats, Random, Statistics
+```{julia}
+using MultivariateStats, LinearAlgebra, Random, Statistics, Printf
 
-Random.seed!(20260620)
+rng = Xoshiro(20260620)
 
+# Helper for correlated Gaussian draws (columns are samples).
+function rand_mvn(rng, mu, Sigma, n)
+    L = cholesky(Symmetric(Sigma)).L
+    return mu .+ L * randn(rng, length(mu), n)
+end
+
+# Three Gaussian classes with deliberately unequal covariances
 means = [[0.0, 0.0], [3.0, 2.5], [-2.0, 3.0]]
 covs = [[1.0 0.4; 0.4 1.0], [1.6 -0.9; -0.9 1.2], [0.6 0.2; 0.2 2.2]]
 nper = 300
+X = hcat([rand_mvn(rng, m, c, nper) for (m, c) in zip(means, covs)]...)  # 2 x N
+y = vcat([fill(k, nper) for k in 1:3]...)
 
-X = hcat([rand_mvn(m, c, nper) for (m, c) in zip(means, covs)]...)  # 2 x N
-y = vcat([fill(k, nper) for k in 0:2]...)
+# Stratified 70/30 train/test split
+te = vcat([shuffle(rng, findall(==(k), y))[1:90] for k in 1:3]...)
+tr = setdiff(1:length(y), te)
+Xtr, ytr, Xte, yte = X[:, tr], y[tr], X[:, te], y[te]
 
-# Multiclass LDA: solves the same generalized eigenproblem S_B a = lambda S_W a
-model = fit(MulticlassLDA, X, y; outdim = 2)
-Z = predict(model, X)            # K-1 dimensional Fisher coordinates
-
-# Helper for correlated Gaussian draws
-function rand_mvn(mu, Sigma, n)
-    L = cholesky(Symmetric(Sigma)).L
-    return mu .+ L * randn(length(mu), n)
+# Gaussian discriminant classifiers from Bayes rule: one pooled covariance
+# (LDA) or one covariance per class (QDA), priors from class frequencies.
+function fit_gda(X, y; shared::Bool)
+    K, n = maximum(y), length(y)
+    mus = [vec(mean(X[:, y .== k]; dims = 2)) for k in 1:K]
+    Sk = [cov(X[:, y .== k]; dims = 2) for k in 1:K]
+    pooled = sum((count(==(k), y) - 1) .* Sk[k] for k in 1:K) ./ (n - K)
+    Sigmas = shared ? fill(pooled, K) : Sk
+    priors = [count(==(k), y) / n for k in 1:K]
+    return (; mus, Sigmas, priors)
 end
+function predict_gda(m, X)
+    K = length(m.mus)
+    scores = map(1:K) do k
+        C = cholesky(Symmetric(m.Sigmas[k]))
+        D = C.L \ (X .- m.mus[k])                   # whitened residuals
+        -0.5 .* vec(sum(abs2, D; dims = 1)) .- logdet(C) / 2 .+ log(m.priors[k])
+    end
+    return [argmax([scores[k][i] for k in 1:K]) for i in 1:size(X, 2)]
+end
+acc(m, X, y) = mean(predict_gda(m, X) .== y)
 
-println("Projected size: ", size(Z))    # (2, N): the two discriminant axes
+lda = fit_gda(Xtr, ytr; shared = true)
+qda = fit_gda(Xtr, ytr; shared = false)
+println("Classifier comparison")
+p = size(X, 1)
+ncov = p * (p + 1) ÷ 2                        # free entries of one symmetric covariance
+println("model  train_acc  test_acc  n_params_cov")
+@printf("  LDA %10.4f %9.4f %13d\n", acc(lda, Xtr, ytr), acc(lda, Xte, yte), ncov)
+@printf("  QDA %10.4f %9.4f %13d\n", acc(qda, Xtr, ytr), acc(qda, Xte, yte), 3ncov)
+
+# Multiclass LDA projection: MultivariateStats solves the same generalized
+# eigenproblem S_B a = lambda S_W a on the full data set.
+model = fit(MulticlassLDA, X, y; outdim = 2)
+Z = predict(model, X)                         # K-1 dimensional Fisher coordinates
+lambdas = sort(eigen(Symmetric(model.stats.Sb), Symmetric(model.stats.Sw)).values; rev = true)
+println("\nTop generalized eigenvalues (separation per direction): ",
+        round.(lambdas[1:2], digits = 4))
+println("Projected size: ", size(Z), "  (the two discriminant axes x N points)")
 ```
 
 ## Rust

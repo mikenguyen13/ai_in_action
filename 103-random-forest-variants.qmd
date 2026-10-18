@@ -1,4 +1,13 @@
+---
+engine: julia
+julia:
+  exeflags: ["--project=julia/BookNotebook"]
+---
+
 # Random Forest Variants
+
+{{< include _julia-setup.qmd >}}
+
 
 The standard random forest of Breiman combines bootstrap aggregation with random feature subsetting to build an ensemble of decorrelated decision trees. Its success rests on a simple variance reduction argument: averaging many high variance, low bias predictors shrinks variance without inflating bias, provided the predictors are not too correlated. This insight has spawned a family of variants that manipulate the same two levers, randomness and aggregation, to target different goals. This chapter focuses on two of the most useful and widely deployed members of that family, Extremely Randomized Trees and Isolation Forests, and shows how to put them to work with mature open-source tooling rather than reimplementing them by hand. Extra-Trees push randomization further to cut variance and training cost on supervised problems. Isolation Forests repurpose tree partitioning entirely, turning it into an unsupervised anomaly detector. We treat the mechanics, the statistical rationale, and the practical tradeoffs of each, and we close with quantile regression forests and rotation forests as briefer pointers to the broader family.
 
@@ -155,35 +164,152 @@ Extra-Trees lands at essentially the same accuracy as the random forest while tr
 
 ## Julia
 
-```julia
-# DecisionTree.jl provides random forests and extremely randomized trees.
-# IsolationForest is not in DecisionTree.jl; OutlierDetection.jl wraps one.
-using DecisionTree
-using MLJ
-using Random
+```{julia}
+# DecisionTree.jl ships random forests but not Extra-Trees or Isolation
+# Forest, so both variants are written out below in a few lines each; they
+# are short precisely because they skip the threshold search. The
+# OutlierDetection.jl family (OutlierDetectionNeighbors here) supplies a
+# library detector to cross-check the isolation scores.
+using DecisionTree, Random, Statistics, Printf
 
-Random.seed!(0)
+rng = MersenneTwister(0)
 
-# Supervised: an Extra-Trees-style forest. Setting the number of random
-# split candidates low and disabling the exhaustive threshold search
-# pushes a RandomForest toward the extremely-randomized regime.
-X, y = make_blobs(1500, 20; centers=3, rng=0)
+# --- Part 1: Extra-Trees vs Random Forest on a 3-class task ---------------
+# 1500 rows, 20 columns: 8 informative, 4 redundant (linear mixes), 8 noise.
+n, p, K = 1500, 20, 3
+y = rand(rng, 1:K, n)
+centers = 0.9 .* randn(rng, K, 8)
+X = randn(rng, n, p)
+X[:, 1:8] .+= centers[y, :]
+X[:, 9:12] = X[:, 1:8] * randn(rng, 8, 4) ./ 3
 
-model = RandomForestClassifier(
-    n_trees       = 300,
-    n_subfeatures = 5,      # ~ sqrt(p) candidate features per split
-    partial_sampling = 1.0, # no bootstrap, like canonical Extra-Trees
-    rng = 0,
-)
-mach = machine(model, X, y) |> fit!
-acc = mean(MLJ.predict_mode(mach, X) .== y)
-println("Extra-Trees-style forest training accuracy: ", round(acc, digits=4))
+abstract type ETNode end
+struct ETLeaf <: ETNode
+    probs::Vector{Float64}
+end
+struct ETSplit <: ETNode
+    f::Int; t::Float64; left::ETNode; right::ETNode
+end
 
-# Unsupervised anomaly detection via OutlierDetection.jl's IForest wrapper.
-using OutlierDetection, OutlierDetectionNeighbors
-detector = IForestDetector(n_estimators = 200, sample_size = 256)
-scores   = fit(detector, Matrix(X)) |> m -> transform(detector, m, Matrix(X))
-println("first five anomaly scores: ", scores[1:5])
+classcounts(y, rows, K) = [count(r -> y[r] == k, rows) for k in 1:K]
+gini(c) = 1 - sum(abs2, c ./ sum(c))
+
+# One extremely randomized tree: m random features, ONE uniform random cut
+# per feature, keep the best of those m cuts by weighted Gini. imp collects
+# the impurity decrease per feature (the MDI importance).
+function grow(X, y, rows, K, m, rng, imp)
+    c = classcounts(y, rows, K)
+    maximum(c) == length(rows) && return ETLeaf(c ./ length(rows))
+    best = (Inf, 0, 0.0)
+    for f in randperm(rng, size(X, 2))[1:m]
+        lo, hi = extrema(X[r, f] for r in rows)
+        lo == hi && continue
+        t = lo + rand(rng) * (hi - lo)
+        L = filter(r -> X[r, f] < t, rows)
+        R = filter(r -> X[r, f] >= t, rows)
+        s = length(L) * gini(classcounts(y, L, K)) + length(R) * gini(classcounts(y, R, K))
+        s < best[1] && (best = (s, f, t))
+    end
+    best[2] == 0 && return ETLeaf(c ./ length(rows))
+    _, f, t = best
+    imp[f] += length(rows) * gini(c) - best[1]
+    L = filter(r -> X[r, f] < t, rows)
+    R = filter(r -> X[r, f] >= t, rows)
+    ETSplit(f, t, grow(X, y, L, K, m, rng, imp), grow(X, y, R, K, m, rng, imp))
+end
+
+predict_proba(node::ETLeaf, x) = node.probs
+predict_proba(node::ETSplit, x) =
+    predict_proba(x[node.f] < node.t ? node.left : node.right, x)
+
+# Extra-Trees: no bootstrap, every tree sees all training rows.
+function extra_trees(X, y, K; n_trees = 300, m = 4, seed = 0)
+    rng = MersenneTwister(seed)
+    imp = zeros(size(X, 2))
+    trees = [grow(X, y, collect(1:size(X, 1)), K, m, rng, imp) for _ in 1:n_trees]
+    trees, imp ./ sum(imp)
+end
+et_predict(trees, X) =
+    [argmax(sum(predict_proba(t, x) for t in trees)) for x in eachrow(X)]
+
+folds = collect(Iterators.partition(randperm(MersenneTwister(1), n), n ÷ 5))
+et_acc, rf_acc = Float64[], Float64[]
+for te in folds
+    tr = setdiff(1:n, te)
+    trees, _ = extra_trees(X[tr, :], y[tr], K)
+    push!(et_acc, mean(et_predict(trees, X[te, :]) .== y[te]))
+    # Random forest: bootstrap rows, best threshold over the m sampled features.
+    rf = build_forest(y[tr], X[tr, :], 4, 300, 1.0; rng = 0)
+    push!(rf_acc, mean(apply_forest(rf, X[te, :]) .== y[te]))
+end
+println("=== Extra-Trees vs Random Forest (5-fold CV accuracy) ===")
+@printf("ExtraTrees   : %.4f +/- %.4f\n", mean(et_acc), std(et_acc, corrected = false))
+@printf("RandomForest : %.4f +/- %.4f\n", mean(rf_acc), std(rf_acc, corrected = false))
+
+_, imp = extra_trees(X, y, K)
+println("top-5 feature importances (Extra-Trees, 1-based columns):")
+for j in sortperm(imp, rev = true)[1:5]
+    @printf("  feature %2d: %.4f\n", j, imp[j])
+end
+
+# --- Part 2: Isolation Forest for unsupervised anomaly detection ----------
+n_in, n_out = 500, 25
+Xa = vcat(randn(rng, n_in, 6), rand(rng, n_out, 6) .* 16 .- 8)
+is_outlier = [falses(n_in); trues(n_out)]
+
+# Expected path length of an unsuccessful BST search over n points.
+cbar(n) = n > 2 ? 2 * (log(n - 1) + Base.MathConstants.eulergamma) - 2 * (n - 1) / n :
+          n == 2 ? 1.0 : 0.0
+
+# Isolation tree: random feature, uniform random cut, until isolated or the
+# height limit. Returns the path length of x.
+function iso_path(X, rows, x, depth, maxdepth, rng)
+    (depth >= maxdepth || length(rows) <= 1) && return depth + cbar(length(rows))
+    f = rand(rng, 1:size(X, 2))
+    lo, hi = extrema(X[r, f] for r in rows)
+    lo == hi && return depth + cbar(length(rows))
+    t = lo + rand(rng) * (hi - lo)
+    side = x[f] < t ? filter(r -> X[r, f] < t, rows) : filter(r -> X[r, f] >= t, rows)
+    iso_path(X, side, x, depth + 1, maxdepth, rng)
+end
+
+# Score s(x) = 2^(-E[h(x)] / c(psi)): near 1 is anomalous, about 0.5 or less is normal.
+# Each tree is grown lazily along x's path only, from the same subsample and seed.
+function isolation_scores(X; n_trees = 200, psi = 256, seed = 0)
+    maxdepth = ceil(Int, log2(psi))
+    samples = [randperm(MersenneTwister(seed + b), size(X, 1))[1:psi] for b in 1:n_trees]
+    map(eachrow(X)) do x
+        h = mean(iso_path(X, samples[b], x, 0, maxdepth, MersenneTwister(10_000 + b))
+                 for b in 1:n_trees)
+        2.0^(-h / cbar(psi))
+    end
+end
+
+function auc(y, s)
+    r = invperm(sortperm(s))
+    n1, n0 = count(y), count(!, y)
+    (sum(r[y]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+end
+function average_precision(y, s)
+    hits = y[sortperm(s, rev = true)]
+    mean((cumsum(hits) ./ (1:length(hits)))[hits])
+end
+
+anomaly = isolation_scores(Xa)
+flag = anomaly .>= sort(anomaly, rev = true)[n_out]   # contamination = 25 / 525
+println("\n=== Isolation Forest (500 inliers + 25 injected outliers) ===")
+@printf("ROC AUC                     : %.4f\n", auc(is_outlier, anomaly))
+@printf("Average precision           : %.4f\n", average_precision(is_outlier, anomaly))
+println("points flagged as anomalies : ", count(flag))
+println("true outliers recovered     : ", count(flag .& is_outlier), " / ", n_out)
+@printf("mean anomaly score, inliers : %.4f\n", mean(anomaly[.!is_outlier]))
+@printf("mean anomaly score, outliers: %.4f\n", mean(anomaly[is_outlier]))
+
+# Library cross-check: k-nearest-neighbour distance scores from OutlierDetection.jl.
+using OutlierDetection, OutlierDetectionNeighbors, MLJ
+knn = machine(KNNDetector(k = 10), MLJ.table(Xa))
+MLJ.fit!(knn, verbosity = 0)
+@printf("KNNDetector ROC AUC (cross-check): %.4f\n", auc(is_outlier, report(knn).scores))
 ```
 
 ## Rust
