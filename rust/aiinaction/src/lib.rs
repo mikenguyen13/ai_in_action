@@ -122,6 +122,7 @@ pub mod ch201_batch_norm;
 pub mod ch202_layer_norm;
 pub mod ch204_dropout;
 pub mod ch207_densenet;
+pub mod ch2071_depth;
 pub mod ch525_oversight;
 pub mod ch_clickgraph;
 pub mod ch526_hitl_discovery;
