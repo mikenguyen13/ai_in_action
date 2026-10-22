@@ -65,6 +65,18 @@ Z_90 = 1.2815515655446004
 DPO_01 = 2.1972245773362196
 DPO_025_BETA2 = 0.5493061443340549
 
+THRESHOLD_CASES = [((0.5, 0.2, 0.25), 1), ((0.2, 0.5, 0.25), -1), ((0.5, 0.4, 0.25), 0), ((0.3, 0.3, 0.0), 0)]
+TRANSITIVE_WEAK = (13, 27, 6, 8)  # weak orders of 3 items; strict-only profiles
+TRANSITIVE_STRICT_PART = 19  # strict partial orders of 3 items
+TRANSITIVE_CASES = [((1, 1, 1), True, True), ((1, -1, 1), False, False),
+                    ((0, 1, 0), False, True), ((0, 0, 1), False, True), ((0, 0, 0), True, True)]
+
+CELL_HUMAN = [1.0, 2.0, 5.0, 6.0]
+CELL_LLM = [2.2, 1.8, 6.2, 5.8]
+CELL_GROUPS = ["a", "a", "b", "b"]
+CELL_POOLED = (0.9411946707617073, 0.9176470588235291)
+CELL_WITHIN = (-1.0, -0.4)
+
 COLLAPSE_IN = ["u", "u", "s", "s", "f", "s"]
 COLLAPSE_OUT = ["u", "s", "f", "s"]
 
@@ -220,6 +232,59 @@ def test_dpo_smoothed_margin_and_optimum():
     loss = -(1 - e) * sp.log(1 / (1 + sp.exp(-m))) - e * sp.log(1 / (1 + sp.exp(m)))
     root = sp.log((1 - e) / e)
     assert sp.simplify(sp.diff(loss, m).subs(m, root)) == 0
+
+
+@pytest.mark.parametrize("args,expected", THRESHOLD_CASES)
+def test_threshold_choice(args, expected):
+    assert s.threshold_choice(*args) == expected
+
+
+def test_threshold_choice_validation():
+    with pytest.raises(ValueError):
+        s.threshold_choice(0.0, 1.0, -0.1)
+    with pytest.raises(ValueError):
+        s.threshold_choice(math.nan, 1.0, 0.1)
+
+
+@pytest.mark.parametrize("answers,weak,strict", TRANSITIVE_CASES)
+def test_pairwise_transitive_cases(answers, weak, strict):
+    assert s.pairwise_transitive(*answers) is weak
+    assert s.pairwise_transitive(*answers, strict_only=True) is strict
+
+
+def test_pairwise_transitive_counts():
+    import itertools
+    profiles = list(itertools.product((-1, 0, 1), repeat=3))
+    strict = [p for p in profiles if 0 not in p]
+    n_t, n, n_ts, n_s = TRANSITIVE_WEAK
+    assert (sum(s.pairwise_transitive(*p) for p in profiles), len(profiles)) == (n_t, n)
+    assert (sum(s.pairwise_transitive(*p) for p in strict), len(strict)) == (n_ts, n_s)
+    assert sum(s.pairwise_transitive(*p, strict_only=True) for p in profiles) == TRANSITIVE_STRICT_PART
+    with pytest.raises(ValueError):
+        s.pairwise_transitive(2, 0, 0)
+
+
+def test_threshold_respondents_have_transitive_strict_part():
+    """A semiorder respondent can fail the weak-order test but never the strict one."""
+    rng = np.random.default_rng(3)
+    for _ in range(500):
+        u = rng.normal(size=3)
+        a = [s.threshold_choice(u[i], u[j], 0.6) for i, j in ((0, 1), (0, 2), (1, 2))]
+        assert s.pairwise_transitive(*a, strict_only=True)
+        assert s.pairwise_transitive(*[s.threshold_choice(u[i], u[j], 0.0)
+                                       for i, j in ((0, 1), (0, 2), (1, 2))])
+
+
+def test_cell_agreement():
+    assert s.cell_agreement(CELL_LLM, CELL_HUMAN) == pytest.approx(CELL_POOLED, rel=1e-12)
+    assert s.cell_agreement(CELL_LLM, CELL_HUMAN, CELL_GROUPS) == pytest.approx(CELL_WITHIN, rel=1e-12)
+    # The correlation is blind to exaggeration; the slope is not.
+    r, b = s.cell_agreement([1.0 + 3.0 * h for h in CELL_HUMAN], CELL_HUMAN)
+    assert (r, b) == pytest.approx((1.0, 3.0))
+    with pytest.raises(ValueError):
+        s.cell_agreement([1.0, 1.0], [1.0, 2.0])
+    with pytest.raises(ValueError):
+        s.cell_agreement([1.0], [1.0])
 
 
 def test_collapse_and_tree():

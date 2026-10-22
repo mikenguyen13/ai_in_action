@@ -245,6 +245,48 @@ end
     @test_throws ArgumentError dpo_smoothed_margin(0.1, 0.0)
 end
 
+const SV945_THRESHOLD_CASES = [((0.5, 0.2, 0.25), 1), ((0.2, 0.5, 0.25), -1),
+    ((0.5, 0.4, 0.25), 0), ((0.3, 0.3, 0.0), 0)]
+const SV945_TRANSITIVE_WEAK = (13, 27, 6, 8)
+const SV945_TRANSITIVE_STRICT_PART = 19
+const SV945_TRANSITIVE_CASES = [((1, 1, 1), true, true), ((1, -1, 1), false, false),
+    ((0, 1, 0), false, true), ((0, 0, 1), false, true), ((0, 0, 0), true, true)]
+const SV945_CELL_HUMAN = [1.0, 2.0, 5.0, 6.0]
+const SV945_CELL_LLM = [2.2, 1.8, 6.2, 5.8]
+const SV945_CELL_GROUPS = ["a", "a", "b", "b"]
+const SV945_CELL_POOLED = (0.9411946707617073, 0.9176470588235291)
+const SV945_CELL_WITHIN = (-1.0, -0.4)
+
+@testset "Ch945 synthetic respondents" begin
+    for (args, expected) in SV945_THRESHOLD_CASES
+        @test threshold_choice(args...) == expected
+    end
+    @test_throws ArgumentError threshold_choice(0.0, 1.0, -0.1)
+    @test_throws ArgumentError threshold_choice(NaN, 1.0, 0.1)
+
+    for (answers, weak, strict) in SV945_TRANSITIVE_CASES
+        @test pairwise_transitive(answers...) == weak
+        @test pairwise_transitive(answers...; strict_only=true) == strict
+    end
+    profiles = [(a, b, c) for a in -1:1 for b in -1:1 for c in -1:1]
+    strict = [p for p in profiles if !(0 in p)]
+    n_t, n, n_ts, n_s = SV945_TRANSITIVE_WEAK
+    @test (count(p -> pairwise_transitive(p...), profiles), length(profiles)) == (n_t, n)
+    @test (count(p -> pairwise_transitive(p...), strict), length(strict)) == (n_ts, n_s)
+    @test count(p -> pairwise_transitive(p...; strict_only=true), profiles) ==
+          SV945_TRANSITIVE_STRICT_PART
+    @test_throws ArgumentError pairwise_transitive(2, 0, 0)
+
+    r, b = cell_agreement(SV945_CELL_LLM, SV945_CELL_HUMAN)
+    @test all((r, b) .≈ SV945_CELL_POOLED)
+    rw, bw = cell_agreement(SV945_CELL_LLM, SV945_CELL_HUMAN, SV945_CELL_GROUPS)
+    @test rw ≈ SV945_CELL_WITHIN[1] rtol = 1e-12
+    @test bw ≈ SV945_CELL_WITHIN[2] rtol = 1e-12
+    @test all(cell_agreement(1.0 .+ 3.0 .* SV945_CELL_HUMAN, SV945_CELL_HUMAN) .≈ (1.0, 3.0))
+    @test_throws ArgumentError cell_agreement([1.0, 1.0], [1.0, 2.0])
+    @test_throws ArgumentError cell_agreement([1.0], [1.0])
+end
+
 @testset "Ch945 reasoning trees" begin
     @test collapse_repeats(SV945_COLLAPSE_IN) == SV945_COLLAPSE_OUT
     @test collapse_repeats(String[]) == String[]

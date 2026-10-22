@@ -23,6 +23,10 @@ three test suites share fixtures):
 * audit decisions: ``cohens_d``, ``tost_p_value`` (equivalence tests for
   "this cue must not matter" requirements), ``design_effect`` and
   ``samples_per_arm`` (power planning), ``dpo_smoothed_margin``;
+* synthetic respondents: ``threshold_choice`` (a semiorder respondent),
+  ``pairwise_transitive`` (weak-order and strict-part tests of three pairwise
+  answers), ``cell_agreement`` (correlation and calibration slope of synthetic
+  on human cell means, optionally within group);
 * reasoning trees: ``collapse_repeats``, ``ReasoningTree`` and
   ``path_probability`` (Algorithm 1 of the paper).
 
@@ -69,6 +73,9 @@ __all__ = [
     "design_effect",
     "samples_per_arm",
     "dpo_smoothed_margin",
+    "threshold_choice",
+    "pairwise_transitive",
+    "cell_agreement",
     "collapse_repeats",
     "ReasoningTree",
     "path_probability",
@@ -484,6 +491,81 @@ def dpo_smoothed_margin(epsilon: float, beta: float = 1.0) -> float:
     if beta <= 0 or not math.isfinite(beta):
         raise ValueError("beta must be positive")
     return math.log((1.0 - epsilon) / epsilon) / beta
+
+
+# ---------------------------------------------------------------------------
+# Synthetic respondents
+# ---------------------------------------------------------------------------
+def threshold_choice(u_first: float, u_second: float, delta: float) -> int:
+    """Pairwise answer of a respondent with a just-noticeable difference ``delta``.
+
+    Returns ``1`` (first option) when ``u_first - u_second > delta``, ``-1``
+    (second option) when ``u_second - u_first > delta``, and ``0``
+    (indifferent) otherwise. With ``delta > 0`` this is Luce's (1956) semiorder:
+    the strict part is transitive but indifference need not be.
+    """
+    _check_finite("u_first", u_first)
+    _check_finite("u_second", u_second)
+    if delta < 0 or not math.isfinite(delta):
+        raise ValueError("delta must be non-negative and finite")
+    d = u_first - u_second
+    return 1 if d > delta else (-1 if d < -delta else 0)
+
+
+def pairwise_transitive(xy: int, xz: int, yz: int, *, strict_only: bool = False) -> bool:
+    """Whether three pairwise answers over items ``x, y, z`` are transitive.
+
+    Each answer is ``1`` (first item of the pair preferred), ``-1`` (second
+    item preferred), or ``0`` (indifferent). By default the weak preference
+    "at least as good as" must be transitive, so the answers must form a weak
+    order: 13 of the 27 possible profiles pass, and 6 of the 8 profiles without
+    any indifference. With ``strict_only=True`` only the strict part must be
+    transitive, the semiorder reading under which indifference may be
+    intransitive: 19 of 27 profiles pass.
+    """
+    answers = (xy, xz, yz)
+    if any(a not in (-1, 0, 1) for a in answers):
+        raise ValueError("answers must be 1, -1, or 0")
+    pairs = {(0, 1): xy, (0, 2): xz, (1, 2): yz}
+    rel = {}
+    for (i, j), a in pairs.items():
+        rel[(i, j)] = (a == 1) if strict_only else (a >= 0)
+        rel[(j, i)] = (a == -1) if strict_only else (a <= 0)
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                if len({i, j, k}) == 3 and rel[(i, j)] and rel[(j, k)] and not rel[(i, k)]:
+                    return False
+    return True
+
+
+def cell_agreement(
+    llm: Sequence[float], human: Sequence[float], groups: Sequence[Hashable] | None = None,
+) -> tuple[float, float]:
+    """Pearson correlation and calibration slope of synthetic on human cell means.
+
+    The slope is the OLS coefficient of ``llm`` on ``human``,
+    ``Cov(llm, human) / Var(human)``: 1 when the synthetic sample reproduces the
+    size of each demographic gap, above 1 when it exaggerates them. The
+    correlation is unchanged by any positive rescaling of ``llm``, so it cannot
+    detect exaggeration. Passing ``groups`` (for example the asset each cell
+    rates) demeans both vectors within group first, so that differences between
+    groups that every respondent agrees on do not count as agreement.
+    """
+    n = len(llm)
+    if n < 2 or len(human) != n:
+        raise ValueError("need at least two cells and equal lengths")
+    x = list(human) if groups is None else demean_by_group(human, groups)
+    y = list(llm) if groups is None else demean_by_group(llm, groups)
+    for v in (*x, *y):
+        _check_finite("cell means", v)
+    mx, my = sum(x) / n, sum(y) / n
+    sxx = sum((v - mx) ** 2 for v in x)
+    syy = sum((v - my) ** 2 for v in y)
+    sxy = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    if sxx == 0.0 or syy == 0.0:
+        raise ValueError("cell means have zero variance")
+    return sxy / math.sqrt(sxx * syy), sxy / sxx
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,10 @@ analyses of the paper, the DPO adapter, and audit specifications) is Python only
 * Audit decisions: `cohens_d`, `tost_p_value` (equivalence tests for "this cue must not
   matter" requirements), `design_effect` and `samples_per_arm` (power planning),
   `dpo_smoothed_margin`.
+* Synthetic respondents: `threshold_choice` (a semiorder respondent), `pairwise_transitive`
+  (weak-order and strict-part tests of three pairwise answers), `cell_agreement`
+  (correlation and calibration slope of synthetic on human cell means, optionally within
+  group).
 * Reasoning trees: `collapse_repeats`, `ReasoningTree` with `add!`, `tree_from_paths`
   and `tree_node`, and `path_probability` (Algorithm 1 of the paper).
 
@@ -33,7 +37,8 @@ module Ch945Suva
 export Z_975, Z_80, MOTIVES, normal_cdf, payoff_grid, motive_features,
     OlsResult, zscores, p_values, ci, ols_cluster, demean_by_group, diff_proportions,
     cohen_kappa, auc_score, cohens_d, tost_p_value, design_effect, samples_per_arm,
-    dpo_smoothed_margin, collapse_repeats, TreeNode, ReasoningTree, add!,
+    dpo_smoothed_margin, threshold_choice, pairwise_transitive, cell_agreement,
+    collapse_repeats, TreeNode, ReasoningTree, add!,
     tree_from_paths, tree_node, path_probability
 
 """Two-sided 5 percent critical value of the standard normal."""
@@ -619,6 +624,82 @@ function dpo_smoothed_margin(epsilon::Real, beta::Real=1.0)
     (beta > 0 && isfinite(beta)) || throw(ArgumentError("beta must be positive"))
     e = Float64(epsilon)
     return log((1.0 - e) / e) / Float64(beta)
+end
+
+# --------------------------------------------------------------------------
+# Synthetic respondents
+# --------------------------------------------------------------------------
+
+"""
+    threshold_choice(u_first, u_second, delta) -> Int
+
+Pairwise answer of a respondent with a just-noticeable difference `delta`: `1` (first
+option) when `u_first - u_second > delta`, `-1` (second option) when
+`u_second - u_first > delta`, and `0` (indifferent) otherwise. With `delta > 0` this is
+Luce's (1956) semiorder: the strict part is transitive but indifference need not be.
+"""
+function threshold_choice(u_first::Real, u_second::Real, delta::Real)
+    _check_finite("u_first", u_first)
+    _check_finite("u_second", u_second)
+    (delta >= 0 && isfinite(delta)) ||
+        throw(ArgumentError("delta must be non-negative and finite"))
+    d = Float64(u_first) - Float64(u_second)
+    return d > delta ? 1 : (d < -delta ? -1 : 0)
+end
+
+"""
+    pairwise_transitive(xy, xz, yz; strict_only=false) -> Bool
+
+Whether three pairwise answers over items `x, y, z` are transitive. Each answer is `1`
+(first item of the pair preferred), `-1` (second item preferred), or `0` (indifferent).
+By default the weak preference "at least as good as" must be transitive, so the answers
+must form a weak order: 13 of the 27 possible profiles pass, and 6 of the 8 profiles
+without any indifference. With `strict_only=true` only the strict part must be
+transitive, the semiorder reading under which indifference may be intransitive: 19 of 27
+profiles pass.
+"""
+function pairwise_transitive(xy::Integer, xz::Integer, yz::Integer; strict_only::Bool=false)
+    all(a -> a in (-1, 0, 1), (xy, xz, yz)) ||
+        throw(ArgumentError("answers must be 1, -1, or 0"))
+    rel = falses(3, 3)
+    for ((i, j), a) in (((1, 2), xy), ((1, 3), xz), ((2, 3), yz))
+        rel[i, j] = strict_only ? a == 1 : a >= 0
+        rel[j, i] = strict_only ? a == -1 : a <= 0
+    end
+    for i in 1:3, j in 1:3, k in 1:3
+        if i != j && j != k && i != k && rel[i, j] && rel[j, k] && !rel[i, k]
+            return false
+        end
+    end
+    return true
+end
+
+"""
+    cell_agreement(llm, human, groups=nothing) -> Tuple{Float64,Float64}
+
+Pearson correlation and calibration slope of synthetic on human cell means.
+
+The slope is the OLS coefficient of `llm` on `human`, `Cov(llm, human) / Var(human)`: 1
+when the synthetic sample reproduces the size of each demographic gap, above 1 when it
+exaggerates them. The correlation is unchanged by any positive rescaling of `llm`, so it
+cannot detect exaggeration. Passing `groups` (for example the asset each cell rates)
+demeans both vectors within group first, so that differences between groups that every
+respondent agrees on do not count as agreement.
+"""
+function cell_agreement(llm::AbstractVector{<:Real}, human::AbstractVector{<:Real},
+                        groups=nothing)
+    n = length(llm)
+    (n >= 2 && length(human) == n) ||
+        throw(ArgumentError("need at least two cells and equal lengths"))
+    x = groups === nothing ? Float64.(human) : demean_by_group(human, groups)
+    y = groups === nothing ? Float64.(llm) : demean_by_group(llm, groups)
+    foreach(v -> _check_finite("cell means", v), vcat(x, y))
+    mx, my = sum(x) / n, sum(y) / n
+    sxx = sum((x .- mx) .^ 2)
+    syy = sum((y .- my) .^ 2)
+    sxy = sum((x .- mx) .* (y .- my))
+    (sxx == 0 || syy == 0) && throw(ArgumentError("cell means have zero variance"))
+    return sxy / sqrt(sxx * syy), sxy / sxx
 end
 
 # --------------------------------------------------------------------------

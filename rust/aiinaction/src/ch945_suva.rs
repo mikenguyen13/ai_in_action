@@ -25,6 +25,10 @@
 //! * **Audit decisions.** [`cohens_d`], [`tost_p_value`] (equivalence tests for
 //!   "this cue must not matter" requirements), [`design_effect`] and
 //!   [`samples_per_arm`] (power planning), and [`dpo_smoothed_margin`].
+//! * **Synthetic respondents.** [`threshold_choice`] (a semiorder respondent),
+//!   [`pairwise_transitive`] (weak-order and strict-part tests of three pairwise
+//!   answers), and [`cell_agreement`] (correlation and calibration slope of
+//!   synthetic on human cell means, optionally within group).
 //! * **Reasoning trees.** [`collapse_repeats`], [`ReasoningTree`], and
 //!   [`path_probability`] (Algorithm 1 of the paper).
 //!
@@ -659,6 +663,103 @@ pub fn dpo_smoothed_margin(epsilon: f64, beta: f64) -> Result<f64, String> {
 }
 
 // --------------------------------------------------------------------------
+// Synthetic respondents
+// --------------------------------------------------------------------------
+
+/// Pairwise answer of a respondent with a just-noticeable difference `delta`.
+///
+/// Returns `1` (first option) when `u_first - u_second > delta`, `-1` (second
+/// option) when `u_second - u_first > delta`, and `0` (indifferent) otherwise.
+/// With `delta > 0` this is Luce's (1956) semiorder: the strict part is
+/// transitive but indifference need not be. Errors on a non-finite utility or a
+/// negative or non-finite `delta`.
+pub fn threshold_choice(u_first: f64, u_second: f64, delta: f64) -> Result<i8, String> {
+    check_finite("u_first", u_first)?;
+    check_finite("u_second", u_second)?;
+    if delta < 0.0 || !delta.is_finite() {
+        return Err("delta must be non-negative and finite".to_string());
+    }
+    let d = u_first - u_second;
+    Ok(if d > delta {
+        1
+    } else if d < -delta {
+        -1
+    } else {
+        0
+    })
+}
+
+/// Whether three pairwise answers over items `x, y, z` are transitive.
+///
+/// Each answer is `1` (first item of the pair preferred), `-1` (second item
+/// preferred), or `0` (indifferent). With `strict_only = false` (the Python
+/// default) the weak preference "at least as good as" must be transitive, so the
+/// answers must form a weak order: 13 of the 27 possible profiles pass, and 6 of
+/// the 8 profiles without any indifference. With `strict_only = true` only the
+/// strict part must be transitive, the semiorder reading under which
+/// indifference may be intransitive: 19 of 27 profiles pass. Errors on an answer
+/// outside `{-1, 0, 1}`.
+pub fn pairwise_transitive(xy: i8, xz: i8, yz: i8, strict_only: bool) -> Result<bool, String> {
+    if [xy, xz, yz].iter().any(|a| !(-1..=1).contains(a)) {
+        return Err("answers must be 1, -1, or 0".to_string());
+    }
+    let mut rel = [[false; 3]; 3];
+    for &((i, j), a) in &[((0, 1), xy), ((0, 2), xz), ((1, 2), yz)] {
+        rel[i][j] = if strict_only { a == 1 } else { a >= 0 };
+        rel[j][i] = if strict_only { a == -1 } else { a <= 0 };
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                if i != j && j != k && i != k && rel[i][j] && rel[j][k] && !rel[i][k] {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Pearson correlation and calibration slope of synthetic on human cell means.
+///
+/// The slope is the OLS coefficient of `llm` on `human`,
+/// `Cov(llm, human) / Var(human)`: 1 when the synthetic sample reproduces the
+/// size of each demographic gap, above 1 when it exaggerates them. The
+/// correlation is unchanged by any positive rescaling of `llm`, so it cannot
+/// detect exaggeration. Passing `Some(groups)` (for example the asset each cell
+/// rates) demeans both vectors within group first, so that differences between
+/// groups that every respondent agrees on do not count as agreement.
+///
+/// Errors on fewer than two cells, mismatched lengths, a non-finite value, or
+/// zero variance on either side.
+pub fn cell_agreement<T: Eq + Hash + Clone>(
+    llm: &[f64],
+    human: &[f64],
+    groups: Option<&[T]>,
+) -> Result<(f64, f64), String> {
+    let n = llm.len();
+    if n < 2 || human.len() != n {
+        return Err("need at least two cells and equal lengths".to_string());
+    }
+    let (x, y) = match groups {
+        Some(g) => (demean_by_group(human, g)?, demean_by_group(llm, g)?),
+        None => (human.to_vec(), llm.to_vec()),
+    };
+    for &v in x.iter().chain(&y) {
+        check_finite("cell means", v)?;
+    }
+    let mx = x.iter().sum::<f64>() / n as f64;
+    let my = y.iter().sum::<f64>() / n as f64;
+    let sxx: f64 = x.iter().map(|v| (v - mx).powi(2)).sum();
+    let syy: f64 = y.iter().map(|v| (v - my).powi(2)).sum();
+    let sxy: f64 = x.iter().zip(&y).map(|(a, b)| (a - mx) * (b - my)).sum();
+    if sxx == 0.0 || syy == 0.0 {
+        return Err("cell means have zero variance".to_string());
+    }
+    Ok((sxy / (sxx * syy).sqrt(), sxy / sxx))
+}
+
+// --------------------------------------------------------------------------
 // Reasoning trees (Algorithm 1)
 // --------------------------------------------------------------------------
 
@@ -896,6 +997,28 @@ mod tests {
 
     const DPO_01: f64 = 2.1972245773362196;
     const DPO_025_BETA2: f64 = 0.5493061443340549;
+
+    #[allow(clippy::type_complexity)]
+    const THRESHOLD_CASES: [((f64, f64, f64), i8); 4] = [
+        ((0.5, 0.2, 0.25), 1),
+        ((0.2, 0.5, 0.25), -1),
+        ((0.5, 0.4, 0.25), 0),
+        ((0.3, 0.3, 0.0), 0),
+    ];
+    const TRANSITIVE_WEAK: (usize, usize, usize, usize) = (13, 27, 6, 8);
+    const TRANSITIVE_STRICT_PART: usize = 19;
+    const TRANSITIVE_CASES: [((i8, i8, i8), bool, bool); 5] = [
+        ((1, 1, 1), true, true),
+        ((1, -1, 1), false, false),
+        ((0, 1, 0), false, true),
+        ((0, 0, 1), false, true),
+        ((0, 0, 0), true, true),
+    ];
+    const CELL_HUMAN: [f64; 4] = [1.0, 2.0, 5.0, 6.0];
+    const CELL_LLM: [f64; 4] = [2.2, 1.8, 6.2, 5.8];
+    const CELL_GROUPS: [&str; 4] = ["a", "a", "b", "b"];
+    const CELL_POOLED: (f64, f64) = (0.9411946707617073, 0.9176470588235291);
+    const CELL_WITHIN: (f64, f64) = (-1.0, -0.4);
 
     const COLLAPSE_IN: [&str; 6] = ["u", "u", "s", "s", "f", "s"];
     const COLLAPSE_OUT: [&str; 4] = ["u", "s", "f", "s"];
@@ -1245,6 +1368,63 @@ mod tests {
         assert!(dpo_smoothed_margin(0.5, 1.0).is_err());
         assert!(dpo_smoothed_margin(0.1, 0.0).is_err());
         assert!(dpo_smoothed_margin(0.1, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn threshold_choice_fixture() {
+        for ((u1, u2, d), e) in THRESHOLD_CASES {
+            assert_eq!(threshold_choice(u1, u2, d).unwrap(), e);
+        }
+        assert!(threshold_choice(0.0, 1.0, -0.1).is_err());
+        assert!(threshold_choice(f64::NAN, 1.0, 0.1).is_err());
+    }
+
+    #[test]
+    fn pairwise_transitive_fixture() {
+        for ((a, b, c), weak, strict) in TRANSITIVE_CASES {
+            assert_eq!(pairwise_transitive(a, b, c, false).unwrap(), weak);
+            assert_eq!(pairwise_transitive(a, b, c, true).unwrap(), strict);
+        }
+        let mut profiles = Vec::new();
+        for a in -1..=1 {
+            for b in -1..=1 {
+                for c in -1..=1 {
+                    profiles.push((a, b, c));
+                }
+            }
+        }
+        let no_ties = |p: &&(i8, i8, i8)| p.0 != 0 && p.1 != 0 && p.2 != 0;
+        let count = |strict_only: bool, strict_profiles: bool| {
+            profiles
+                .iter()
+                .filter(|p| !strict_profiles || no_ties(p))
+                .filter(|p| pairwise_transitive(p.0, p.1, p.2, strict_only).unwrap())
+                .count()
+        };
+        let (n_t, n, n_ts, n_s) = TRANSITIVE_WEAK;
+        assert_eq!((count(false, false), profiles.len()), (n_t, n));
+        assert_eq!(
+            (count(false, true), profiles.iter().filter(no_ties).count()),
+            (n_ts, n_s)
+        );
+        assert_eq!(count(true, false), TRANSITIVE_STRICT_PART);
+        assert!(pairwise_transitive(2, 0, 0, false).is_err());
+    }
+
+    #[test]
+    fn cell_agreement_fixture() {
+        let (r, b) = cell_agreement::<&str>(&CELL_LLM, &CELL_HUMAN, None).unwrap();
+        assert_rel(r, CELL_POOLED.0, 1e-12, 0.0);
+        assert_rel(b, CELL_POOLED.1, 1e-12, 0.0);
+        let (rw, bw) = cell_agreement(&CELL_LLM, &CELL_HUMAN, Some(&CELL_GROUPS[..])).unwrap();
+        assert_rel(rw, CELL_WITHIN.0, 1e-12, 0.0);
+        assert_rel(bw, CELL_WITHIN.1, 1e-12, 0.0);
+        let scaled: Vec<f64> = CELL_HUMAN.iter().map(|h| 1.0 + 3.0 * h).collect();
+        let (rs, bs) = cell_agreement::<&str>(&scaled, &CELL_HUMAN, None).unwrap();
+        assert_approx(rs, 1.0);
+        assert_approx(bs, 3.0);
+        assert!(cell_agreement::<&str>(&[1.0, 1.0], &[1.0, 2.0], None).is_err());
+        assert!(cell_agreement::<&str>(&[1.0], &[1.0], None).is_err());
     }
 
     #[test]
