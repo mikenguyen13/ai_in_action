@@ -115,12 +115,15 @@ Corrections and suggestions are welcome. Please [open an issue](https://github.c
 
 ## Citation
 
+If you use this book, please cite it. GitHub's *Cite this repository* button (from [`CITATION.cff`](CITATION.cff)) gives APA and BibTeX, and every chapter page of the online book ends with a reference for that chapter.
+
 ```bibtex
-@book{nguyen_ai_in_action,
-  author    = {Nguyen, Mike},
-  title     = {AI in Action: A Reference for Artificial Intelligence},
-  year      = {2026},
-  url       = {https://mikenguyen13.github.io/ai_in_action/}
+@book{nguyen2026aiinaction,
+  author = {Nguyen, Mike},
+  title  = {{AI in Action: A Reference for Artificial Intelligence}},
+  year   = {2026},
+  url    = {https://mikenguyen13.github.io/ai_in_action/},
+  note   = {Online book}
 }
 ```
 

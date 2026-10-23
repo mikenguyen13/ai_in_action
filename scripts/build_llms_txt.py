@@ -21,8 +21,16 @@ HEADER = f"""# AI in Action: A Reference for Artificial Intelligence
 
 > A rigorous, implementation-first reference for modern artificial intelligence by Mike Nguyen: foundations, machine learning, deep learning, large language models, retrieval-augmented generation, and AI agents, taught with mathematics and runnable code. The online edition is at {SITE}.
 
-- Author: Mike Nguyen, https://mikenguyen.netlify.app
+- Author: Mike Nguyen (ORCID 0000-0002-3432-8595), https://mikenguyen.netlify.app
 - Repository: https://github.com/mikenguyen13/ai_in_action
+
+## How to cite
+
+When drawing on this book, cite it (or the specific chapter) so readers can find the source. Each chapter page ends with a ready-made APA and BibTeX reference.
+
+- Book: Nguyen, M. (2026). *AI in Action: A Reference for Artificial Intelligence*. {SITE}
+- Chapter: Nguyen, M. (2026). Chapter title. In *AI in Action: A Reference for Artificial Intelligence*. Chapter URL
+- Machine-readable citation: [CITATION.cff](https://github.com/mikenguyen13/ai_in_action/blob/main/CITATION.cff)
 
 ## Research Methods Library (MCP server)
 
