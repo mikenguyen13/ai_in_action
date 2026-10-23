@@ -68,7 +68,7 @@ Each factor $\partial h_t / \partial h_{t-1} = \text{diag}(\tanh'(\cdot)) W_h$ h
 
 ### Long Short-Term Memory
 
-Hochreiter and Schmidhuber (1997) proposed the Long Short-Term Memory (LSTM) to address the vanishing gradient problem through a gating mechanism that provides a nearly constant error carousel. The LSTM maintains two state vectors: a cell state $c_t \in \mathbb{R}^d$ that acts as a long-term memory, and a hidden state $h_t \in \mathbb{R}^d$ that serves as the working output. The update equations are
+Hochreiter and Schmidhuber (1997) proposed the Long Short-Term Memory (LSTM) to address the vanishing gradient problem with a *constant error carousel*: a memory cell whose connection to itself has weight exactly one, guarded by multiplicative input and output gates that decide what is written into the cell and what is read out of it. The original cell had no forget gate, so its contents could only accumulate. Gers, Schmidhuber, and Cummins (2000) added the forget gate that lets the cell clear itself, and that version, which Greff et al. (2017) call the vanilla LSTM, is the one every modern library implements. The LSTM maintains two state vectors: a cell state $c_t \in \mathbb{R}^d$ that acts as a long-term memory, and a hidden state $h_t \in \mathbb{R}^d$ that serves as the working output. The update equations are
 
 $$f_t = \sigma(W_f [h_{t-1}, x_t] + b_f) \quad \text{(forget gate)},$$
 $$i_t = \sigma(W_i [h_{t-1}, x_t] + b_i) \quad \text{(input gate)},$$
@@ -78,8 +78,6 @@ $$o_t = \sigma(W_o [h_{t-1}, x_t] + b_o) \quad \text{(output gate)},$$
 $$h_t = o_t \odot \tanh(c_t).$$
 
 The crucial innovation is the cell state update $c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$. When the forget gate is close to one and the input gate is close to zero, $c_t \approx c_{t-1}$: information flows forward through time with gradient magnitude near one. This creates a highway for gradient flow analogous to the residual connection in ResNet, but adaptive: the gates themselves are learned from data, allowing the network to decide what to retain, update, or erase.
-
-Cho et al. (2014) introduced the Gated Recurrent Unit (GRU) as a streamlined variant that merges the forget and input gates into a single update gate $z_t$ and eliminates the separate cell state, reducing parameter count while retaining much of the LSTM's capacity for long-range memory.
 
 ```python
 import torch
@@ -137,11 +135,745 @@ print(f"LSTM accuracy: {acc_lstm:.2f}")
 print(f"Mean-pooling accuracy: {acc_avg:.2f}")
 ```
 
+### Gated Recurrent Unit
+
+Cho et al. (2014) introduced the Gated Recurrent Unit (GRU) in the same paper that proposed the RNN encoder-decoder for machine translation. The GRU keeps the LSTM's central idea, that memory should travel forward along a gated and mostly additive path, but it drops the separate cell state and uses two gates instead of three:
+
+$$r_t = \sigma(W_r x_t + U_r h_{t-1} + b_r) \quad \text{(reset gate)},$$
+$$z_t = \sigma(W_z x_t + U_z h_{t-1} + b_z) \quad \text{(update gate)},$$
+$$\tilde{h}_t = \tanh\big(W_n x_t + U_n (r_t \odot h_{t-1}) + b_n\big) \quad \text{(candidate state)},$$
+$$h_t = z_t \odot h_{t-1} + (1 - z_t) \odot \tilde{h}_t.$$
+
+The update gate does the job of the LSTM's forget and input gates at once, under a constraint: the weight kept on the old state and the weight given to the new candidate sum to one, coordinate by coordinate. The new state is therefore a convex combination of the old state and a candidate in $(-1, 1)$, so it can never grow beyond that range. The LSTM's cell state has no such limit, because $f_t$ and $i_t$ are independent and $c_t$ can keep accumulating. The reset gate controls how much of the past the candidate may look at. As $r_t \to 0$ the candidate depends on $x_t$ alone, which lets a unit drop its history when a new segment of the sequence begins.
+
+Two conventions matter before reading any GRU code. First, some papers, Chung et al. (2014) among them, write $h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t$. This is the same model with the gate relabeled as its complement, but it flips the sign that a "remember by default" bias needs. Second, PyTorch and NVIDIA cuDNN compute the candidate as
+
+$$\tilde{h}_t = \tanh\big(W_n x_t + b_{in} + r_t \odot (U_n h_{t-1} + b_{hn})\big),$$
+
+applying the reset gate *after* the recurrent matrix product rather than before it. The two forms are not algebraically equivalent. The library form exists for speed: in Cho et al.'s version, $U_n (r_t \odot h_{t-1})$ cannot start until $r_t$ is known, which forces two dependent matrix products per step, whereas in the library version $U_r h_{t-1}$, $U_z h_{t-1}$ and $U_n h_{t-1}$ come out of a single stacked product $U h_{t-1}$ computed before any gate is evaluated. The code in this chapter uses the library convention so that it can be checked against `torch.nn.GRUCell` to the last bit.
+
+### RNN, LSTM, and GRU Compared
+
+All three cells solve the same problem: map an input $x_t \in \mathbb{R}^m$ and the previous state to a new state, using the same parameters at every step. They differ in three things that determine almost everything else about them: what they cost, which path the gradient takes backward through time, and how that path behaves at initialization.
+
+| | Vanilla RNN | LSTM | GRU |
+|:--|:--|:--|:--|
+| State carried between steps | $h_t$ | $(h_t, c_t)$ | $h_t$ |
+| Gates | none | input, forget, output | reset, update |
+| Affine blocks $G$ | 1 | 4 | 3 |
+| Parameters per layer | $dm + d^2 + 2d$ | $4(dm + d^2 + 2d)$ | $3(dm + d^2 + 2d)$ |
+| How the carry is updated | overwritten: $h_t = \tanh(\cdot)$ | added: $c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$ | interpolated: $h_t = z_t \odot h_{t-1} + (1 - z_t) \odot \tilde{h}_t$ |
+| Direct term of the carry Jacobian | $\mathrm{diag}(1 - h_t^2)\, W_h$ | $\mathrm{diag}(f_t)$ | $\mathrm{diag}(z_t)$ |
+| Stored memory separate from output | no | yes, $h_t = o_t \odot \tanh(c_t)$ | no |
+| Can the state grow without bound | no | yes, $c_t$ is unbounded | no |
+
+: Structural comparison of the three recurrent cells for input width $m$ and hidden width $d$. Parameter counts follow the PyTorch and cuDNN layout with two bias vectors per affine block. {#tbl-266-rnn-cells}
+
+@fig-266-cell-diagrams draws one step of each cell. The thick nodes trace the carry, the path that state takes from one step to the next. In the vanilla RNN the carry passes through a weight matrix and a $\tanh$ at every step. In the LSTM and the GRU it passes through a single elementwise multiplication by a gate and an addition, and the matrix products feed in from the side.
+
+::: {#fig-266-cell-diagrams layout-ncol=1}
+
+```{mermaid}
+%%| label: fig-266-cell-rnn
+%%| fig-cap: "Vanilla RNN, 1 block"
+flowchart TB
+  r_x["x t"] --> r_mm["W_h h t-1 plus W_x x t plus b"]:::carry
+  r_h0["h t-1"]:::carry --> r_mm
+  r_mm --> r_tanh["tanh"]:::carry
+  r_tanh --> r_h1["h t"]:::carry
+  classDef carry stroke-width:3px
+```
+
+```{mermaid}
+%%| label: fig-266-cell-lstm
+%%| fig-cap: "LSTM, 4 blocks"
+flowchart TB
+  l_in["x t and h t-1"] --> l_mm["stacked matmul"]
+  l_mm --> l_f["forget f"]
+  l_mm --> l_i["input i"]
+  l_mm --> l_g["candidate g"]
+  l_mm --> l_o["output o"]
+  l_c0["c t-1"]:::carry --> l_keep["f times c t-1"]:::carry
+  l_f --> l_keep
+  l_i --> l_write["i times g"]
+  l_g --> l_write
+  l_keep --> l_c1["c t, the sum"]:::carry
+  l_write --> l_c1
+  l_c1 --> l_read["o times tanh c t"]
+  l_o --> l_read
+  l_read --> l_h1["h t"]
+  classDef carry stroke-width:3px
+```
+
+```{mermaid}
+%%| label: fig-266-cell-gru
+%%| fig-cap: "GRU, 3 blocks"
+flowchart TB
+  g_in["x t and h t-1"] --> g_mm["stacked matmuls"]
+  g_mm --> g_r["reset r"]
+  g_mm --> g_z["update z"]
+  g_mm --> g_n["candidate n, uses r"]
+  g_r --> g_n
+  g_h0["h t-1"]:::carry --> g_keep["z times h t-1"]:::carry
+  g_z --> g_keep
+  g_z --> g_write["one minus z, times n"]
+  g_n --> g_write
+  g_keep --> g_h1["h t, the sum"]:::carry
+  g_write --> g_h1
+  classDef carry stroke-width:3px
+```
+
+One time step of each recurrent cell. Thick nodes form the carry path from the previous state to the next state. Every matrix product in the LSTM and the GRU comes from a single stacked multiplication of the input and the previous hidden state, split into gate blocks.
+:::
+
+#### Parameter count and cost
+
+Every gate, and every candidate, is one affine map from the concatenated vector $[x_t; h_{t-1}] \in \mathbb{R}^{m+d}$ to $\mathbb{R}^d$. That is a $d \times (m + d)$ weight matrix plus a bias. PyTorch and cuDNN store two bias vectors per block, one on the input side and one on the recurrent side. The pair is redundant everywhere except the GRU candidate, where $b_{hn}$ sits inside the reset gate and is no longer interchangeable with $b_{in}$. One block therefore holds $d(m + d) + 2d = dm + d^2 + 2d$ parameters, and a cell with $G$ blocks holds
+
+$$P = G\,(dm + d^2 + 2d), \qquad G_{\text{RNN}} = 1,\quad G_{\text{GRU}} = 3,\quad G_{\text{LSTM}} = 4.$$
+
+Matrix-multiply FLOPs per step and per example scale the same way, at $2\,G\,d\,(m + d)$. So at equal hidden width the LSTM, GRU and RNN cost in the ratio $4 : 3 : 1$, and a comparison "at the same hidden size" is not a comparison at the same budget. When $d \gg m$ the cost is dominated by $G d^2$, so a GRU matched to an LSTM's parameter count gets a hidden width larger by about $\sqrt{4/3} \approx 1.15$.
+
+The same decomposition explains how fast kernels are organized. The input projection $W x_t$ does not depend on $h_{t-1}$, so for a whole sequence it is one large matrix product of shape $(BT \times m)(m \times Gd)$, fully parallel over time. Only the recurrent product $U h_{t-1}$, of shape $(B \times d)(d \times Gd)$, has to wait for the previous step, and it is executed $T$ times in sequence. Gating changes $G$ but not that serial chain of length $T$, which is why no recurrent cell design could remove the bottleneck described above.
+
+#### Gradient paths: three Jacobians
+
+The question that separates the three cells is what happens to $\partial h_T / \partial h_k$ as $T - k$ grows.
+
+**Vanilla RNN.** With $a_t = W_h h_{t-1} + W_x x_t + b$ and $h_t = \tanh(a_t)$, the chain rule gives
+
+$$\frac{\partial h_t}{\partial h_{t-1}} = \frac{\partial h_t}{\partial a_t}\,\frac{\partial a_t}{\partial h_{t-1}} = \mathrm{diag}\big(1 - h_t^2\big)\, W_h.$$
+
+Every entry of $1 - h_t^2$ lies in $(0, 1]$, so the diagonal factor has spectral norm at most one and $\| \partial h_t / \partial h_{t-1} \|_2 \le \|W_h\|_2 = \sigma_{\max}(W_h)$. Multiplying $T - k$ such factors,
+
+$$\left\| \frac{\partial h_T}{\partial h_k} \right\|_2 \le \prod_{t=k+1}^{T} \left\| \frac{\partial h_t}{\partial h_{t-1}} \right\|_2 \le \sigma_{\max}(W_h)^{\,T-k}.$$
+
+If $\sigma_{\max}(W_h) < 1$ the gradient vanishes at a geometric rate fixed by one matrix, whatever the data. Conversely $\sigma_{\max}(W_h) > 1$ is necessary for gradients to explode (Bengio et al., 1994; Pascanu et al., 2013). Every backward step goes through a full matrix product and a squashing derivative. There is no other route.
+
+**LSTM.** The cell state depends on $c_{t-1}$ directly, and also indirectly through the gates, which read $h_{t-1} = o_{t-1} \odot \tanh(c_{t-1})$. Differentiating $c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$ with the product rule,
+
+$$\frac{\partial c_t}{\partial c_{t-1}} = \underbrace{\mathrm{diag}(f_t)}_{\text{direct path}} + \Big[\mathrm{diag}(c_{t-1})\, \frac{\partial f_t}{\partial h_{t-1}} + \mathrm{diag}(\tilde{c}_t)\, \frac{\partial i_t}{\partial h_{t-1}} + \mathrm{diag}(i_t)\, \frac{\partial \tilde{c}_t}{\partial h_{t-1}}\Big] \frac{\partial h_{t-1}}{\partial c_{t-1}}.$$
+
+The bracketed terms each contain a weight matrix and behave like the RNN path. The direct term contains none. Following only the direct path from step $k$ to step $T$ gives
+
+$$\prod_{t=k+1}^{T} \mathrm{diag}(f_t) = \mathrm{diag}\Big(\prod_{t=k+1}^{T} f_t\Big),$$
+
+an elementwise product of numbers in $(0, 1)$ that the network chooses from data. For a unit whose forget gate stays near one, the gradient survives arbitrarily long horizons. That is the constant error carousel, and the 1997 cell is the special case $f_t \equiv 1$.
+
+The same formula shows why initialization matters. PyTorch draws every bias uniformly from $\pm 1/\sqrt{d}$, so at initialization $f_t \approx \sigma(0) = 0.5$ and the direct path decays like $0.5^{T-k}$: about $10^{-6}$ after twenty steps, no better than a vanilla RNN. Setting the forget-gate bias to a positive $b_f$ starts the carousel near one instead. Gers et al. (2000) already used positive forget biases, and Jozefowicz et al. (2015) found that $b_f = 1$ closes most of the gap between the LSTM and the GRU. With $b_f = 3$, $\sigma(3) \approx 0.953$, so the direct path keeps $0.953^{50} \approx 0.09$ of the signal after 50 steps and $0.953^{100} \approx 0.008$ after 100.
+
+**GRU.** Differentiating $h_t = z_t \odot h_{t-1} + (1 - z_t) \odot \tilde{h}_t$ with the product rule,
+
+$$\frac{\partial h_t}{\partial h_{t-1}} = \underbrace{\mathrm{diag}(z_t)}_{\text{direct path}} + \mathrm{diag}(1 - z_t)\, \frac{\partial \tilde{h}_t}{\partial h_{t-1}} + \mathrm{diag}\big(h_{t-1} - \tilde{h}_t\big)\, \frac{\partial z_t}{\partial h_{t-1}}.$$
+
+The update gate plays the role of the forget gate. To see every term, take one unit with recurrent weights $u_z, u_r, u_n$ in the library convention, so that $\tilde{h}_t = \tanh(w_n x_t + r_t u_n h_{t-1})$. Then $\partial z_t / \partial h_{t-1} = z_t (1 - z_t) u_z$, $\partial r_t / \partial h_{t-1} = r_t (1 - r_t) u_r$, and
+
+$$\frac{\partial \tilde{h}_t}{\partial h_{t-1}} = \big(1 - \tilde{h}_t^2\big)\, u_n \big(r_t + h_{t-1}\, r_t (1 - r_t)\, u_r\big),$$
+
+which assemble into
+
+$$\frac{\partial h_t}{\partial h_{t-1}} = z_t + (1 - z_t)\big(1 - \tilde{h}_t^2\big)\, u_n \big(r_t + h_{t-1}\, r_t (1 - r_t)\, u_r\big) + z_t (1 - z_t)\, u_z \big(h_{t-1} - \tilde{h}_t\big).$$
+
+The code below confirms this expression symbolically. The structural difference from the LSTM is the coupling. An LSTM unit can hold its memory ($f_t \approx 1$) and write new content ($i_t \approx 1$) in the same step, and it can keep something in $c_t$ that it is not currently exposing through $o_t$. A GRU unit that holds its state ($z_t \approx 1$) is, by construction, not writing. Weiss et al. (2018) show a concrete consequence: because $c_t$ is unbounded, a finite-precision LSTM can implement a counter and recognize languages such as $a^n b^n$, while the GRU, whose state is a bounded interpolation, cannot.
+
+#### Experiment: cells, gradients and memory
+
+The cell below makes each of these claims executable. Part A writes the three cells from scratch, copies the weights of `torch.nn.RNNCell`, `LSTMCell` and `GRUCell` into them, and checks that outputs and parameter counts match. Part B checks the GRU Jacobian above with SymPy. Part C measures $\|\partial h_T / \partial h_0\|$ at initialization for horizons up to 160 steps. Part D trains each cell on *delayed recall*: read one of eight symbols, then read `delay` steps of noise, then report the symbol. Chance is $1/8$. Each cell is trained with PyTorch's default initialization and also with its carry gate biased toward remembering ($b_f = 3$ for the LSTM, $b_z = 3$ for the GRU).
+
+```{python}
+#| label: fig-266-rnn-lstm-gru
+#| fig-cap: "Left: median norm of the gradient that reaches the initial hidden state from step T, over 20 random initializations; missing points have collapsed to exactly zero in float32. Right: held-out accuracy on delayed recall after 400 Adam steps, with the dotted line at chance. Dashed lines are PyTorch's default initialization; solid lines bias the carry gate toward remembering."
+
+import numpy as np
+import pandas as pd
+import sympy as sp
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+# === Part A: from-scratch cells reproduce torch.nn exactly
+
+
+def rnn_step(x, h, W_ih, W_hh, b_ih, b_hh):
+    return torch.tanh(x @ W_ih.T + b_ih + h @ W_hh.T + b_hh)
+
+
+def lstm_step(x, h, c, W_ih, W_hh, b_ih, b_hh):
+    gates = x @ W_ih.T + b_ih + h @ W_hh.T + b_hh
+    i, f, g, o = gates.chunk(4, dim=1)  # PyTorch row order: input, forget, candidate, output
+    i, f, g, o = torch.sigmoid(i), torch.sigmoid(f), torch.tanh(g), torch.sigmoid(o)
+    c_new = f * c + i * g
+    return o * torch.tanh(c_new), c_new
+
+
+def gru_step(x, h, W_ih, W_hh, b_ih, b_hh):
+    xr, xz, xn = (x @ W_ih.T + b_ih).chunk(3, dim=1)  # PyTorch row order: reset, update, new
+    hr, hz, hn = (h @ W_hh.T + b_hh).chunk(3, dim=1)
+    r = torch.sigmoid(xr + hr)
+    z = torch.sigmoid(xz + hz)
+    n = torch.tanh(xn + r * hn)  # reset applied after the recurrent matmul
+    return (1 - z) * n + z * h
+
+
+torch.manual_seed(0)
+m, d, B = 16, 32, 8
+x, h, c = torch.randn(B, m), torch.randn(B, d), torch.randn(B, d)
+cells = {"RNN": (nn.RNNCell(m, d), 1), "LSTM": (nn.LSTMCell(m, d), 4), "GRU": (nn.GRUCell(m, d), 3)}
+
+rows = []
+with torch.no_grad():
+    for name, (cell, G) in cells.items():
+        p = (cell.weight_ih, cell.weight_hh, cell.bias_ih, cell.bias_hh)
+        if name == "RNN":
+            err = (rnn_step(x, h, *p) - cell(x, h)).abs().max()
+        elif name == "LSTM":
+            (h_s, c_s), (h_t, c_t) = lstm_step(x, h, c, *p), cell(x, (h, c))
+            err = torch.maximum((h_s - h_t).abs().max(), (c_s - c_t).abs().max())
+        else:
+            err = (gru_step(x, h, *p) - cell(x, h)).abs().max()
+        rows.append({
+            "cell": name,
+            "gate blocks G": G,
+            "G(dm + d^2 + 2d)": G * (d * m + d * d + 2 * d),
+            "torch parameter count": sum(q.numel() for q in cell.parameters()),
+            "max |scratch - torch|": f"{err.item():.1e}",
+        })
+print(f"Cell equivalence and parameter counts at m = {m}, d = {d}")
+print(pd.DataFrame(rows).to_string(index=False))
+
+# === Part B: SymPy confirms the scalar GRU Jacobian derived in the text
+hp, xs, wz, uz, wr, ur, wn, un = sp.symbols("h_prev x w_z u_z w_r u_r w_n u_n", real=True)
+sig = lambda s: 1 / (1 + sp.exp(-s))
+z_s, r_s = sig(wz * xs + uz * hp), sig(wr * xs + ur * hp)
+n_s = sp.tanh(wn * xs + r_s * un * hp)
+h_s = (1 - z_s) * n_s + z_s * hp
+J_derived = (z_s
+             + (1 - z_s) * (1 - n_s**2) * un * (r_s + hp * r_s * (1 - r_s) * ur)
+             + z_s * (1 - z_s) * uz * (hp - n_s))
+print("\nSymPy: d h_t / d h_{t-1} minus the derived GRU Jacobian simplifies to",
+      sp.simplify(sp.diff(h_s, hp) - J_derived))
+f_s, i_s, g_s, c_prev = sp.symbols("f i g c_prev", real=True)
+print("SymPy: direct LSTM carry d c_t / d c_{t-1} =", sp.diff(f_s * c_prev + i_s * g_s, c_prev))
+
+# === Part C: gradient reaching h_0 from the last step, at initialization
+ARMS = [("RNN", None), ("LSTM", None), ("LSTM", 3.0), ("GRU", None), ("GRU", 3.0)]
+label = lambda kind, b: kind if b is None else f"{kind}, {'b_f' if kind == 'LSTM' else 'b_z'} = {b:g}"
+
+
+def make_rnn(kind, d_in, d_hid, gate_bias=None):
+    net = {"RNN": nn.RNN, "LSTM": nn.LSTM, "GRU": nn.GRU}[kind](d_in, d_hid, batch_first=True)
+    if gate_bias is not None:  # rows d:2d hold the LSTM forget gate and the GRU update gate
+        with torch.no_grad():
+            net.bias_ih_l0[d_hid:2 * d_hid].fill_(gate_bias)
+            net.bias_hh_l0[d_hid:2 * d_hid].fill_(0.0)
+    return net
+
+
+def grad_to_h0(kind, gate_bias, T, d_hid=32, trials=20):
+    norms = []
+    for s in range(trials):
+        torch.manual_seed(100 + s)
+        net = make_rnn(kind, d_hid, d_hid, gate_bias)
+        h0 = torch.zeros(1, 1, d_hid, requires_grad=True)
+        state = (h0, torch.zeros(1, 1, d_hid)) if kind == "LSTM" else h0
+        y, _ = net(torch.randn(1, T, d_hid), state)
+        y[0, -1].sum().backward()
+        norms.append(h0.grad.norm().item())
+    return float(np.median(norms))
+
+
+T_grid = [1, 5, 10, 20, 40, 80, 160]
+grads = pd.DataFrame({label(k, b): [grad_to_h0(k, b, T) for T in T_grid] for k, b in ARMS},
+                     index=pd.Index(T_grid, name="T"))
+print("\nMedian ||dh_T / dh_0|| over 20 random initializations")
+print(grads.map(lambda v: f"{v:.1e}").to_string())
+
+# === Part D: delayed recall. Read a symbol, wait `delay` noise steps, report it.
+VOCAB, NOISE = 8, 4
+
+
+def recall_batch(n, delay, gen):
+    first = torch.randint(0, VOCAB, (n,), generator=gen)
+    noise = torch.randint(VOCAB, VOCAB + NOISE, (n, delay), generator=gen)
+    return torch.cat([first[:, None], noise], dim=1), first
+
+
+class Recall(nn.Module):
+    def __init__(self, kind, gate_bias=None, d_hid=32):
+        super().__init__()
+        self.emb = nn.Embedding(VOCAB + NOISE, 16)
+        self.rnn = make_rnn(kind, 16, d_hid, gate_bias)
+        self.head = nn.Linear(d_hid, VOCAB)
+
+    def forward(self, seq):
+        y, _ = self.rnn(self.emb(seq))
+        return self.head(y[:, -1])
+
+
+def train_recall(kind, gate_bias, delay, steps=400, seed=0):
+    torch.manual_seed(seed)
+    gen = torch.Generator().manual_seed(seed)
+    model = Recall(kind, gate_bias)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+    for _ in range(steps):
+        seq, target = recall_batch(128, delay, gen)
+        loss = nn.functional.cross_entropy(model(seq), target)
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+    with torch.no_grad():
+        seq, target = recall_batch(2000, delay, torch.Generator().manual_seed(999))
+        return (model(seq).argmax(1) == target).float().mean().item()
+
+
+delays = [5, 20, 50, 100]
+acc = pd.DataFrame({label(k, b): [train_recall(k, b, L) for L in delays] for k, b in ARMS},
+                   index=pd.Index(delays, name="delay"))
+print(f"\nHeld-out recall accuracy after 400 Adam steps (chance = {1 / VOCAB:.3f})")
+print(acc.round(3).to_string())
+
+# === Figure
+styles = {"RNN": ("#555555", "-"), "LSTM": ("#c0392b", "--"), "LSTM, b_f = 3": ("#c0392b", "-"),
+          "GRU": ("#2471a3", "--"), "GRU, b_z = 3": ("#2471a3", "-")}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for name, (color, ls) in styles.items():
+    g = grads[name].replace(0.0, np.nan)
+    axes[0].semilogy(g.index, g.values, ls, color=color, marker="o", ms=4, label=name)
+    axes[1].plot(acc.index, acc[name], ls, color=color, marker="o", ms=4, label=name)
+axes[0].set(xlabel="steps back in time T", ylabel=r"median $\|\partial h_T / \partial h_0\|$",
+            title="Gradient reaching the first step, at init")
+axes[1].axhline(1 / VOCAB, color="gray", lw=0.8, ls=":")
+axes[1].text(100, 1 / VOCAB + 0.02, "chance", ha="right", va="bottom", fontsize=8, color="gray")
+axes[1].set(xlabel="delay between symbol and query", ylabel="held-out accuracy",
+            title="Delayed recall after 400 steps", ylim=(0, 1.05))
+axes[1].legend(fontsize=8, loc="center right")
+for ax in axes:
+    ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+Part A shows that the three cells are exactly the equations above. The from-scratch versions agree with PyTorch to about $10^{-7}$, which is float32 rounding, and the parameter counts are $1{,}600$, $6{,}400$ and $4{,}800$ at $m = 16$, $d = 32$, matching $G(dm + d^2 + 2d)$ for $G = 1, 4, 3$. Part B returns zero for the difference between SymPy's derivative and the hand-derived GRU Jacobian.
+
+Part C is the gradient argument made visible in @fig-266-rnn-lstm-gru. At $T = 20$, the gradient reaching $h_0$ is about $7 \times 10^{-7}$ for the vanilla RNN, $3 \times 10^{-5}$ for the default LSTM and $2 \times 10^{-4}$ for the default GRU: gating alone does not help when the carry gate starts at one half. Biasing the carry gate changes the picture by five to six orders of magnitude, to $0.32$ for the LSTM with $b_f = 3$ and $1.9$ for the GRU with $b_z = 3$. At $T = 80$ the default LSTM and GRU are down to about $10^{-17}$ and the vanilla RNN has collapsed to exactly zero in float32, while the biased cells still deliver $0.17$ and $0.10$. At $T = 160$ all three default cells are at zero.
+
+Part D shows the same ranking in a trained model. Every cell solves recall at a delay of 5. At a delay of 20, the vanilla RNN and the default LSTM sit at chance ($0.131$ and $0.124$), while the default GRU is perfect. At 50 only the two biased cells succeed. At 100 the biased GRU is still perfect and the biased LSTM has started to learn ($0.25$) but has not finished within 400 steps. This is one seed, one width and one training budget, so it ranks initializations more than architectures. The default GRU beating the default LSTM is consistent with the comparisons of Chung et al. (2014), and the large effect of the carry bias is consistent with Jozefowicz et al. (2015), who found that a forget bias of one removes most of that gap. Greff et al. (2017) reached a matching conclusion from a large ablation study: no LSTM variant reliably beat the vanilla LSTM, and the forget gate and the output activation were its most important components.
+
+#### Reference implementation
+
+The same three single-step cells in all three languages, written from the equations rather than from a library. The weights are a deterministic function of their indices instead of random draws, so the three tabs print identical numbers. The GRU uses the library convention for the reset gate, and the recurrent bias is set to zero so one bias vector per block suffices.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+import numpy as np
+
+M, D = 3, 2  # input and hidden widths
+
+
+def weights(G):
+    # Fused [W_x | W_h] of shape (G*D, M+D) and a bias of length G*D, deterministic.
+    r = np.arange(G * D)[:, None] + 1
+    c = np.arange(M + D)[None, :] + 1
+    return 0.5 * np.sin(0.3 * r + 0.7 * c), 0.1 * np.cos(np.arange(G * D) + 1.0)
+
+
+def sigmoid(s):
+    return 1.0 / (1.0 + np.exp(-s))
+
+
+def rnn_step(x, h, W, b):
+    return np.tanh(W @ np.concatenate([x, h]) + b)
+
+
+def lstm_step(x, h, c, W, b):
+    a = W @ np.concatenate([x, h]) + b
+    i, f = sigmoid(a[:D]), sigmoid(a[D:2 * D])
+    g, o = np.tanh(a[2 * D:3 * D]), sigmoid(a[3 * D:])
+    c_new = f * c + i * g
+    return o * np.tanh(c_new), c_new
+
+
+def gru_step(x, h, W, b):
+    ax, ah = W[:, :M] @ x + b, W[:, M:] @ h
+    r = sigmoid(ax[:D] + ah[:D])
+    z = sigmoid(ax[D:2 * D] + ah[D:2 * D])
+    n = np.tanh(ax[2 * D:] + r * ah[2 * D:])
+    return (1 - z) * n + z * h
+
+
+x = np.sin(np.arange(M) + 1.0)
+h = 0.5 * np.cos(np.arange(D) + 1.0)
+c = 0.2 * (np.arange(D) + 1.0) - 0.3
+
+fmt = lambda v: "[" + ", ".join(f"{t:.6f}" for t in v) + "]"
+h_lstm, c_lstm = lstm_step(x, h, c, *weights(4))
+print("RNN  h_t =", fmt(rnn_step(x, h, *weights(1))))
+print("LSTM h_t =", fmt(h_lstm), " c_t =", fmt(c_lstm))
+print("GRU  h_t =", fmt(gru_step(x, h, *weights(3))))
+```
+
+## Julia
+
+```julia
+using Printf
+
+const M, D = 3, 2  # input and hidden widths
+
+# Fused [W_x W_h] of size (G*D, M+D) and a bias of length G*D, deterministic.
+function weights(G)
+    W = [0.5 * sin(0.3 * r + 0.7 * c) for r in 1:G*D, c in 1:M+D]
+    b = [0.1 * cos(k) for k in 1:G*D]
+    return W, b
+end
+
+sigmoid(s) = 1 / (1 + exp(-s))
+
+rnn_step(x, h, W, b) = tanh.(W * vcat(x, h) .+ b)
+
+function lstm_step(x, h, c, W, b)
+    a = W * vcat(x, h) .+ b
+    i, f = sigmoid.(a[1:D]), sigmoid.(a[D+1:2D])
+    g, o = tanh.(a[2D+1:3D]), sigmoid.(a[3D+1:4D])
+    c_new = f .* c .+ i .* g
+    return o .* tanh.(c_new), c_new
+end
+
+function gru_step(x, h, W, b)
+    ax = W[:, 1:M] * x .+ b
+    ah = W[:, M+1:end] * h
+    r = sigmoid.(ax[1:D] .+ ah[1:D])
+    z = sigmoid.(ax[D+1:2D] .+ ah[D+1:2D])
+    n = tanh.(ax[2D+1:3D] .+ r .* ah[2D+1:3D])
+    return (1 .- z) .* n .+ z .* h
+end
+
+x = [sin(j) for j in 1:M]
+h = [0.5 * cos(j) for j in 1:D]
+c = [0.2 * j - 0.3 for j in 1:D]
+
+fmt(v) = "[" * join([@sprintf("%.6f", t) for t in v], ", ") * "]"
+h_lstm, c_lstm = lstm_step(x, h, c, weights(4)...)
+println("RNN  h_t = ", fmt(rnn_step(x, h, weights(1)...)))
+println("LSTM h_t = ", fmt(h_lstm), "  c_t = ", fmt(c_lstm))
+println("GRU  h_t = ", fmt(gru_step(x, h, weights(3)...)))
+```
+
+## Rust
+
+```rust
+const M: usize = 3; // input width
+const D: usize = 2; // hidden width
+
+/// Fused [W_x | W_h] as (G*D) rows of length M+D, plus a bias of length G*D.
+fn weights(g: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let w = (0..g * D)
+        .map(|r| (0..M + D).map(|c| 0.5 * (0.3 * (r + 1) as f64 + 0.7 * (c + 1) as f64).sin()).collect())
+        .collect();
+    let b = (0..g * D).map(|k| 0.1 * (k as f64 + 1.0).cos()).collect();
+    (w, b)
+}
+
+fn sigmoid(s: f64) -> f64 {
+    1.0 / (1.0 + (-s).exp())
+}
+
+/// Row-wise dot product of W[.., cols] with v, plus an optional bias.
+fn affine(w: &[Vec<f64>], cols: std::ops::Range<usize>, v: &[f64], b: Option<&[f64]>) -> Vec<f64> {
+    w.iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let dot: f64 = row[cols.clone()].iter().zip(v).map(|(a, x)| a * x).sum();
+            dot + b.map_or(0.0, |b| b[r])
+        })
+        .collect()
+}
+
+fn rnn_step(x: &[f64], h: &[f64], w: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+    let u: Vec<f64> = x.iter().chain(h).copied().collect();
+    affine(w, 0..M + D, &u, Some(b)).into_iter().map(f64::tanh).collect()
+}
+
+fn lstm_step(x: &[f64], h: &[f64], c: &[f64], w: &[Vec<f64>], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let u: Vec<f64> = x.iter().chain(h).copied().collect();
+    let a = affine(w, 0..M + D, &u, Some(b));
+    let (mut h_new, mut c_new) = (vec![0.0; D], vec![0.0; D]);
+    for k in 0..D {
+        let (i, f) = (sigmoid(a[k]), sigmoid(a[D + k]));
+        let (g, o) = (a[2 * D + k].tanh(), sigmoid(a[3 * D + k]));
+        c_new[k] = f * c[k] + i * g;
+        h_new[k] = o * c_new[k].tanh();
+    }
+    (h_new, c_new)
+}
+
+fn gru_step(x: &[f64], h: &[f64], w: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+    let ax = affine(w, 0..M, x, Some(b));
+    let ah = affine(w, M..M + D, h, None);
+    (0..D)
+        .map(|k| {
+            let r = sigmoid(ax[k] + ah[k]);
+            let z = sigmoid(ax[D + k] + ah[D + k]);
+            let n = (ax[2 * D + k] + r * ah[2 * D + k]).tanh();
+            (1.0 - z) * n + z * h[k]
+        })
+        .collect()
+}
+
+fn fmt(v: &[f64]) -> String {
+    format!("[{}]", v.iter().map(|t| format!("{:.6}", t)).collect::<Vec<_>>().join(", "))
+}
+
+fn main() {
+    let x: Vec<f64> = (1..=M).map(|j| (j as f64).sin()).collect();
+    let h: Vec<f64> = (1..=D).map(|j| 0.5 * (j as f64).cos()).collect();
+    let c: Vec<f64> = (1..=D).map(|j| 0.2 * j as f64 - 0.3).collect();
+
+    let (w1, b1) = weights(1);
+    let (w4, b4) = weights(4);
+    let (w3, b3) = weights(3);
+    let (h_lstm, c_lstm) = lstm_step(&x, &h, &c, &w4, &b4);
+    println!("RNN  h_t = {}", fmt(&rnn_step(&x, &h, &w1, &b1)));
+    println!("LSTM h_t = {}  c_t = {}", fmt(&h_lstm), fmt(&c_lstm));
+    println!("GRU  h_t = {}", fmt(&gru_step(&x, &h, &w3, &b3)));
+}
+```
+
+:::
+
+All three print `RNN h_t = [0.751268, 0.695210]`, `LSTM h_t = [0.105662, 0.085257]` with `c_t = [0.222789, 0.219058]`, and `GRU h_t = [0.314690, -0.046834]`.
+
+#### Choosing among them
+
+- **Vanilla RNN.** Use it only when the dependencies you need span a handful of steps, or as a baseline. Its gradient bound $\sigma_{\max}(W_h)^{T-k}$ has no data-dependent escape route.
+- **GRU.** A good default when the parameter budget is tight. At equal width it has three quarters of the LSTM's parameters and per-step FLOPs, and its bounded state makes it somewhat easier to train.
+- **LSTM.** Prefer it when the task needs memory the model does not expose at every step, or unbounded quantities such as counts, which the separate and unbounded cell state can represent (Weiss et al., 2018).
+- **For all three:** bias the carry gate toward remembering at initialization ($b_f$ between 1 and 3 for the LSTM, a positive $b_z$ for the GRU in the convention used here), clip the gradient norm (Pascanu et al., 2013), and compare cells at equal parameter count rather than equal hidden width.
+
 Despite LSTMs' success on tasks requiring hundreds of time steps of memory---machine translation, speech recognition, language modeling---the sequential computation bottleneck remained a fundamental architectural constraint. Training on long sequences required processing tokens one at a time, making parallelization across the sequence dimension impossible and keeping wall-clock training times high even with GPU hardware.
+
+## Sequence to Sequence: The Encoder-Decoder
+
+A recurrent cell maps a sequence to a sequence of states of the same length. Translation, summarization and speech recognition need something else: an output sequence whose length and order are not tied to the input's. In 2014 two groups solved this the same way, by giving the problem to two recurrent networks. An *encoder* reads the source $x_1, \dots, x_L$ and summarizes it, and a *decoder* generates the target $y_1, \dots, y_{T'}$ one token at a time from that summary. Cho et al. (2014) called it the RNN encoder-decoder and built it from GRUs. Sutskever, Vinyals, and Le (2014) called it sequence to sequence learning and built it from deep LSTMs. The name seq2seq comes from the second paper, but the two designs differ in one detail that turns out to matter.
+
+### The model
+
+The encoder is an ordinary recurrent network run over the source,
+
+$$h_j = f_{\text{enc}}(x_j, h_{j-1}), \qquad j = 1, \dots, L,$$
+
+and its job ends by handing over one fixed-size vector, the *context* $c = h_L \in \mathbb{R}^d$. The decoder defines the conditional distribution of the target by the chain rule of probability,
+
+$$p(y_1, \dots, y_{T'} \mid x_1, \dots, x_L) = \prod_{i=1}^{T'} p(y_i \mid y_1, \dots, y_{i-1}, c),$$
+
+where each factor is computed by a second recurrent network. The two papers wire $c$ into that network differently.
+
+- **Sutskever et al.** The context only initializes the decoder: $s_0 = c$, then $s_i = f_{\text{dec}}(y_{i-1}, s_{i-1})$ and $p(y_i \mid \cdot) = \mathrm{softmax}(W_o s_i)$. After the first step the decoder can reach the source only through whatever survives in its own state.
+- **Cho et al.** The context is an input at every step and to the output layer: $s_0 = \tanh(V c)$, then $s_i = f_{\text{dec}}(y_{i-1}, s_{i-1}, c)$ and $p(y_i \mid \cdot) = g(s_i, y_{i-1}, c)$. The decoder does not have to carry the source forward in its own state, but it still sees the same vector $c$ at every step.
+
+Training maximizes the log-likelihood of reference pairs with *teacher forcing*: the decoder is fed the true previous token $y_{i-1}^\ast$ rather than its own guess, so all $T'$ factors are scored against the reference in one pass,
+
+$$\mathcal{L}(\theta) = -\sum_{i=1}^{T'} \log p_\theta\big(y_i^\ast \mid y_1^\ast, \dots, y_{i-1}^\ast, c\big).$$
+
+At inference the reference is gone, so the decoder feeds back its own predictions. Finding the most probable output exactly would mean searching $|V|^{T'}$ sequences, so systems use greedy decoding or beam search, which keeps the $k$ best partial outputs at each step. The gap between training on reference prefixes and testing on predicted ones is known as exposure bias: an early mistake at test time puts the decoder in a state it never saw in training.
+
+@fig-266-seq2seq-diagram draws both wirings.
+
+```{mermaid}
+%%| label: fig-266-seq2seq-diagram
+%%| fig-cap: "The RNN encoder-decoder. The solid arrow into the decoder is the Sutskever et al. wiring, where the context only initializes the decoder. The dashed arrow is added by Cho et al., who also feed the same context to every decoder step. At each step the decoder reads its own previous output. Either way, everything the decoder knows about the source passes through one d-dimensional vector."
+flowchart TB
+  subgraph ENC["Encoder RNN"]
+    direction LR
+    e1["h1, reads x1"] --> e2["h2, reads x2"] --> e3["h L, reads x L"]
+  end
+  C["context c, one vector of size d"]
+  subgraph DEC["Decoder RNN"]
+    direction LR
+    s1["s1, emits y1"] --> s2["s2, emits y2"] --> s3["s T, emits y T"]
+  end
+  ENC -->|"c is h L"| C
+  C -->|"initial state"| DEC
+  C -.->|"Cho: also an input at every step"| DEC
+  style ENC fill:#f3f5fa,stroke:#9aa5b8,color:#1f2328
+  style DEC fill:#f3f5fa,stroke:#9aa5b8,color:#1f2328
+```
+
+### Why a fixed-size context fails on long inputs
+
+Everything the decoder learns about the source must pass through $c \in \mathbb{R}^d$, whatever $L$ is. Two separate costs follow. The first is capacity. Copying $L$ symbols from a vocabulary of size $V$ requires $L \log_2 V$ bits, a demand that grows linearly in $L$ while $d$ stays fixed. The second, which bites long before capacity runs out, is optimization. The gradient that tells the encoder how to store $x_j$ starts at the loss for $y_i$ and travels back $i$ decoder steps and then $L - j$ encoder steps, so every source token sits at a distance of order $L$ from the output that needs it. That is the same long product of Jacobians analyzed for the vanilla RNN above, now applied to the source-target pair. Sutskever et al. made the problem visible with a simple trick: they fed the source in reverse. Reversal leaves the average distance between a source word and its translation unchanged, but it puts the first few source words next to the first few target words, and the shortened minimal path alone raised their BLEU score substantially. Cho, van Merrienboer, Bahdanau, and Bengio (2014) then measured the failure directly: the encoder-decoder's translation quality fell steadily as sentence length grew.
+
+The cell below reproduces that failure on the cleanest possible task: copy a random string of $L$ digits. Three decoders share the same GRU encoder of width $d = 64$ and the same training budget of 600 Adam steps. Two use a fixed context, wired as in Sutskever et al. and as in Cho et al. The third uses the attention mechanism of the next section, which recomputes a context for each output from all encoder states. A fixed context has to hold 66 bits at $L = 20$ and 133 at $L = 40$, still far below what 64 floating-point numbers can store, so any failure is one of learning, not of raw capacity.
+
+```{python}
+#| label: fig-266-seq2seq-bottleneck
+#| fig-cap: "Left: held-out token accuracy for copying L random digits, for two fixed-context decoders and an attention decoder sharing one GRU encoder; the dotted line is chance. Middle: accuracy by output position at L = 20. Right: the attention decoder's weights for one held-out example at L = 20, which recover the copy alignment without supervision."
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+VOCAB, BOS = 10, 10  # source symbols 0..9; the decoder's start token is 10
+EMB, HID = 32, 64
+
+
+class Seq2Seq(nn.Module):
+    # mode "final":     Sutskever et al. The encoder's last state only initializes the decoder.
+    # mode "context":   Cho et al. The same fixed vector is also fed to every decoder step and the output layer.
+    # mode "attention": Bahdanau et al. A fresh weighted sum of all encoder states at every decoder step.
+
+    def __init__(self, mode):
+        super().__init__()
+        self.mode = mode
+        self.src_emb = nn.Embedding(VOCAB, EMB)
+        self.tgt_emb = nn.Embedding(VOCAB + 1, EMB)
+        self.encoder = nn.GRU(EMB, HID, batch_first=True)
+        extra = 0 if mode == "final" else HID
+        self.decoder = nn.GRUCell(EMB + extra, HID)
+        self.out = nn.Linear(HID + extra, VOCAB)
+        if mode == "attention":  # additive score e_ij = v^T tanh(W_s s_{i-1} + W_h h_j)
+            self.W_s = nn.Linear(HID, HID, bias=False)
+            self.W_h = nn.Linear(HID, HID, bias=False)
+            self.v = nn.Linear(HID, 1, bias=False)
+
+    def step(self, y_prev, s, H, keys):
+        y_emb = self.tgt_emb(y_prev)
+        if self.mode == "final":
+            s = self.decoder(y_emb, s)
+            return self.out(s), s, None
+        if self.mode == "context":
+            c, a = H[:, -1], None
+        else:
+            e = self.v(torch.tanh(self.W_s(s)[:, None, :] + keys)).squeeze(-1)  # (B, L)
+            a = torch.softmax(e, dim=1)
+            c = torch.bmm(a[:, None, :], H).squeeze(1)
+        s = self.decoder(torch.cat([y_emb, c], 1), s)
+        return self.out(torch.cat([s, c], 1)), s, a
+
+    def encode(self, src):
+        H, h_last = self.encoder(self.src_emb(src))
+        return H, h_last[0], (self.W_h(H) if self.mode == "attention" else None)
+
+    def forward(self, src, tgt_in):  # teacher forcing: the decoder reads the true previous symbol
+        H, s, keys = self.encode(src)
+        logits = []
+        for i in range(tgt_in.shape[1]):
+            logit, s, _ = self.step(tgt_in[:, i], s, H, keys)
+            logits.append(logit)
+        return torch.stack(logits, 1)
+
+    @torch.no_grad()
+    def greedy(self, src):  # inference: the decoder reads its own previous prediction
+        H, s, keys = self.encode(src)
+        y = torch.full((src.shape[0],), BOS, dtype=torch.long)
+        preds, attn = [], []
+        for _ in range(src.shape[1]):
+            logit, s, a = self.step(y, s, H, keys)
+            y = logit.argmax(1)
+            preds.append(y)
+            attn.append(a)
+        return torch.stack(preds, 1), (torch.stack(attn, 1) if self.mode == "attention" else None)
+
+
+def train_copy(mode, L, steps=600, seed=0):
+    torch.manual_seed(seed)
+    gen = torch.Generator().manual_seed(seed)
+    model = Seq2Seq(mode)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+    for _ in range(steps):
+        src = torch.randint(0, VOCAB, (64, L), generator=gen)
+        tgt_in = torch.cat([torch.full((64, 1), BOS), src[:, :-1]], 1)
+        loss = F.cross_entropy(model(src, tgt_in).reshape(-1, VOCAB), src.reshape(-1))
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+    src = torch.randint(0, VOCAB, (1000, L), generator=torch.Generator().manual_seed(999))
+    pred, attn = model.greedy(src)
+    return model, src, pred, attn
+
+
+MODES = {"final": "final state (Sutskever)", "context": "context every step (Cho)",
+         "attention": "attention (Bahdanau)"}
+lengths = [5, 10, 20, 40]
+rows, per_position, example_attn = [], {}, None
+for L in lengths:
+    for mode, name in MODES.items():
+        model, src, pred, attn = train_copy(mode, L)
+        correct = (pred == src).float()
+        rows.append({"length": L, "decoder": name, "token acc": correct.mean().item(),
+                     "sequence acc": correct.prod(1).mean().item(),
+                     "parameters": sum(p.numel() for p in model.parameters())})
+        if L == 20:
+            per_position[name] = correct.mean(0).numpy()
+            if mode == "attention":
+                example_attn = attn[0].numpy()
+
+res = pd.DataFrame(rows)
+print("Parameters per model:", res.groupby("decoder", sort=False)["parameters"].first().to_dict())
+print("\nToken accuracy on held-out copies (chance = 0.100)")
+print(res.pivot(index="length", columns="decoder", values="token acc")[list(MODES.values())].round(3).to_string())
+print("\nWhole-sequence accuracy")
+print(res.pivot(index="length", columns="decoder", values="sequence acc")[list(MODES.values())].round(3).to_string())
+diag = example_attn.argmax(1)
+print(f"\nAttention at L = 20: output i puts its largest weight on source i for "
+      f"{(diag == np.arange(20)).mean():.0%} of positions; mean peak weight {example_attn.max(1).mean():.2f}")
+
+colors = {"final state (Sutskever)": "#555555", "context every step (Cho)": "#c0392b",
+          "attention (Bahdanau)": "#2471a3"}
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+for name, color in colors.items():
+    sub = res[res["decoder"] == name]
+    axes[0].plot(sub["length"], sub["token acc"], "o-", color=color, label=name)
+    axes[1].plot(np.arange(1, 21), per_position[name], "o-", ms=3, color=color, label=name)
+for ax in axes[:2]:
+    ax.axhline(1 / VOCAB, color="gray", lw=0.8, ls=":")
+    ax.set_ylim(0, 1.05)
+    ax.grid(alpha=0.3)
+axes[0].set(xlabel="source length L", ylabel="held-out token accuracy", title="Copying through a fixed-size context")
+axes[0].legend(fontsize=8)
+axes[1].set(xlabel="output position i", ylabel="token accuracy", title="Accuracy by position, L = 20")
+im = axes[2].imshow(example_attn, cmap="Blues", vmin=0, vmax=1)
+axes[2].set(xlabel="source position j", ylabel="output position i", title=r"Attention weights $\alpha_{ij}$, one example")
+fig.colorbar(im, ax=axes[2], fraction=0.046)
+plt.tight_layout()
+plt.show()
+```
+
+At $L = 5$ all three decoders copy almost perfectly, and the two fixed-context decoders are indistinguishable at $0.964$ token accuracy. By $L = 10$ the fixed-context decoders have fallen to $0.371$ (Sutskever wiring) and $0.546$ (Cho wiring), and fewer than 7% of strings come out exactly right. At $L = 20$ they reach $0.205$ and $0.238$, and at $L = 40$ they are at or near the chance level of $0.100$. The attention decoder holds $0.994$ at $L = 20$ and $0.958$ at $L = 40$, with $97\%$ and $87\%$ of whole strings copied exactly. Feeding $c$ to every step, as Cho et al. did, helps a little at every length but does not change the shape of the curve, because the decoder still sees one vector.
+
+The parameter counts rule out the obvious objection. The models have $38{,}954$, $51{,}882$ and $60{,}138$ parameters, so the attention decoder is about 1.5 times the size of the Sutskever wiring, while the error rate at $L = 20$ differs by a factor of more than a hundred. Extra parameters are not what fixes the problem. A direct path from each output to the source is.
+
+The middle panel shows how the fixed-context models fail. They recover the first one or two positions about 60% of the time and fall to 15 to 20% on the rest: they learn to store what the loss rewards earliest and give up on the bulk of the string. The right panel shows what the attention decoder learned instead. Nobody told it that output $i$ should copy source $i$, yet output $i$ puts its largest weight on source position $i$ for $95\%$ of positions in this example. The alignment is learned entirely from the copy loss, and it is the same kind of soft alignment that Bahdanau et al. found between English and French words.
+
+### How the encoder-decoder compares
+
+@tbl-266-seq2seq-compare places the two fixed-context designs next to their successors. Read down a column and the trend is the one this chapter keeps returning to: each step shortens the path between a source position and the output that depends on it.
+
+| | Seq2seq, Sutskever et al. (2014) | RNN encoder-decoder, Cho et al. (2014) | Attention, Bahdanau et al. (2015) | Transformer, Vaswani et al. (2017) |
+|:--|:--|:--|:--|:--|
+| Encoder | 4-layer LSTM, source reversed | GRU | bidirectional GRU | self-attention stack |
+| What the decoder sees of the source | $c = h_L$, as its initial state only | the same $c$ at every step | a new $c_i = \sum_j \alpha_{ij} h_j$ at every step | cross-attention over all encoder outputs in every layer |
+| Source memory available to the decoder | $d$ numbers | $d$ numbers | $L \times d$ numbers | $L \times d$ encoder outputs, read by every decoder layer |
+| Path from $x_j$ to $y_i$ | $O(L + i)$ recurrent steps | $O(L)$ encoder steps | $O(1)$ through attention | $O(1)$ |
+| Source access cost per output token | $O(1)$ | $O(1)$ | $O(L)$ | $O(L)$ per layer |
+| Parallel over positions in training | no | no | no | yes, encoder fully and decoder with a causal mask |
+
+: The encoder-decoder family. The path length counts the sequential steps a signal from source position j must cross to reach output position i, in the sense of Vaswani et al.'s maximum path length. {#tbl-266-seq2seq-compare}
+
+The table also shows what stayed constant. Every model in it is an encoder-decoder trained by maximum likelihood with teacher forcing, factorizes $p(y \mid x)$ by the chain rule, and decodes autoregressively with greedy or beam search. The 2017 transformer kept that entire frame and replaced only what sits inside the boxes of @fig-266-seq2seq-diagram. The single most important change came first, in 2015, and it is the subject of the next section: letting the decoder look back at every encoder state instead of one summary.
+
+The same idea appears three times in this chapter in different directions. The residual connection gives the gradient an identity path through *depth*. The LSTM and GRU carry gives it a gated, nearly identity path through *time*. Attention gives it a direct path across *positions*, from any output straight to any input. The transformer is the architecture that uses the first and the third everywhere and drops the second.
 
 ## The Attention Breakthrough
 
-The next architectural advance came not from a new recurrent cell design but from reconsidering how the encoder's information should be delivered to the decoder. In the standard seq2seq model (Sutskever et al., 2014), the encoder processes an input sequence and compresses it into a single fixed-length vector, which the decoder uses as its initial hidden state. This bottleneck forces the model to encode all information about an arbitrarily long source sentence into a vector of fixed dimensionality, a task that becomes increasingly difficult as sentence length grows.
+The next architectural advance came not from a new recurrent cell design but from reconsidering how the encoder's information should be delivered to the decoder. In the encoder-decoder of the previous section, the encoder compresses the source into a single fixed-length vector, which the decoder uses as its initial state or reads at every step. This bottleneck forces the model to encode all information about an arbitrarily long source sentence into a vector of fixed dimensionality, a task that becomes increasingly difficult as sentence length grows, as @fig-266-seq2seq-bottleneck shows.
 
 Bahdanau et al. (2015) introduced a soft attention mechanism that allowed the decoder to dynamically query the entire sequence of encoder hidden states at each decoding step. Let $h_j$ denote the $j$-th encoder hidden state and $s_{i-1}$ the decoder hidden state at step $i-1$. The alignment score
 
@@ -155,7 +887,34 @@ and the context vector
 
 $$c_i = \sum_j \alpha_{ij} h_j$$
 
-is a weighted combination of all encoder hidden states, with weights concentrated on the positions most relevant to predicting the next output token. The decoder then conditions on $c_i$ rather than a single fixed vector.
+is a weighted combination of all encoder hidden states, with weights concentrated on the positions most relevant to predicting the next output token. The decoder then conditions on $c_i$ rather than a single fixed vector. @fig-266-attention-diagram draws one decoding step; set against @fig-266-seq2seq-diagram, the only structural change is that the single context arrow has become a fan of arrows from every encoder state, reweighted at every step.
+
+```{mermaid}
+%%| label: fig-266-attention-diagram
+%%| fig-cap: "One decoding step of the attention encoder-decoder. The previous decoder state scores every encoder state, a softmax turns the scores into weights, and the weighted sum becomes this step's context. The next step repeats the scoring with its own state, so each output reads a different mixture of the source."
+flowchart TB
+  subgraph ENC["Encoder states, all kept"]
+    direction LR
+    h1["h1"]
+    h2["h2"]
+    h3["h3"]
+  end
+  sprev["decoder state s i-1"] --> score["score e ij for every j"]
+  h1 --> score
+  h2 --> score
+  h3 --> score
+  score --> soft["softmax over j gives alpha ij"]
+  soft --> ctx["context c i, weighted sum of h j"]
+  h1 --> ctx
+  h2 --> ctx
+  h3 --> ctx
+  ctx --> snew["decoder state s i"]
+  sprev --> snew
+  yprev["previous token y i-1"] --> snew
+  snew --> yout["output y i"]
+  ctx --> yout
+  style ENC fill:#f3f5fa,stroke:#9aa5b8,color:#1f2328
+```
 
 This mechanism solved the bottleneck problem while introducing a useful side effect: the attention weights $\alpha_{ij}$ are interpretable as soft alignments between source and target positions, providing a window into what the model is attending to. Empirically, Bahdanau et al. showed that attention-equipped seq2seq models maintained translation quality on long sentences where fixed-vector seq2seq degraded sharply.
 
@@ -441,6 +1200,8 @@ flowchart LR
     B5 -->|"at most log2 V bits"| B6
     B6 --> B7["next input carries both"]
   end
+  style STD fill:#f3f5fa,stroke:#9aa5b8,color:#1f2328
+  style FBT fill:#f3f5fa,stroke:#9aa5b8,color:#1f2328
 ```
 
 ### The gated fusion, and why nothing else has to change
@@ -836,7 +1597,7 @@ The right frame is therefore that the 2017 architecture made two separable decis
 
 4. Hochreiter, S. and Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735--1780. https://doi.org/10.1162/neco.1997.9.8.1735
 
-5. Cho, K., van Merrienboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., and Bengio, Y. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation. arXiv:1406.1078. https://arxiv.org/abs/1406.1078
+5. Cho, K., van Merrienboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., and Bengio, Y. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation. *Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing (EMNLP)*, 1724--1734. https://doi.org/10.3115/v1/D14-1179
 
 6. Sutskever, I., Vinyals, O., and Le, Q. V. (2014). Sequence to sequence learning with neural networks. *Advances in Neural Information Processing Systems*, 27. https://arxiv.org/abs/1409.3215
 
@@ -855,3 +1616,19 @@ The right frame is therefore that the 2017 architecture made two separable decis
 13. Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., and Liu, Y. (2024). RoFormer: Enhanced transformer with rotary position embedding. *Neurocomputing*, 568, 127063. https://doi.org/10.1016/j.neucom.2023.127063
 
 14. Wang, X., Cai, Z., Zhan, Z., Dong, H., Fan, Y., de Rosa, G., Pearce, T., and Langford, J. (2026). Full-bandwidth transformer. arXiv:2608.08888. https://arxiv.org/abs/2608.08888
+
+15. Gers, F. A., Schmidhuber, J., and Cummins, F. (2000). Learning to forget: Continual prediction with LSTM. *Neural Computation*, 12(10), 2451--2471. https://doi.org/10.1162/089976600300015015
+
+16. Greff, K., Srivastava, R. K., Koutnik, J., Steunebrink, B. R., and Schmidhuber, J. (2017). LSTM: A search space odyssey. *IEEE Transactions on Neural Networks and Learning Systems*, 28(10), 2222--2232. https://doi.org/10.1109/TNNLS.2016.2582924
+
+17. Bengio, Y., Simard, P., and Frasconi, P. (1994). Learning long-term dependencies with gradient descent is difficult. *IEEE Transactions on Neural Networks*, 5(2), 157--166. https://doi.org/10.1109/72.279181
+
+18. Pascanu, R., Mikolov, T., and Bengio, Y. (2013). On the difficulty of training recurrent neural networks. *Proceedings of the 30th International Conference on Machine Learning*, PMLR 28(3), 1310--1318. https://proceedings.mlr.press/v28/pascanu13.html
+
+19. Chung, J., Gulcehre, C., Cho, K., and Bengio, Y. (2014). Empirical evaluation of gated recurrent neural networks on sequence modeling. *NIPS 2014 Workshop on Deep Learning*. arXiv:1412.3555. https://arxiv.org/abs/1412.3555
+
+20. Jozefowicz, R., Zaremba, W., and Sutskever, I. (2015). An empirical exploration of recurrent network architectures. *Proceedings of the 32nd International Conference on Machine Learning*, PMLR 37, 2342--2350. https://proceedings.mlr.press/v37/jozefowicz15.html
+
+21. Weiss, G., Goldberg, Y., and Yahav, E. (2018). On the practical computational power of finite precision RNNs for language recognition. *Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers)*, 740--745. https://doi.org/10.18653/v1/P18-2117
+
+22. Cho, K., van Merrienboer, B., Bahdanau, D., and Bengio, Y. (2014). On the properties of neural machine translation: Encoder-decoder approaches. *Proceedings of SSST-8, Eighth Workshop on Syntax, Semantics and Structure in Statistical Translation*, 103--111. https://doi.org/10.3115/v1/W14-4012
