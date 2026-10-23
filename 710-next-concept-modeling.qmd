@@ -1,0 +1,1261 @@
+# Next-Concept Modeling: Parallel Coarse-to-Fine Text Generation {#sec-710-next-concept-modeling}
+
+## Introduction {#sec-710-introduction}
+
+Every language model covered so far in this part writes the way a typewriter does. It emits one token, appends it to the context, runs the whole network again, and emits the next. A thousand-token answer costs a thousand sequential forward passes, and no amount of hardware parallelism removes that chain, because token $t$ cannot be computed before token $t-1$ exists. Speculative decoding (@sec-speculative-decoding) shortens the chain by guessing ahead and verifying in bulk, and the KV cache of the efficient attention chapter makes each link cheaper, but the chain itself remains.
+
+Two families of models try to break it. **Diffusion language models** start from a fully masked sequence and fill in many positions per step over a fixed number of denoising steps. **Coarse-to-fine models** first commit to a compressed plan of the whole output and then refine it, generating every position at a given level of detail in parallel. In October 2026 a group at Stanford's Hazy Research lab and collaborators released **Next-Concept Modeling (NCM)** [@kumbong2026nextconcept], which belongs to the second family. A multiscale residual vector-quantized autoencoder turns a sentence into a short hierarchy of discrete codes, from a handful of coarse codes that summarize the whole sequence down to one code per position, and a transformer generates that hierarchy one level at a time, predicting all codes of a level in a single forward pass. On their benchmarks the authors report matching or beating the strongest diffusion language model they compared against while generating roughly 10 to 31 times faster.
+
+This chapter treats NCM as what it is at the time of writing: a new, unreviewed preprint with released checkpoints and evaluation code, and an idea with a clean mathematical core. The plan is as follows.
+
+1. Derive *why* parallel decoding is hard. The error of sampling several positions in one step is exactly the **total correlation** among them, and a good coarse-to-fine schedule is one that leaves almost no total correlation at each level.
+2. Review diffusion language models, which are NCM's baselines, including the masked diffusion objective and why they degrade at few sampling steps.
+3. Trace NCM's lineage through vector quantization, residual quantization, next-scale prediction for images, and concept-level language models.
+4. Derive the multiscale residual tokenizer and the coarse-to-fine generator, and build a small but complete working version of both on a GPU.
+5. Compare it against an autoregressive model and a masked diffusion model trained on the same data, then build a cost model that explains where reported speedups come from and when they shrink.
+6. Close with the reported results, how to run the official release, and an honest account of what is not yet known.
+
+## Why Parallel Decoding Is Hard {#sec-710-parallel-hard}
+
+### The autoregressive chain {#sec-710-ar-chain}
+
+Let $x = (x_1, \dots, x_L)$ be a sequence over a vocabulary $\mathcal{V}$. Any joint distribution factorizes exactly by the chain rule of probability:
+
+$$
+p(x) = \prod_{t=1}^{L} p(x_t \mid x_{<t}).
+$$ {#eq-710-ar}
+
+An autoregressive model learns each conditional with a causal transformer and samples them in order. The factorization is exact, so a perfect model samples perfectly, but the sampling procedure has **sequential depth** $L$: there are $L$ forward passes, each of which depends on the previous one. Depth, not total arithmetic, is what sets latency on a parallel accelerator.
+
+### Sampling many positions at once {#sec-710-parallel-sampling}
+
+Suppose instead we sample a set of positions $S = \{i_1, \dots, i_m\}$ in one step. A single forward pass of a transformer produces, for every position, a *marginal* distribution given whatever context $c$ is already fixed, so the most a one-pass sampler can do is draw each position independently from its own conditional marginal. The distribution it actually samples from is
+
+$$
+q(x_S \mid c) = \prod_{i \in S} p(x_i \mid c),
+$$ {#eq-710-product}
+
+while the target is the joint $p(x_S \mid c)$. The cost of the shortcut is the Kullback-Leibler divergence between the two, which we now compute. Write $\mathbb{E}$ for expectation under $p(x_S \mid c)$:
+
+$$
+\begin{aligned}
+\mathrm{KL}\big(p(x_S \mid c)\,\|\,q(x_S \mid c)\big)
+&= \mathbb{E}\Big[\log p(x_S \mid c) - \sum_{i \in S} \log p(x_i \mid c)\Big] \\
+&= -H(X_S \mid c) + \sum_{i \in S} H(X_i \mid c) \\
+&= \sum_{i \in S} H(X_i \mid c) - H(X_S \mid c).
+\end{aligned}
+$$
+
+Averaging over the context gives the quantity Watanabe named **total correlation** [@watanabe1960information]:
+
+$$
+\mathrm{TC}(X_S \mid C) = \sum_{i \in S} H(X_i \mid C) - H(X_S \mid C) \;\ge\; 0.
+$$ {#eq-710-tc}
+
+Total correlation is zero exactly when the positions are conditionally independent given the context, and for two variables it reduces to mutual information, $\mathrm{TC}(X_1, X_2) = I(X_1; X_2)$ [@cover2006elements]. So the error of one parallel step is not a modelling artifact that more parameters will remove: even a perfect network that outputs the exact conditional marginals pays $\mathrm{TC}(X_S \mid C)$ nats every time it decodes a dependent set of positions together.
+
+### The error of a whole schedule {#sec-710-schedule-error}
+
+A parallel sampler runs a **schedule**: an ordered partition of the positions into groups $S_1, S_2, \dots, S_K$, where step $k$ samples group $S_k$ given everything sampled earlier, $S_{<k} = S_1 \cup \dots \cup S_{k-1}$. Its sampling distribution is
+
+$$
+q(x) = \prod_{k=1}^{K} \prod_{i \in S_k} p(x_i \mid x_{S_{<k}}),
+$$
+
+and the true distribution, by the chain rule applied group by group, is $p(x) = \prod_{k} p(x_{S_k} \mid x_{S_{<k}})$. Taking the log ratio, every factor separates:
+
+$$
+\mathrm{KL}(p \,\|\, q) = \sum_{k=1}^{K} \mathbb{E}\Big[\log \frac{p(x_{S_k} \mid x_{S_{<k}})}{\prod_{i \in S_k} p(x_i \mid x_{S_{<k}})}\Big]
+= \sum_{k=1}^{K} \mathrm{TC}\big(X_{S_k} \mid X_{S_{<k}}\big).
+$$ {#eq-710-schedule-kl}
+
+Equation @eq-710-schedule-kl is the central identity of this chapter. It says that the quality of any one-pass-per-step sampler is governed by a **dependency budget**: the sum over steps of the total correlation that each step is forced to ignore. Autoregressive decoding makes every group a single position, so every term is zero and the budget is spent entirely on depth. A fully parallel sampler has one group and pays $\mathrm{TC}(X)$ in one go. Everything interesting lies between, and the question becomes *which* positions to group so that each group is nearly conditionally independent given the previous ones.
+
+### A worked example where the answer is exact {#sec-710-markov-example}
+
+A stationary first-order Markov chain makes this concrete because every term in @eq-710-schedule-kl has a closed form. Take $V$ states and transition matrix $P = \lambda I + \frac{1-\lambda}{V}\mathbf{1}\mathbf{1}^\top$, which stays put with extra probability $\lambda$ and otherwise jumps uniformly. Its stationary distribution is uniform, and by induction $P^d = \lambda^d I + \frac{1-\lambda^d}{V}\mathbf{1}\mathbf{1}^\top$, so every row of $P^d$ has the same entropy
+
+$$
+h(d) = -\Big(\lambda^d + \tfrac{1-\lambda^d}{V}\Big)\log\Big(\lambda^d + \tfrac{1-\lambda^d}{V}\Big) - (V-1)\,\tfrac{1-\lambda^d}{V}\log\tfrac{1-\lambda^d}{V}.
+$$ {#eq-710-hd}
+
+Observed at sorted positions $p_1 < \dots < p_m$, the chain is again Markov with transitions $P^{p_{j+1}-p_j}$, so $H(X_{p_1}, \dots, X_{p_m}) = \log V + \sum_j h(p_{j+1} - p_j)$. Two consequences follow.
+
+* **Left-to-right blocks are bad.** Decoding $b$ adjacent positions at once, given only the block to their left, leaves the strong short-range dependence between neighbours inside the group. The total correlation of a block grows roughly linearly in $b$.
+* **Dyadic coarse-to-fine is nearly free.** Decode the two endpoints first, then the midpoint, then the quarter points, and so on. By the Markov property, a new position whose nearest left and right neighbours are already known is conditionally independent of every other new position at the same level. Every term of @eq-710-schedule-kl after the first is therefore exactly zero, and the whole budget collapses to the first step, $\mathrm{TC}(X_0, X_{16}) = I(X_0; X_{16}) = \log V - h(16)$, which is tiny because the chain has nearly forgotten its start after sixteen steps.
+
+The dyadic schedule needs only $\lceil \log_2 L \rceil + 1$ steps. This is the mathematical heart of the coarse-to-fine bet. If the coarse levels capture the long-range structure, the fine levels become nearly conditionally independent and can be sampled in parallel at almost no cost. Real text is not a first-order Markov chain, so the fine levels will not be *exactly* independent, but the tokenizer in NCM is trained to make them as close to independent as it can.
+
+The first cell checks the identity $\mathrm{KL}(p \,\|\, p_1 p_2) = \mathrm{TC}$ symbolically for an arbitrary $2 \times 2$ joint distribution, and verifies the chain-rule decomposition used in @eq-710-schedule-kl.
+
+```{python}
+#| label: code-710-sympy-tc
+#| code-fold: false
+import sympy as sp
+
+# A general 2x2 joint distribution with free parameters a, b, c.
+a, b, c = sp.symbols("a b c", positive=True)
+p = sp.Matrix([[a, b], [c, 1 - a - b - c]])
+p_row = [p[0, 0] + p[0, 1], p[1, 0] + p[1, 1]]
+p_col = [p[0, 0] + p[1, 0], p[0, 1] + p[1, 1]]
+
+# KL between the joint and the product of its marginals (what a parallel
+# sampler that draws both positions independently would produce).
+kl = sum(p[i, j] * sp.log(p[i, j] / (p_row[i] * p_col[j]))
+         for i in range(2) for j in range(2))
+
+
+def H(q):
+    return -sum(x * sp.log(x) for x in q)
+
+
+tc = H(p_row) + H(p_col) - H(list(p))
+print("KL(p || p_row p_col) - TC  =", sp.simplify(sp.expand_log(kl - tc, force=True)))
+
+# Chain rule check for three variables: TC(X1,X2,X3) = I(X1;X2) + I(X1,X2;X3)
+# written in entropies, as a polynomial identity in symbolic entropy terms.
+H1, H2, H3, H12, H123 = sp.symbols("H1 H2 H3 H12 H123")
+tc3 = H1 + H2 + H3 - H123
+chain = (H1 + H2 - H12) + (H12 + H3 - H123)
+print("TC3 - chain-rule decomposition =", sp.simplify(tc3 - chain))
+```
+
+The second cell evaluates @eq-710-schedule-kl in closed form for a chain with $V = 6$, $L = 17$ and $\lambda = 0.75$, checks the closed form against brute-force enumeration of all $6^5$ sequences on a shorter chain, and compares schedules.
+
+```{python}
+#| label: fig-710-tc-schedules
+#| fig-cap: "Exact sampling error of one-pass-per-step schedules on a sticky Markov chain. Left-to-right blocks keep neighbouring dependencies inside each step; random orders spread them out; the dyadic coarse-to-fine schedule leaves essentially no total correlation after its first step."
+#| code-fold: false
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+V, T, lam = 6, 17, 0.75   # states, sequence length, stickiness of the chain
+
+
+def h(d):
+    """Entropy (nats) of any row of P^d, where P = lam*I + (1-lam)/V * ones."""
+    if d == 0:
+        return 0.0
+    ld = lam ** d
+    stay, move = ld + (1 - ld) / V, (1 - ld) / V
+    return -(stay * np.log(stay) + (V - 1) * move * np.log(move))
+
+
+def H_pos(pos):
+    """Joint entropy of the chain observed at a sorted set of positions."""
+    pos = sorted(pos)
+    return np.log(V) + sum(h(q - p) for p, q in zip(pos[:-1], pos[1:])) if pos else 0.0
+
+
+def cond_tc(known, new):
+    """TC(X_new | X_known), using only the Markov property."""
+    total = 0.0
+    for i in new:
+        left = max([k for k in known if k < i], default=None)
+        right = min([k for k in known if k > i], default=None)
+        ctx = [x for x in (left, right) if x is not None]
+        total += H_pos(ctx + [i]) - H_pos(ctx)
+    return total - (H_pos(known + new) - H_pos(known))
+
+
+def sampler_kl(levels):
+    known, kl = [], 0.0
+    for lev in levels:
+        kl += cond_tc(known, list(lev))
+        known += list(lev)
+    return kl
+
+
+def brute_kl(levels, n):
+    """Direct enumeration of all V**n sequences: KL(p || q) for the schedule."""
+    P = lam * np.eye(V) + (1 - lam) / V
+    J = np.full(V, 1 / V)
+    for _ in range(n - 1):
+        J = J[..., None] * P.reshape([1] * (J.ndim - 1) + [V, V])
+    logq, known = np.zeros_like(J), []
+    for lev in levels:
+        for i in lev:
+            keep = known + [i]
+            Ji = J.sum(axis=tuple(x for x in range(n) if x not in keep), keepdims=True)
+            Jk = J.sum(axis=tuple(x for x in range(n) if x not in known), keepdims=True)
+            logq += np.log(Ji) - np.log(Jk)
+        known += list(lev)
+    return float((J * (np.log(J) - logq)).sum())
+
+
+check = [[0, 4], [2], [1, 3]]
+print(f"closed form {sampler_kl(check):.6f}  vs brute force {brute_kl(check, 5):.6f}  (T=5)")
+
+
+def contiguous(b):
+    return [list(range(s, min(s + b, T))) for s in range(0, T, b)]
+
+
+def random_order(steps, rng):
+    perm = rng.permutation(T)
+    return [list(chunk) for chunk in np.array_split(perm, steps)]
+
+
+dyadic = [[0, 16], [8], [4, 12], [2, 6, 10, 14], list(range(1, 17, 2))]
+rng = np.random.default_rng(0)
+rows = [("all at once", 1, sampler_kl([list(range(T))]))]
+for b in (8, 4, 2):
+    lv = contiguous(b)
+    rows.append((f"left-to-right blocks of {b}", len(lv), sampler_kl(lv)))
+for s in (5, 9):
+    rows.append((f"random order, {s} steps", s,
+                 np.mean([sampler_kl(random_order(s, rng)) for _ in range(200)])))
+rows.append(("dyadic coarse-to-fine", len(dyadic), sampler_kl(dyadic)))
+rows.append(("autoregressive", T, sampler_kl(contiguous(1))))
+tab = pd.DataFrame(rows, columns=["schedule", "sequential steps", "KL (nats)"])
+print(tab.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+print("per-level TC of the dyadic schedule:",
+      [round(float(cond_tc(sum(dyadic[:k], []), dyadic[k])), 5) for k in range(len(dyadic))])
+
+fig, ax = plt.subplots(figsize=(7, 4))
+for (name, steps, kl), mk in zip(rows, "osssDD^v"):
+    ax.scatter(steps, kl + 1e-4, s=60, marker=mk, label=name)
+ax.set_yscale("log")
+ax.set_xlabel("sequential forward passes")
+ax.set_ylabel("KL(p || q) in nats (log scale)")
+ax.set_title("Parallel sampling error is the total correlation decoded together")
+ax.legend(fontsize=8, loc="upper right")
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+The table makes the dependency budget tangible. At the same five sequential steps, left-to-right blocks of four pay about 8.1 nats, a random order (the schedule a masked diffusion model uses) pays about 2.1 nats on average, and the dyadic schedule pays 0.00025 nats, all of it in its first step. Random order beats contiguous blocks because it scatters dependent neighbours across different steps, but only an order that *knows the structure* drives the budget to zero. This is the gap NCM tries to exploit for text.
+
+The same computation in Julia and Rust prints identical numbers.
+
+::: {.panel-tabset}
+
+## Julia
+
+```julia
+using Printf
+
+const V, T, λ = 6, 17, 0.75
+
+function h(d)                       # entropy of a row of P^d
+    d == 0 && return 0.0
+    ld = λ^d
+    stay, move = ld + (1 - ld) / V, (1 - ld) / V
+    -(stay * log(stay) + (V - 1) * move * log(move))
+end
+
+H_pos(pos) = isempty(pos) ? 0.0 :
+    log(V) + sum((h(q - p) for (p, q) in zip(sort(pos)[1:end-1], sort(pos)[2:end])); init=0.0)
+
+function cond_tc(known, new)
+    total = 0.0
+    for i in new
+        ctx = Int[]
+        l = filter(<(i), known); isempty(l) || push!(ctx, maximum(l))
+        r = filter(>(i), known); isempty(r) || push!(ctx, minimum(r))
+        total += H_pos(vcat(ctx, i)) - H_pos(ctx)
+    end
+    total - (H_pos(vcat(known, new)) - H_pos(known))
+end
+
+function sampler_kl(levels)
+    known, kl = Int[], 0.0
+    for lev in levels
+        kl += cond_tc(known, lev)
+        append!(known, lev)
+    end
+    kl
+end
+
+contiguous(b) = [collect(s:min(s + b - 1, T - 1)) for s in 0:b:T-1]
+dyadic = [[0, 16], [8], [4, 12], [2, 6, 10, 14], collect(1:2:15)]
+@printf("all at once            KL = %.5f\n", sampler_kl([collect(0:T-1)]))
+@printf("blocks of 4 (5 steps)  KL = %.5f\n", sampler_kl(contiguous(4)))
+@printf("dyadic (5 steps)       KL = %.5f\n", sampler_kl(dyadic))
+```
+
+## Rust
+
+```rust
+const V: f64 = 6.0;
+const T: usize = 17;
+const LAM: f64 = 0.75;
+
+fn h(d: usize) -> f64 {
+    // entropy of a row of P^d
+    if d == 0 {
+        return 0.0;
+    }
+    let ld = LAM.powi(d as i32);
+    let (stay, mv) = (ld + (1.0 - ld) / V, (1.0 - ld) / V);
+    -(stay * stay.ln() + (V - 1.0) * mv * mv.ln())
+}
+
+fn h_pos(pos: &[usize]) -> f64 {
+    if pos.is_empty() {
+        return 0.0;
+    }
+    let mut p = pos.to_vec();
+    p.sort();
+    V.ln() + p.windows(2).map(|w| h(w[1] - w[0])).sum::<f64>()
+}
+
+fn cond_tc(known: &[usize], new: &[usize]) -> f64 {
+    let mut total = 0.0;
+    for &i in new {
+        let mut ctx: Vec<usize> = Vec::new();
+        if let Some(&l) = known.iter().filter(|&&k| k < i).max() {
+            ctx.push(l);
+        }
+        if let Some(&r) = known.iter().filter(|&&k| k > i).min() {
+            ctx.push(r);
+        }
+        let mut with_i = ctx.clone();
+        with_i.push(i);
+        total += h_pos(&with_i) - h_pos(&ctx);
+    }
+    let all: Vec<usize> = known.iter().chain(new).copied().collect();
+    total - (h_pos(&all) - h_pos(known))
+}
+
+fn sampler_kl(levels: &[Vec<usize>]) -> f64 {
+    let mut known: Vec<usize> = Vec::new();
+    let mut kl = 0.0;
+    for lev in levels {
+        kl += cond_tc(&known, lev);
+        known.extend(lev);
+    }
+    kl
+}
+
+fn main() {
+    let contiguous = |b: usize| -> Vec<Vec<usize>> {
+        (0..T).step_by(b).map(|s| (s..(s + b).min(T)).collect()).collect()
+    };
+    let dyadic = vec![vec![0, 16], vec![8], vec![4, 12], vec![2, 6, 10, 14],
+                      (1..16).step_by(2).collect()];
+    println!("all at once            KL = {:.5}", sampler_kl(&[(0..T).collect()]));
+    println!("blocks of 4 (5 steps)  KL = {:.5}", sampler_kl(&contiguous(4)));
+    println!("dyadic (5 steps)       KL = {:.5}", sampler_kl(&dyadic));
+}
+```
+
+:::
+
+Both print
+
+```
+all at once            KL = 15.11552
+blocks of 4 (5 steps)  KL = 8.14348
+dyadic (5 steps)       KL = 0.00025
+```
+
+## Diffusion Language Models in Brief {#sec-710-diffusion}
+
+NCM's baselines are diffusion language models, and its design choices are reactions to their costs, so we need them on the table.
+
+### From non-autoregressive translation to discrete diffusion {#sec-710-nat}
+
+Parallel text generation predates diffusion. Non-autoregressive machine translation [@gu2018nonautoregressive] predicted all target tokens in one pass and immediately ran into what its authors called the **multimodality problem**: a source sentence admits several valid translations, and sampling each target position independently mixes them, producing repeated or missing words that belong to no single translation. In the language of @eq-710-tc this is total correlation, and Gu et al.'s fix was a latent "fertility" plan sampled first, which is a primitive coarse level. Mask-Predict [@ghazvininejad2019maskpredict] instead iterated: predict everything, keep the most confident tokens, re-mask the rest, and repeat for a fixed number of rounds. MaskGIT [@chang2022maskgit] carried the same confidence-ordered unmasking to image tokens.
+
+Discrete diffusion gave these procedures a likelihood. D3PM [@austin2021structured] defined forward corruption processes on categorical variables, and the **absorbing-state** (masking) process turned out to be the best for text. SEDD [@lou2024discrete] reframed training as estimating ratios of the data distribution, MDLM [@sahoo2024simple] showed that the absorbing-state objective simplifies to a weighted masked language modelling loss, and LLaDA [@nie2025large] scaled the recipe to an 8B-parameter model competitive with autoregressive models of similar size.
+
+### The masked diffusion objective {#sec-710-mdlm}
+
+Let $\mathbf{m}$ denote a special mask token and let $\alpha_t \in [0, 1]$ be a decreasing **noise schedule** on $t \in [0, 1]$ with $\alpha_0 = 1$ and $\alpha_1 = 0$. The forward process masks each position independently:
+
+$$
+q(z_t^i \mid x_i) = \alpha_t \,\delta(z_t^i = x_i) + (1 - \alpha_t)\,\delta(z_t^i = \mathbf{m}).
+$$ {#eq-710-forward}
+
+For $s < t$, the posterior of an earlier, less masked state follows from Bayes' rule. A position that is already unmasked at time $t$ stays as it is. A position that is masked at $t$ was either still visible at $s$, with probability proportional to $\alpha_s - \alpha_t$, or already masked, with probability proportional to $1 - \alpha_s$:
+
+$$
+q(z_s^i \mid z_t^i = \mathbf{m}, x_i) = \frac{\alpha_s - \alpha_t}{1 - \alpha_t}\,\delta(z_s^i = x_i) + \frac{1 - \alpha_s}{1 - \alpha_t}\,\delta(z_s^i = \mathbf{m}).
+$$ {#eq-710-posterior}
+
+The reverse model replaces the unknown $x_i$ with a network prediction $p_\theta(x_i \mid z_t)$ and keeps the same two-way split. The KL divergence between the true and model posteriors at a masked position is then
+
+$$
+\mathrm{KL}\big(q(z_s^i \mid z_t, x)\,\|\,p_\theta(z_s^i \mid z_t)\big) = \frac{\alpha_s - \alpha_t}{1 - \alpha_t}\,\big(-\log p_\theta(x_i \mid z_t)\big),
+$$
+
+because the mask branch is identical in both distributions and contributes nothing. Summing over a partition of $[0, 1]$ into $T$ steps and letting $T \to \infty$, the differences $\alpha_s - \alpha_t$ become $-\alpha_t'\,dt$ and the negative evidence lower bound becomes [@sahoo2024simple]
+
+$$
+\mathcal{L}_{\text{MDLM}} = \int_0^1 \frac{-\alpha_t'}{1 - \alpha_t}\; \mathbb{E}_{z_t \sim q(\cdot \mid x)}\Big[\sum_{i:\, z_t^i = \mathbf{m}} -\log p_\theta(x_i \mid z_t)\Big]\, dt.
+$$ {#eq-710-mdlm}
+
+For the linear schedule $\alpha_t = 1 - t$ the weight is $1/t$: a masked language modelling loss in which each mask rate $t$ is sampled uniformly and the loss at that rate is up-weighted by $1/t$. Our toy implementation below trains with the unweighted per-masked-token average, a common practical variant that trades the exact bound for lower gradient variance.
+
+Sampling runs the reverse process on a grid $1 = t_0 > t_1 > \dots > t_S = 0$. At each step the network predicts all masked positions, and each masked position is revealed with probability $\frac{\alpha_{t_{j+1}} - \alpha_{t_j}}{1 - \alpha_{t_j}}$, which is $\frac{t_j - t_{j+1}}{t_j}$ under the linear schedule.
+
+### The three costs NCM targets {#sec-710-dlm-costs}
+
+The abstract of @kumbong2026nextconcept names three weaknesses of diffusion language models, and each one is visible in the formulas above.
+
+1. **Quality falls with fewer steps.** With $S$ steps, about $L/S$ positions are revealed per step, sampled independently given the current context. By @eq-710-schedule-kl the sampler pays the total correlation of each revealed set, and the reveal order is random, not structure-aware. Fewer steps means bigger sets and more ignored dependence.
+2. **Every step processes the whole sequence.** The network is bidirectional and the masked positions change every step, so there is no KV cache to reuse. A step costs a full $L$-token forward pass, and $S$ steps cost $S$ of them.
+3. **Training needs many passes over the data.** Each example teaches the model only the masked subset at one sampled noise level, which is a weaker signal per token than next-token prediction, so diffusion language models typically need more epochs to reach a given quality.
+
+## Lineage {#sec-710-lineage}
+
+NCM recombines four established ideas.
+
+**Vector quantization.** A vector quantizer maps a continuous vector to the nearest of a finite set of codewords, a technique with a long history in signal compression [@gray1984vector]. VQ-VAE [@oord2017neural] put a learned codebook inside an autoencoder and trained it end to end with the straight-through gradient estimator [@bengio2013estimating], producing discrete latent codes that a second model can generate.
+
+**Residual quantization.** One codebook of size $C$ carries only $\log_2 C$ bits per vector. Residual quantization stacks several codebooks: quantize the vector, quantize what is left over, quantize what is left over again. SoundStream [@zeghidour2022soundstream] used it for neural audio codecs, and RQ-VAE [@lee2022autoregressive] used it for images, generating the stack of codes at each position with a small autoregressive model.
+
+**Next-scale prediction.** VAR [@tian2024visual] changed *what* is generated next for images. Instead of the next patch in raster order, it generates the next *resolution*: a $1 \times 1$ token map, then $2 \times 2$, then $4 \times 4$, each map predicted in a single parallel pass conditioned on all coarser maps, with a multiscale residual quantizer providing the maps. NCM is, to a first approximation, VAR transposed from two-dimensional images to one-dimensional text.
+
+**Concept-level language modelling.** Meta's Large Concept Models [@barrault2024large] argued that language models should predict at the level of ideas, not tokens, and modelled sequences of continuous sentence embeddings. NCM shares the slogan but not the mechanism: its "concepts" are discrete codes in a learned multiscale hierarchy, not sentence embeddings, and nothing forces any code to align with a human concept.
+
+```{mermaid}
+%%| label: fig-710-lineage
+%%| fig-cap: "Where Next-Concept Modeling comes from. Quantized autoencoders supply discrete multiscale codes, next-scale prediction supplies the coarse-to-fine generator, and parallel text generation supplies the problem and the baselines."
+flowchart LR
+    A["Vector quantization"] --> B["VQ-VAE"]
+    B --> C["Residual VQ"]
+    C --> D["VAR next-scale images"]
+    E["Non-autoregressive MT"] --> F["Mask-Predict"]
+    F --> G["Masked diffusion LMs"]
+    H["Large Concept Models"] --> I["Next-Concept Modeling"]
+    D --> I
+    G --> I
+```
+
+## The Multiscale Residual Tokenizer {#sec-710-tokenizer}
+
+### Encoding a sequence into a hierarchy {#sec-710-encoding}
+
+An encoder $E$ maps the token sequence to continuous latents $z = E(x) \in \mathbb{R}^{L \times d}$. Choose $K$ levels with lengths $n_1 < n_2 < \dots < n_K = L$, for example $1, 2, 4, \dots, L$. Each level has a codebook $\mathcal{C}_k = \{e_{k,1}, \dots, e_{k,C}\} \subset \mathbb{R}^d$, a downsampling operator $D_k: \mathbb{R}^{L \times d} \to \mathbb{R}^{n_k \times d}$ (average pooling into $n_k$ equal bins) and an upsampling operator $U_k: \mathbb{R}^{n_k \times d} \to \mathbb{R}^{L \times d}$ (repeat each bin value across its bin). Starting from $\hat f_0 = 0$, level $k$ quantizes the pooled residual:
+
+$$
+\begin{aligned}
+\bar e_k &= D_k\big(z - \hat f_{k-1}\big), \\
+c_{k,b} &= \arg\min_{j} \big\| \bar e_{k,b} - e_{k,j} \big\|_2, \qquad b = 1, \dots, n_k, \\
+\hat f_k &= \hat f_{k-1} + U_k\big(e_{k, c_{k}}\big).
+\end{aligned}
+$$ {#eq-710-msrq}
+
+The output is a hierarchy of integer codes $c_1, \dots, c_K$ with $\sum_k n_k$ codes in total, and a decoder $G$ maps the final reconstruction $\hat f_K$ (or any partial one $\hat f_k$) back to token logits.
+
+### Why pooling, nearest neighbour and repetition fit together {#sec-710-pooling-lemma}
+
+The three operators in @eq-710-msrq are not an arbitrary choice. Fix one bin $b$ of width $w$ containing residual vectors $e_1, \dots, e_w$ with mean $\bar e$, and one correction $q$ copied to every position of the bin. Expanding $e_i - q = (e_i - \bar e) + (\bar e - q)$ and using $\sum_i (e_i - \bar e) = 0$ to kill the cross term,
+
+$$
+\sum_{i=1}^{w} \|e_i - q\|^2 = \sum_{i=1}^{w} \|e_i - \bar e\|^2 + w\,\|\bar e - q\|^2.
+$$ {#eq-710-pool-decomp}
+
+The first term does not depend on $q$, so minimizing the full-resolution error of a piecewise-constant correction is the same as minimizing the distance between the codeword and the **pooled** residual, which is exactly the nearest-neighbour rule in @eq-710-msrq. Two consequences follow. First, the coarse levels are optimal at what they are allowed to do: remove the bin means. Second, if a codebook contains the zero vector, the residual energy can never increase from one level to the next, because choosing $q = 0$ leaves it unchanged and the nearest-neighbour rule can only do at least as well. The within-bin spread $\sum_i \|e_i - \bar e\|^2$ is what finer levels must remove, and at the finest level, where $w = 1$, it is zero.
+
+```{python}
+#| label: code-710-pool-lemma
+#| code-fold: false
+import sympy as sp
+
+# One pooling bin of width w = 3 with scalar residuals e1, e2, e3 and a single
+# correction value q broadcast to all three positions by nearest upsampling.
+e1, e2, e3, q = sp.symbols("e1 e2 e3 q", real=True)
+e = [e1, e2, e3]
+e_bar = sum(e) / 3
+lhs = sum((ei - q) ** 2 for ei in e)                       # full-resolution error
+rhs = sum((ei - e_bar) ** 2 for ei in e) + 3 * (e_bar - q) ** 2
+print("full error - (within-bin spread + w * pooled error) =", sp.simplify(sp.expand(lhs - rhs)))
+print("minimiser over q:", sp.solve(sp.diff(lhs, q), q)[0], " (the pooled mean)")
+```
+
+### Training: the vector quantization losses {#sec-710-vq-loss}
+
+The argmin in @eq-710-msrq has no gradient. The **straight-through estimator** [@bengio2013estimating] uses the quantized value in the forward pass and the identity in the backward pass, $\tilde q = \bar e + \operatorname{sg}[q - \bar e]$, where $\operatorname{sg}$ stops gradients. Codewords and encoder are then pulled toward each other by the VQ-VAE losses [@oord2017neural]:
+
+$$
+\mathcal{L}_{\text{VQ}} = \sum_{k=1}^{K} \Big( \big\| \operatorname{sg}[\bar e_k] - q_k \big\|^2 + \beta\, \big\| \bar e_k - \operatorname{sg}[q_k] \big\|^2 \Big),
+$$ {#eq-710-vq-loss}
+
+added to the reconstruction cross-entropy $-\sum_t \log G(\hat f_K)_{t, x_t}$. The first term moves codewords toward the residuals assigned to them, and the **commitment** term with weight $\beta$ keeps the encoder from drifting away from the codebook. Codewords that no residual selects receive no gradient, so practical quantizers restart these **dead codes** from recent residuals.
+
+The **rate** of the tokenizer is $R = \sum_k n_k \log_2 C$ bits per sequence. With $K$ dyadic levels the code count is $\sum_k 2^{k-1} = 2L - 1$, just under twice the sequence length, so the tokenizer is not a compressor in the usual sense. What it buys is *order*: the first few codes summarize the whole sequence, and each later level adds detail.
+
+### A worked example in three languages {#sec-710-msrq-demo}
+
+To see @eq-710-msrq and @eq-710-pool-decomp in action without any learning, quantize a fixed one-dimensional signal of length 16 with five levels of 1, 2, 4, 8 and 16 codes, using a fixed scalar codebook of nine evenly spaced values whose range shrinks by a factor of 1.3 per level. The root-mean-square residual must fall level by level.
+
+::: {.panel-tabset}
+
+## Python
+
+```{python}
+#| label: code-710-msrq-demo
+#| code-fold: false
+import numpy as np
+
+L = 16
+SCALES = [1, 2, 4, 8, 16]
+z = np.array([np.sin(0.4 * i) + 0.5 * np.cos(1.3 * i) for i in range(L)])
+
+
+def codebook(k):
+    """Scalar codebook for level k: 9 evenly spaced values, range shrinking by 1.3x per level."""
+    return np.linspace(-1.5, 1.5, 9) / 1.3 ** k
+
+
+def down(f, n):            # average-pool L values into n bins
+    return f.reshape(n, L // n).mean(axis=1)
+
+
+def up(q, n):              # nearest-neighbour upsample n values back to L
+    return np.repeat(q, L // n)
+
+
+f_hat = np.zeros(L)
+for k, n in enumerate(SCALES):
+    r = down(z - f_hat, n)
+    cb = codebook(k)
+    idx = np.abs(r[:, None] - cb[None, :]).argmin(axis=1)
+    f_hat += up(cb[idx], n)
+    rms = np.sqrt(np.mean((z - f_hat) ** 2))
+    print(f"level {k + 1} ({n:2d} codes): codes={idx.tolist()}  rms residual={rms:.4f}")
+```
+
+## Julia
+
+```julia
+using Printf
+
+const L = 16
+const SCALES = [1, 2, 4, 8, 16]
+z = [sin(0.4i) + 0.5cos(1.3i) for i in 0:L-1]
+
+codebook(k) = collect(range(-1.5, 1.5, length=9)) ./ 1.3^k
+down(f, n) = [sum(f[(j-1)*(L÷n)+1:j*(L÷n)]) / (L ÷ n) for j in 1:n]
+up(q, n) = repeat(q, inner=L ÷ n)
+
+f_hat = zeros(L)
+for (k, n) in enumerate(SCALES)
+    r = down(z .- f_hat, n)
+    cb = codebook(k - 1)
+    idx = [argmin(abs.(ri .- cb)) - 1 for ri in r]      # 0-based codes, as in Python
+    global f_hat = f_hat .+ up(cb[idx.+1], n)
+    rms = sqrt(sum((z .- f_hat) .^ 2) / L)
+    @printf("level %d (%2d codes): codes=%s  rms residual=%.4f\n", k, n, string(idx), rms)
+end
+```
+
+## Rust
+
+```rust
+const L: usize = 16;
+const SCALES: [usize; 5] = [1, 2, 4, 8, 16];
+
+fn codebook(k: usize) -> Vec<f64> {
+    (0..9).map(|j| (-1.5 + 3.0 * j as f64 / 8.0) / 1.3f64.powi(k as i32)).collect()
+}
+
+fn down(f: &[f64], n: usize) -> Vec<f64> {
+    let w = L / n;
+    (0..n).map(|j| f[j * w..(j + 1) * w].iter().sum::<f64>() / w as f64).collect()
+}
+
+fn main() {
+    let z: Vec<f64> = (0..L)
+        .map(|i| (0.4 * i as f64).sin() + 0.5 * (1.3 * i as f64).cos())
+        .collect();
+    let mut f_hat = vec![0.0; L];
+    for (k, &n) in SCALES.iter().enumerate() {
+        let resid: Vec<f64> = z.iter().zip(&f_hat).map(|(a, b)| a - b).collect();
+        let r = down(&resid, n);
+        let cb = codebook(k);
+        let idx: Vec<usize> = r
+            .iter()
+            .map(|&ri| {
+                (0..cb.len())
+                    .min_by(|&a, &b| (ri - cb[a]).abs().partial_cmp(&(ri - cb[b]).abs()).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        for i in 0..L {
+            f_hat[i] += cb[idx[i / (L / n)]]; // nearest-neighbour upsample
+        }
+        let rms = (z.iter().zip(&f_hat).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / L as f64).sqrt();
+        println!("level {} ({:2} codes): codes={:?}  rms residual={:.4}", k + 1, n, idx, rms);
+    }
+}
+```
+
+:::
+
+All three implementations print the same codes and residuals, with the error falling from 0.78 after one code to 0.043 after all 31.
+
+### A learned multiscale tokenizer on a toy language {#sec-710-toy-tokenizer}
+
+To build and test a complete NCM pipeline in a few minutes, we need a language whose correctness we can check exactly. The cell below defines a small grammar: two sentences per sequence, each of the form *determiner, optional adjective, noun, verb, determiner, optional adjective, noun, preposition, "the", place*, with three long-range constraints. Determiners agree with their nouns in number, the verb agrees with the subject, and every noun, verb and place in *both* sentences comes from one shared topic (animals in a zoo, or vehicles on a road). The function `is_valid` checks all three exactly. A single random swap of two words breaks almost nine in ten sequences, so the grammaticality rate is a sharp measure of whether a generator has captured the joint structure rather than the marginals.
+
+```{python}
+#| label: code-710-grammar
+#| code-fold: false
+import numpy as np
+
+TOPICS = {
+    "zoo": {
+        "noun": [("cat", "cats"), ("dog", "dogs"), ("fox", "foxes"), ("owl", "owls")],
+        "verb": [("chases", "chase"), ("watches", "watch"), ("bites", "bite")],
+        "place": ["barn", "field", "forest"],
+    },
+    "road": {
+        "noun": [("car", "cars"), ("bus", "buses"), ("truck", "trucks"), ("bike", "bikes")],
+        "verb": [("passes", "pass"), ("follows", "follow"), ("blocks", "block")],
+        "place": ["bridge", "street", "tunnel"],
+    },
+}
+ADJ = ["big", "small", "red", "old"]
+PREP = ["near", "in", "under"]
+DET_SG, DET_PL = ["a", "the"], ["some", "the"]
+SPECIAL = ["<pad>", "."]
+
+vocab = list(SPECIAL) + ADJ + PREP + sorted(set(DET_SG + DET_PL))
+for t in TOPICS.values():
+    for s, p in t["noun"]:
+        vocab += [s, p]
+    for s, p in t["verb"]:
+        vocab += [s, p]
+    vocab += t["place"]
+vocab = list(dict.fromkeys(vocab))
+stoi = {w: i for i, w in enumerate(vocab)}
+L = 32
+
+
+def noun_phrase(rng, topic, plural):
+    det = rng.choice(DET_PL if plural else DET_SG)
+    adjs = list(rng.choice(ADJ, size=rng.integers(0, 2), replace=False))
+    noun = TOPICS[topic]["noun"][rng.integers(4)][int(plural)]
+    return [det] + adjs + [noun]
+
+
+def sentence(rng, topic):
+    plural = bool(rng.integers(2))
+    verb = TOPICS[topic]["verb"][rng.integers(3)][int(plural)]
+    obj = noun_phrase(rng, topic, bool(rng.integers(2)))
+    place = ["the", TOPICS[topic]["place"][rng.integers(3)]]
+    return noun_phrase(rng, topic, plural) + [verb] + obj + [rng.choice(PREP)] + place + ["."]
+
+
+def sample_seq(rng):
+    topic = rng.choice(list(TOPICS))
+    words = sentence(rng, topic) + sentence(rng, topic)
+    return [stoi[w] for w in words] + [0] * (L - len(words))
+
+
+def make_data(n, seed):
+    rng = np.random.default_rng(seed)
+    return np.array([sample_seq(rng) for _ in range(n)], dtype=np.int64)
+
+
+def is_valid(ids):
+    """Exact grammar check: two sentences, agreement, one shared topic, pads at end."""
+    words = [vocab[i] for i in ids]
+    if "<pad>" in words:
+        k = words.index("<pad>")
+        if any(w != "<pad>" for w in words[k:]):
+            return False
+        words = words[:k]
+    if words.count(".") != 2 or not words or words[-1] != ".":
+        return False
+    cut = words.index(".")
+    sents = [words[:cut], words[cut + 1:-1]]
+    topics = set()
+
+    def parse_np(ws, i):
+        if i >= len(ws) or ws[i] not in DET_SG + DET_PL:
+            return None
+        det = ws[i]; i += 1
+        n_adj = 0
+        while i < len(ws) and ws[i] in ADJ:
+            i += 1; n_adj += 1
+        if n_adj > 1 or i >= len(ws):
+            return None
+        for tname, t in TOPICS.items():
+            for s, p in t["noun"]:
+                if ws[i] in (s, p):
+                    plural = ws[i] == p
+                    if (plural and det not in DET_PL) or (not plural and det not in DET_SG):
+                        return None
+                    return i + 1, plural, tname
+        return None
+
+    for ws in sents:
+        r = parse_np(ws, 0)
+        if r is None:
+            return False
+        i, plural, tname = r
+        topics.add(tname)
+        if i >= len(ws):
+            return False
+        vt = [t for t, d in TOPICS.items() for s, p in d["verb"] if ws[i] == (p if plural else s)]
+        if not vt:
+            return False
+        topics.add(vt[0])
+        r = parse_np(ws, i + 1)
+        if r is None:
+            return False
+        i, _, tname = r
+        topics.add(tname)
+        if ws[i:i + 2] == [] or ws[i] not in PREP or len(ws) != i + 3 or ws[i + 1] != "the":
+            return False
+        pt = [t for t, d in TOPICS.items() if ws[i + 2] in d["place"]]
+        if not pt:
+            return False
+        topics.add(pt[0])
+    return len(topics) == 1
+
+
+Xtr_np, Xte_np = make_data(40000, 0), make_data(2000, 99)
+print(f"vocabulary {len(vocab)} words, sequence length {L}, "
+      f"longest sentence pair {(Xtr_np != 0).sum(1).max()} words")
+print("valid rate on held-out data:", np.mean([is_valid(x) for x in Xte_np]))
+swap_rng = np.random.default_rng(1)
+corrupt = Xte_np[:500].copy()
+for row in corrupt:
+    j, k = swap_rng.integers(0, 10, 2)
+    row[j], row[k] = row[k], row[j]
+print("valid rate after one random swap:", np.mean([is_valid(x) for x in corrupt]))
+print("example:", " ".join(vocab[i] for i in Xte_np[0] if i))
+```
+
+The tokenizer follows @eq-710-msrq with six levels of 1, 2, 4, 8, 16 and 32 codes, a 64-entry codebook per level, a two-layer transformer encoder and decoder, the losses of @eq-710-vq-loss, and dead-code restarts. One addition is specific to this toy: at each training step the decoder also reconstructs from a random *prefix* of levels, $\hat f_k$ for a uniformly drawn $k$, a form of nested dropout that forces the coarse levels to carry as much of the sequence as they can on their own. Without it, the finest level can encode everything and the coarse codes collapse to a single value, which is useless for coarse-to-fine generation.
+
+```{python}
+#| label: code-710-tokenizer
+#| code-fold: false
+import time
+import warnings
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+warnings.filterwarnings("ignore", message=".*enable_nested_tensor.*")
+torch.manual_seed(0)
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+torch.backends.cuda.matmul.allow_tf32 = True
+Vv = len(vocab)
+D, LAYERS, HEADS, BS = 128, 4, 4, 512
+SCALES = [1, 2, 4, 8, 16, 32]     # tokens per level, coarse to fine
+K, CODES, DZ = len(SCALES), 64, 32
+Xtr = torch.tensor(Xtr_np, device=dev)
+Xte = torch.tensor(Xte_np, device=dev)
+
+
+def encoder(n_layers=LAYERS):
+    layer = nn.TransformerEncoderLayer(D, HEADS, 4 * D, dropout=0.0,
+                                       batch_first=True, norm_first=True)
+    return nn.TransformerEncoder(layer, n_layers)
+
+
+class Backbone(nn.Module):
+    """Token (or feature) embedding, learned positions, transformer, linear head."""
+
+    def __init__(self, n_in, n_out, n_pos, n_layers=LAYERS):
+        super().__init__()
+        self.emb = nn.Embedding(n_in, D)
+        self.pos = nn.Parameter(torch.randn(n_pos, D) * 0.02)
+        self.body = encoder(n_layers)
+        self.head = nn.Linear(D, n_out)
+
+    def forward(self, x, mask=None, feats=None):
+        h = self.emb(x) if feats is None else feats
+        h = h + self.pos[: h.shape[1]]
+        return self.head(self.body(h, mask=mask))
+
+
+def train(model, loss_fn, steps, lr=1e-3, label=""):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=steps, pct_start=0.05)
+    t0 = time.time()
+    for _ in range(steps):
+        xb = Xtr[torch.randint(0, len(Xtr), (BS,), device=dev)]
+        loss = loss_fn(xb)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sched.step()
+    print(f"{label:24s} {steps} steps, final loss {loss.item():.4f}, {time.time() - t0:.0f}s")
+
+
+class MultiscaleRVQ(nn.Module):
+    """Multiscale residual VQ: level k quantizes the residual pooled to SCALES[k]."""
+
+    def __init__(self):
+        super().__init__()
+        self.enc = Backbone(Vv, DZ, L, n_layers=2)
+        self.dec = Backbone(Vv, Vv, L, n_layers=2)
+        self.dec_in = nn.Linear(DZ, D)
+        self.books = nn.ParameterList(
+            [nn.Parameter(torch.randn(CODES, DZ) * 0.1) for _ in SCALES])
+
+    def up(self, q, k):                        # n_k positions -> L positions
+        if SCALES[k] == L:
+            return q
+        return F.interpolate(q.transpose(1, 2), size=L, mode="nearest").transpose(1, 2)
+
+    def down(self, f, k):                      # L positions -> n_k positions
+        return F.adaptive_avg_pool1d(f.transpose(1, 2), SCALES[k]).transpose(1, 2)
+
+    def nearest(self, r, k):
+        cb = self.books[k]
+        d2 = r.pow(2).sum(-1, keepdim=True) - 2 * r @ cb.T + cb.pow(2).sum(-1)
+        return d2.argmin(-1)
+
+    def quantize(self, z):
+        """Returns the running reconstruction after every level, the codes, the VQ loss."""
+        f_hat, codes, vq_loss, residuals, partial = torch.zeros_like(z), [], 0.0, [], []
+        for k in range(K):
+            r = self.down(z - f_hat, k)                # residual at this scale
+            idx = self.nearest(r.detach(), k)
+            q = self.books[k][idx]
+            vq_loss = vq_loss + F.mse_loss(q, r.detach()) + 0.25 * F.mse_loss(r, q.detach())
+            q = r + (q - r).detach()                   # straight-through estimator
+            f_hat = f_hat + self.up(q, k)
+            codes.append(idx)
+            residuals.append(r.detach())
+            partial.append(f_hat)
+        return partial, codes, vq_loss, residuals
+
+    def decode(self, codes):
+        f_hat = sum(self.up(self.books[k][idx], k) for k, idx in enumerate(codes))
+        return self.dec(None, feats=self.dec_in(f_hat))
+
+    @torch.no_grad()
+    def restart_dead_codes(self, residuals, codes):
+        for k, (r, idx) in enumerate(zip(residuals, codes)):
+            dead = (torch.bincount(idx.reshape(-1), minlength=CODES) == 0).nonzero().squeeze(1)
+            if len(dead):
+                pool = r.reshape(-1, DZ)
+                self.books[k].data[dead] = pool[torch.randint(0, len(pool), (len(dead),), device=dev)]
+
+
+tok = MultiscaleRVQ().to(dev)
+step = {"n": 0}
+
+
+def tok_loss(x):
+    z = tok.enc(x)
+    partial, codes, vq_loss, residuals = tok.quantize(z)
+    k = int(torch.randint(0, K, (1,)))          # nested level dropout: random prefix
+    ce = sum(F.cross_entropy(tok.dec(None, feats=tok.dec_in(f)).reshape(-1, Vv), x.reshape(-1))
+             for f in (partial[k], partial[-1]))
+    step["n"] += 1
+    if step["n"] % 100 == 0:
+        tok.restart_dead_codes(residuals, codes)
+    return ce + vq_loss
+
+
+train(tok, tok_loss, 2000, label="multiscale RVQ tokenizer")
+tok.eval()
+for p in tok.parameters():
+    p.requires_grad_(False)
+
+with torch.no_grad():
+    # encode the whole corpus once; the generator trains on these frozen codes
+    codes_tr = [torch.cat(c) for c in zip(*[tok.quantize(tok.enc(xb))[1] for xb in Xtr.split(4000)])]
+    _, codes_te, _, _ = tok.quantize(tok.enc(Xte))
+    word = Xte != 0
+    rd = []
+    for k in range(1, K + 1):
+        pred = tok.decode(codes_te[:k]).argmax(-1)
+        rd.append((k, sum(SCALES[:k]), ((pred == Xte) & word).sum().item() / word.sum().item(),
+                   (pred == Xte).all(1).float().mean().item(),
+                   np.mean([is_valid(s) for s in pred.cpu().numpy()])))
+rd_tab = pd.DataFrame(rd, columns=["levels used", "codes", "word accuracy",
+                                   "exact sequence", "grammatical"])
+print(rd_tab.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+print("codes in use per level:", [len(torch.unique(c)) for c in codes_te])
+```
+
+The rate-distortion table is the multiscale hierarchy made visible. A single code for the entire 32-position sequence already recovers about 46% of the words, mostly the shared structure: where the sentences fall, where padding starts, and which topic the pair belongs to. That one code is enough to make the decoded sequence grammatical about three times in four, because the decoder fills in a plausible sentence pair for the topic it is given; the rate dips slightly at levels two and three, where partial detail can contradict the decoder's default sentence, before rising again. Word accuracy then climbs level by level, and the full hierarchy of 63 codes reconstructs nearly every held-out sequence exactly. All 64 entries of every codebook are in use, so no level has collapsed. Note that the rate is $63 	imes \log_2 64 = 378$ bits, more than the $32 \log_2 46 pprox 177$ bits of the raw tokens: the tokenizer spends extra bits to make the representation *ordered*, which is what the generator needs.
+
+## The Coarse-to-Fine Generator {#sec-710-generator}
+
+### Factorization and mask {#sec-710-factorization}
+
+With the tokenizer frozen, generation happens in code space. NCM models the code hierarchy level by level, with all codes inside a level conditionally independent given the coarser levels:
+
+$$
+p_\theta(c_1, \dots, c_K) = \prod_{k=1}^{K} \prod_{b=1}^{n_k} p_\theta\big(c_{k,b} \mid c_{<k}\big).
+$$ {#eq-710-ncm-factor}
+
+Compared with the exact chain rule over levels, $\prod_k p(c_k \mid c_{<k})$, the within-level product is precisely the one-pass shortcut of @eq-710-product. By @eq-710-schedule-kl the distribution NCM can represent is therefore off by $\sum_k \mathrm{TC}(C_k \mid C_{<k})$, the dependency budget of the level schedule. The tokenizer and the generator together succeed exactly to the extent that the coarse levels absorb the dependence among the fine codes.
+
+The input to level $k$ is the running reconstruction $\hat f_{k-1}$ pooled to the new length, $D_k(\hat f_{k-1}) \in \mathbb{R}^{n_k \times d}$, projected to the model width and tagged with a level embedding; level 1 receives a learned start vector. All levels are concatenated into one sequence of $\sum_k n_k$ positions and processed by one transformer with a **block-causal** attention mask,
+
+$$
+M_{ij} = \begin{cases} 0 & \text{if } \operatorname{level}(j) \le \operatorname{level}(i), \\ -\infty & \text{otherwise,} \end{cases}
+$$ {#eq-710-block-mask}
+
+so a position sees its own level bidirectionally and every coarser level, but nothing finer. Training is teacher-forced: one forward pass over the true code hierarchy produces logits for every code, and the loss is the summed cross-entropy $-\sum_k \sum_b \log p_\theta(c_{k,b} \mid c_{<k})$. This is as data-efficient per example as next-token training, since every code in the sequence contributes a loss term, which addresses the third diffusion cost of @sec-710-dlm-costs.
+
+Sampling runs $K$ forward passes. Pass $k$ reads the level-$k$ logits, samples all $n_k$ codes at once, updates $\hat f_k$, and moves on. After the last level the tokenizer's decoder turns $\hat f_K$ into tokens in one more pass.
+
+```{mermaid}
+%%| label: fig-710-pipeline
+%%| fig-cap: "The NCM pipeline. Training encodes text into a frozen hierarchy of codes; generation predicts the hierarchy level by level, one parallel forward pass per level, then decodes all tokens at once."
+flowchart LR
+    T["Text tokens"] --> E["Encoder"]
+    E --> Q["Multiscale residual VQ"]
+    Q --> C1["Level 1 codes"]
+    C1 --> C2["Level 2 codes"]
+    C2 --> CK["Level K codes"]
+    CK --> G["Decoder"]
+    G --> O["Output tokens"]
+```
+
+For conditional tasks such as summarization, the README of the official release exposes **classifier-free guidance** [@ho2022classifierfree]. The generator is trained with the condition $y$ randomly dropped, and at sampling time the conditional and unconditional logits $\ell(\cdot \mid y)$ and $\ell(\cdot \mid \varnothing)$ are extrapolated,
+
+$$
+\tilde\ell = \ell(\cdot \mid \varnothing) + w\,\big(\ell(\cdot \mid y) - \ell(\cdot \mid \varnothing)\big),
+$$ {#eq-710-cfg}
+
+with $w = 1$ recovering the plain conditional model and $w > 1$ sharpening toward the condition. Exactly how the release parametrizes its guidance scale is defined in its code, not in the abstract, so treat @eq-710-cfg as the generic form.
+
+### Training the toy generator {#sec-710-toy-generator}
+
+The generator is a four-layer, 128-wide transformer over the $63$ code positions of our six levels. The cell encodes the training corpus once with the frozen tokenizer and trains on those codes.
+
+```{python}
+#| label: code-710-generator
+#| code-fold: false
+level_of = torch.cat([torch.full((n,), k) for k, n in enumerate(SCALES)]).to(dev)
+starts = np.cumsum([0] + SCALES)
+NPOS = int(starts[-1])
+# Block-causal mask: a position may attend to every position in its own level
+# and in all coarser levels, never to a finer level.
+block_mask = torch.where(level_of[None, :] <= level_of[:, None], 0.0, float("-inf"))
+
+
+class NCMGenerator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sos = nn.Parameter(torch.randn(1, 1, D) * 0.02)
+        self.inp = nn.Linear(DZ, D)
+        self.lvl = nn.Embedding(K, D)
+        self.pos = nn.Parameter(torch.randn(NPOS, D) * 0.02)
+        self.body = encoder()
+        self.head = nn.Linear(D, CODES)
+
+    def forward(self, feats, batch):
+        h = torch.cat([self.sos.expand(batch, 1, D)] + [self.inp(f) for f in feats], 1)
+        n = h.shape[1]
+        h = h + self.pos[:n] + self.lvl(level_of[:n])
+        return self.head(self.body(h, mask=block_mask[:n, :n]))
+
+
+def level_inputs(codes):
+    """Teacher inputs for levels 2..K: the running reconstruction pooled to the next scale."""
+    feats, f_hat = [], 0
+    for k, idx in enumerate(codes[: K - 1]):
+        f_hat = f_hat + tok.up(tok.books[k][idx], k)
+        feats.append(tok.down(f_hat, k + 1))
+    return feats
+
+
+gen = NCMGenerator().to(dev)
+
+
+def gen_loss(_unused_batch):
+    # train() hands us a token batch; the generator samples its own rows of frozen codes
+    rows = torch.randint(0, len(Xtr), (BS,), device=dev)
+    codes = [c[rows] for c in codes_tr]
+    with torch.no_grad():
+        feats = level_inputs(codes)
+    logits = gen(feats, BS)
+    return F.cross_entropy(logits.reshape(-1, CODES), torch.cat(codes, 1).reshape(-1))
+
+
+@torch.no_grad()
+def ncm_sample(n, temp=1.0, prefix=()):
+    """Coarse to fine: one forward pass per level, all codes of a level in parallel."""
+    codes = [c[:n] for c in prefix]
+    for k in range(len(codes), K):
+        logits = gen(level_inputs(codes), n)[:, starts[k]:starts[k + 1]]
+        probs = F.softmax(logits / temp, -1)
+        codes.append(torch.multinomial(probs.reshape(-1, CODES), 1).reshape(n, SCALES[k]))
+    return tok.decode(codes).argmax(-1), K - len(prefix)
+
+
+train(gen, gen_loss, 3000, label="NCM generator")
+gen.eval()
+```
+
+### Baselines on the same data {#sec-710-baselines}
+
+For comparison we train two models of the same width and depth on the same sequences: a causal autoregressive transformer, and a masked diffusion model following @sec-710-mdlm.
+
+```{python}
+#| label: code-710-baselines
+#| code-fold: false
+# Autoregressive baseline: causal transformer, one forward pass per token.
+BOS = MASK = Vv
+ar = Backbone(Vv + 1, Vv, L).to(dev)
+causal = torch.triu(torch.full((L, L), float("-inf"), device=dev), 1)
+
+
+def ar_loss(x):
+    inp = torch.cat([torch.full_like(x[:, :1], BOS), x[:, :-1]], 1)
+    return F.cross_entropy(ar(inp, causal).reshape(-1, Vv), x.reshape(-1))
+
+
+@torch.no_grad()
+def ar_sample(n, temp=1.0):
+    seq = torch.full((n, 1), BOS, device=dev)
+    for t in range(L):
+        logits = ar(seq, causal[: t + 1, : t + 1])[:, -1] / temp
+        seq = torch.cat([seq, torch.multinomial(F.softmax(logits, -1), 1)], 1)
+    return seq[:, 1:], L
+
+
+# Masked (absorbing-state) diffusion baseline in the style of MDLM.
+mdlm = Backbone(Vv + 1, Vv, L).to(dev)
+
+
+def mdlm_loss(x):
+    t = torch.rand(x.shape[0], 1, device=dev).clamp(min=1e-3)
+    masked = torch.rand(x.shape, device=dev) < t
+    logits = mdlm(torch.where(masked, MASK, x))
+    ce = F.cross_entropy(logits.transpose(1, 2), x, reduction="none")
+    return (ce * masked).sum() / masked.sum().clamp(min=1)
+
+
+@torch.no_grad()
+def mdlm_sample(n, steps, temp=1.0):
+    x = torch.full((n, L), MASK, device=dev)
+    ts = torch.linspace(1, 0, steps + 1, device=dev)
+    for t, s in zip(ts[:-1], ts[1:]):
+        probs = F.softmax(mdlm(x) / temp, -1)
+        draw = torch.multinomial(probs.reshape(-1, Vv), 1).reshape(n, L)
+        reveal = (x == MASK) & (torch.rand(n, L, device=dev) < (t - s) / t)
+        x = torch.where(reveal, draw, x)
+    return x, steps
+
+
+train(ar, ar_loss, 1000, label="autoregressive")
+train(mdlm, mdlm_loss, 3000, label="masked diffusion")
+ar.eval()
+mdlm.eval()
+```
+
+### Quality against sequential compute {#sec-710-toy-comparison}
+
+Each model draws 1,000 samples at temperature 1.0 and 0.7. We record the number of sequential forward passes (NFE), the fraction of samples that are grammatical, the fraction that are distinct (to catch a model that memorizes or collapses), and wall-clock milliseconds per sample on the GPU.
+
+```{python}
+#| label: fig-710-quality-nfe
+#| fig-cap: "Grammaticality against sequential forward passes on the toy grammar. Masked diffusion trades quality for steps along a curve; the coarse-to-fine generator sits above that curve at six passes; the autoregressive model is near perfect at 32 passes."
+#| code-fold: false
+N = 1000
+results = []
+
+
+def evaluate(method, fn, **meta):
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.time()
+    x, nfe = fn()
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    x = x.cpu().numpy()
+    results.append(dict(method=method, NFE=nfe, **meta,
+                        grammatical=np.mean([is_valid(s) for s in x]),
+                        distinct=len({tuple(s) for s in x}) / len(x),
+                        ms_per_seq=1000 * (time.time() - t0) / len(x)))
+
+
+torch.manual_seed(1)
+for temp in (1.0, 0.7):
+    evaluate("autoregressive", lambda: ar_sample(N, temp), temp=temp)
+    for steps in (4, 8, 16, 32, 64):
+        evaluate("masked diffusion", lambda: mdlm_sample(N, steps, temp), temp=temp)
+    evaluate("NCM", lambda: ncm_sample(N, temp), temp=temp)
+res = pd.DataFrame(results)
+print(res.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
+fig, ax = plt.subplots(figsize=(7, 4.2))
+for (method, temp), g in res.groupby(["method", "temp"]):
+    style = "-o" if method == "masked diffusion" else ("s" if method == "NCM" else "^")
+    ax.plot(g.NFE, g.grammatical, style, ms=8, alpha=1.0 if temp == 1.0 else 0.55,
+            label=f"{method}, T={temp}")
+ax.set_xscale("log", base=2)
+ax.set_xlabel("sequential forward passes (NFE, log scale)")
+ax.set_ylabel("fraction of samples that are grammatical")
+ax.set_title("Quality versus sequential compute on the toy grammar")
+ax.grid(alpha=0.3)
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+Three things stand out. First, the masked diffusion model traces exactly the curve that @sec-710-dlm-costs predicts: with four steps almost nothing it writes is grammatical, and quality climbs steadily as steps are added, because each additional step shrinks the set of positions revealed together and so the total correlation it ignores. Second, the coarse-to-fine generator at six sequential passes is more than twice as often grammatical as masked diffusion at eight passes, and about as good as masked diffusion at sixteen passes (better at temperature 0.7), while taking roughly half the time per sample. That is the shape of the claim in @kumbong2026nextconcept, matched quality at a fraction of the sequential compute, reproduced in miniature. Given 32 or 64 steps, masked diffusion overtakes the six-pass generator, so the advantage is one of speed at a quality level, not of a higher ceiling. Third, neither parallel method reaches the autoregressive model, which is essentially perfect at 32 passes. On this grammar the dependency budget of @eq-710-schedule-kl is real, and only the chain rule pays it in full. Lowering the temperature helps every method, because it concentrates each independent draw on its most likely value and so reduces the chance that independently sampled positions disagree. It does so at a cost in diversity that our tiny vocabulary cannot show, since every sample remains distinct.
+
+Treat these numbers as an illustration, not a benchmark. The models are tiny, the training budgets are a few minutes each (the generator and the diffusion model both get 3,000 steps, the autoregressive model only 1,000 and still wins), and GPU timings at this scale are dominated by kernel launch overhead.
+
+### Where the remaining errors come from {#sec-710-diagnosis}
+
+@eq-710-ncm-factor predicts that NCM's errors come from total correlation left *within* levels. We can locate it. Take held-out sequences, give the generator the true codes for the first $j$ levels, and let it sample only the remaining $K - j$ levels.
+
+```{python}
+#| label: code-710-diagnosis
+#| code-fold: false
+torch.manual_seed(2)
+diag = []
+for j in range(K):
+    x, nfe = ncm_sample(N, prefix=codes_te[:j])
+    diag.append((j, K - j, np.mean([is_valid(s) for s in x.cpu().numpy()])))
+diag = pd.DataFrame(diag, columns=["true levels given", "levels sampled", "grammatical"])
+print(diag.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+```
+
+The pattern matches the theory. Supplying the coarsest levels changes little, because they are cheap to get right: a level with one or two codes has almost no internal dependence to ignore. The gains arrive when the true codes of the fine levels are supplied, and the largest single jump, from about 66% to about 90%, comes from giving the sixteen codes of level five. With every level except the finest given, about one sample in ten is still ungrammatical, and that residue is the total correlation among the 32 finest codes given everything coarser, $\mathrm{TC}(C_K \mid C_{<K})$, which our toy tokenizer did not drive to zero. A better tokenizer would push more of the sequence's dependence into the coarse levels, which is where the engineering effort of a method like NCM has to go.
+
+## A Cost Model {#sec-710-cost}
+
+Reported speedups compare wall-clock time, which mixes three different costs. For a sequence of length $L$, count **sequential passes** (latency on an idle accelerator), **token work** (the number of token positions pushed through the dense layers, proportional to FLOPs in the feed-forward and projection layers) and **attention pairs** (query-key products).
+
+* An autoregressive model with a KV cache runs $L$ passes, processes each token once, and computes $\sum_{t=1}^{L} t = L(L+1)/2$ attention pairs.
+* A masked diffusion model with $S$ steps runs $S$ passes over all $L$ positions, so its token work is $SL$ and its attention is $SL^2$.
+* A coarse-to-fine model with levels $n_1, \dots, n_K$ runs $K$ passes. With a cache across levels, level $k$ processes only its own $n_k$ new positions, which attend to all $N_k = \sum_{j \le k} n_j$ positions so far, so token work is $N_K$ and attention is $\sum_k n_k N_k$.
+
+The cell evaluates these counts for $L = 1024$ and an illustrative dyadic schedule of eleven levels. The paper's own level schedule is set in its configuration files, so the exact numbers for the released models will differ.
+
+```{python}
+#| label: code-710-cost
+#| code-fold: false
+import numpy as np
+import pandas as pd
+
+Lseq = 1024
+scales = [2 ** k for k in range(11)]            # 1, 2, 4, ..., 1024: an illustrative schedule
+cum = np.cumsum(scales)
+
+
+def row(name, passes, tokens, attn):
+    return dict(method=name, sequential_passes=passes,
+                token_forwards=tokens, attention_pairs=attn)
+
+
+rows = [row("autoregressive, KV cache", Lseq, Lseq, Lseq * (Lseq + 1) // 2)]
+for S in (64, 256, 1024):
+    rows.append(row(f"masked diffusion, S={S}", S, S * Lseq, S * Lseq ** 2))
+rows.append(row("coarse-to-fine, KV cache", len(scales), int(cum[-1]),
+                int(sum(n * c for n, c in zip(scales, cum)))))
+rows.append(row("coarse-to-fine, recompute", len(scales), int(cum.sum()),
+                int(sum(c * c for c in cum))))
+cost = pd.DataFrame(rows)
+base = cost.iloc[0]
+cost["passes vs AR"] = cost.sequential_passes / base.sequential_passes
+cost["token work vs AR"] = cost.token_forwards / base.token_forwards
+cost["attention vs AR"] = cost.attention_pairs / base.attention_pairs
+print(cost.to_string(index=False, float_format=lambda v: f"{v:.3g}"))
+```
+
+The table separates the claims cleanly. Against diffusion, the coarse-to-fine model wins on all three axes at once: it needs about 23 times fewer passes than a 256-step sampler, about 128 times less token work, and about 96 times fewer attention pairs. That is consistent with the 10 to 31 times wall-clock speedups that @kumbong2026nextconcept report over diffusion baselines. Against a KV-cached autoregressive model the picture changes. Sequential passes fall by about 93 times, but token work roughly doubles and attention grows about five times, because the finest level attends over every coarser code. On an idle GPU serving one request, latency is set by passes and the coarse-to-fine model should win easily. In a saturated server that batches many requests, throughput is set by total work, and the advantage shrinks or reverses. Speculative decoding (@sec-speculative-decoding) attacks the same depth problem from the autoregressive side without changing the output distribution [@leviathan2023fast], and the abstract reports no comparison against it.
+
+## Reported Results {#sec-710-reported}
+
+The numbers below are **reported by the authors** in the abstract and repository of @kumbong2026nextconcept. They have not been reproduced for this book, and the paper had not been peer reviewed at the time of writing.
+
+| Benchmark | Task | Metric | Reported outcome versus the strongest diffusion baseline | Reported speed |
+|---|---|---|---|---|
+| LM1B | unconditional text | generative perplexity | better at matched parameter scale | 21 times faster |
+| OpenWebText | unconditional text | generative perplexity | competitive | 10 times faster |
+| XSum | summarization | ROUGE-L | matches | 31 times faster |
+| Sudoku | constraint reasoning | solved rate | beats autoregressive and diffusion baselines at all difficulty levels | fewer function evaluations |
+
+: Results as reported by @kumbong2026nextconcept. The repository also ships evaluation configurations for TinyStories and WMT14 German to English, without numbers in the README. {#tbl-710-reported}
+
+Two cautions apply to reading the table.
+
+**Generative perplexity is easy to game.** It scores samples under a separate, larger language model (GPT-2 Large in this release). A sampler that produces low-entropy, repetitive text scores *better*, and @zheng2025masked showed that reported gains of masked diffusion models were partly an artifact of reduced token diversity caused by low-precision categorical sampling. The release reports unigram entropy alongside generative perplexity over five seeds of 256 unconditional samples, which is the right control: read the two together, never perplexity alone.
+
+**The baselines are diffusion models.** The headline speedups compare against the strongest diffusion language model at matched scale, not against a production autoregressive stack with a KV cache, continuous batching and speculative decoding. The cost model of @sec-710-cost suggests that comparison would look very different, and it has not been made.
+
+## Running the Official Release {#sec-710-official}
+
+The code is MIT licensed and published on GitHub as `HazyResearch/ncm`, with checkpoints and preprocessed data on the Hugging Face Hub. At the time of writing the repository contains evaluation code and released checkpoints but **no training code**. The commands below follow the repository README. They are shown, not executed in this book, for three reasons: the downloads are large (the LM1B generators alone are about 0.39 GB, 1.27 GB and 2.9 GB for the small, medium and large models, and the LM1B training data file is about 1.8 GB), scoring needs a separate GPT-2 Large model, and loading third-party pickled PyTorch checkpoints can execute code embedded in the file, which belongs in a sandbox you control.
+
+```bash
+# requires a CUDA GPU and Python 3.10+; run inside an isolated environment
+git clone https://github.com/HazyResearch/ncm
+cd ncm
+pip install -r requirements.txt
+
+# checkpoints and data from the Hugging Face Hub (several GB in total)
+hf download hazyresearch/ncm-checkpoints --local-dir artifacts
+hf download hazyresearch/ncm-datasets --repo-type dataset --local-dir data
+
+# unconditional generation: generative perplexity and unigram entropy
+python evaluate.py --config config/eval/lm1b.yaml --checkpoint-dir artifacts/lm1b
+
+# conditional generation with classifier-free guidance
+python evaluate.py --config config/eval/xsum.yaml --checkpoint-dir artifacts/xsum \
+    --data-dir data/xsum --cfg 1.0
+
+# Sudoku at three difficulty levels
+python evaluate.py --config config/eval/sudoku.yaml --checkpoint-dir artifacts/sudoku \
+    --data-dir data/sudoku
+```
+
+The exact configuration file names per task and size are listed in the repository's `config/eval/` directory; check them against the README before running, since an early-stage research repository can change quickly.
+
+## Honest Limits {#sec-710-limits}
+
+**It is a preprint.** The paper appeared on arXiv on 9 October 2026 and had not been peer reviewed when this chapter was written. The results have not been independently reproduced.
+
+**No training code, no scaling law.** Without training code, nobody outside the authors can yet retrain the models, ablate the tokenizer, or test how quality scales with parameters and data. Autoregressive models earned their position through scaling laws (@sec-scaling-laws); NCM has not yet shown one.
+
+**The tokenizer is a ceiling.** Generation happens in code space, so output quality can never exceed what the tokenizer can reconstruct, and every error the tokenizer makes is baked into every sample. Our toy needed a nested-dropout device just to stop its coarse levels from collapsing, which hints at how much of the method's quality lives in tokenizer engineering.
+
+**Within-level independence is an assumption, not a theorem.** @eq-710-schedule-kl gives the exact price of that assumption. On a Markov chain with a dyadic schedule the price is zero; on text it is whatever total correlation the learned levels leave behind, and the diagnosis in @sec-710-diagnosis shows it concentrating at the finest level.
+
+**"Concept" is a name, not a property.** The coarse codes are whatever the quantizer finds useful for reconstruction. They may line up with topic or sentence structure, as our toy grammar encourages, or they may not; the method does not require or guarantee interpretable concepts, unlike the sentence-embedding concepts of @barrault2024large.
+
+**Length and editing.** A fixed hierarchy of $n_1, \dots, n_K$ codes implies a maximum sequence length chosen in advance, and coarse-to-fine generation does not obviously support streaming the first words to a user while the rest is computed, which is something autoregressive models do for free.
+
+## Conclusion {#sec-710-conclusion}
+
+The cost of sampling several positions in one forward pass is exactly their total correlation given what is already known, and the error of any parallel schedule is the sum of those total correlations over its steps (@eq-710-schedule-kl). Autoregressive decoding avoids the cost by paying in depth; diffusion language models pay it at every step with a random order and so need many steps; coarse-to-fine models try to choose an order in which the fine details are nearly independent once the coarse structure is fixed. Next-Concept Modeling realizes that bet for text with a multiscale residual vector-quantized tokenizer, whose pooling, nearest-neighbour and repetition operators are jointly optimal for piecewise-constant corrections (@eq-710-pool-decomp), and a block-causal transformer that predicts each level of codes in one pass. On a toy grammar, a few minutes of GPU training reproduced the qualitative claim: at six sequential passes the coarse-to-fine model matched a masked diffusion model running sixteen and more than doubled one running eight, while remaining well short of an autoregressive model at thirty-two. The reported 10 to 31 times speedups are speedups over diffusion models, and the cost model shows why they should not be read as speedups over a cached autoregressive server. Whether concept-level parallel generation becomes the next default or stays a fast niche depends on the things a two-week-old preprint cannot yet show: training code, scaling behaviour, and a head-to-head against the best autoregressive serving stacks.
+
+## Exercises {#sec-710-exercises}
+
+1. Prove @eq-710-schedule-kl for $K = 2$ directly from the definitions, without invoking the general chain rule.
+2. For the sticky Markov chain, show that $I(X_0; X_d) = \log V - h(d)$ decays geometrically in $d$ for large $d$, and find the rate in terms of $\lambda$ and $V$.
+3. Modify the dyadic schedule to start from three evenly spaced positions instead of two endpoints. Compute its KL with the code in this chapter and explain the change.
+4. Replace the first-order chain with a second-order chain, in which $X_t$ depends on $X_{t-1}$ and $X_{t-2}$. Which terms of the dyadic schedule are no longer zero, and why?
+5. Remove nested level dropout from the toy tokenizer and retrain. Report the number of codes used per level and the generator's grammaticality, and relate the result to @eq-710-pool-decomp.
+6. Add confidence-ordered unmasking in the style of Mask-Predict to the masked diffusion baseline. How much does it close the gap to the coarse-to-fine model at eight steps?
+7. Extend the cost model with a speculative decoding row that accepts on average $a$ tokens per target pass, and find the value of $a$ at which it matches the coarse-to-fine model on sequential passes for $L = 1024$.
+
+## References {#sec-710-references}
+
+1. van den Oord, A. et al. "Neural Discrete Representation Learning." Advances in Neural Information Processing Systems 30, 2017. https://doi.org/10.48550/arXiv.1711.00937
+2. Zeghidour, N. et al. "SoundStream: An End-to-End Neural Audio Codec." IEEE/ACM Transactions on Audio, Speech, and Language Processing 30, 495-507, 2022. https://doi.org/10.1109/TASLP.2021.3129994
+3. Lee, D. et al. "Autoregressive Image Generation using Residual Quantization." IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022. https://doi.org/10.1109/CVPR52688.2022.01123
+4. Tian, K. et al. "Visual Autoregressive Modeling: Scalable Image Generation via Next-Scale Prediction." Advances in Neural Information Processing Systems 37, 2024. https://doi.org/10.52202/079017-2694
+5. Gu, J. et al. "Non-Autoregressive Neural Machine Translation." International Conference on Learning Representations (ICLR), 2018. https://doi.org/10.48550/arXiv.1711.02281
+6. Ghazvininejad, M. et al. "Mask-Predict: Parallel Decoding of Conditional Masked Language Models." Proceedings of EMNLP-IJCNLP, 2019. https://doi.org/10.18653/v1/D19-1633
+7. Austin, J. et al. "Structured Denoising Diffusion Models in Discrete State-Spaces." Advances in Neural Information Processing Systems 34, 2021. https://doi.org/10.48550/arXiv.2107.03006
+8. Sahoo, S. S. et al. "Simple and Effective Masked Diffusion Language Models." Advances in Neural Information Processing Systems 37, 2024. https://doi.org/10.52202/079017-4135
+9. Lou, A., Meng, C. and Ermon, S. "Discrete Diffusion Modeling by Estimating the Ratios of the Data Distribution." Proceedings of the 41st International Conference on Machine Learning (ICML), PMLR 235, 2024. https://doi.org/10.48550/arXiv.2310.16834
+10. Nie, S. et al. "Large Language Diffusion Models." Advances in Neural Information Processing Systems 38, 2025. https://doi.org/10.52202/085713-1689
+11. LCM team, Barrault, L. et al. "Large Concept Models: Language Modeling in a Sentence Representation Space." arXiv preprint, 2024. https://doi.org/10.48550/arXiv.2412.08821
+12. Ho, J. and Salimans, T. "Classifier-Free Diffusion Guidance." arXiv preprint, 2022. https://doi.org/10.48550/arXiv.2207.12598
+13. Leviathan, Y., Kalman, M. and Matias, Y. "Fast Inference from Transformers via Speculative Decoding." Proceedings of the 40th International Conference on Machine Learning (ICML), PMLR 202, 2023. https://doi.org/10.48550/arXiv.2211.17192
+14. Kumbong, H. et al. "Next-Concept Modeling: Fast, Parallel Coarse-to-Fine Text Generation." arXiv preprint, 2026. https://doi.org/10.48550/arXiv.2610.14162
+15. Bengio, Y., Leonard, N. and Courville, A. "Estimating or Propagating Gradients Through Stochastic Neurons for Conditional Computation." arXiv preprint, 2013. https://doi.org/10.48550/arXiv.1308.3432
+16. Watanabe, S. "Information Theoretical Analysis of Multivariate Correlation." IBM Journal of Research and Development 4(1), 66-82, 1960. https://doi.org/10.1147/rd.41.0066
+17. Cover, T. M. and Thomas, J. A. "Elements of Information Theory." 2nd ed., Wiley-Interscience, 2006. https://doi.org/10.1002/047174882X
+18. Chang, H. et al. "MaskGIT: Masked Generative Image Transformer." IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022. https://doi.org/10.1109/CVPR52688.2022.01103
+19. Gray, R. M. "Vector Quantization." IEEE ASSP Magazine 1(2), 4-29, 1984. https://doi.org/10.1109/MASSP.1984.1162229
+20. Zheng, K. et al. "Masked Diffusion Models are Secretly Time-Agnostic Masked Models and Exploit Inaccurate Categorical Sampling." International Conference on Learning Representations (ICLR), 2025. https://doi.org/10.48550/arXiv.2409.02908
+21. Vaswani, A. et al. "Attention Is All You Need." Advances in Neural Information Processing Systems 30, 2017. https://doi.org/10.48550/arXiv.1706.03762
