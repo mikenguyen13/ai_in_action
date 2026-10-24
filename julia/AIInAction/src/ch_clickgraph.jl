@@ -12,8 +12,9 @@ numeric function is ported.
   `upstream_neighbors`.
 * Scaling and burstiness: `robust_median_scale`, `burstiness`, `neighbor_burstiness`,
   `ema_last`, `burst_forecast`.
-* Embeddings: `lstm_embed` (time series to vector) and `attention_neighbor_embedding`
-  (one-head graph transformer layer with an edge term).
+* Embeddings: `lstm_embed` (time series to vector), the alternative encoders `rnn_embed`
+  (Elman RNN) and `gru_embed` (GRU, PyTorch and cuDNN convention), and
+  `attention_neighbor_embedding` (one-head graph transformer layer with an edge term).
 * Forecast assembly and loss: `gated_forecast`, `pinball_loss`, `total_quantile_loss`,
   `weighted_quantile_loss`, `interval_coverage`.
 
@@ -25,7 +26,8 @@ module ChClickgraph
 
 export RobustScaled, robust_median_scale, burstiness, session_graph, average_graph,
     normalize_edge_weights, upstream_neighbors, neighbor_burstiness, ema_last,
-    burst_forecast, softmax, sigmoid, det_matrix, lstm_embed, attention_neighbor_embedding,
+    burst_forecast, softmax, sigmoid, det_matrix, lstm_embed, rnn_embed, gru_embed,
+    attention_neighbor_embedding,
     gated_forecast, pinball_loss, total_quantile_loss, weighted_quantile_loss,
     interval_coverage
 
@@ -188,6 +190,56 @@ function lstm_embed(x_seq::AbstractMatrix{<:Real}, W::AbstractMatrix{<:Real}, b:
         o = sigmoid.(z[3H+1:4H])
         c = f .* c .+ i .* gg
         h = o .* tanh.(c)
+    end
+    return h
+end
+
+"""
+    rnn_embed(x_seq, W, b)
+
+Final hidden state of a single-layer Elman RNN `h_t = tanh(W [x_t; h_(t-1)] + b)`. `x_seq` is
+`(T, d)`, `W` is `(H, d + H)` and `b` has length `H`. The initial state is zero.
+"""
+function rnn_embed(x_seq::AbstractMatrix{<:Real}, W::AbstractMatrix{<:Real}, b::AbstractVector{<:Real})
+    T, d = size(x_seq)
+    T > 0 || throw(ArgumentError("x_seq must be non-empty"))
+    H = size(W, 1)
+    (H > 0 && size(W) == (H, d + H) && length(b) == H) ||
+        throw(ArgumentError("W must be (H, d+H) and b must be (H,)"))
+    h = zeros(H)
+    for t in 1:T
+        h = tanh.(W * vcat(Float64.(x_seq[t, :]), h) .+ b)
+    end
+    return h
+end
+
+"""
+    gru_embed(x_seq, W, b_ih, b_hh)
+
+Final hidden state of a single-layer GRU in the PyTorch and cuDNN convention. `W` is
+`(3H, d + H)`: the first `d` columns act on `x_t`, the last `H` on `h_(t-1)`, with gate
+blocks reset, update, candidate. With `a = W[:, 1:d] x_t + b_ih` and
+`u = W[:, d+1:end] h_(t-1) + b_hh`: `r = σ(a_r + u_r)`, `z = σ(a_z + u_z)`,
+`n = tanh(a_n + r .* u_n)`, `h_t = (1 - z) .* n + z .* h_(t-1)`. The candidate parts of the
+two biases are not interchangeable because the reset gate multiplies `u_n`. The initial
+state is zero.
+"""
+function gru_embed(x_seq::AbstractMatrix{<:Real}, W::AbstractMatrix{<:Real},
+                   b_ih::AbstractVector{<:Real}, b_hh::AbstractVector{<:Real})
+    T, d = size(x_seq)
+    T > 0 || throw(ArgumentError("x_seq must be non-empty"))
+    H = size(W, 1) ÷ 3
+    (H > 0 && size(W) == (3H, d + H) && length(b_ih) == 3H && length(b_hh) == 3H) ||
+        throw(ArgumentError("W must be (3H, d+H) and b_ih, b_hh must be (3H,)"))
+    Wx, Wh = W[:, 1:d], W[:, d+1:end]
+    h = zeros(H)
+    for t in 1:T
+        a = Wx * Float64.(x_seq[t, :]) .+ b_ih
+        u = Wh * h .+ b_hh
+        r = sigmoid.(a[1:H] .+ u[1:H])
+        z = sigmoid.(a[H+1:2H] .+ u[H+1:2H])
+        n = tanh.(a[2H+1:3H] .+ r .* u[2H+1:3H])
+        h = (1 .- z) .* n .+ z .* h
     end
     return h
 end

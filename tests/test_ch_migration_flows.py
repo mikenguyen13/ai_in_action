@@ -62,6 +62,17 @@ ENSEMBLE_SAMPLES = [[1.0, 2.0], [2.0, 4.0], [4.0, 5.0], [5.0, 9.0]]
 ENSEMBLE_MEAN = [3.0, 5.0]
 ENSEMBLE_STD = [1.8257418583505538, 2.943920288775949]
 
+GATED_Z = [0.5, -0.2, 0.0, 1.5]
+GATED_AC = [0.3, -1.0, 2.0, 0.0]
+GATED_AG = [0.0, 2.0, -1.0, 3.0]
+GATED_NEXT = [0.39565630622579545, -0.266943664380472, 0.7047606324503499, 1.42886119023365]
+GATED_DZ = [0.5, 0.8807970779778823, 0.2689414213699951, 0.9525741268224334]
+GATED_DAC = [0.4575684809133146, 0.05006216869470697, 0.051649891596191815, 0.047425873177566635]
+GATED_DAG = [0.052171846887102274, 0.058963783975451815, -0.18953932621681382, 0.067764989596368]
+CARRY_BIRTH = [0.012, 0.01]
+CARRY_MORT = [0.01, 0.008]
+CARRY = [[1.002, 0.0, 0.012, 0.0], [0.0, 0.992, 0.0, 0.0], [0.0, 0.0, 0.99, 0.0], [0.0, 0.01, 0.0, 1.002]]
+
 
 def close(a, b, tol=1e-12):
     np.testing.assert_allclose(np.asarray(a, dtype=float), np.asarray(b, dtype=float), rtol=tol, atol=tol)
@@ -206,6 +217,55 @@ def test_baseline_gravity_metrics():
         m.ensemble_mean_std([[1.0, 2.0]])
 
 
+def test_gated_latent_update_fixture_and_partials():
+    close(m.gated_latent_update(GATED_Z, GATED_AC, GATED_AG), GATED_NEXT)
+    g, dc, dg = m.gated_latent_partials(GATED_Z, GATED_AC, GATED_AG)
+    close(g, GATED_DZ)
+    close(dc, GATED_DAC)
+    close(dg, GATED_DAG)
+    # the partials are the derivatives of the update, checked by central differences
+    z, ac, ag = (np.array(v) for v in (GATED_Z, GATED_AC, GATED_AG))
+    h = 1e-6
+    f = m.gated_latent_update
+    close((f(z + h, ac, ag) - f(z - h, ac, ag)) / (2 * h), g, 1e-8)
+    close((f(z, ac + h, ag) - f(z, ac - h, ag)) / (2 * h), dc, 1e-8)
+    close((f(z, ac, ag + h) - f(z, ac, ag - h)) / (2 * h), dg, 1e-8)
+    # a convex combination of a state in (-1, 1) and a tanh candidate stays in (-1, 1)
+    zs = np.array([0.99, -0.99, 0.0])
+    assert np.all(np.abs(f(zs, [50.0, -50.0, 3.0], [-3.0, 0.0, 4.0])) < 1.0)
+    # a saturated gate keeps the old state, a closed gate takes the candidate
+    close(f(z, ac, np.full(4, 40.0)), z, 1e-12)
+    close(f(z, ac, np.full(4, -40.0)), np.tanh(ac), 1e-12)
+    with pytest.raises(ValueError):
+        f([0.1, 0.2], [0.1], [0.1, 0.2])
+    with pytest.raises(ValueError):
+        f([0.1], [float("nan")], [0.0])
+
+
+def test_stock_carry_jacobian_fixture_and_linearity():
+    a = m.stock_carry_jacobian(CARRY_BIRTH, CARRY_MORT)
+    close(a, CARRY)
+    eig = np.sort(np.linalg.eigvals(a).real)
+    b, mu = np.array(CARRY_BIRTH), np.array(CARRY_MORT)
+    close(eig, np.sort(np.concatenate([1 - mu, 1 - mu + b])), 1e-12)
+    # stock_step with births b_j * colsum is affine in S: differences map through A
+    t = np.zeros((3, 3, 3))
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                if j != k:
+                    t[i, j, k] = 0.1 * (i + 1) * (j + 2) * (k + 1)
+    br = np.array([0.012, 0.01, 0.015])
+    s1, s2 = np.array(STOCK), np.array(STOCK_NEXT)
+    step = lambda s: m.stock_step(s, br * s.sum(axis=0), MORT, t)  # noqa: E731
+    a3 = m.stock_carry_jacobian(br, MORT)
+    close((step(s1) - step(s2)).ravel(), a3 @ (s1 - s2).ravel(), 1e-12)
+    with pytest.raises(ValueError):
+        m.stock_carry_jacobian([0.01, 0.02], [0.01])
+    with pytest.raises(ValueError):
+        m.stock_carry_jacobian([0.01], [1.5])
+
+
 # ---------------------------------------------------------------------------
 # Python-only: the synthetic world, the observations, and the recurrent model
 # ---------------------------------------------------------------------------
@@ -258,3 +318,26 @@ def test_train_ensemble_smoke():
     assert set(rep) == {"observed corridors", "unobserved corridors"}
     el = m.feature_elasticity(w, res, years=(2,))
     assert set(el) == {"origin", "destination"}
+
+
+def test_gated_cell_matches_numpy_update_and_trains():
+    torch = pytest.importorskip("torch")
+    cfg = m.TrainConfig(latent=3, hidden=6, layers=2, gate_bias=1.5, cell="gated")
+    torch.manual_seed(0)
+    net = m._make_gated_net(torch, 5 + cfg.latent, cfg)
+    assert torch.allclose(net.head.bias[1 + cfg.latent :], torch.full((cfg.latent,), 1.5))
+    x = torch.randn(7, 5 + cfg.latent, dtype=torch.float32)
+    with torch.no_grad():
+        out = net(x)
+        a_u, a_c, a_g = net.heads(x)
+    z_np = m.gated_latent_update(x[:, -cfg.latent :].numpy(), a_c.numpy(), a_g.numpy())
+    np.testing.assert_allclose(out[:, 1:].numpy(), z_np, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(out[:, 0].numpy(), torch.nn.functional.celu(a_u[:, 0], 8.0).numpy(), rtol=1e-6)
+    w = m.make_world(seed=0)
+    obs = m.observe(w, seed=1)
+    small = m.TrainConfig(epochs=3, members=2, pushforward_draws=2, latent=4, hidden=8, layers=2, cell="gated")
+    res = m.train_ensemble(w, obs, small)
+    assert res["samples"].shape == (4, w.years, w.n, w.n, w.n)
+    assert np.all(np.isfinite(res["samples"])) and np.all(res["samples"] >= 0)
+    with pytest.raises(ValueError):
+        m.train_ensemble(w, obs, m.TrainConfig(epochs=1, members=1, cell="lstm"))

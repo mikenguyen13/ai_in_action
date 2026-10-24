@@ -17,6 +17,9 @@ and the training loop are Python only; every numeric function is ported.
   `fit_yj_lambda`, `elasticity_chain`.
 * Balancing: `ipf` and `demographic_balance`, then `uncertainty_weights`.
 * Loss and calibration: `weighted_l2`, `survival_fraction`, `calibrate_offset`.
+* Recurrence: `stock_carry_jacobian` (the fixed additive carry of the accounting
+  step), and `gated_latent_update` with `gated_latent_partials` (the GRU-style convex
+  latent update of the gated ablation and its local derivatives).
 * Baseline and metrics: `stock_difference_baseline`, `gravity_log_rate`, `log_rmse`,
   `pearson`, `coverage`, `ensemble_mean_std`.
 
@@ -28,7 +31,7 @@ export yj_sym, yj_sym_inv, yj_sym_deriv, yj_profile_loglik, fit_yj_lambda,
     elasticity_chain, stock_step, od_flows, net_migration, ipf, demographic_balance,
     uncertainty_weights, weighted_l2, survival_fraction, calibrate_offset,
     stock_difference_baseline, gravity_log_rate, log_rmse, pearson, coverage,
-    ensemble_mean_std
+    ensemble_mean_std, stock_carry_jacobian, gated_latent_update, gated_latent_partials
 
 # --------------------------------------------------------------------------
 # Validation helpers
@@ -196,6 +199,70 @@ function stock_difference_baseline(s_prev::AbstractMatrix{<:Real},
         out[i, i] = 0.0
     end
     return out
+end
+
+"""
+    stock_carry_jacobian(birth_rate, mortality)
+
+Jacobian of one accounting step with respect to the stock table, flows held fixed, with
+births `B_j = b_j sum_i S_ij`. Rows and columns index stock cells in row-major order,
+`(i - 1) n + j` (the same layout as the Python and Rust versions), and
+`A[(i,j), (i',j')] = delta_ii' delta_jj' (1 - mu_j) + delta_ij delta_jj' b_j`.
+"""
+function stock_carry_jacobian(birth_rate::AbstractVector{<:Real}, mortality::AbstractVector{<:Real})
+    n = length(birth_rate)
+    (n >= 1 && length(mortality) == n) ||
+        throw(ArgumentError("birth_rate and mortality must be non-empty and of equal length"))
+    _check_finite("birth_rate", birth_rate)
+    _check_finite("mortality", mortality)
+    (any(<(0), birth_rate) || any(<(0), mortality) || any(>(1), mortality)) &&
+        throw(ArgumentError("birth_rate must be non-negative and mortality in [0, 1]"))
+    idx(i, j) = (i - 1) * n + j
+    a = zeros(Float64, n * n, n * n)
+    for i in 1:n, j in 1:n
+        a[idx(i, j), idx(i, j)] = 1.0 - mortality[j]
+    end
+    for j in 1:n, i2 in 1:n
+        a[idx(j, j), idx(i2, j)] += birth_rate[j]
+    end
+    return a
+end
+
+_sigmoid(a::Real) = a >= 0 ? 1.0 / (1.0 + exp(-a)) : exp(a) / (1.0 + exp(a))
+
+function _check_gated(z, candidate_preact, gate_preact)
+    (size(z) == size(candidate_preact) == size(gate_preact)) ||
+        throw(ArgumentError("z, candidate_preact, gate_preact must have the same shape"))
+    _check_finite("z", z)
+    _check_finite("candidate_preact", candidate_preact)
+    _check_finite("gate_preact", gate_preact)
+    return nothing
+end
+
+"""
+    gated_latent_update(z, candidate_preact, gate_preact)
+
+GRU-style convex latent update `z' = g z + (1 - g) c` with `g = sigmoid(gate_preact)`
+and `c = tanh(candidate_preact)`, elementwise.
+"""
+function gated_latent_update(z::AbstractArray{<:Real}, candidate_preact::AbstractArray{<:Real},
+                             gate_preact::AbstractArray{<:Real})
+    _check_gated(z, candidate_preact, gate_preact)
+    g = _sigmoid.(gate_preact)
+    return g .* z .+ (1.0 .- g) .* tanh.(candidate_preact)
+end
+
+"""
+    gated_latent_partials(z, candidate_preact, gate_preact)
+
+Elementwise `(dz'/dz, dz'/da_c, dz'/da_g) = (g, (1 - g)(1 - c^2), g (1 - g)(z - c))`.
+"""
+function gated_latent_partials(z::AbstractArray{<:Real}, candidate_preact::AbstractArray{<:Real},
+                               gate_preact::AbstractArray{<:Real})
+    _check_gated(z, candidate_preact, gate_preact)
+    g = _sigmoid.(gate_preact)
+    c = tanh.(candidate_preact)
+    return g, (1.0 .- g) .* (1.0 .- c .^ 2), g .* (1.0 .- g) .* (z .- c)
 end
 
 # --------------------------------------------------------------------------

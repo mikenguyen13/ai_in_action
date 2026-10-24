@@ -17,6 +17,10 @@ This module contains the pieces of that pipeline:
   uncertainty per cell, which ``uncertainty_weights`` turns into loss weights.
 * **Loss and calibration.** ``weighted_l2`` and ``calibrate_offset`` (the closed-form
   initial-stock offset, with the non-negativity constraint).
+* **Recurrence.** ``stock_carry_jacobian`` is the Jacobian of one accounting step
+  with respect to the stocks (the fixed additive carry of the model), and
+  ``gated_latent_update`` with ``gated_latent_partials`` is the GRU-style convex
+  latent update used by the gated ablation, with its local derivatives.
 * **A synthetic world** (``make_world``) with gravity-style ground truth, a memory
   effect, and noisy partial observations, plus a **torch recurrent latent-state
   model** (``train_ensemble``) and recovery metrics. The torch section is Python only.
@@ -50,6 +54,9 @@ __all__ = [
     "survival_fraction",
     "calibrate_offset",
     "stock_difference_baseline",
+    "stock_carry_jacobian",
+    "gated_latent_update",
+    "gated_latent_partials",
     "gravity_log_rate",
     "log_rmse",
     "pearson",
@@ -239,6 +246,73 @@ def stock_difference_baseline(s_prev, s_next, interval: float) -> np.ndarray:
     out = np.maximum(b - a, 0.0) / float(interval)
     np.fill_diagonal(out, 0.0)
     return out
+
+
+def stock_carry_jacobian(birth_rate, mortality) -> np.ndarray:
+    """Jacobian of one accounting step with respect to the stock table, flows held fixed.
+
+    With births ``B_j = b_j sum_i S_ij`` (the rollout's convention), ``stock_step`` is
+    affine in the stocks, ``S(t+1) = A S(t) + R(T)``, and this returns the
+    ``(n * n, n * n)`` matrix ``A`` with rows and columns indexing the stock cells in
+    row-major order ``i * n + j``:
+    ``A[(i, j), (i', j')] = delta_ii' delta_jj' (1 - mu_j) + delta_ij delta_jj' b_j``.
+    Its eigenvalues are ``1 - mu_j`` (``n - 1`` times per country) and ``1 - mu_j + b_j``.
+    """
+    b = _finite_array("birth_rate", birth_rate, ndim=1)
+    mu = _finite_array("mortality", mortality, ndim=1)
+    n = b.size
+    if n < 1 or mu.shape != (n,):
+        raise ValueError("birth_rate and mortality must be non-empty and of equal length")
+    if np.any(b < 0) or np.any(mu < 0) or np.any(mu > 1):
+        raise ValueError("birth_rate must be non-negative and mortality in [0, 1]")
+    a = np.zeros((n * n, n * n))
+    for i in range(n):
+        for j in range(n):
+            a[i * n + j, i * n + j] = 1.0 - mu[j]
+    for j in range(n):
+        for i2 in range(n):  # native stock S_jj gains b_j times every cell of column j
+            a[j * n + j, i2 * n + j] += b[j]
+    return a
+
+
+def _sigmoid(a: np.ndarray) -> np.ndarray:
+    e = np.exp(-np.abs(a))
+    return np.where(a >= 0, 1.0 / (1.0 + e), e / (1.0 + e))
+
+
+def _gated_inputs(z, candidate_preact, gate_preact):
+    zz = _finite_array("z", z)
+    ac = _finite_array("candidate_preact", candidate_preact)
+    ag = _finite_array("gate_preact", gate_preact)
+    if not (zz.shape == ac.shape == ag.shape):
+        raise ValueError("z, candidate_preact, gate_preact must have the same shape")
+    return zz, ac, ag
+
+
+def gated_latent_update(z, candidate_preact, gate_preact) -> np.ndarray:
+    """GRU-style convex latent update ``z' = g z + (1 - g) c``.
+
+    ``g = sigmoid(gate_preact)`` is the update gate and ``c = tanh(candidate_preact)``
+    the candidate, coordinate by coordinate. The new state is a convex combination of
+    the old state and a candidate in ``(-1, 1)``, so it stays bounded, and the direct
+    term of ``d z' / d z`` is ``diag(g)`` (see ``gated_latent_partials``).
+    """
+    zz, ac, ag = _gated_inputs(z, candidate_preact, gate_preact)
+    g = _sigmoid(ag)
+    return g * zz + (1.0 - g) * np.tanh(ac)
+
+
+def gated_latent_partials(z, candidate_preact, gate_preact):
+    """Local derivatives of ``gated_latent_update``, elementwise.
+
+    Returns ``(dz'/dz, dz'/d a_c, dz'/d a_g) = (g, (1 - g)(1 - c^2), g (1 - g)(z - c))``.
+    The full Jacobian of a gated cell follows by the chain rule,
+    ``diag(g) + diag((1 - g)(1 - c^2)) da_c/dz + diag(g (1 - g)(z - c)) da_g/dz``.
+    """
+    zz, ac, ag = _gated_inputs(z, candidate_preact, gate_preact)
+    g = _sigmoid(ag)
+    c = np.tanh(ac)
+    return g, (1.0 - g) * (1.0 - c * c), g * (1.0 - g) * (zz - c)
 
 
 # --------------------------------------------------------------------------
@@ -659,6 +733,8 @@ class TrainConfig:
     use_memory: bool = True  # False zeroes the latent state every year (ablation)
     seed: int = 0
     threads: int = 4
+    cell: str = "elman"  # "elman": latent block of the MLP output; "gated": convex update
+    gate_bias: float = 0.0  # initial update-gate bias of the gated cell (sigmoid(0) = 0.5)
 
 
 def _import_torch():
@@ -705,6 +781,42 @@ def _make_net(torch, n_in: int, cfg: TrainConfig):
         width = cfg.hidden
     layers += [torch.nn.Linear(width, 1 + cfg.latent), torch.nn.CELU(alpha=cfg.celu_alpha)]
     return torch.nn.Sequential(*layers)
+
+
+def _make_gated_net(torch, n_in: int, cfg: TrainConfig):
+    """Same tanh trunk as ``_make_net``; the latent block is a GRU-style convex update.
+
+    The head maps the trunk to ``1 + 2 Z`` pre-activations: the log flow (through the
+    same CELU), the candidate ``a_c`` and the update gate ``a_g``. The input's last
+    ``Z`` columns are the current latent state, and the output's latent block is
+    ``gated_latent_update(z, a_c, a_g)``, so ``_rollout`` needs no change.
+    """
+    Z = cfg.latent
+
+    class GatedLatentNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            layers, width = [], n_in
+            for _ in range(cfg.layers):
+                layers += [torch.nn.Linear(width, cfg.hidden), torch.nn.Tanh()]
+                width = cfg.hidden
+            self.trunk = torch.nn.Sequential(*layers)
+            self.head = torch.nn.Linear(width, 1 + 2 * Z)
+            self.celu = torch.nn.CELU(alpha=cfg.celu_alpha)
+            with torch.no_grad():
+                self.head.bias[1 + Z :].fill_(cfg.gate_bias)
+
+        def heads(self, x):
+            a = self.head(self.trunk(x))
+            return a[:, :1], a[:, 1 : 1 + Z], a[:, 1 + Z :]
+
+        def forward(self, x):
+            a_u, a_c, a_g = self.heads(x)
+            g = torch.sigmoid(a_g)
+            z_next = g * x[:, -Z:] + (1.0 - g) * torch.tanh(a_c)
+            return torch.cat([self.celu(a_u), z_next], dim=1)
+
+    return GatedLatentNet()
 
 
 def _rollout(torch, net, static, stock0, world, cfg, norm, steps, edge, trace=None):
@@ -767,6 +879,9 @@ def train_ensemble(world: SyntheticWorld, obs: Observations, cfg: TrainConfig | 
     """
     torch = _import_torch()
     cfg = cfg or TrainConfig()
+    if cfg.cell not in ("elman", "gated"):
+        raise ValueError(f"cell must be 'elman' or 'gated', got {cfg.cell!r}")
+    make_net = _make_net if cfg.cell == "elman" else _make_gated_net
     torch.set_num_threads(cfg.threads)
     n, years = world.n, world.years
     edge, base = _build_inputs(world, cfg.lambda_input)
@@ -827,7 +942,7 @@ def train_ensemble(world: SyntheticWorld, obs: Observations, cfg: TrainConfig | 
     nets, losses, histories = [], [], []
     for m in range(cfg.members):
         torch.manual_seed(cfg.seed * 1000 + m)
-        net = _make_net(torch, n_in, cfg)
+        net = make_net(torch, n_in, cfg)
         opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
         s0 = torch.tensor(stock0_np, dtype=torch.float32)
