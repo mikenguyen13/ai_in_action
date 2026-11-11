@@ -1,4 +1,5 @@
 using Test
+using LinearAlgebra: eigvals
 using AIInAction.ChMigrationFlows
 
 # Shared fixtures: identical to the Python (tests/test_ch_migration_flows.py) and Rust
@@ -46,6 +47,17 @@ const MF_PEARSON = 0.9986517555689657
 const MF_ENSEMBLE = [1.0 2.0; 2.0 4.0; 4.0 5.0; 5.0 9.0]
 const MF_ENSEMBLE_MEAN = [3.0, 5.0]
 const MF_ENSEMBLE_STD = [1.8257418583505538, 2.943920288775949]
+
+const MF_GATED_Z = [0.5, -0.2, 0.0, 1.5]
+const MF_GATED_AC = [0.3, -1.0, 2.0, 0.0]
+const MF_GATED_AG = [0.0, 2.0, -1.0, 3.0]
+const MF_GATED_NEXT = [0.39565630622579545, -0.266943664380472, 0.7047606324503499, 1.42886119023365]
+const MF_GATED_DZ = [0.5, 0.8807970779778823, 0.2689414213699951, 0.9525741268224334]
+const MF_GATED_DAC = [0.4575684809133146, 0.05006216869470697, 0.051649891596191815, 0.047425873177566635]
+const MF_GATED_DAG = [0.052171846887102274, 0.058963783975451815, -0.18953932621681382, 0.067764989596368]
+const MF_CARRY_BIRTH = [0.012, 0.01]
+const MF_CARRY_MORT = [0.01, 0.008]
+const MF_CARRY = [1.002 0.0 0.012 0.0; 0.0 0.992 0.0 0.0; 0.0 0.0 0.99 0.0; 0.0 0.01 0.0 1.002]
 
 function mf_flows()
     t = zeros(3, 3, 3)
@@ -138,4 +150,35 @@ end
     @test m ≈ MF_ENSEMBLE_MEAN atol = 1e-12
     @test sd ≈ MF_ENSEMBLE_STD atol = 1e-12
     @test_throws ArgumentError ensemble_mean_std([1.0 2.0])
+end
+
+@testset "ChMigrationFlows recurrence" begin
+    z, ac, ag = MF_GATED_Z, MF_GATED_AC, MF_GATED_AG
+    @test gated_latent_update(z, ac, ag) ≈ MF_GATED_NEXT atol = 1e-12
+    g, dc, dg = gated_latent_partials(z, ac, ag)
+    @test g ≈ MF_GATED_DZ atol = 1e-12
+    @test dc ≈ MF_GATED_DAC atol = 1e-12
+    @test dg ≈ MF_GATED_DAG atol = 1e-12
+    h = 1e-6
+    f = gated_latent_update
+    @test (f(z .+ h, ac, ag) .- f(z .- h, ac, ag)) ./ (2h) ≈ g atol = 1e-8
+    @test (f(z, ac .+ h, ag) .- f(z, ac .- h, ag)) ./ (2h) ≈ dc atol = 1e-8
+    @test (f(z, ac, ag .+ h) .- f(z, ac, ag .- h)) ./ (2h) ≈ dg atol = 1e-8
+    @test all(abs.(f([0.99, -0.99, 0.0], [50.0, -50.0, 3.0], [-3.0, 0.0, 4.0])) .< 1.0)
+    @test f(z, ac, fill(40.0, 4)) ≈ z atol = 1e-12
+    @test f(z, ac, fill(-40.0, 4)) ≈ tanh.(ac) atol = 1e-12
+    @test_throws ArgumentError f([0.1, 0.2], [0.1], [0.1, 0.2])
+    @test_throws ArgumentError f([0.1], [NaN], [0.0])
+
+    a = stock_carry_jacobian(MF_CARRY_BIRTH, MF_CARRY_MORT)
+    @test a ≈ MF_CARRY atol = 1e-12
+    @test sort(real.(eigvals(a))) ≈ sort(vcat(1 .- MF_CARRY_MORT, 1 .- MF_CARRY_MORT .+ MF_CARRY_BIRTH)) atol = 1e-12
+    t = mf_flows()
+    br = [0.012, 0.01, 0.015]
+    step(s) = stock_step(s, br .* vec(sum(s, dims=1)), MF_MORT, t)
+    a3 = stock_carry_jacobian(br, MF_MORT)
+    rowmajor(m) = vec(permutedims(m))
+    @test rowmajor(step(MF_STOCK) .- step(MF_STOCK_NEXT)) ≈ a3 * rowmajor(MF_STOCK .- MF_STOCK_NEXT) atol = 1e-12
+    @test_throws ArgumentError stock_carry_jacobian([0.01, 0.02], [0.01])
+    @test_throws ArgumentError stock_carry_jacobian([0.01], [1.5])
 end

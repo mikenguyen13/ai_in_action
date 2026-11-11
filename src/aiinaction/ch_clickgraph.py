@@ -17,7 +17,9 @@ pieces so that they can be tested and ported:
   upstream neighbors of a node. ``ema_last`` and ``burst_forecast`` convert a network
   output in ``[-1, 1]`` (via ``tanh``) into a percentage deviation from the trend.
 * **Embeddings.** ``lstm_embed`` is a plain LSTM forward pass that maps a time series
-  to a fixed-size vector (a *time series embedding*). ``attention_neighbor_embedding``
+  to a fixed-size vector (a *time series embedding*). ``rnn_embed`` (Elman RNN) and
+  ``gru_embed`` (GRU in the PyTorch and cuDNN convention) are the alternative encoders
+  compared in the chapter. ``attention_neighbor_embedding``
   is a one-head graph transformer layer with an edge term: the softmax weights are a
   learned stand-in for conversion rates.
 * **Forecast assembly and loss.** ``gated_forecast`` adds a sigmoid-gated neighbor
@@ -53,6 +55,8 @@ __all__ = [
     "sigmoid",
     "det_matrix",
     "lstm_embed",
+    "rnn_embed",
+    "gru_embed",
     "attention_neighbor_embedding",
     "gated_forecast",
     "pinball_loss",
@@ -258,6 +262,67 @@ def lstm_embed(x_seq: np.ndarray, W: np.ndarray, b: np.ndarray) -> np.ndarray:
         o = sigmoid(z[3 * H :])
         c = f * c + i * g
         h = o * np.tanh(c)
+    return h
+
+
+def _check_seq(x_seq: np.ndarray) -> np.ndarray:
+    x_seq = np.asarray(x_seq, dtype=float)
+    if x_seq.ndim != 2 or x_seq.shape[0] == 0:
+        raise ValueError("x_seq must be a non-empty (T, d) array")
+    return x_seq
+
+
+def rnn_embed(x_seq: np.ndarray, W: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Final hidden state of a single-layer Elman RNN ``h_t = tanh(W [x_t; h_(t-1)] + b)``.
+
+    ``x_seq`` has shape ``(T, d)``; ``W`` has shape ``(H, d + H)`` acting on the
+    concatenation ``[x_t; h_(t-1)]``; ``b`` has length ``H``. The initial state is zero.
+    """
+    x_seq = _check_seq(x_seq)
+    W = np.asarray(W, dtype=float)
+    b = np.asarray(b, dtype=float)
+    d = x_seq.shape[1]
+    H = W.shape[0]
+    if W.shape != (H, d + H) or b.shape != (H,) or H == 0:
+        raise ValueError("W must be (H, d+H) and b must be (H,)")
+    h = np.zeros(H)
+    for x in x_seq:
+        h = np.tanh(W @ np.concatenate([x, h]) + b)
+    return h
+
+
+def gru_embed(x_seq: np.ndarray, W: np.ndarray, b_ih: np.ndarray, b_hh: np.ndarray) -> np.ndarray:
+    """Final hidden state of a single-layer GRU in the PyTorch and cuDNN convention.
+
+    ``x_seq`` has shape ``(T, d)``. ``W`` has shape ``(3H, d + H)``: its first ``d``
+    columns act on ``x_t`` and its last ``H`` columns on ``h_(t-1)``, with gate blocks
+    ordered reset, update, candidate. With ``a = W[:, :d] x_t + b_ih`` and
+    ``u = W[:, d:] h_(t-1) + b_hh`` split into those three blocks,
+
+    ``r = sigmoid(a_r + u_r)``, ``z = sigmoid(a_z + u_z)``, ``n = tanh(a_n + r * u_n)``,
+    ``h_t = (1 - z) * n + z * h_(t-1)``.
+
+    The reset gate multiplies the recurrent product *including* its bias, so the
+    candidate parts of ``b_ih`` and ``b_hh`` are not interchangeable and both are
+    needed (the reset and update parts only enter as a sum). The initial state is zero.
+    """
+    x_seq = _check_seq(x_seq)
+    W = np.asarray(W, dtype=float)
+    b_ih = np.asarray(b_ih, dtype=float)
+    b_hh = np.asarray(b_hh, dtype=float)
+    d = x_seq.shape[1]
+    H = W.shape[0] // 3
+    if H == 0 or W.shape != (3 * H, d + H) or b_ih.shape != (3 * H,) or b_hh.shape != (3 * H,):
+        raise ValueError("W must be (3H, d+H) and b_ih, b_hh must be (3H,)")
+    Wx, Wh = W[:, :d], W[:, d:]
+    h = np.zeros(H)
+    for x in x_seq:
+        a = Wx @ x + b_ih
+        u = Wh @ h + b_hh
+        r = sigmoid(a[:H] + u[:H])
+        z = sigmoid(a[H : 2 * H] + u[H : 2 * H])
+        n = np.tanh(a[2 * H :] + r * u[2 * H :])
+        h = (1.0 - z) * n + z * h
     return h
 
 

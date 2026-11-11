@@ -16,6 +16,9 @@
 //!   [`calibrate_offset`].
 //! * **Baseline and metrics.** [`stock_difference_baseline`], [`gravity_log_rate`],
 //!   [`log_rmse`], [`pearson`], [`coverage`], [`ensemble_mean_std`].
+//! * **Recurrence.** [`stock_carry_jacobian`] (the fixed additive carry of the
+//!   accounting step), and [`gated_latent_update`] with [`gated_latent_partials`] (the
+//!   GRU-style convex latent update of the gated ablation and its local derivatives).
 //!
 //! Storage: an `n x n` matrix is a flat row-major `&[f64]` (`m[i * n + j]`); the
 //! tensor `T[i, j, k]` is flat row-major `t[(i * n + j) * n + k]`. This is a std-only
@@ -213,6 +216,86 @@ pub fn od_flows(flows: &[f64], n: usize) -> Result<Vec<f64>, String> {
         }
     }
     Ok(f)
+}
+
+/// Jacobian of one accounting step with respect to the stock table, flows held fixed,
+/// with births `B_j = b_j sum_i S_ij`. Returns the flat row-major `(n * n) x (n * n)`
+/// matrix `A`, whose rows and columns index stock cells as `i * n + j`:
+/// `A[(i,j), (i',j')] = delta_ii' delta_jj' (1 - mu_j) + delta_ij delta_jj' b_j`.
+pub fn stock_carry_jacobian(birth_rate: &[f64], mortality: &[f64]) -> Result<Vec<f64>, String> {
+    let n = birth_rate.len();
+    if n == 0 || mortality.len() != n {
+        return Err("birth_rate and mortality must be non-empty and of equal length".to_string());
+    }
+    check_finite("birth_rate", birth_rate)?;
+    check_finite("mortality", mortality)?;
+    if birth_rate.iter().any(|&b| b < 0.0) || mortality.iter().any(|&m| !(0.0..=1.0).contains(&m)) {
+        return Err("birth_rate must be non-negative and mortality in [0, 1]".to_string());
+    }
+    let nn = n * n;
+    let mut a = vec![0.0; nn * nn];
+    for i in 0..n {
+        for j in 0..n {
+            let q = i * n + j;
+            a[q * nn + q] = 1.0 - mortality[j];
+        }
+    }
+    for j in 0..n {
+        for i2 in 0..n {
+            a[(j * n + j) * nn + (i2 * n + j)] += birth_rate[j];
+        }
+    }
+    Ok(a)
+}
+
+fn sigmoid(a: f64) -> f64 {
+    if a >= 0.0 {
+        1.0 / (1.0 + (-a).exp())
+    } else {
+        a.exp() / (1.0 + a.exp())
+    }
+}
+
+fn check_gated(z: &[f64], candidate_preact: &[f64], gate_preact: &[f64]) -> Result<(), String> {
+    if z.len() != candidate_preact.len() || z.len() != gate_preact.len() {
+        return Err("z, candidate_preact, gate_preact must have the same shape".to_string());
+    }
+    check_finite("z", z)?;
+    check_finite("candidate_preact", candidate_preact)?;
+    check_finite("gate_preact", gate_preact)
+}
+
+/// GRU-style convex latent update `z' = g z + (1 - g) c` with `g = sigmoid(gate_preact)`
+/// and `c = tanh(candidate_preact)`, elementwise.
+pub fn gated_latent_update(z: &[f64], candidate_preact: &[f64], gate_preact: &[f64]) -> Result<Vec<f64>, String> {
+    check_gated(z, candidate_preact, gate_preact)?;
+    Ok(z.iter()
+        .zip(candidate_preact.iter().zip(gate_preact.iter()))
+        .map(|(&zv, (&ac, &ag))| {
+            let g = sigmoid(ag);
+            g * zv + (1.0 - g) * ac.tanh()
+        })
+        .collect())
+}
+
+/// Elementwise `(dz'/dz, dz'/da_c, dz'/da_g) = (g, (1 - g)(1 - c^2), g (1 - g)(z - c))`.
+pub fn gated_latent_partials(
+    z: &[f64],
+    candidate_preact: &[f64],
+    gate_preact: &[f64],
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    check_gated(z, candidate_preact, gate_preact)?;
+    let mut dz = Vec::with_capacity(z.len());
+    let mut dc = Vec::with_capacity(z.len());
+    let mut dg = Vec::with_capacity(z.len());
+    for q in 0..z.len() {
+        let g = sigmoid(gate_preact[q]);
+        let c = candidate_preact[q].tanh();
+        dz.push(g);
+        dc.push((1.0 - g) * (1.0 - c * c));
+        dg.push(g * (1.0 - g) * (z[q] - c));
+    }
+    Ok((dz, dc, dg))
 }
 
 /// `mu_j = sum_k F[k, j] - sum_k F[j, k]`; the entries sum to zero.
@@ -598,6 +681,19 @@ mod tests {
     const ENSEMBLE_MEAN: [f64; 2] = [3.0, 5.0];
     const ENSEMBLE_STD: [f64; 2] = [1.8257418583505538, 2.943920288775949];
 
+    const GATED_Z: [f64; 4] = [0.5, -0.2, 0.0, 1.5];
+    const GATED_AC: [f64; 4] = [0.3, -1.0, 2.0, 0.0];
+    const GATED_AG: [f64; 4] = [0.0, 2.0, -1.0, 3.0];
+    const GATED_NEXT: [f64; 4] = [0.39565630622579545, -0.266943664380472, 0.7047606324503499, 1.42886119023365];
+    const GATED_DZ: [f64; 4] = [0.5, 0.8807970779778823, 0.2689414213699951, 0.9525741268224334];
+    const GATED_DAC: [f64; 4] = [0.4575684809133146, 0.05006216869470697, 0.051649891596191815, 0.047425873177566635];
+    const GATED_DAG: [f64; 4] = [0.052171846887102274, 0.058963783975451815, -0.18953932621681382, 0.067764989596368];
+    const CARRY_BIRTH: [f64; 2] = [0.012, 0.01];
+    const CARRY_MORT: [f64; 2] = [0.01, 0.008];
+    const CARRY: [f64; 16] = [
+        1.002, 0.0, 0.012, 0.0, 0.0, 0.992, 0.0, 0.0, 0.0, 0.0, 0.99, 0.0, 0.0, 0.01, 0.0, 1.002,
+    ];
+
     fn close(a: f64, b: f64, tol: f64) {
         assert!((a - b).abs() <= tol * (1.0 + b.abs()), "{} vs {}", a, b);
     }
@@ -759,5 +855,74 @@ mod tests {
         close_all(&m, &ENSEMBLE_MEAN, 1e-12);
         close_all(&s, &ENSEMBLE_STD, 1e-12);
         assert!(ensemble_mean_std(&samples[..1]).is_err());
+    }
+
+    #[test]
+    fn recurrence_fixtures() {
+        let f = |z: &[f64], ac: &[f64], ag: &[f64]| gated_latent_update(z, ac, ag).unwrap();
+        close_all(&f(&GATED_Z, &GATED_AC, &GATED_AG), &GATED_NEXT, 1e-12);
+        let (g, dc, dg) = gated_latent_partials(&GATED_Z, &GATED_AC, &GATED_AG).unwrap();
+        close_all(&g, &GATED_DZ, 1e-12);
+        close_all(&dc, &GATED_DAC, 1e-12);
+        close_all(&dg, &GATED_DAG, 1e-12);
+        let h = 1e-6;
+        let shift = |v: &[f64], d: f64| -> Vec<f64> { v.iter().map(|x| x + d).collect() };
+        let central = |plus: Vec<f64>, minus: Vec<f64>| -> Vec<f64> {
+            plus.iter().zip(minus.iter()).map(|(p, m)| (p - m) / (2.0 * h)).collect()
+        };
+        let num_z = central(
+            f(&shift(&GATED_Z, h), &GATED_AC, &GATED_AG),
+            f(&shift(&GATED_Z, -h), &GATED_AC, &GATED_AG),
+        );
+        let num_c = central(
+            f(&GATED_Z, &shift(&GATED_AC, h), &GATED_AG),
+            f(&GATED_Z, &shift(&GATED_AC, -h), &GATED_AG),
+        );
+        let num_g = central(
+            f(&GATED_Z, &GATED_AC, &shift(&GATED_AG, h)),
+            f(&GATED_Z, &GATED_AC, &shift(&GATED_AG, -h)),
+        );
+        close_all(&num_z, &g, 1e-8);
+        close_all(&num_c, &dc, 1e-8);
+        close_all(&num_g, &dg, 1e-8);
+        assert!(f(&[0.99, -0.99, 0.0], &[50.0, -50.0, 3.0], &[-3.0, 0.0, 4.0])
+            .iter()
+            .all(|v| v.abs() < 1.0));
+        close_all(&f(&GATED_Z, &GATED_AC, &[40.0; 4]), &GATED_Z, 1e-12);
+        let cand: Vec<f64> = GATED_AC.iter().map(|a| a.tanh()).collect();
+        close_all(&f(&GATED_Z, &GATED_AC, &[-40.0; 4]), &cand, 1e-12);
+        assert!(gated_latent_update(&[0.1, 0.2], &[0.1], &[0.1, 0.2]).is_err());
+        assert!(gated_latent_update(&[0.1], &[f64::NAN], &[0.0]).is_err());
+
+        let a = stock_carry_jacobian(&CARRY_BIRTH, &CARRY_MORT).unwrap();
+        close_all(&a, &CARRY, 1e-12);
+        // A is permutation-similar to a triangular matrix, so its eigenvalues are its
+        // diagonal: 1 - mu_j for migrant cells and 1 - mu_j + b_j for each native cell.
+        let mut diag: Vec<f64> = (0..4).map(|q| a[q * 4 + q]).collect();
+        let mut expected = vec![
+            1.0 - CARRY_MORT[0],
+            1.0 - CARRY_MORT[1],
+            1.0 - CARRY_MORT[0] + CARRY_BIRTH[0],
+            1.0 - CARRY_MORT[1] + CARRY_BIRTH[1],
+        ];
+        diag.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        expected.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        close_all(&diag, &expected, 1e-12);
+        // stock_step with births b_j * colsum is affine in S: differences map through A
+        let t = flows();
+        let br = [0.012, 0.01, 0.015];
+        let step = |s: &[f64]| -> Vec<f64> {
+            let births: Vec<f64> =
+                (0..3).map(|j| br[j] * (0..3).map(|i| s[i * 3 + j]).sum::<f64>()).collect();
+            stock_step(s, 3, &births, &MORT, &t).unwrap()
+        };
+        let a3 = stock_carry_jacobian(&br, &MORT).unwrap();
+        let (s1, s2) = (step(&STOCK), step(&STOCK_NEXT));
+        for r in 0..9 {
+            let lin: f64 = (0..9).map(|c| a3[r * 9 + c] * (STOCK[c] - STOCK_NEXT[c])).sum();
+            close(s1[r] - s2[r], lin, 1e-12);
+        }
+        assert!(stock_carry_jacobian(&[0.01, 0.02], &[0.01]).is_err());
+        assert!(stock_carry_jacobian(&[0.01], &[1.5]).is_err());
     }
 }

@@ -20,7 +20,7 @@ In 2026, Thomas Gaskin and Guy Abel published an answer in *Nature* (Gaskin and 
 When the quantity you need is never observed directly, but several aggregates of it are observed by different noisy instruments, do not discard the instruments that disagree. Write the exact relation between the hidden quantity and each aggregate, put those relations inside a differentiable model, and train the model on the aggregates. Add three ingredients that make this work in practice: a recurrent latent state so that today's flows can depend on the whole past (@sec-mf-network), a variable transform and an uncertainty weighting so that no single huge value or unreliable source dominates the loss (@sec-mf-scaling and @sec-mf-loss), and an ensemble so that the answer comes with an honest spread (@sec-mf-uncertainty). The chapter derives each piece, implements it in a tested tri-language library, and replicates the idea on a synthetic world of eight countries where the truth is known, so that we can measure what the method recovers and where it fails.
 :::
 
-The structure is as follows. We first state what the paper observed and what it estimated (@sec-mf-problem), derive the accounting identity and count unknowns against observations (@sec-mf-accounting), describe the recurrent network and why memory matters (@sec-mf-network), then the scaling, loss, and demographic balancing (@sec-mf-scaling, @sec-mf-loss, @sec-mf-balancing). A synthetic world follows (@sec-mf-world), with training and an honest recovery check (@sec-mf-training and @sec-mf-results). We then cover elasticities, initial-stock calibration, and uncertainty (@sec-mf-elasticity, @sec-mf-calibration, @sec-mf-uncertainty), what to change to rerun on the real data (@sec-mf-real), and the reference implementation in Python, Julia, and Rust (@sec-mf-reference-implementation).
+The structure is as follows. We first state what the paper observed and what it estimated (@sec-mf-problem), derive the accounting identity and count unknowns against observations (@sec-mf-accounting), describe the recurrent network, why memory matters, how it relates to the RNN, LSTM, and GRU, and how gradients travel through its two recurrent paths (@sec-mf-network, @sec-mf-rnn-family, @sec-mf-bptt), then the scaling, loss, and demographic balancing (@sec-mf-scaling, @sec-mf-loss, @sec-mf-balancing). A synthetic world follows (@sec-mf-world), with training and an honest recovery check (@sec-mf-training and @sec-mf-results), and a measurement of the trained model's gradient paths with a gated ablation (@sec-mf-recurrence-experiments). We then cover elasticities, initial-stock calibration, and uncertainty (@sec-mf-elasticity, @sec-mf-calibration, @sec-mf-uncertainty), what to change to rerun on the real data (@sec-mf-real), and the reference implementation in Python, Julia, and Rust (@sec-mf-reference-implementation).
 
 ::: {.callout-note appearance="simple"}
 ## What the paper did, and what this chapter does
@@ -132,7 +132,7 @@ $$
 u_\theta\!\left(\boldsymbol{\phi}_{ijk}(t), \mathbf{z}_{ijk}(t)\right) = \left( \log \hat T_{ijk}(t),\; \mathbf{z}_{ijk}(t+1) \right) \in \mathbb{R}^{1 + Z}.
 $$ {#eq-mf-recurrence}
 
-The latent state starts at zero and "is a memory of past changes and their effects on the present flow estimate". This is a recurrent neural network in the sense of Hochreiter and Schmidhuber (1997), except that the recurrence runs over years and the same network is applied independently to every edge $(i, j, k)$. The covariates include the migrant stocks $S_{ij}$ and $S_{ik}$, which are not observed every year. In intermediate years the stocks fed to the network come from the network's own earlier predictions, via the accounting identity. That is the recursion: output at year $t$ determines stocks at $t + 1$, which are inputs at $t + 1$.
+The latent state starts at zero and "is a memory of past changes and their effects on the present flow estimate". The paper cites the encoder-decoder papers of Cho et al. (2014) and Sutskever, Vinyals, and Le (2014) for its recurrent network, but the mapping in @eq-mf-recurrence has no gates and no separate memory cell, so it is not a long short-term memory network (LSTM; Hochreiter and Schmidhuber, 1997) or a gated recurrent unit (GRU). It is a *simple recurrent network* in the sense of Elman (1990): part of the network's activity at year $t$ is copied back and read as an extra input at year $t + 1$, and the same network is applied independently to every edge $(i, j, k)$, with the recurrence running over years. @sec-mf-rnn-family places it precisely among the vanilla RNN, the LSTM, and the GRU. The covariates include the migrant stocks $S_{ij}$ and $S_{ik}$, which are not observed every year. In intermediate years the stocks fed to the network come from the network's own earlier predictions, via the accounting identity. That is a second recursion: output at year $t$ determines stocks at $t + 1$, which are inputs at $t + 1$.
 
 ```{mermaid}
 %%| label: fig-mf-recursion
@@ -153,7 +153,7 @@ flowchart LR
 
 Why bother with memory? The paper's argument is that the decision to leave is "not merely predicated on the current economic climate: crises from past years can influence a person's decision". There are mechanical reasons too: diaspora networks, remittances, and visa regimes all carry the past forward. A feedforward network that maps this year's covariates to this year's flows has no way to represent a shock that raised flows two years ago and is still decaying. The toy builds this effect into the ground truth on purpose, so that we can test whether the latent state captures it (@sec-mf-results).
 
-Two details matter for implementation. First, the output is $\log \hat T$, so $\hat T = \exp(\cdot) > 0$ and the model cannot propose negative flows; the paper finishes the network with a CELU activation (Barron, 2017), which is linear for positive inputs and saturates smoothly below, giving a floor on $\log T$. Second, training runs through the whole simulated history, so gradients flow backward through every year of the recursion (backpropagation through time), and the full loss is computed on aggregates over all edges. In the toy the whole 20-year rollout for all 448 edges is one forward pass, so this is cheap. At the paper's scale it is the reason training is a serious computational project.
+Two details matter for implementation. First, the output is $\log \hat T$, so $\hat T = \exp(\cdot) > 0$ and the model cannot propose negative flows; the paper finishes the network with a CELU activation (Barron, 2017), which is linear for positive inputs. With a positive scale $\alpha$, as in the toy's $\alpha = 8$, it saturates smoothly at $-\alpha$ below, giving a floor on $\log T$. Second, training runs through the whole simulated history, so gradients flow backward through every year of the recursion (backpropagation through time; Werbos, 1990), and the full loss is computed on aggregates over all edges. In the toy the whole 20-year rollout for all 448 edges is one forward pass, so this is cheap. At the paper's scale it is the reason training is a serious computational project. @sec-mf-bptt works out which paths that gradient takes and when it vanishes.
 
 The code below shows the model the chapter's library trains: an MLP with tanh hidden layers and a CELU output, applied to every edge, with the latent block of the output fed back as input. The network is deliberately small. Nothing in the method depends on size, and a small network makes the replication fast and the failure modes visible.
 
@@ -166,6 +166,198 @@ print(src)
 cfg_demo = mf.TrainConfig()
 print("toy configuration:", cfg_demo)
 ```
+
+### The recurrence the library implements {#sec-mf-rnn-equations}
+
+Write $e = (i, j, k)$ for an edge, $E = n^2 (n - 1)$ for the number of edges (448 in the toy), $\boldsymbol{\phi}^e_t \in \mathbb{R}^{10}$ for the edge's standardised covariates in year $t$ (populations and GDP of origin and destination, distance, common language, the two conflict indicators, and the two native indicators $\delta_{ij}$, $\delta_{ik}$), and $Z$ for the latent width. The network sees the two stock cells of an edge through a logarithm and a standardisation,
+
+$$
+\sigma(S) = \frac{\log\big(1 + \max(S, 0)\big) - \mu_s}{s_s},
+$$ {#eq-mf-sigma}
+
+where $\mu_s$ and $s_s$ are the mean and standard deviation of the log observed stocks. One year of the model for edge $e$ is then
+
+$$
+\begin{aligned}
+\mathbf{x}^e_t &= \big[\boldsymbol{\phi}^e_t;\ \sigma(S_{ij,t});\ \sigma(S_{ik,t});\ \mathbf{z}^e_t\big] \in \mathbb{R}^{12 + Z}, \\
+\mathbf{h}^{(0)} &= \mathbf{x}^e_t, \qquad \mathbf{h}^{(l)} = \tanh\big(W_l \mathbf{h}^{(l-1)} + \mathbf{b}_l\big), \quad l = 1, \dots, L, \\
+\mathbf{o}^e_t &= \operatorname{CELU}_\alpha\big(W_o \mathbf{h}^{(L)} + \mathbf{b}_o\big) \in \mathbb{R}^{1 + Z}, \\
+u^e_t &= \log \hat T^e_t = o^e_{t,0}, \qquad \mathbf{z}^e_{t+1} = \big(o^e_{t,1}, \dots, o^e_{t,Z}\big), \qquad \mathbf{z}^e_0 = \mathbf{0},
+\end{aligned}
+$$ {#eq-mf-rnn-step}
+
+with $\operatorname{CELU}_\alpha(a) = \max(0, a) + \min\big(0, \alpha(e^{a/\alpha} - 1)\big)$ applied coordinate by coordinate. The toy uses $L = 3$ layers of 32 units, $Z = 8$, and $\alpha = 8$ (`TrainConfig`); the paper uses 7 layers of 60 units and $Z = 100$. The flows close the loop through the accounting identity, with births proportional to the population of the country of residence, $B_j = b_j \sum_{i'} S_{i'j}$:
+
+$$
+S_{t+1} = A(S_t) + R(\hat T_t), \qquad
+\big[A(S)\big]_{ij} = (1 - m_j)\, S_{ij} + \delta_{ij}\, b_j \sum_{i'} S_{i'j}, \qquad
+\big[R(T)\big]_{ij} = \sum_k T_{ikj} - \sum_k T_{ijk}.
+$$ {#eq-mf-rnn-stock}
+
+Two features of these equations decide everything that follows. First, the latent block is read off the *output layer* and copied back into the input layer one year later. Copied-back units are Elman's context units, and the only difference from his network is what sits between the copy and its next value: Elman's network has one hidden layer, so a context vector passes through one affine map and one squashing function per step, while here $\mathbf{z}$ passes through $L + 1 = 4$ affine maps, three $\tanh$ layers, and a CELU. Pascanu et al. (2014) call this a *deep transition* recurrent network. The vanilla RNN of @sec-road-to-transformers is the special case $L = 0$, with $\tanh$ in place of the CELU. Second, the network's state is not all overwritten each year. The latent coordinates are, but the stocks are carried forward by a fixed affine map $A$, and only the increment $R(\hat T_t)$ is produced by the network.
+
+### Where it sits among the RNN, the LSTM, and the GRU {#sec-mf-rnn-family}
+
+@tbl-266-rnn-cells in @sec-road-to-transformers compares the three classical recurrent cells by the state they carry, how they update it, and the direct term of the Jacobian of that update, which controls how gradient travels backward through time. The same three questions applied to this chapter's model give @tbl-mf-rnn-family. The model carries two states at once, and they answer the questions differently.
+
+| | Vanilla RNN (Elman, 1990) | This model: latent path | This model: stock path | LSTM | GRU |
+|:--|:--|:--|:--|:--|:--|
+| State carried | $h_t$ | $\mathbf{z}^e_t$, private to edge $e$ | $S_t$, shared by all edges | $(h_t, c_t)$ | $h_t$ |
+| How it is updated | overwritten, $\tanh(W_h h + W_x x + b)$ | overwritten, CELU of a four-layer network | added, $A(S_t) + R(\hat T_t)$ | added, $f_t \odot c_{t-1} + i_t \odot \tilde c_t$ | interpolated, $g_t \odot h_{t-1} + (1 - g_t) \odot \tilde h_t$ |
+| Direct term of the carry Jacobian | $\mathrm{diag}(1 - h_t^2)\, W_h$ | a product of four weight matrices and four activation derivatives | $A$, eigenvalues $1 - m_j$ and $1 - m_j + b_j$ | $\mathrm{diag}(f_t)$ | $\mathrm{diag}(g_t)$ |
+| Who sets the carry | weights | weights | demography, fixed | learned forget gate | learned update gate |
+| What writes into it | the whole update | the whole update | the network's flows | input gate times candidate | one minus update gate, times candidate |
+| Bounded | yes, in $(-1, 1)$ | below only, $z > -\alpha$ | no | no, $c_t$ is unbounded | yes, in $(-1, 1)$ |
+
+: The two recurrent paths of the migration model next to the classical cells. The latent path is an ungated deep-transition Elman recurrence; the stock path is an additive carry whose "forget gate" is fixed by mortality and whose write is the network's flow output. The GRU's update gate, written $z_t$ in the Road to Transformers chapter, is written $g_t$ here because $\mathbf{z}$ is the latent state. {#tbl-mf-rnn-family}
+
+Read as a whole, the network is an Elman recurrence in its latent block with something like an LSTM cell running beside it. The stock table plays the part of the LSTM's cell state $c_t$: it is carried forward additively, with a coefficient $1 - m_j \approx 0.99$ where the LSTM has its forget gate $f_t$, and the flows play the part of the gated write $i_t \odot \tilde c_t$. The difference is who controls the carry. An LSTM learns $f_t$ and can choose what to keep; here demography sets the carry, and the network can use it only indirectly, by writing flows whose effect on the stocks it later reads back through @eq-mf-sigma. Note also that the "no memory" ablation of @sec-mf-training zeroes $\mathbf{z}$ every year but keeps the stock path, so it is memoryless only in its latent block.
+
+### Backpropagation through time along two paths {#sec-mf-bptt}
+
+Training minimises the loss of @eq-mf-loss, which depends on the flows of every year, by differentiating through the whole 20-year rollout (backpropagation through time; Werbos, 1990). Stack the state of year $t$ as $X_t = (\mathbf{z}_t, S_t)$, where $\mathbf{z}_t \in \mathbb{R}^{EZ}$ collects the latent states of all edges and $S_t \in \mathbb{R}^{n^2}$ is the stock table. @eq-mf-rnn-step and @eq-mf-rnn-stock define a map $X_{t+1} = \Phi_t(X_t)$. For a loss term $\ell$ that depends on the log flows $\mathbf{u}_\tau$ of a late year $\tau$, the chain rule gives its gradient with respect to the state of an earlier year $s < \tau$ as
+
+$$
+\frac{\partial \ell}{\partial X_s} = \frac{\partial \ell}{\partial \mathbf{u}_\tau}\, \frac{\partial \mathbf{u}_\tau}{\partial X_\tau}\, \mathcal{J}_{\tau-1}\, \mathcal{J}_{\tau-2} \cdots \mathcal{J}_s, \qquad \mathcal{J}_t = \frac{\partial X_{t+1}}{\partial X_t}.
+$$ {#eq-mf-bptt-chain}
+
+**The one-year Jacobian of the network.** For one edge, differentiate @eq-mf-rnn-step layer by layer. Each layer contributes its weight matrix and the derivative of its activation, $\tanh'(a) = 1 - \tanh^2(a)$, and for the output layer
+
+$$
+\operatorname{CELU}'_\alpha(a) = \begin{cases} 1 & a > 0, \\ e^{a/\alpha} & a \le 0, \end{cases}
+$$
+
+so the Jacobian of the output with respect to the input is the product
+
+$$
+D^e_t = \frac{\partial \mathbf{o}^e_t}{\partial \mathbf{x}^e_t} = \mathrm{diag}\big(\operatorname{CELU}'_\alpha(\mathbf{a}_o)\big)\, W_o\, \mathrm{diag}\big(1 - (\mathbf{h}^{(L)})^2\big)\, W_L \cdots \mathrm{diag}\big(1 - (\mathbf{h}^{(1)})^2\big)\, W_1,
+$$ {#eq-mf-rnn-jacobian}
+
+with $\mathbf{a}_o = W_o \mathbf{h}^{(L)} + \mathbf{b}_o$. Its rows split into the flow (row 0) and the latent block (rows 1 to $Z$), and its columns into the covariates, the two stock inputs, and the latent inputs. That defines four per-edge blocks: $P^e_t = \partial \mathbf{z}^e_{t+1} / \partial \mathbf{z}^e_t$ ($Z \times Z$), $\mathbf{g}^e_t = \partial u^e_t / \partial \mathbf{z}^e_t$ ($1 \times Z$), and the derivatives of $\mathbf{z}^e_{t+1}$ and $u^e_t$ with respect to the two stock inputs, which pick up the factor $\partial \sigma / \partial S = 1 / \big(s_s (1 + S)\big)$ from @eq-mf-sigma.
+
+**The one-year Jacobian of the state.** Collect the per-edge blocks over all edges: $P_t = \mathrm{blockdiag}_e(P^e_t)$ of size $EZ \times EZ$, $G_t = \mathrm{blockdiag}_e(\mathbf{g}^e_t)$ of size $E \times EZ$, $Q_t = \partial \mathbf{z}_{t+1} / \partial S_t$ of size $EZ \times n^2$, and $H_t = \partial \mathbf{u}_t / \partial S_t$ of size $E \times n^2$. The flow is $\hat T = e^{u}$, so $\partial \hat T / \partial u = \mathrm{diag}(\hat T)$, and $R$ is linear, $R(\hat T) = M \hat T$, where column $e = (i, j, k)$ of $M \in \mathbb{R}^{n^2 \times E}$ has $+1$ in row $(i, k)$ (an arrival) and $-1$ in row $(i, j)$ (a departure). Writing $A$ also for the $n^2 \times n^2$ matrix of the linear map in @eq-mf-rnn-stock, differentiating $X_{t+1} = \Phi_t(X_t)$ block by block gives
+
+$$
+\mathcal{J}_t =
+\begin{pmatrix}
+\dfrac{\partial \mathbf{z}_{t+1}}{\partial \mathbf{z}_t} & \dfrac{\partial \mathbf{z}_{t+1}}{\partial S_t} \\[3mm]
+\dfrac{\partial S_{t+1}}{\partial \mathbf{z}_t} & \dfrac{\partial S_{t+1}}{\partial S_t}
+\end{pmatrix}
+=
+\begin{pmatrix}
+P_t & Q_t \\
+M\, \mathrm{diag}(\hat T_t)\, G_t & A + M\, \mathrm{diag}(\hat T_t)\, H_t
+\end{pmatrix}.
+$$ {#eq-mf-bptt-blocks}
+
+Multiplying out @eq-mf-bptt-chain, every term is a path through these blocks. A path that stays in the top-left block is the *latent path*, one that stays in the bottom-right block is the *stock path*, and a path that switches between them is *mixed*. @fig-mf-two-paths draws one year.
+
+```{mermaid}
+%%| label: fig-mf-two-paths
+%%| fig-cap: "The two recurrent paths of one year, as blocks of the state Jacobian. Gradient can travel back from a late flow through the latent state of the same edge, through the stock table, or through mixed paths that cross between them via the flows and the stock inputs."
+flowchart LR
+    Z0["latent z at t"] -->|"P: latent path"| Z1["latent z at t plus 1"]
+    S0["stocks S at t"] -->|"A plus MTH: stock path"| S1["stocks S at t plus 1"]
+    S0 -->|"Q: stock inputs"| Z1
+    Z0 -->|"MTG: flows"| S1
+    Z0 --> U["log flows u at t"]
+    S0 --> U
+```
+
+**When the latent path vanishes or explodes.** $P_t$ is block diagonal, so each edge's latent memory is private: it never mixes with another edge's latent state. Because $0 < \tanh' \le 1$ and $0 < \operatorname{CELU}'_\alpha \le 1$, the diagonal factors in @eq-mf-rnn-jacobian have spectral norm at most one, and
+
+$$
+\big\| P^e_t \big\|_2 \le \big\| W_o^{[z]} \big\|_2\, \big\| W_3 \big\|_2\, \big\| W_2 \big\|_2\, \big\| W_1^{[z]} \big\|_2 =: \beta,
+\qquad
+\Big\| \frac{\partial \mathbf{z}^e_\tau}{\partial \mathbf{z}^e_s} \Big\|_2 \le \prod_{t=s}^{\tau-1} \big\| P^e_t \big\|_2 \le \beta^{\,\tau - s},
+$$ {#eq-mf-bptt-latent}
+
+where $W_o^{[z]}$ is the latent rows of $W_o$ and $W_1^{[z]}$ the latent columns of $W_1$ (the latent path ignores every other row and column). This is the vanilla RNN bound $\sigma_{\max}(W_h)^{T-k}$ of @sec-road-to-transformers with one matrix replaced by a product of four (Bengio, Simard, and Frasconi, 1994; Pascanu, Mikolov, and Bengio, 2013). The latent gradient therefore vanishes geometrically whenever the per-year norms stay below one, which happens as soon as the $\tanh$ units saturate or the CELU sits in its negative range, where its slope $e^{a/\alpha}$ falls below one. It can explode only if $\beta > 1$ *and* the units stay in their linear range. The CELU makes that possible, because it is the identity for positive arguments and a latent coordinate can grow without bound in that range. Over a 20-year horizon a per-year norm of 0.5 leaves $0.5^{20} \approx 10^{-6}$ of the gradient, and 1.1 multiplies it by $1.1^{20} \approx 6.7$.
+
+**Why the stock path does neither.** The accounting carry $A$ has a simple spectrum. A migrant row $(i, j)$, $i \neq j$, of $A$ has only its diagonal entry $1 - m_j$, and the native row $(j, j)$ has $1 - m_j + b_j$ on the diagonal plus $b_j$ in the columns of the migrant cells $(i', j)$ of the same country. Order the stock cells so that the $n$ native cells come first. Then every off-diagonal entry sits in a native row and a migrant column, above the diagonal, so $A$ is upper triangular and its eigenvalues are its diagonal entries:
+
+$$
+\operatorname{spec}(A) = \{\, 1 - m_j \ (\text{each } n - 1 \text{ times}),\ \ 1 - m_j + b_j \,:\, j = 1, \dots, n \,\}.
+$$ {#eq-mf-carry-spectrum}
+
+With annual mortality around one percent, every eigenvalue is within about one percent of one: in LSTM language the stock path has a forget gate pinned near 0.99. The learned correction $M\, \mathrm{diag}(\hat T_t)\, H_t$ has entries of size $\hat T / \big(s_s (1 + S)\big)$ times a sensitivity $\partial u / \partial \sigma$, that is, a migration rate of a few percent a year times a number of order one. So $\partial S_{t+1} / \partial S_t$ stays within a few percent of $A$ unless the network learns a strongly self-reinforcing response (a larger diaspora raising the flow that feeds it), and only that would make the stock path explode, at a compounding rate of a few percent a year.
+
+**Where the paths cross.** The two off-diagonal blocks are not alike. The latent-to-stock block carries $\mathrm{diag}(\hat T_t)$: a latent change moves next year's stocks through a change in a flow, which is a few percent of a stock per year. The stock-to-latent block carries $1 / \big(s_s (1 + S)\big)$, so a *relative* change in a stock enters the latent state at order one. Gradient that starts in the latent state must cross the narrow block to use the stock carry, so the stock path is a poor store for latent memory. Gradient that starts in the stocks enters the latent state cheaply, and from there it is subject to the latent path's decay over the remaining years. The stock path is also the only channel between edges, since $P_t$ is block diagonal.
+
+**A gated latent update.** @sec-road-to-transformers shows that the remedy for a vanishing latent path is a gate. Keep the trunk of @eq-mf-rnn-step but let the head emit $1 + 2Z$ numbers, the log flow pre-activation and two vectors $\mathbf{a}_c, \mathbf{a}_g \in \mathbb{R}^Z$, and replace the latent block by the convex update
+
+$$
+\mathbf{z}^e_{t+1} = \mathbf{g} \odot \mathbf{z}^e_t + (1 - \mathbf{g}) \odot \mathbf{c}, \qquad \mathbf{g} = \operatorname{sigmoid}(\mathbf{a}_g), \qquad \mathbf{c} = \tanh(\mathbf{a}_c).
+$$ {#eq-mf-gated}
+
+This is the GRU update of @sec-road-to-transformers without the reset gate. The product rule gives the per-edge latent Jacobian
+
+$$
+\frac{\partial \mathbf{z}^e_{t+1}}{\partial \mathbf{z}^e_t} = \underbrace{\mathrm{diag}(\mathbf{g})}_{\text{direct}} + \mathrm{diag}\big((1 - \mathbf{g}) \odot (1 - \mathbf{c}^2)\big) \frac{\partial \mathbf{a}_c}{\partial \mathbf{z}^e_t} + \mathrm{diag}\big(\mathbf{g} \odot (1 - \mathbf{g}) \odot (\mathbf{z}^e_t - \mathbf{c})\big) \frac{\partial \mathbf{a}_g}{\partial \mathbf{z}^e_t},
+$$ {#eq-mf-gated-jacobian}
+
+whose direct term contains no weight matrix: a coordinate whose gate stays near one passes gradient across years whatever the trunk does. The initial gate bias $b_g$ sets where training starts, $\mathbf{g} \approx \operatorname{sigmoid}(b_g)$, which is 0.5 per year for $b_g = 0$ ($0.5^{20} \approx 10^{-6}$ after 20 years) and 0.88 for $b_g = 2$ ($0.88^{20} \approx 0.08$), the same reasoning as the forget-gate bias of Gers, Schmidhuber, and Cummins (2000) and Jozefowicz, Zaremba, and Sutskever (2015). There is also a closer fit to this particular world. The generator's memory $s_j(t) = 0.8\, s_j(t-1) + c_j(t)$ of @sec-mf-world is a leaky integrator, and a single gated coordinate with $g = 0.8$ and candidate $\kappa\, c_j(t)$, a constant times the conflict indicator, reproduces it exactly up to scale, since $z_t = 0.8\, z_{t-1} + 0.2\, \kappa\, c_j(t)$ gives $z_t = 0.2\, \kappa\, s_j(t)$. The ungated block can represent the same trace only through its four-layer composition. The library implements the update and its three local derivatives in `gated_latent_update` and `gated_latent_partials`, and the accounting carry in `stock_carry_jacobian`, in all three languages (@sec-mf-reference-implementation).
+
+The cell below checks the derivations symbolically: the block structure of @eq-mf-bptt-blocks on a scalar model with one latent unit and one stock cell, the gated Jacobian @eq-mf-gated-jacobian, and the factorisation of the characteristic polynomial of $A$ behind @eq-mf-carry-spectrum. It then evaluates the carry of the synthetic world.
+
+```{python}
+#| label: cell-mf-bptt-check
+import sympy as sp
+
+# (1) A scalar caricature of the two recurrent paths: one latent unit z and one stock
+#     cell S that receives the flow. The network reads log(1 + S), as the library does.
+z_s, S_s, w_z, w_s, v_z, v_s, m_s = sp.symbols("z S w_z w_s v_z v_s m", real=True)
+z_next = sp.tanh(w_z * z_s + w_s * sp.log(1 + S_s))       # latent path
+u = v_z * z_s + v_s * sp.log(1 + S_s)                     # log flow
+S_next = (1 - m_s) * S_s + sp.exp(u)                      # accounting carry plus arrivals
+J_auto = sp.Matrix([z_next, S_next]).jacobian([z_s, S_s])
+P_ = (1 - z_next**2) * w_z                                # d z' / d z
+Q_ = (1 - z_next**2) * w_s / (1 + S_s)                    # d z' / d S
+G_, H_, T_ = v_z, v_s / (1 + S_s), sp.exp(u)              # d u / d z, d u / d S, the flow
+J_derived = sp.Matrix([[P_, Q_], [T_ * G_, (1 - m_s) + T_ * H_]])
+print("SymPy: block Jacobian of the scalar model minus the derived blocks:",
+      list(sp.simplify(J_auto - J_derived)))
+
+# (2) The gated update: direct carry diag(g) plus the candidate and gate terms.
+w_c, w_g, x_c, x_g = sp.symbols("w_c w_g x_c x_g", real=True)
+g_s = 1 / (1 + sp.exp(-(w_g * z_s + x_g)))
+c_s = sp.tanh(w_c * z_s + x_c)
+z_gated = g_s * z_s + (1 - g_s) * c_s
+dz_derived = g_s + (1 - g_s) * (1 - c_s**2) * w_c + g_s * (1 - g_s) * (z_s - c_s) * w_g
+print("SymPy: d z'/d z of the gated update minus the derived Jacobian:",
+      sp.simplify(sp.diff(z_gated, z_s) - dz_derived))
+
+# (3) The accounting carry A for two countries: its characteristic polynomial factors
+#     into (lambda - (1 - m_j)) and (lambda - (1 - m_j + b_j)) for each country j.
+lam = sp.symbols("lambda")
+bs, ms = sp.symbols("b_1 b_2", positive=True), sp.symbols("m_1 m_2", positive=True)
+A_sym = sp.zeros(4, 4)
+for i in range(2):
+    for j in range(2):
+        A_sym[i * 2 + j, i * 2 + j] = 1 - ms[j]
+for j in range(2):
+    for i2 in range(2):
+        A_sym[j * 2 + j, i2 * 2 + j] += bs[j]
+target = sp.prod([(lam - (1 - ms[j])) * (lam - (1 - ms[j] + bs[j])) for j in range(2)])
+print("SymPy: char poly of A minus the product of its claimed factors:",
+      sp.expand(A_sym.charpoly(lam).as_expr() - target))
+num = {bs[0]: 0.012, bs[1]: 0.01, ms[0]: 0.01, ms[1]: 0.008}
+print("library stock_carry_jacobian equals the symbolic A:",
+      bool(np.allclose(np.array(A_sym.subs(num), dtype=float),
+                       mf.stock_carry_jacobian([0.012, 0.01], [0.01, 0.008]))))
+
+# (4) The accounting carry of the synthetic world, over the 20-year horizon.
+A_world = mf.stock_carry_jacobian(world.birth_rate, world.mortality)
+eig_A = np.linalg.eigvals(A_world).real
+surv20 = (1 - world.mortality) ** years
+grow20 = (1 - world.mortality + world.birth_rate) ** years
+normA20 = float(np.linalg.norm(np.linalg.matrix_power(A_world, years), 2))
+print(f"\neigenvalues of the accounting carry A: {eig_A.min():.4f} to {eig_A.max():.4f}")
+print(f"over {years} years: migrant cells keep (1 - m)^{years} = {surv20.min():.3f} to {surv20.max():.3f}, "
+      f"native cells grow by at most {grow20.max():.3f}, and ||A^{years}||_2 = {normA20:.3f}")
+```
+
+All three symbolic differences are zero. For the synthetic world the eigenvalues of $A$ lie between `{python} f"{eig_A.min():.4f}"` and `{python} f"{eig_A.max():.4f}"`, so over the 20 simulated years a migrant cell keeps between `{python} f"{surv20.min():.3f}"` and `{python} f"{surv20.max():.3f}"` of a perturbation and a native cell amplifies it by at most `{python} f"{grow20.max():.3f}"`. The spectral norm of $A^{20}$ is somewhat larger, `{python} f"{normA20:.3f}"`, because $A$ is not a normal matrix: births couple every cell of a column to its native cell, and a perturbation can grow transiently along that coupling even though no eigenvalue exceeds `{python} f"{eig_A.max():.4f}"`. Neither number is anywhere near vanishing or exploding. @sec-mf-recurrence-experiments measures all three paths in the trained networks.
 
 ## Scaling the Data: the Symmetrised Yeo-Johnson Transform {#sec-mf-scaling}
 
@@ -442,7 +634,317 @@ Three honest conclusions follow from the toy.
 
 1. **Structure is recovered much better than level.** The log correlation is high, but the mean log ratio of estimate to truth is `{python} f"{ratio.mean():+.2f}"`, a bias of `{python} f"{np.exp(ratio.mean()) - 1:+.0%}"`, and the scatter plot shows the points mostly below the diagonal at all sizes, with the largest corridors underestimated by a factor of about two. This run does not isolate the cause. Candidates are that flows are small relative to the census noise in the stock differences, which are the only dense data, and that the network's smooth fit to ten observed corridors extrapolates conservatively. More flow observations help: an early prototype of this chapter observed only six corridors and had a considerably larger bias.
 2. **The ensemble is overconfident about the truth.** Only `{python} f"{np.mean(np.abs(m_t - e_m) <= 2 * e_s):.0%}"` of the unobserved corridors have the truth inside the two-sigma band. The ensemble spread measures disagreement among *fitted* solutions and the effect of initial-stock uncertainty. It cannot see a bias shared by all members, which comes from the data and the inductive bias. The paper has the same limitation in principle, and its answer is validation on held-out real flows. A reader should treat an ensemble band as a lower bound on uncertainty.
-3. **Memory helps where memory exists, and costs elsewhere.** The recurrent model fits the training data far better and follows post-shock decay, but on the pooled unobserved corridors it is slightly worse than the memoryless model in this run. A latent state is extra capacity that can also fit noise; with ten observed corridors and five ensemble members the toy cannot tell the two effects apart.
+3. **Memory helps where memory exists, and costs elsewhere.** The recurrent model fits the training data far better and follows post-shock decay, but on the pooled unobserved corridors it is slightly worse than the memoryless model in this run. A latent state is extra capacity that can also fit noise; with ten observed corridors and five ensemble members the toy cannot tell the two effects apart. @sec-mf-recurrence-experiments traces most of that cost to the ungated form of the latent update rather than to memory itself.
+
+## Inside the Recurrence: Gradient Paths and a Gated Ablation {#sec-mf-recurrence-experiments}
+
+@sec-mf-bptt makes three predictions about the trained networks. The latent path should lose gradient quickly unless its per-year Jacobian blocks stay near norm one; the stock path should carry gradient across all 20 years almost unchanged; and gradient that starts in the latent state should barely use the stock path, because it must cross the narrow latent-to-stock block. The first experiment measures all three. The second replaces the ungated latent block by the gated update of @eq-mf-gated and asks whether that changes what the model recovers.
+
+### Measuring the two gradient paths
+
+The cell below rebuilds the rollout of `_rollout` with two switches. One detaches the stocks fed to the network, so gradient can reach the past only through $\mathbf{z}$ (the latent path). The other detaches the latent recurrence every year, so gradient can reach the past only through the flows, the accounting identity, and the stock inputs (the stock path). With neither switch the rebuilt rollout is the library's, which the cell checks first. For each of the five trained recurrent networks it differentiates the mean log flow of the last year, $\ell = E^{-1} \sum_e u^e_\tau$ with $\tau = 19$, with respect to the latent state $\mathbf{z}_s$ and the log stock table $\log S_s$ of every earlier year, and reports the median over the five networks. The gradient with respect to $\log S$ is $S \odot \partial \ell / \partial S$, which puts stocks of very different sizes on a common, relative scale. The *mixed* curve is the full gradient minus the stock-path gradient, so it collects every path that crosses into the latent state at least once (the latent switch alone gives zero gradient with respect to stocks, by construction). The cell also computes the per-edge latent blocks $P^e_t$ along each network's own trajectory, and the learned stock block $\partial S_{t+1} / \partial S_t$ of @eq-mf-bptt-blocks, to compare with the fixed carry $A$.
+
+```{python}
+#| label: fig-mf-gradient-paths
+#| fig-cap: "Gradient paths through the trained recurrent ensemble (median over five networks). Left: norm of the gradient of the last year's mean log flow with respect to the latent state s years earlier, through both paths, the latent path alone, and the stock path alone. Middle: the same with respect to the log stock table, split into the stock path and the mixed paths that cross into the latent state. Right: spectral norm of the k-year Jacobian of the latent path for the median and the 90th percentile edge, against the accounting carry A to the power k."
+import torch
+
+t0 = time.time()
+tau = years - 1  # the last simulated year
+
+
+def year_step(net, fit, t, stock, z, cut_stock=False):
+    # One year of the library rollout: network output and next year's stocks.
+    norm = fit["norm"]
+    I, J, K = (torch.as_tensor(a) for a in fit["edge"])
+    src = stock.detach() if cut_stock else stock
+    s_ij = (torch.log1p(src[I, J].clamp(min=0.0)) - norm["s_mu"]) / norm["s_sd"]
+    s_ik = (torch.log1p(src[I, K].clamp(min=0.0)) - norm["s_mu"]) / norm["s_sd"]
+    out = net(torch.cat([fit["static"][t], s_ij[:, None], s_ik[:, None], z], dim=1))
+    T = torch.zeros(n, n, n).index_put((I, J, K), torch.exp(out[:, 0]))
+    births = torch.tensor(world.birth_rate, dtype=torch.float32) * stock.sum(0)
+    mort = torch.tensor(world.mortality, dtype=torch.float32)
+    return out, stock + torch.diag(births) - mort[None, :] * stock + T.sum(1) - T.sum(2)
+
+
+def rollout_paths(net, fit, mode="full"):
+    # Keeps every state and can cut one recurrent path. "full": both paths.
+    # "latent": the stocks fed to the network are detached, so gradient reaches the
+    # past only through z. "stock": the latent recurrence is detached every year, so
+    # gradient travels only through the flows, the accounting identity and the stock
+    # inputs.
+    stock = torch.tensor(np.maximum(fit["stock0"], 0.0), dtype=torch.float32, requires_grad=True)
+    z = torch.zeros(len(fit["edge"][0]), fit["cfg"].latent, requires_grad=True)
+    zs, ss, us = [z], [stock], []
+    for t in range(years):
+        out, stock = year_step(net, fit, t, stock, z, cut_stock=(mode == "latent"))
+        if mode == "stock":
+            z = out[:, 1:].detach().requires_grad_(True)
+        else:
+            z = out[:, 1:]
+            z.retain_grad()
+        stock.retain_grad()
+        us.append(out[:, 0])
+        zs.append(z)
+        ss.append(stock)
+    return us, zs, ss
+
+
+# The replica reproduces the library's rollout.
+with torch.no_grad():
+    f_lib, _ = mf._rollout(torch, fit_mem["nets"][0], fit_mem["static"],
+                           torch.tensor(np.maximum(fit_mem["stock0"], 0.0), dtype=torch.float32),
+                           world, fit_mem["cfg"], fit_mem["norm"], years, fit_mem["edge"])
+us0, _, _ = rollout_paths(fit_mem["nets"][0], fit_mem)
+I_, J_, K_ = fit_mem["edge"]
+replica_err = float((torch.stack(us0).detach() - torch.log(f_lib[:, I_, J_, K_])).abs().max())
+print(f"replica against the library rollout, max |log T difference|: {replica_err:.1e}")
+
+
+def path_gradients(fit, mode):
+    # Gradient of the mean log flow in the last year with respect to z(s) (all edges)
+    # and to log S(s), for s = 0..tau, as vectors, one list per ensemble member.
+    gz, gs = [], []
+    for net in fit["nets"]:
+        us, zs, ss = rollout_paths(net, fit, mode)
+        us[tau].mean().backward()
+        gz.append([zs[s].grad.flatten() if zs[s].grad is not None else torch.zeros(zs[s].numel())
+                   for s in range(tau + 1)])
+        gs.append([(ss[s].grad * ss[s].detach()).flatten() if ss[s].grad is not None
+                   else torch.zeros(n * n) for s in range(tau + 1)])
+    return gz, gs
+
+
+def by_lag(vecs):
+    # median over members of the gradient norm, indexed by lag tau - s
+    return np.median([[float(v[tau - L].norm()) for L in range(tau + 1)] for v in vecs], axis=0)
+
+
+paths = {mode: path_gradients(fit_mem, mode) for mode in ("full", "latent", "stock")}
+mixed_s = [[paths["full"][1][q][s] - paths["stock"][1][q][s] for s in range(tau + 1)]
+           for q in range(len(fit_mem["nets"]))]
+grad_z = {mode: by_lag(paths[mode][0]) for mode in paths}
+grad_s = {mode: by_lag(paths[mode][1]) for mode in ("full", "stock")}
+grad_s["mixed"] = by_lag(mixed_s)
+
+
+def latent_carry(fit):
+    # One-year latent Jacobian blocks P_t = dz(t+1)/dz(t), one Z x Z block per edge,
+    # along each member's own trajectory, and the spectral norm of their products.
+    one_year, prod_norms = [], []
+    for net in fit["nets"]:
+        trace = []
+        with torch.no_grad():
+            mf._rollout(torch, net, fit["static"], torch.tensor(np.maximum(fit["stock0"], 0.0),
+                        dtype=torch.float32), world, fit["cfg"], fit["norm"], years, fit["edge"], trace=trace)
+        Z = fit["cfg"].latent
+        prod = torch.eye(Z).expand(len(fit["edge"][0]), Z, Z)
+        norms_t = [torch.ones(len(fit["edge"][0]))]
+        for feats, zt in trace:
+            x = torch.cat([feats, zt], dim=1).requires_grad_(True)
+            out = net(x)
+            rows = [torch.autograd.grad(out[:, 1 + a].sum(), x, retain_graph=True)[0][:, -Z:]
+                    for a in range(Z)]
+            P = torch.stack(rows, dim=1)  # (E, Z, Z)
+            one_year.append(torch.linalg.matrix_norm(P, ord=2))
+            prod = P @ prod
+            norms_t.append(torch.linalg.matrix_norm(prod, ord=2))
+        prod_norms.append(torch.stack(norms_t).numpy())  # (years + 1, E)
+    return torch.cat(one_year).numpy(), np.concatenate(prod_norms, axis=1)
+
+
+P1_mem, Pprod_mem = latent_carry(fit_mem)
+
+
+def latent_bound(net, Z):
+    # beta of the latent-path bound: latent rows of W_o, W_3, W_2, latent columns of W_1
+    W = [m_.weight.detach() for m_ in net if isinstance(m_, torch.nn.Linear)]
+    parts = [W[0][:, -Z:], *W[1:-1], W[-1][1:]]
+    return float(np.prod([torch.linalg.matrix_norm(w, ord=2).item() for w in parts]))
+
+
+beta_mem = np.array([latent_bound(net, fit_mem["cfg"].latent) for net in fit_mem["nets"]])
+
+
+def learned_stock_block(fit):
+    # J_SS(t) = A + M diag(T) H_t, the stock block of the trained model in each year,
+    # with the latent state held at its value on the trajectory.
+    rho, dev, prod_norm = [], [], []
+    for net in fit["nets"]:
+        trace = []
+        with torch.no_grad():
+            _, stocks = mf._rollout(torch, net, fit["static"], torch.tensor(np.maximum(fit["stock0"], 0.0),
+                                    dtype=torch.float32), world, fit["cfg"], fit["norm"], years, fit["edge"],
+                                    trace=trace)
+        prod = np.eye(n * n)
+        for t in range(years):
+            step = lambda s_, t=t: year_step(net, fit, t, s_, trace[t][1])[1]  # noqa: E731
+            Jm = torch.autograd.functional.jacobian(step, stocks[t], vectorize=True)
+            Jm = Jm.reshape(n * n, n * n).double().numpy()
+            rho.append(np.abs(np.linalg.eigvals(Jm)).max())
+            dev.append(np.linalg.norm(Jm - A_world, 2))
+            prod = Jm @ prod
+        prod_norm.append(np.linalg.norm(prod, 2))
+    return np.array(rho), np.array(dev), np.array(prod_norm)
+
+
+rho_SS, dev_SS, prod_SS = learned_stock_block(fit_mem)
+A_pow = [float(np.linalg.norm(np.linalg.matrix_power(A_world, L), 2)) for L in range(years + 1)]
+
+fig, ax = plt.subplots(1, 3, figsize=(12, 3.6))
+lags = np.arange(tau + 1)
+ax[0].semilogy(lags, grad_z["full"], "o-", color="tab:red", ms=3, label="both paths")
+ax[0].semilogy(lags, grad_z["latent"], "--", color="black", label="latent path only")
+ax[0].semilogy(lags[1:], np.maximum(grad_z["stock"][1:], 1e-12), ":", color="tab:green",
+               label="stock path only")
+ax[0].set(xlabel=r"lag $\tau - s$ (years)", ylabel=r"$\|\partial \ell / \partial z_s\|$", title="into the latent state")
+ax[1].plot(lags, grad_s["full"], "o-", color="tab:red", ms=3, label="both paths")
+ax[1].plot(lags, grad_s["stock"], ":", color="tab:green", label="stock path only")
+ax[1].plot(lags, grad_s["mixed"], "--", color="tab:purple", label="mixed paths")
+ax[1].set(xlabel=r"lag $\tau - s$ (years)", ylabel=r"$\|\partial \ell / \partial \log S_s\|$", title="into the stocks",
+          ylim=(0, None))
+q50, q90 = np.median(Pprod_mem, axis=1), np.quantile(Pprod_mem, 0.9, axis=1)
+ax[2].semilogy(range(years + 1), np.maximum(q50, 1e-30), "-", color="tab:red", label="latent, median edge")
+ax[2].semilogy(range(years + 1), np.maximum(q90, 1e-30), "--", color="tab:red", label="latent, 90th pct edge")
+ax[2].semilogy(range(years + 1), A_pow, "-", color="tab:green", label=r"accounting carry $A^k$")
+ax[2].set(xlabel="years k", ylabel="spectral norm of the k-year Jacobian", title="carry over k years", ylim=(1e-12, 10))
+for a_ in ax:
+    a_.grid(alpha=0.3)
+    a_.legend(frameon=False, fontsize=8)
+plt.tight_layout(); plt.show()
+
+show = [0, 1, 2, 5, 10, 19]
+print("median over members, by lag:", show)
+print("  d ell/d z(s), both paths      ", np.array2string(grad_z["full"][show], precision=4))
+print("  d ell/d z(s), latent path only", np.array2string(grad_z["latent"][show], precision=4))
+print("  d ell/d z(s), stock path only ", np.array2string(grad_z["stock"][show], precision=4))
+print("  d ell/d log S(s), both paths  ", np.array2string(grad_s["full"][show], precision=4))
+print("  d ell/d log S(s), stock only  ", np.array2string(grad_s["stock"][show], precision=4))
+print(f"latent-path bound beta per network: {np.array2string(beta_mem, precision=2)}")
+print("one-year latent Jacobian norm per edge, quantiles 10/50/90/99:",
+      np.array2string(np.quantile(P1_mem, [0.1, 0.5, 0.9, 0.99]), precision=3))
+print(f"learned stock block J_SS: spectral radius {rho_SS.min():.4f} to {rho_SS.max():.4f} "
+      f"(A: {np.abs(eig_A).max():.4f}), median ||J_SS - A|| = {np.median(dev_SS):.4f}, "
+      f"20-year product norm {prod_SS.min():.3f} to {prod_SS.max():.3f}")
+print(f"median edge, norm of the k-year latent Jacobian: k=5 {q50[5]:.1e}, k=10 {q50[10]:.1e}, "
+      f"k=20 {q50[20]:.1e};  ||A^20|| = {A_pow[20]:.3f}")
+t_grad = time.time() - t0
+print(f"({t_grad:.0f} s)")
+```
+
+The rebuilt rollout matches the library's to `{python} f"{replica_err:.0e}"` in log flow, which is float32 rounding, so the switches cut paths without changing anything else. @fig-mf-gradient-paths and the printed numbers show that the three predictions hold.
+
+*The latent path vanishes for most edges.* The one-year latent Jacobian has median spectral norm `{python} f"{np.median(P1_mem):.2f}"` per edge, with a 90th percentile of `{python} f"{np.quantile(P1_mem, 0.9):.2f}"` and a 99th percentile of `{python} f"{np.quantile(P1_mem, 0.99):.2f}"`. For the median edge the latent memory is effectively gone within a few years: its five-year Jacobian has norm `{python} f"{q50[5]:.0e}"` and its ten-year Jacobian `{python} f"{q50[10]:.0e}"`. The generator's memory trace, for comparison, still holds $0.8^{5} \approx 0.33$ and $0.8^{10} \approx 0.11$ of a shock. The gradient norm summed over all edges decays more slowly, from `{python} f"{grad_z['latent'][0]:.4f}"` at lag 0 to `{python} f"{grad_z['latent'][19]:.4f}"` at lag 19 along the latent path alone, a factor of about `{python} f"{grad_z['latent'][0] / grad_z['latent'][19]:.0f}"`, because a sum of norms is dominated by the few edges whose per-year norm stays near or above one. Those edges are the ones that could explode, which is the other side of @eq-mf-bptt-latent: the bound $\beta$ of the five networks lies between `{python} f"{beta_mem.min():.1f}"` and `{python} f"{beta_mem.max():.1f}"`, so nothing in the architecture rules out growth, and only the trained weights and the saturation of the units keep it rare. The bound is also far from tight, since the median edge sits near `{python} f"{np.median(P1_mem):.2f}"`.
+
+*The stock path neither vanishes nor explodes.* Along the stock path alone the gradient with respect to $\log S_s$ is flat, `{python} f"{grad_s['stock'][0]:.4f}"` at lag 0 and `{python} f"{grad_s['stock'][19]:.4f}"` at lag 19. The learned stock block has spectral radius between `{python} f"{rho_SS.min():.4f}"` and `{python} f"{rho_SS.max():.4f}"` across years and networks, against `{python} f"{np.abs(eig_A).max():.4f}"` for the fixed carry, and it differs from $A$ by a median spectral norm of `{python} f"{np.median(dev_SS):.3f}"`. Over 20 years its product has norm `{python} f"{prod_SS.min():.2f}"` to `{python} f"{prod_SS.max():.2f}"`, close to $\|A^{20}\|_2 =$ `{python} f"{A_pow[20]:.2f}"`. So the network's learned feedback (the correction $M\, \mathrm{diag}(\hat T)\, H_t$) adds at most a few percent per year to what demography already carries, as @sec-mf-bptt predicted.
+
+*The crossing is asymmetric.* Gradient that starts in the latent state almost never uses the stock carry: through the stock path alone the gradient with respect to $\mathbf{z}_s$ is `{python} f"{grad_z['stock'][1]:.4f}"` at lag 1, against `{python} f"{grad_z['latent'][1]:.4f}"` through the latent path. Gradient that starts in the stocks crosses easily: the mixed paths grow with the lag and, at lag 19, the full gradient with respect to $\log S_s$ (`{python} f"{grad_s['full'][19]:.4f}"`) is `{python} f"{grad_s['full'][19] / grad_s['stock'][19]:.1f}"` times the stock path's alone. Every extra year of lag adds another year in which a stock perturbation can enter the latent state and reach $\ell$ through a short latent segment at the end.
+
+In plain terms, for most edges the trained Elman block remembers a shock for a few years at most, and the stock path, which does remember, can store a latent memory only by writing it into flows, a channel too narrow to hold it. That matches what @fig-mf-memory showed for country 2, whose recovered outflow decays too fast after the conflict.
+
+### A gated latent update
+
+`TrainConfig(cell="gated")` keeps the inputs, the $\tanh$ trunk, the CELU flow output, the loss, the seeds, and the training schedule of the recurrent ensemble, and replaces only the latent block by @eq-mf-gated. The head of the network emits $1 + 2Z$ pre-activations instead of $1 + Z$, the latent block of the output is `gated_latent_update` applied to the input's latent block, and `gate_bias` sets the initial update-gate bias $b_g$. We train two ensembles: $b_g = 0$, which starts every gate at 0.5, and $b_g = 2$, which starts them at 0.88 so that the network remembers by default.
+
+```{python}
+#| label: cell-mf-gated-train
+t0 = time.time()
+fit_g0 = mf.train_ensemble(world, obs, mf.TrainConfig(cell="gated", gate_bias=0.0))
+fit_g2 = mf.train_ensemble(world, obs, mf.TrainConfig(cell="gated", gate_bias=2.0))
+t_gated = time.time() - t0
+n_par = lambda fit: sum(p.numel() for p in fit["nets"][0].parameters())  # noqa: E731
+for name, fit in (("recurrent (Elman)", fit_mem), ("gated, b_g = 0", fit_g0), ("gated, b_g = 2", fit_g2)):
+    fl = np.array(fit["final_loss"])
+    print(f"{name:18s} parameters {n_par(fit):5d}   final loss per member {np.round(fl, 3)}  mean {fl.mean():.3f}")
+print(f"({t_gated:.0f} s for both gated ensembles)")
+```
+
+```{python}
+#| label: tbl-mf-gated
+#| tbl-cap: "The gated ablation against the recurrent (Elman) and no-memory ensembles trained earlier, on the same synthetic world and observations. Columns 2 to 4 are the recovery metrics of the recovery table (all years pooled); the last four columns are the log RMSE of each conflict country's total outflow, over years 6 to 18 as in the memory figure and over the years after the conflict covariate has switched off (country 6: years 9 to 18; country 2: years 14 to 18)."
+models = {"recurrent (Elman)": fit_mem, "gated, b_g = 0": fit_g0, "gated, b_g = 2": fit_g2,
+          "no memory": fit_ff}
+windows = {6: (slice(6, 19), slice(9, 19)), 2: (slice(6, 19), slice(14, 19))}
+rows = []
+for name, fit in models.items():
+    rep = mf.recovery_report(world, fit["samples"], obs)
+    out = fit["samples"].sum(axis=2).sum(axis=-1).mean(0)       # (years, n) total outflow
+    row = {"model": name, "final loss": np.mean(fit["final_loss"]),
+           "unobserved log RMSE": rep["unobserved corridors"]["log_rmse"],
+           "unobserved coverage": rep["unobserved corridors"]["coverage_95"],
+           "observed log RMSE": rep["observed corridors"]["log_rmse"]}
+    for c, (w_all, w_post) in windows.items():
+        tru = tF[:, c, :].sum(axis=1)
+        row[f"country {c}, years 6-18"] = mf.log_rmse(tru[w_all], out[w_all, c])
+        row[f"country {c}, after conflict"] = mf.log_rmse(tru[w_post], out[w_post, c])
+    rows.append(row)
+gated_tab = pd.DataFrame(rows).set_index("model")
+gated_tab.round(3)
+```
+
+```{python}
+#| label: fig-mf-gated
+#| fig-cap: "The gated ablation. Left: norm of the gradient of the last year's mean log flow with respect to the latent state s years earlier, through the latent path only (median over five networks), for the Elman block and the two gated blocks. Middle and right: total outflow of the two conflict countries, truth against the ensemble means of the Elman, gated (b_g = 2, with a two standard deviation band) and no-memory models; the conflict years are shaded."
+grad_latent = {"recurrent (Elman)": grad_z["latent"],
+               "gated, b_g = 0": by_lag(path_gradients(fit_g0, "latent")[0]),
+               "gated, b_g = 2": by_lag(path_gradients(fit_g2, "latent")[0])}
+P1_g2, Pprod_g2 = latent_carry(fit_g2)
+
+
+def learned_gates(fit):
+    gates = []
+    for net in fit["nets"]:
+        trace = []
+        with torch.no_grad():
+            mf._rollout(torch, net, fit["static"], torch.tensor(np.maximum(fit["stock0"], 0.0),
+                        dtype=torch.float32), world, fit["cfg"], fit["norm"], years, fit["edge"], trace=trace)
+            for feats, zt in trace:
+                gates.append(torch.sigmoid(net.heads(torch.cat([feats, zt], dim=1))[2]).numpy())
+    return np.array(gates)
+
+
+gates_g0, gates_g2 = learned_gates(fit_g0), learned_gates(fit_g2)
+style = {"recurrent (Elman)": ("tab:red", "-"), "gated, b_g = 0": ("tab:purple", "--"),
+         "gated, b_g = 2": ("tab:green", "-"), "no memory": ("tab:blue", ":")}
+fig, ax = plt.subplots(1, 3, figsize=(12, 3.6))
+for name, g_ in grad_latent.items():
+    ax[0].semilogy(np.arange(tau + 1), g_, color=style[name][0], ls=style[name][1], marker="o", ms=3, label=name)
+ax[0].set(xlabel=r"lag $\tau - s$ (years)", ylabel=r"$\|\partial \ell / \partial z_s\|$, latent path",
+          title="gradient through the latent path")
+for a_, c in zip(ax[1:], (6, 2)):
+    a_.plot(tF[:, c, :].sum(axis=1), color="black", label="truth")
+    for name in ("recurrent (Elman)", "gated, b_g = 2", "no memory"):
+        sm = models[name]["samples"].sum(axis=2)[:, :, c, :].sum(axis=-1)
+        a_.plot(sm.mean(0), color=style[name][0], ls=style[name][1], label=name)
+        if name == "gated, b_g = 2":
+            mu_, sd_ = sm.mean(0), sm.std(0, ddof=1)
+            a_.fill_between(range(years), mu_ - 2 * sd_, mu_ + 2 * sd_, color=style[name][0], alpha=0.2)
+    yrs = np.where(world.conflict[:, c] > 0)[0]
+    a_.axvspan(yrs.min() - 0.5, yrs.max() + 0.5, color="gray", alpha=0.15)
+    a_.set(title=f"country {c}", xlabel="year", ylabel="outflow (thousands)")
+for a_ in ax:
+    a_.grid(alpha=0.3)
+ax[0].legend(frameon=False, fontsize=8)
+ax[1].legend(frameon=False, fontsize=8)
+plt.tight_layout(); plt.show()
+
+print("latent-path gradient at lag 19 relative to lag 0:")
+for name, g_ in grad_latent.items():
+    print(f"  {name:18s} {g_[19] / g_[0]:.3f}")
+print("one-year latent Jacobian norm per edge, median: "
+      f"Elman {np.median(P1_mem):.3f}, gated b_g = 2 {np.median(P1_g2):.3f}; "
+      f"20-year product, median edge: Elman {np.median(Pprod_mem[20]):.1e}, gated b_g = 2 {np.median(Pprod_g2[20]):.3f}")
+for name, gq in (("b_g = 0", gates_g0), ("b_g = 2", gates_g2)):
+    print(f"learned update gates, {name}: quartiles {np.array2string(np.quantile(gq, [0.25, 0.5, 0.75]), precision=3)}")
+```
+
+The two gated ensembles take `{python} f"{t_gated:.0f}"` seconds together and add `{python} f"{n_par(fit_g2) - n_par(fit_mem)}"` parameters per network to the recurrent model's `{python} f"{n_par(fit_mem):,}"`. @tbl-mf-gated and @fig-mf-gated show what they change:
+
+* **The latent path no longer vanishes.** Through the latent path alone, the gradient at lag 19 keeps `{python} f"{grad_latent['gated, b_g = 2'][19] / grad_latent['gated, b_g = 2'][0]:.2f}"` of its lag-0 value for $b_g = 2$ and `{python} f"{grad_latent['gated, b_g = 0'][19] / grad_latent['gated, b_g = 0'][0]:.2f}"` for $b_g = 0$, against `{python} f"{grad_latent['recurrent (Elman)'][19] / grad_latent['recurrent (Elman)'][0]:.3f}"` for the Elman block. For the median edge the one-year latent Jacobian has norm `{python} f"{np.median(P1_g2):.3f}"` and the 20-year product `{python} f"{np.median(Pprod_g2[20]):.2f}"` with $b_g = 2$, where the Elman block's 20-year product is `{python} f"{np.median(Pprod_mem[20]):.0e}"`. This is the direct term $\mathrm{diag}(\mathbf{g})$ of @eq-mf-gated-jacobian at work: the learned gates have median `{python} f"{np.median(gates_g2):.2f}"` (quartiles `{python} f"{np.quantile(gates_g2, 0.25):.2f}"` and `{python} f"{np.quantile(gates_g2, 0.75):.2f}"`) with $b_g = 2$. With $b_g = 0$ they settle lower, at a median of `{python} f"{np.median(gates_g0):.2f}"`, close to the generator's decay of 0.8, although a gate is per coordinate and per edge and nothing forces it to equal that number.
+* **It fits better and recovers the post-shock decay better.** The final training loss falls from `{python} f"{gated_tab.loc['recurrent (Elman)', 'final loss']:.3f}"` (Elman) to `{python} f"{gated_tab.loc['gated, b_g = 0', 'final loss']:.3f}"` and `{python} f"{gated_tab.loc['gated, b_g = 2', 'final loss']:.3f}"`. After the conflict covariate switches off, the log RMSE of country 6's outflow is `{python} f"{gated_tab.loc['gated, b_g = 2', 'country 6, after conflict']:.3f}"` with $b_g = 2$, against `{python} f"{gated_tab.loc['recurrent (Elman)', 'country 6, after conflict']:.3f}"` for the Elman block and `{python} f"{gated_tab.loc['no memory', 'country 6, after conflict']:.3f}"` without memory. For country 2, which has no annual data, it is `{python} f"{gated_tab.loc['gated, b_g = 2', 'country 2, after conflict']:.3f}"`, against `{python} f"{gated_tab.loc['recurrent (Elman)', 'country 2, after conflict']:.3f}"` and `{python} f"{gated_tab.loc['no memory', 'country 2, after conflict']:.3f}"`.
+* **It removes the pooled cost of memory in this run.** On the pooled unobserved corridors, where @sec-mf-results found the Elman model worse than the memoryless one, the gated model with $b_g = 2$ reaches a log RMSE of `{python} f"{gated_tab.loc['gated, b_g = 2', 'unobserved log RMSE']:.3f}"`, against `{python} f"{gated_tab.loc['recurrent (Elman)', 'unobserved log RMSE']:.3f}"` for the Elman model and `{python} f"{gated_tab.loc['no memory', 'unobserved log RMSE']:.3f}"` for the memoryless one, and $b_g = 0$ lands in between at `{python} f"{gated_tab.loc['gated, b_g = 0', 'unobserved log RMSE']:.3f}"`. In this run, then, most of the cost of memory seen earlier belonged to the ungated latent block, not to memory as such.
+
+What it does not change is equally clear. Coverage of the unobserved corridors stays below one half (`{python} f"{gated_tab.loc['gated, b_g = 2', 'unobserved coverage']:.2f}"` for $b_g = 2$), because the ensemble still cannot see a bias shared by all members. Country 2's decay is still too fast, as the right panel of @fig-mf-gated shows. With no annual data for that country the evidence of its slow decay is indirect, the five-yearly stock differences and whatever the shared parameters learn from country 6, and a better latent cell cannot add information that the data do not contain. And this is one data seed, one ensemble of five networks per arm, and two gate initialisations. The two initialisations agree closely on the outflow metrics, within a few hundredths of log RMSE, but not on the pooled unobserved corridors, and one seed cannot say whether that difference is systematic. The paper's own network has a deeper transition than the toy's (7 layers of 60 units) and the same ungated latent block, so nothing in its architecture protects its latent path either, and the gated update of @eq-mf-gated is a cheap change to try on the real data.
 
 ## Elasticities Through the Chain Rule {#sec-mf-elasticity}
 
@@ -574,7 +1076,7 @@ from aiinaction.ch_migration_flows import od_flows, net_migration, stock_step
 
 ## Reference Implementation {#sec-mf-reference-implementation}
 
-The numeric core of `aiinaction.ch_migration_flows` is implemented in all three of the book's languages with identical names and semantics, and the three test suites assert the same fixtures. These cover the Yeo-Johnson transform and its inverse, derivative, and profile likelihood; the stock step, total flows, and net migration; iterative proportional fitting and demographic balancing; uncertainty weights and the weighted loss; survival fractions and the offset calibration (including the non-negativity constraint); stock differencing; the gravity rate; and the recovery metrics. The synthetic world generator, observation noise, torch recurrent model, and ensemble training are Python only, because they depend on random number generators and an autodiff framework whose streams would not match across languages.
+The numeric core of `aiinaction.ch_migration_flows` is implemented in all three of the book's languages with identical names and semantics, and the three test suites assert the same fixtures. These cover the Yeo-Johnson transform and its inverse, derivative, and profile likelihood; the stock step, total flows, and net migration; iterative proportional fitting and demographic balancing; uncertainty weights and the weighted loss; survival fractions and the offset calibration (including the non-negativity constraint); stock differencing; the gravity rate; the recovery metrics; and, for @sec-mf-bptt, the Jacobian of the accounting carry (`stock_carry_jacobian`) and the gated latent update with its local derivatives (`gated_latent_update`, `gated_latent_partials`). The synthetic world generator, observation noise, torch recurrent model (with either latent block), and ensemble training are Python only, because they depend on random number generators and an autodiff framework whose streams would not match across languages.
 
 ::: {.panel-tabset}
 
@@ -606,6 +1108,16 @@ print(f"ipf converged in {iters} iterations; row sums {fit.sum(axis=1).round(6)}
 print("weights:", np.round(uncertainty_weights([0.05, 0.1, 0.2, 0.4, 0.8, 1.6]), 4))
 s = survival_fraction([0.01, 0.02, 0.03])
 print(f"offset: {calibrate_offset([10, 12, 14, 15], [9, 10.5, 13, 13.2], [1, 1, 2, 0.5], s):.4f}")
+
+from aiinaction.ch_migration_flows import gated_latent_partials, gated_latent_update, stock_carry_jacobian
+
+z, a_c, a_g = [0.5, -0.2, 0.0, 1.5], [0.3, -1.0, 2.0, 0.0], [0.0, 2.0, -1.0, 3.0]
+print("gated update:", np.round(gated_latent_update(z, a_c, a_g), 6))
+g, d_c, d_g = gated_latent_partials(z, a_c, a_g)
+print("direct carry g:", np.round(g, 6), " d/d a_g:", np.round(d_g, 6))
+A = stock_carry_jacobian([0.012, 0.01], [0.01, 0.008])   # (4, 4), cells in row-major order
+print("carry diagonal (its eigenvalues):", np.round(np.diag(A), 6))
+print("carry off-diagonal sum:", round(float(A.sum() - np.trace(A)), 6))
 ```
 
 ## Julia
@@ -629,15 +1141,27 @@ println("weights: ", round.(uncertainty_weights([0.05, 0.1, 0.2, 0.4, 0.8, 1.6])
 s = survival_fraction([0.01, 0.02, 0.03])
 println("offset: ", round(calibrate_offset([10.0, 12.0, 14.0, 15.0], [9.0, 10.5, 13.0, 13.2],
                                            [1.0, 1.0, 2.0, 0.5], s), digits=4))
+
+z, a_c, a_g = [0.5, -0.2, 0.0, 1.5], [0.3, -1.0, 2.0, 0.0], [0.0, 2.0, -1.0, 3.0]
+println("gated update: ", round.(gated_latent_update(z, a_c, a_g), digits=6))
+g, d_c, d_g = gated_latent_partials(z, a_c, a_g)
+println("direct carry g: ", round.(g, digits=6), "  d/d a_g: ", round.(d_g, digits=6))
+A = stock_carry_jacobian([0.012, 0.01], [0.01, 0.008])   # (4, 4), cells in row-major order
+println("carry diagonal (its eigenvalues): ", round.([A[q, q] for q in 1:4], digits=6))
+println("carry off-diagonal sum: ", round(sum(A) - sum(A[q, q] for q in 1:4), digits=6))
 ```
 
 ## Rust
 
 ```rust
 use aiinaction::ch_migration_flows::{
-    calibrate_offset, ipf, net_migration, od_flows, stock_step, survival_fraction,
-    uncertainty_weights, yj_sym,
+    calibrate_offset, gated_latent_partials, gated_latent_update, ipf, net_migration, od_flows,
+    stock_carry_jacobian, stock_step, survival_fraction, uncertainty_weights, yj_sym,
 };
+
+fn r6(v: &[f64]) -> Vec<f64> {
+    v.iter().map(|x| (x * 1e6).round() / 1e6).collect()
+}
 
 fn main() -> Result<(), String> {
     let x = [-5.0, -0.3, 0.0, 2.0, 10.0];
@@ -667,19 +1191,29 @@ fn main() -> Result<(), String> {
     let surv = survival_fraction(&[0.01, 0.02, 0.03])?;
     let b = calibrate_offset(&[10.0, 12.0, 14.0, 15.0], &[9.0, 10.5, 13.0, 13.2], &[1.0, 1.0, 2.0, 0.5], &surv)?;
     println!("offset: {:.4}", b);
+
+    let (z, a_c, a_g) = ([0.5, -0.2, 0.0, 1.5], [0.3, -1.0, 2.0, 0.0], [0.0, 2.0, -1.0, 3.0]);
+    println!("gated update: {:?}", r6(&gated_latent_update(&z, &a_c, &a_g)?));
+    let (g, _d_c, d_g) = gated_latent_partials(&z, &a_c, &a_g)?;
+    println!("direct carry g: {:?}  d/d a_g: {:?}", r6(&g), r6(&d_g));
+    let a = stock_carry_jacobian(&[0.012, 0.01], &[0.01, 0.008])?; // flat 4 x 4, row-major cells
+    let diag: Vec<f64> = (0..4).map(|q| a[q * 4 + q]).collect();
+    println!("carry diagonal (its eigenvalues): {:?}", r6(&diag));
+    let off = a.iter().sum::<f64>() - diag.iter().sum::<f64>();
+    println!("carry off-diagonal sum: {}", r6(&[off])[0]);
     Ok(())
 }
 ```
 
 :::
 
-Rust has no default arguments or multidimensional array literals, so callers pass the matrix side length `n` and the Python defaults explicitly (`tol = 1e-10`, `max_iter = 10000`, clamp bounds and floor), and tensors are flat row-major slices. Julia indexes from one, which only matters for the hand-built flow tensor in the example.
+Rust has no default arguments or multidimensional array literals, so callers pass the matrix side length `n` and the Python defaults explicitly (`tol = 1e-10`, `max_iter = 10000`, clamp bounds and floor), and tensors are flat row-major slices. Julia indexes from one, which only matters for the hand-built flow tensor in the example. `stock_carry_jacobian` orders stock cells row-major in all three languages, Julia included, so the fixture matrices agree entry by entry.
 
 ## Summary {#sec-mf-summary}
 
 The paper's contribution is a way of posing the estimation problem as much as a model. The flow tensor $T_{ijk}$ is never observed, but its aggregates (stocks, net migration, corridor totals) are, by instruments that disagree. Writing the exact accounting identity of @eq-mf-stock inside a recurrent network lets one training run reconcile all of them, with the network's covariate-driven smoothness selecting one solution among the many consistent ones. Four supporting choices make it work: the symmetrised Yeo-Johnson transform so heavy-tailed and signed values can share a loss; matching *differences* of stocks so census level errors do not leak in; weights built from the uncertainty of each source; and an ensemble with an initial-stock pushforward to put an interval on the answer.
 
-The synthetic replication shows the idea working and shows its limits. The accounting identity holds to rounding error, the recurrent ensemble fits its targets much better than a memoryless one, it orders corridors it never saw correctly, and it reproduces the slow decay after a shock where a memoryless model cannot. It also shows what the method does not give for free: unobserved small corridors are underestimated by a sizeable margin, the ensemble band is too narrow because it cannot see bias shared by all members, and elasticities are not recovered when the covariates vary too little to identify them. These are the reasons the paper validates on held-out real flows, and the reasons a reader adopting the pattern for a new problem should build a synthetic world first and measure what comes back.
+The synthetic replication shows the idea working and shows its limits. The accounting identity holds to rounding error, the recurrent ensemble fits its targets much better than a memoryless one, it orders corridors it never saw correctly, and it reproduces the slow decay after a shock where a memoryless model cannot. It also shows what the method does not give for free: unobserved small corridors are underestimated by a sizeable margin, the ensemble band is too narrow because it cannot see bias shared by all members, and elasticities are not recovered when the covariates vary too little to identify them. Looking inside the recurrence adds a further lesson. The model has two recurrent paths: an ungated Elman latent block, whose gradient vanishes within a few years for most edges, and the accounting identity, an additive carry with a forget gate fixed near 0.99 by mortality. Replacing the latent block by a gated, GRU-style update keeps the latent gradient alive across all 20 years and, in this run, improves the fit and the post-shock recovery. These are the reasons the paper validates on held-out real flows, and the reasons a reader adopting the pattern for a new problem should build a synthetic world first and measure what comes back.
 
 ## Exercises {#sec-mf-exercises}
 
@@ -691,6 +1225,9 @@ The synthetic replication shows the idea working and shows its limits. The accou
 6. **Memory ablation.** In `TrainConfig`, vary `latent` over 1, 4, 8, and 16 and plot final loss and recovery on country 2's outflow. Does more memory always help?
 7. **Observation budget.** Using `observe` with more or fewer corridors (the `corridors` argument), estimate how the log RMSE on unobserved corridors changes with the number of observed corridors. How many does the toy need before the level bias disappears?
 8. **Elasticity identification.** Make the generator produce 40 countries instead of 8 (`make_world(n=40)`; keep the training budget small) and re-test whether the GDP elasticities approach the truth. What does this say about interpreting elasticities from the real model?
+9. **An LSTM latent block.** Replace the gated update of @eq-mf-gated by an LSTM cell (Hochreiter and Schmidhuber, 1997) whose cell state is the latent block, with a forget-gate bias of one (Jozefowicz, Zaremba, and Sutskever, 2015). Derive the direct term of its carry Jacobian as in @eq-mf-gated-jacobian, add it as a third `cell` option of `TrainConfig`, and compare it with the gated arms of @tbl-mf-gated. Is a separate cell state worth its extra parameters here?
+10. **Cutting the stock path in training.** Modify `_rollout` so that the stocks fed to the network are detached (the latent switch of @fig-mf-gradient-paths) and retrain the recurrent and gated ensembles. The forward model is unchanged, only the gradient is cut. Which entries of @tbl-mf-gated move, and what does that say about how much training relies on the stock path?
+11. **The carry spectrum.** Prove @eq-mf-carry-spectrum for general $n$ by exhibiting the ordering of stock cells that makes $A$ triangular, and use it to show that $\|A^k\|_2$ can exceed $\rho(A)^k$. Which entries of $A$ make it non-normal?
 
 ## References {#sec-mf-references}
 
@@ -699,11 +1236,20 @@ The synthetic replication shows the idea working and shows its limits. The accou
 3. Abel, G. J., and Sander, N. (2014). Quantifying global international migration flows. *Science*, 343(6178), 1520-1522. https://doi.org/10.1126/science.1248676
 4. Azose, J. J., and Raftery, A. E. (2019). Estimation of emigration, return migration, and transit migration between all pairs of countries. *Proceedings of the National Academy of Sciences*, 116(1), 116-122. https://doi.org/10.1073/pnas.1722334116
 5. Barron, J. T. (2017). Continuously differentiable exponential linear units. arXiv preprint arXiv:1704.07483. https://arxiv.org/abs/1704.07483
-6. Deming, W. E., and Stephan, F. F. (1940). On a least squares adjustment of a sampled frequency table when the expected marginal totals are known. *The Annals of Mathematical Statistics*, 11(4), 427-444. https://doi.org/10.1214/aoms/1177731829
-7. Gaskin, T., and Abel, G. J. (2026). Deep learning four decades of human migration. *Nature*, 655(8121), 148-157. https://doi.org/10.1038/s41586-026-10611-7 (preprint arXiv:2506.22821; data: https://doi.org/10.5281/zenodo.15623215; code: https://github.com/ThGaskin/Migration_flows)
-8. Hochreiter, S., and Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735-1780. https://doi.org/10.1162/neco.1997.9.8.1735
-9. Lakshminarayanan, B., Pritzel, A., and Blundell, C. (2017). Simple and scalable predictive uncertainty estimation using deep ensembles. *Advances in Neural Information Processing Systems 30*. arXiv:1612.01474. https://arxiv.org/abs/1612.01474
-10. Paszke, A., Gross, S., Massa, F., Lerer, A., et al. (2019). PyTorch: An imperative style, high-performance deep learning library. *Advances in Neural Information Processing Systems 32*. arXiv:1912.01703. https://arxiv.org/abs/1912.01703
-11. Rackauckas, C., Ma, Y., Martensen, J., Warner, C., et al. (2020). Universal differential equations for scientific machine learning. arXiv preprint arXiv:2001.04385. https://arxiv.org/abs/2001.04385
-12. Raissi, M., Perdikaris, P., and Karniadakis, G. E. (2019). Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations. *Journal of Computational Physics*, 378, 686-707. https://doi.org/10.1016/j.jcp.2018.10.045
-13. Yeo, I.-K., and Johnson, R. A. (2000). A new family of power transformations to improve normality or symmetry. *Biometrika*, 87(4), 954-959. https://doi.org/10.1093/biomet/87.4.954
+6. Bengio, Y., Simard, P., and Frasconi, P. (1994). Learning long-term dependencies with gradient descent is difficult. *IEEE Transactions on Neural Networks*, 5(2), 157-166. https://doi.org/10.1109/72.279181
+7. Cho, K., van Merrienboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., and Bengio, Y. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation. *Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing (EMNLP)*, 1724-1734. https://doi.org/10.3115/v1/D14-1179
+8. Deming, W. E., and Stephan, F. F. (1940). On a least squares adjustment of a sampled frequency table when the expected marginal totals are known. *The Annals of Mathematical Statistics*, 11(4), 427-444. https://doi.org/10.1214/aoms/1177731829
+9. Elman, J. L. (1990). Finding structure in time. *Cognitive Science*, 14(2), 179-211. https://doi.org/10.1207/s15516709cog1402_1
+10. Gaskin, T., and Abel, G. J. (2026). Deep learning four decades of human migration. *Nature*, 655(8121), 148-157. https://doi.org/10.1038/s41586-026-10611-7 (preprint arXiv:2506.22821; data: https://doi.org/10.5281/zenodo.15623215; code: https://github.com/ThGaskin/Migration_flows)
+11. Gers, F. A., Schmidhuber, J., and Cummins, F. (2000). Learning to forget: Continual prediction with LSTM. *Neural Computation*, 12(10), 2451-2471. https://doi.org/10.1162/089976600300015015
+12. Hochreiter, S., and Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735-1780. https://doi.org/10.1162/neco.1997.9.8.1735
+13. Jozefowicz, R., Zaremba, W., and Sutskever, I. (2015). An empirical exploration of recurrent network architectures. *Proceedings of the 32nd International Conference on Machine Learning*, PMLR 37, 2342-2350. https://proceedings.mlr.press/v37/jozefowicz15.html
+14. Lakshminarayanan, B., Pritzel, A., and Blundell, C. (2017). Simple and scalable predictive uncertainty estimation using deep ensembles. *Advances in Neural Information Processing Systems 30*. arXiv:1612.01474. https://arxiv.org/abs/1612.01474
+15. Pascanu, R., Gulcehre, C., Cho, K., and Bengio, Y. (2014). How to construct deep recurrent neural networks. *International Conference on Learning Representations*. arXiv:1312.6026. https://arxiv.org/abs/1312.6026
+16. Pascanu, R., Mikolov, T., and Bengio, Y. (2013). On the difficulty of training recurrent neural networks. *Proceedings of the 30th International Conference on Machine Learning*, PMLR 28(3), 1310-1318. https://proceedings.mlr.press/v28/pascanu13.html
+17. Paszke, A., Gross, S., Massa, F., Lerer, A., et al. (2019). PyTorch: An imperative style, high-performance deep learning library. *Advances in Neural Information Processing Systems 32*. arXiv:1912.01703. https://arxiv.org/abs/1912.01703
+18. Rackauckas, C., Ma, Y., Martensen, J., Warner, C., et al. (2020). Universal differential equations for scientific machine learning. arXiv preprint arXiv:2001.04385. https://arxiv.org/abs/2001.04385
+19. Raissi, M., Perdikaris, P., and Karniadakis, G. E. (2019). Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations. *Journal of Computational Physics*, 378, 686-707. https://doi.org/10.1016/j.jcp.2018.10.045
+20. Sutskever, I., Vinyals, O., and Le, Q. V. (2014). Sequence to sequence learning with neural networks. *Advances in Neural Information Processing Systems 27*. arXiv:1409.3215. https://arxiv.org/abs/1409.3215
+21. Werbos, P. J. (1990). Backpropagation through time: What it does and how to do it. *Proceedings of the IEEE*, 78(10), 1550-1560. https://doi.org/10.1109/5.58337
+22. Yeo, I.-K., and Johnson, R. A. (2000). A new family of power transformations to improve normality or symmetry. *Biometrika*, 87(4), 954-959. https://doi.org/10.1093/biomet/87.4.954

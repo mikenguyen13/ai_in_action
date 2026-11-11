@@ -35,6 +35,8 @@ EMA_123_07 = 2.61
 
 LSTM_X = [[1.0], [2.0], [0.5]]
 LSTM_H = [-0.007358975720281007, -0.3247841816214326]
+RNN_H = [0.7327923787582081, 0.20401955903303856]  # W = det_matrix(2, 3), b = det_matrix(1, 2, 0.3)
+GRU_H = [-0.18247873874066795, -0.6512644859666139]  # W = det_matrix(6, 3), b_ih/b_hh salts 0.3/0.6
 
 ATT_H = [0.5, -0.2, 0.1, 0.8]
 ATT_E = [0.2, 1.0, 0.5]
@@ -132,6 +134,70 @@ def test_lstm_embed_fixture_and_bounds():
     assert np.all(np.abs(h) < 1.0)
     with pytest.raises(ValueError):
         g.lstm_embed(LSTM_X, W[:, :2], b)
+
+
+def rnn_params():
+    return g.det_matrix(2, 3), g.det_matrix(1, 2, 0.3)[0]
+
+
+def gru_params():
+    return g.det_matrix(6, 3), g.det_matrix(1, 6, 0.3)[0], g.det_matrix(1, 6, 0.6)[0]
+
+
+def test_rnn_embed_fixture_and_bounds():
+    W, b = rnn_params()
+    h = g.rnn_embed(LSTM_X, W, b)
+    assert h == pytest.approx(RNN_H, abs=1e-12)
+    assert np.all(np.abs(h) < 1.0)
+    # one step from the zero state is tanh(W_x x + b)
+    assert g.rnn_embed([[0.7]], W, b) == pytest.approx(np.tanh(W[:, 0] * 0.7 + b), abs=1e-15)
+    with pytest.raises(ValueError):
+        g.rnn_embed(LSTM_X, W[:, :2], b)
+    with pytest.raises(ValueError):
+        g.rnn_embed(np.zeros((0, 1)), W, b)
+
+
+def test_gru_embed_fixture_and_bias_split():
+    W, b_ih, b_hh = gru_params()
+    h = g.gru_embed(LSTM_X, W, b_ih, b_hh)
+    assert h == pytest.approx(GRU_H, abs=1e-12)
+    assert np.all(np.abs(h) < 1.0)
+    # the reset and update biases only enter as a sum: moving them between b_ih and b_hh is a no-op
+    moved_ih, moved_hh = b_ih.copy(), b_hh.copy()
+    moved_ih[:4] += b_hh[:4]
+    moved_hh[:4] = 0.0
+    assert g.gru_embed(LSTM_X, W, moved_ih, moved_hh) == pytest.approx(h, abs=1e-14)
+    # the candidate's recurrent bias sits inside the reset gate, so moving it changes the output
+    moved_ih, moved_hh = b_ih.copy(), b_hh.copy()
+    moved_ih[4:] += b_hh[4:]
+    moved_hh[4:] = 0.0
+    assert np.abs(g.gru_embed(LSTM_X, W, moved_ih, moved_hh) - h).max() > 1e-3
+    with pytest.raises(ValueError):
+        g.gru_embed(LSTM_X, W[:, :2], b_ih, b_hh)
+    with pytest.raises(ValueError):
+        g.gru_embed(LSTM_X, W, b_ih, b_hh[:5])
+
+
+def test_gru_embed_carry_limits():
+    W, b_ih, b_hh = gru_params()
+    # a saturated update gate (z = 1) keeps the zero initial state
+    shut = b_ih.copy()
+    shut[2:4] = 50.0
+    assert np.abs(g.gru_embed(LSTM_X, W, shut, b_hh)).max() < 1e-20
+    # constant update gate and a history-free candidate: h_T is the EMA of the candidates
+    # with alpha = 1 - z, started from zero (the chapter's burst-retention identity)
+    W0 = W.copy()
+    W0[:4, :] = 0.0  # reset and update gates ignore x and h
+    W0[4:, 1:] = 0.0  # candidate ignores h
+    zeta = 0.4
+    b0 = b_ih.copy()
+    b0[2:4] = zeta
+    bh0 = np.zeros(6)
+    h = g.gru_embed(LSTM_X, W0, b0, bh0)
+    alpha = 1.0 - float(g.sigmoid(zeta))
+    for k in range(2):
+        n = [math.tanh(W0[4 + k, 0] * x[0] + b0[4 + k]) for x in LSTM_X]
+        assert h[k] == pytest.approx(g.ema_last([0.0] + n, alpha), abs=1e-14)
 
 
 def test_attention_fixture_and_properties():

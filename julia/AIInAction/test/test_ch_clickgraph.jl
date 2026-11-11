@@ -21,6 +21,8 @@ const CG_SESSION_W = [
 const CG_EMA_123_07 = 2.61
 const CG_LSTM_X = [1.0; 2.0; 0.5;;]
 const CG_LSTM_H = [-0.007358975720281007, -0.3247841816214326]
+const CG_RNN_H = [0.7327923787582081, 0.20401955903303856]
+const CG_GRU_H = [-0.18247873874066795, -0.6512644859666139]
 const CG_ATT_H = [0.5, -0.2, 0.1, 0.8]
 const CG_ATT_E = [0.2, 1.0, 0.5]
 const CG_ATT_Z = [0.13473023562592665, -0.13723523527276552]
@@ -77,6 +79,41 @@ const CG_BURST_FC = [0.0, 7.6159415595576485]
         @test isapprox(h, CG_LSTM_H; atol=1e-12)
         @test all(abs.(h) .< 1)
         @test_throws ArgumentError lstm_embed(CG_LSTM_X, W[:, 1:2], b)
+
+        Wr, br = det_matrix(2, 3), vec(det_matrix(1, 2, 0.3))
+        hr = rnn_embed(CG_LSTM_X, Wr, br)
+        @test isapprox(hr, CG_RNN_H; atol=1e-12)
+        @test all(abs.(hr) .< 1)
+        @test isapprox(rnn_embed([0.7;;], Wr, br), tanh.(Wr[:, 1] .* 0.7 .+ br); atol=1e-15)
+        @test_throws ArgumentError rnn_embed(CG_LSTM_X, Wr[:, 1:2], br)
+        @test_throws ArgumentError rnn_embed(zeros(0, 1), Wr, br)
+
+        Wg, bih, bhh = det_matrix(6, 3), vec(det_matrix(1, 6, 0.3)), vec(det_matrix(1, 6, 0.6))
+        hg = gru_embed(CG_LSTM_X, Wg, bih, bhh)
+        @test isapprox(hg, CG_GRU_H; atol=1e-12)
+        @test all(abs.(hg) .< 1)
+        # reset and update biases enter only as a sum; the candidate's do not
+        mih, mhh = copy(bih), copy(bhh)
+        mih[1:4] .+= bhh[1:4]; mhh[1:4] .= 0.0
+        @test isapprox(gru_embed(CG_LSTM_X, Wg, mih, mhh), hg; atol=1e-14)
+        mih, mhh = copy(bih), copy(bhh)
+        mih[5:6] .+= bhh[5:6]; mhh[5:6] .= 0.0
+        @test maximum(abs.(gru_embed(CG_LSTM_X, Wg, mih, mhh) .- hg)) > 1e-3
+        @test_throws ArgumentError gru_embed(CG_LSTM_X, Wg[:, 1:2], bih, bhh)
+        @test_throws ArgumentError gru_embed(CG_LSTM_X, Wg, bih, bhh[1:5])
+        # a saturated update gate keeps the zero initial state
+        shut = copy(bih); shut[3:4] .= 50.0
+        @test maximum(abs.(gru_embed(CG_LSTM_X, Wg, shut, bhh))) < 1e-20
+        # constant update gate, history-free candidate: h_T is the EMA of the candidates
+        W0 = copy(Wg); W0[1:4, :] .= 0.0; W0[5:6, 2:end] .= 0.0
+        zeta = 0.4
+        b0 = copy(bih); b0[3:4] .= zeta
+        h0 = gru_embed(CG_LSTM_X, W0, b0, zeros(6))
+        alpha = 1 - sigmoid(zeta)
+        for k in 1:2
+            n = [tanh(W0[4 + k, 1] * x + b0[4 + k]) for x in CG_LSTM_X[:, 1]]
+            @test isapprox(h0[k], ema_last(vcat(0.0, n), alpha); atol=1e-14)
+        end
 
         Wq, Wk, Wv = det_matrix(3, 4, 0.1), det_matrix(3, 4, 0.2), det_matrix(2, 4, 0.3)
         we, Hn = vec(det_matrix(1, 3, 0.4)), det_matrix(3, 4, 0.5)

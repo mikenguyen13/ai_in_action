@@ -9,8 +9,9 @@
 //!   [`normalize_edge_weights`], [`upstream_neighbors`].
 //! * **Scaling and burstiness.** [`robust_median_scale`], [`burstiness`],
 //!   [`neighbor_burstiness`], [`ema_last`], [`burst_forecast`].
-//! * **Embeddings.** [`lstm_embed`] maps a time series to a vector;
-//!   [`attention_neighbor_embedding`] is a one-head graph transformer layer with an edge
+//! * **Embeddings.** [`lstm_embed`] maps a time series to a vector; [`rnn_embed`]
+//!   (Elman RNN) and [`gru_embed`] (GRU, PyTorch and cuDNN convention) are the
+//!   alternative encoders compared in the chapter; [`attention_neighbor_embedding`] is a one-head graph transformer layer with an edge
 //!   term whose softmax weights act as learned conversion rates.
 //! * **Forecast assembly and loss.** [`gated_forecast`], [`pinball_loss`],
 //!   [`total_quantile_loss`], [`weighted_quantile_loss`], [`interval_coverage`].
@@ -258,6 +259,65 @@ pub fn lstm_embed(x_seq: &Matrix, w: &Matrix, b: &[f64]) -> Result<Vec<f64>, Str
     Ok(h)
 }
 
+/// Final hidden state of a single-layer Elman RNN `h_t = tanh(W [x_t; h_(t-1)] + b)`.
+/// `x_seq` is `(T, d)`, `w` is `(H, d + H)` and `b` has length `H`. The initial state is
+/// zero.
+pub fn rnn_embed(x_seq: &Matrix, w: &Matrix, b: &[f64]) -> Result<Vec<f64>, String> {
+    if x_seq.is_empty() {
+        return Err("x_seq must be non-empty".to_string());
+    }
+    let d = x_seq[0].len();
+    let hdim = w.len();
+    if hdim == 0 || w.iter().any(|r| r.len() != d + hdim) || b.len() != hdim {
+        return Err("W must be (H, d+H) and b must be (H,)".to_string());
+    }
+    let mut h = vec![0.0; hdim];
+    for x in x_seq {
+        let mut inp = x.clone();
+        inp.extend_from_slice(&h);
+        h = matvec(w, &inp).iter().zip(b).map(|(a, bb)| (a + bb).tanh()).collect();
+    }
+    Ok(h)
+}
+
+/// Final hidden state of a single-layer GRU in the PyTorch and cuDNN convention. `w` is
+/// `(3H, d + H)`: the first `d` columns act on `x_t`, the last `H` on `h_(t-1)`, with gate
+/// blocks reset, update, candidate. With `a = W_x x_t + b_ih` and `u = W_h h_(t-1) + b_hh`:
+/// `r = sigmoid(a_r + u_r)`, `z = sigmoid(a_z + u_z)`, `n = tanh(a_n + r * u_n)`,
+/// `h_t = (1 - z) * n + z * h_(t-1)`. The candidate parts of the two biases are not
+/// interchangeable because the reset gate multiplies `u_n`. The initial state is zero.
+pub fn gru_embed(x_seq: &Matrix, w: &Matrix, b_ih: &[f64], b_hh: &[f64]) -> Result<Vec<f64>, String> {
+    if x_seq.is_empty() {
+        return Err("x_seq must be non-empty".to_string());
+    }
+    let d = x_seq[0].len();
+    let hdim = w.len() / 3;
+    if hdim == 0
+        || w.len() != 3 * hdim
+        || w.iter().any(|r| r.len() != d + hdim)
+        || b_ih.len() != 3 * hdim
+        || b_hh.len() != 3 * hdim
+    {
+        return Err("W must be (3H, d+H) and b_ih, b_hh must be (3H,)".to_string());
+    }
+    let wx: Matrix = w.iter().map(|r| r[..d].to_vec()).collect();
+    let wh: Matrix = w.iter().map(|r| r[d..].to_vec()).collect();
+    let mut h = vec![0.0; hdim];
+    for x in x_seq {
+        let a: Vec<f64> = matvec(&wx, x).iter().zip(b_ih).map(|(v, bb)| v + bb).collect();
+        let u: Vec<f64> = matvec(&wh, &h).iter().zip(b_hh).map(|(v, bb)| v + bb).collect();
+        h = (0..hdim)
+            .map(|k| {
+                let r = sigmoid(a[k] + u[k]);
+                let z = sigmoid(a[hdim + k] + u[hdim + k]);
+                let n = (a[2 * hdim + k] + r * u[2 * hdim + k]).tanh();
+                (1.0 - z) * n + z * h[k]
+            })
+            .collect();
+    }
+    Ok(h)
+}
+
 /// One-head graph transformer layer. `q = Wq h_i`, `k_j = Wk h_j + we * e_ij`,
 /// `v_j = Wv h_j`, `alpha = softmax(q . k_j / sqrt(d_k))`, `z = sum_j alpha_j v_j`.
 /// Returns `(z, alpha)`; no neighbors gives `z = 0` and an empty `alpha`.
@@ -376,6 +436,8 @@ mod tests {
     const SESSION_COUNTS: [f64; 5] = [4.0, 3.0, 1.0, 3.0, 1.0];
     const EMA_123_07: f64 = 2.61;
     const LSTM_H: [f64; 2] = [-0.007358975720281007, -0.3247841816214326];
+    const RNN_H: [f64; 2] = [0.7327923787582081, 0.20401955903303856];
+    const GRU_H: [f64; 2] = [-0.18247873874066795, -0.6512644859666139];
     const ATT_H: [f64; 4] = [0.5, -0.2, 0.1, 0.8];
     const ATT_E: [f64; 3] = [0.2, 1.0, 0.5];
     const ATT_Z: [f64; 2] = [0.13473023562592665, -0.13723523527276552];
@@ -481,6 +543,84 @@ mod tests {
         let (z0, a0) = attention_neighbor_embedding(&ATT_H, &Vec::new(), &[], &wq, &wk, &wv, &we).unwrap();
         assert_eq!(z0, vec![0.0; 2]);
         assert!(a0.is_empty());
+    }
+
+    #[test]
+    fn rnn_embed_matches_fixture() {
+        let w = det_matrix(2, 3, 0.0);
+        let b = det_matrix(1, 2, 0.3).remove(0);
+        let x = vec![vec![1.0], vec![2.0], vec![0.5]];
+        let h = rnn_embed(&x, &w, &b).unwrap();
+        assert!(close(&h, &RNN_H, 1e-12));
+        assert!(h.iter().all(|v| v.abs() < 1.0));
+        let one = rnn_embed(&vec![vec![0.7]], &w, &b).unwrap();
+        let want: Vec<f64> = (0..2).map(|k| (w[k][0] * 0.7 + b[k]).tanh()).collect();
+        assert!(close(&one, &want, 1e-15));
+        let w_bad: Matrix = w.iter().map(|r| r[..2].to_vec()).collect();
+        assert!(rnn_embed(&x, &w_bad, &b).is_err());
+        assert!(rnn_embed(&Vec::new(), &w, &b).is_err());
+    }
+
+    #[test]
+    fn gru_embed_matches_fixture_and_bias_split() {
+        let w = det_matrix(6, 3, 0.0);
+        let b_ih = det_matrix(1, 6, 0.3).remove(0);
+        let b_hh = det_matrix(1, 6, 0.6).remove(0);
+        let x = vec![vec![1.0], vec![2.0], vec![0.5]];
+        let h = gru_embed(&x, &w, &b_ih, &b_hh).unwrap();
+        assert!(close(&h, &GRU_H, 1e-12));
+        assert!(h.iter().all(|v| v.abs() < 1.0));
+        // reset and update biases enter only as a sum; the candidate's do not
+        let (mut mih, mut mhh) = (b_ih.clone(), b_hh.clone());
+        for k in 0..4 {
+            mih[k] += b_hh[k];
+            mhh[k] = 0.0;
+        }
+        assert!(close(&gru_embed(&x, &w, &mih, &mhh).unwrap(), &h, 1e-14));
+        let (mut mih, mut mhh) = (b_ih.clone(), b_hh.clone());
+        for k in 4..6 {
+            mih[k] += b_hh[k];
+            mhh[k] = 0.0;
+        }
+        let moved = gru_embed(&x, &w, &mih, &mhh).unwrap();
+        assert!(moved.iter().zip(&h).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) > 1e-3);
+        let w_bad: Matrix = w.iter().map(|r| r[..2].to_vec()).collect();
+        assert!(gru_embed(&x, &w_bad, &b_ih, &b_hh).is_err());
+        assert!(gru_embed(&x, &w, &b_ih, &b_hh[..5]).is_err());
+    }
+
+    #[test]
+    fn gru_embed_carry_limits() {
+        let w = det_matrix(6, 3, 0.0);
+        let b_ih = det_matrix(1, 6, 0.3).remove(0);
+        let b_hh = det_matrix(1, 6, 0.6).remove(0);
+        let x = vec![vec![1.0], vec![2.0], vec![0.5]];
+        // a saturated update gate keeps the zero initial state
+        let mut shut = b_ih.clone();
+        shut[2] = 50.0;
+        shut[3] = 50.0;
+        let h = gru_embed(&x, &w, &shut, &b_hh).unwrap();
+        assert!(h.iter().all(|v| v.abs() < 1e-20));
+        // constant update gate, history-free candidate: h_T is the EMA of the candidates
+        let mut w0 = w.clone();
+        for (r, row) in w0.iter_mut().enumerate() {
+            for (c, v) in row.iter_mut().enumerate() {
+                if r < 4 || c >= 1 {
+                    *v = 0.0;
+                }
+            }
+        }
+        let zeta = 0.4;
+        let mut b0 = b_ih.clone();
+        b0[2] = zeta;
+        b0[3] = zeta;
+        let h0 = gru_embed(&x, &w0, &b0, &[0.0; 6]).unwrap();
+        let alpha = 1.0 - sigmoid(zeta);
+        for k in 0..2 {
+            let mut series = vec![0.0];
+            series.extend(x.iter().map(|xt| (w0[4 + k][0] * xt[0] + b0[4 + k]).tanh()));
+            assert!((h0[k] - ema_last(&series, alpha).unwrap()).abs() < 1e-14);
+        }
     }
 
     #[test]

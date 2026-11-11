@@ -21,7 +21,7 @@ A note on what is and is not claimed. The paper's results come from a large publ
 |---|---|---|---|
 | Product-stage nodes with count series | A node can be a time series, not a word or a row | @sec-cg-graph | `session_graph`, `average_graph`, `upstream_neighbors` |
 | Robust median scaling | Embeddings need inputs on a common scale | @sec-cg-embed | `robust_median_scale` |
-| LSTM embedding of each series | A recurrent encoder is a function from a series to a vector | @sec-cg-embed | `lstm_embed` |
+| LSTM embedding of each series | A recurrent encoder is a function from a series to a vector | @sec-cg-embed, @sec-cg-encoder-choice | `lstm_embed`, `rnn_embed`, `gru_embed` |
 | Burstiness of upstream neighbors | Hand-built, scale-free features still help beside learned ones | @sec-cg-burst | `burstiness`, `neighbor_burstiness`, `ema_last`, `burst_forecast` |
 | Graph Transformer neighbor embedding | Attention weights as a learned conversion rate | @sec-cg-attention | `attention_neighbor_embedding`, `softmax` |
 | Sigmoid gate over three embeddings | Learned control over redundant signals | @sec-cg-assembly | `gated_forecast` |
@@ -145,6 +145,218 @@ print("max abs difference:", float(np.abs(h_torch - h_lib).max()))
 ```
 
 The two agree to floating point precision, which is the point of keeping the encoder in the library: the formula in @eq-cg-lstm is the whole story, and nothing else is hiding inside the framework.
+
+### Choosing the encoder {#sec-cg-encoder-choice}
+
+The LSTM is the paper's choice, but it is one of three standard recurrent cells, and @sec-road-to-transformers derives all three side by side: the vanilla (Elman) RNN (Elman, 1990), the LSTM with the forget gate of Gers, Schmidhuber, and Cummins (2000), and the gated recurrent unit (GRU) of Cho et al. (2014). That chapter counts their parameters, derives the Jacobians that carry gradients backward through time, and runs a delayed recall experiment over 5 to 100 steps in which the initial bias of the carry gate decides whether anything is remembered at all. Its question is long range memory. The question here is narrower, because the encoder in this chapter works under three conditions that a language model does not face. The windows are short ($T = 7$ days). The inputs are robustly scaled counts (@eq-cg-scale), so a quiet day sits near zero and a promotion day can sit several deviations above it. And the information that matters most for a forecast, a burst, can arrive on any day of the window, while the embedding (@eq-cg-node-embedding) is read only at the end. So the question to ask of an encoder is concrete: if a burst arrives on day $s = T - k$, that is $k$ days before the end of the window, how much of it is still present in $h_T$?
+
+#### What survives of a burst $k$ days back
+
+**LSTM.** Unroll the cell update of @eq-cg-lstm from $c_0 = 0$. For $T = 1$ it gives $c_1 = i_1 \odot g_1$. If $c_{T-1} = \sum_{s=1}^{T-1} \big(\prod_{t=s+1}^{T-1} f_t\big) \odot i_s \odot g_s$, then
+
+$$
+c_T \;=\; f_T \odot c_{T-1} + i_T \odot g_T \;=\; \sum_{s=1}^{T} \Big(\prod_{t=s+1}^{T} f_t\Big) \odot i_s \odot g_s,
+$$
+
+with the empty product equal to one, so by induction the cell state at the end of the window is a gated sum of everything written into it. The write of day $s$ reaches $c_T$ with the coordinatewise weight
+
+$$
+\rho^{\text{LSTM}}_{s} \;=\; i_s \odot \prod_{t=s+1}^{T} f_t,
+$$ {#eq-cg-lstm-retention}
+
+and the embedding reads the sum out as $h_T = o_T \odot \tanh(c_T)$. This is an identity, not a linearization. The gates depend on the data, but once their values on a window are known, @eq-cg-lstm-retention says exactly how much of each day's write is left at the end.
+
+**GRU.** In the convention of @sec-road-to-transformers, which is also PyTorch's, the state update is $h_t = z_t \odot h_{t-1} + (1 - z_t) \odot n_t$ with a candidate $n_t \in (-1, 1)^d$ computed from $x_t$ and the reset-gated $h_{t-1}$. The same induction from $h_0 = 0$ gives
+
+$$
+h_T \;=\; \sum_{s=1}^{T} \rho^{\text{GRU}}_s \odot n_s, \qquad \rho^{\text{GRU}}_s \;=\; (1 - z_s) \odot \prod_{t=s+1}^{T} z_t.
+$$ {#eq-cg-gru-retention}
+
+Write $P_s = \prod_{t=s+1}^{T} z_t$, so that $P_T = 1$ and $\rho^{\text{GRU}}_s = P_s - P_{s-1}$. The weights telescope, $\sum_{s=1}^{T} \rho^{\text{GRU}}_s = P_T - P_0 = 1 - \prod_{t=1}^{T} z_t \le 1$, so the GRU embedding is a weighted average of its candidates whose weights sum to at most one. With a constant update gate $z$ the weight of day $T - k$ is $(1 - z) z^k$, and $h_T$ is exactly the exponential moving average of the candidates with smoothing $\alpha = 1 - z$, started from zero. That is the same smoother that @eq-cg-burst-forecast applies to raw counts, so a GRU is, in a precise sense, a learned EMA whose smoothing can change from day to day.
+
+**Vanilla RNN.** Here the state is overwritten at every step, $h_t = \tanh(W_x x_t + W_h h_{t-1} + b)$, so there is no additive carry and no weight to read off. Differentiating instead, with $J_t = \operatorname{diag}(1 - h_t^2)\, W_h$,
+
+$$
+\frac{\partial h_T}{\partial x_{T-k}} \;=\; J_T J_{T-1} \cdots J_{T-k+1}\, \operatorname{diag}\big(1 - h_{T-k}^2\big)\, W_x, \qquad \Big\|\frac{\partial h_T}{\partial x_{T-k}}\Big\|_2 \;\le\; \sigma_{\max}(W_h)^{k}\, \|W_x\|_2,
+$$ {#eq-cg-rnn-retention}
+
+because every diagonal factor has entries in $(0, 1]$. This is the bound of @sec-road-to-transformers applied to an input rather than to a state. Two things happen to a burst in a vanilla RNN. It decays through the same matrix at every later step, whatever the data, and it is clipped on its own day, because a value several deviations above zero drives $h_{T-k}$ into the flat part of $\tanh$, where $1 - h_{T-k}^2 \approx 0$.
+
+**The trade-off a GRU cannot escape with constant gates.** Compare the constant-gate weights. The LSTM's are $i f^k$, and $i = f = 1$ keeps every write at full size for any $k$: the cell is then an accumulator, which is the counting ability that Weiss, Goldberg, and Yahav (2018) prove a finite precision LSTM has and a GRU lacks. The GRU's weights are $(1 - z) z^k$, and one gate sets both factors. Maximizing over $z$,
+
+$$
+\frac{d}{dz}\Big[(1 - z) z^k\Big] \;=\; z^{k-1}\big(k - (k + 1) z\big) \;=\; 0 \;\;\Longrightarrow\;\; z^\ast = \frac{k}{k+1}, \qquad \max_{z}\,(1 - z) z^k \;=\; \frac{k^k}{(k+1)^{k+1}} \;\approx\; \frac{1}{e\,(k + 1)},
+$$ {#eq-cg-gru-tradeoff}
+
+where the approximation uses $\big(1 - \tfrac{1}{k+1}\big)^{k} \to e^{-1}$. For a burst on the first day of a seven day window ($k = 6$) the best constant gate keeps $6^6 / 7^7 \approx 0.057$ of it. The way out is a gate that depends on the input: a unit that sets $z_s \approx 0$ on the burst day and $z_t \approx 1$ on the quiet days after it keeps $\rho^{\text{GRU}}_s \approx 1$. A trained GRU can learn exactly that, since its gates see $x_t$. The constant-gate bound describes where training starts, and what any unit that does not tell burst days from quiet days can keep.
+
+**At initialization.** PyTorch draws every weight and bias from $U(-1/\sqrt{d}, 1/\sqrt{d})$, which is $\pm 0.25$ at the chapter's width $d = 16$, so with scaled inputs of order one every gate starts near $\sigma(0) = 1/2$. Both gated cells then start with $\rho \approx 0.5^{k+1}$: one half of a burst on the last day reaches the cell state, and $0.0078$ of a burst on the first day. A carry bias of one, $\sigma(1) \approx 0.731$, the setting Jozefowicz, Zaremba, and Sutskever (2015) recommend for the LSTM, raises the first-day weight to $0.5 \times 0.731^6 \approx 0.076$ for the LSTM, whose input gate stays at one half, and only to $0.269 \times 0.731^6 \approx 0.041$ for the GRU, whose write weight $1 - z$ falls as its retention rises.
+
+#### Parameters at the chapter's widths
+
+@tbl-266-rnn-cells gives a cell with $G$ gate blocks, input width $m$ and hidden width $d$ exactly $G\,(dm + d^2 + 2d)$ parameters and $2\,G\,d\,(m + d)$ multiply-add FLOPs per step. At the chapter's $d = 16$:
+
+| | Vanilla RNN | GRU | LSTM |
+|:--|--:|--:|--:|
+| Gate blocks $G$ | 1 | 3 | 4 |
+| Parameters, $m = 1$ (one scaled series: univariate and graph models) | 304 | 912 | 1,216 |
+| Parameters, $m = 3$ (views, carts, purchases: covariate model) | 336 | 1,008 | 1,344 |
+| Recurrent FLOPs per graph-model example, $m = 1$ | 26,656 | 79,968 | 106,624 |
+
+: The three encoders at the hidden width used in this chapter. The graph model applies one shared encoder to the product's own purchase series and to each of its $K = 6$ neighbor series, so every example costs $7 \times 7 = 49$ recurrent steps. {#tbl-cg-encoder-params}
+
+The encoder is a small part of the graph model, whose heads, attention maps and gate hold most of its parameters (the ablation in @sec-cg-encoder-ablation prints the totals), but it runs 49 times per example and sits on the only serial path. At parameter parity with the LSTM a GRU would get a width of about $\sqrt{4/3} \times 16 \approx 18.5$; solving $3(d + d^2 + 2d) = 1{,}216$ exactly gives $d \approx 18.7$.
+
+#### What the GRU would change
+
+- **Size and speed.** Three quarters of the LSTM's parameters and recurrent FLOPs at equal width.
+- **The embedding is the memory.** The LSTM's $h_T = o_T \odot \tanh(c_T)$ is a gated read of an unbounded memory, which can hold something the output gate is not currently exposing. The GRU's $h_T$ is its memory: by @eq-cg-gru-retention a weighted average of candidates, bounded inside $(-1, 1)^d$. For this chapter that costs nothing, because the head and the query, key and value maps of the attention layer receive a vector in $(-1, 1)^d$ from either cell.
+- **Writing costs forgetting.** @eq-cg-gru-tradeoff: on any day a GRU unit writes, it overwrites part of what it held. With one burst in a short window this matters little. With two events in one window, for example a weekend dip and then the first day of a promotion, the GRU must decide at the second how much of the first to give up, and the LSTM need not.
+- **No counting.** An LSTM unit can accumulate a running total of its inputs and a GRU unit cannot. Robust scaling removes the level of the series before the encoder sees it and the forecast is unscaled afterward (@eq-cg-scale), which weakens the case for accumulation in this pipeline.
+- **Conventions.** In PyTorch's convention the remember bias of a GRU is a positive $b_z$. And the GRU needs both of its bias vectors, because the candidate's recurrent bias sits inside the reset gate (see @sec-road-to-transformers). The library's `gru_embed` therefore takes `b_ih` and `b_hh` separately, while `lstm_embed` and `rnn_embed` take their sum.
+
+The first cell below checks the two new library encoders against PyTorch and the parameter formula against PyTorch's own count. The second confirms the unrolled carries @eq-cg-lstm-retention and @eq-cg-gru-retention, the telescoping sum and the maximizer of @eq-cg-gru-tradeoff with SymPy, checks the EMA reading of a constant-gate GRU with the library, and then measures how strongly $h_T$ depends on each day of a window at initialization.
+
+```{python}
+#| label: cg-encoder-check
+# rnn_embed and gru_embed against torch.nn.RNN and torch.nn.GRU on the scaled series above
+torch.manual_seed(1)
+enc_x = torch.tensor(scaled.scaled, dtype=torch.float64).view(1, -1, 1)
+enc_rows = []
+for enc_name, enc_cls in (("RNN", nn.RNN), ("GRU", nn.GRU)):
+    enc_net = enc_cls(1, hid, batch_first=True).double()
+    with torch.no_grad():
+        enc_torch = enc_net(enc_x)[1][0, 0].numpy()
+    enc_p = {k: v.detach().numpy() for k, v in enc_net.named_parameters()}
+    enc_W = np.concatenate([enc_p["weight_ih_l0"], enc_p["weight_hh_l0"]], axis=1)
+    if enc_name == "RNN":   # the two RNN biases only ever appear as a sum
+        enc_lib = cg.rnn_embed(scaled.scaled[:, None], enc_W, enc_p["bias_ih_l0"] + enc_p["bias_hh_l0"])
+    else:                   # the GRU needs both: b_hn sits inside the reset gate
+        enc_lib = cg.gru_embed(scaled.scaled[:, None], enc_W, enc_p["bias_ih_l0"], enc_p["bias_hh_l0"])
+    enc_rows.append({"encoder": enc_name, "max |library - torch|": float(np.abs(enc_lib - enc_torch).max())})
+print(pd.DataFrame(enc_rows).to_string(index=False))
+
+# Parameter counts at the chapter's widths: G (d m + d^2 + 2 d) for G = 1, 3, 4
+enc_count = []
+for m_in in (1, 3):
+    for enc_name, enc_cls, G in (("RNN", nn.RNN, 1), ("GRU", nn.GRU, 3), ("LSTM", nn.LSTM, 4)):
+        enc_count.append({"input width m": m_in, "encoder": enc_name, "G": G,
+                          "formula": G * (16 * m_in + 16 ** 2 + 2 * 16),
+                          "torch": sum(p.numel() for p in enc_cls(m_in, 16).parameters())})
+print(pd.DataFrame(enc_count).to_string(index=False))
+```
+
+```{python}
+#| label: fig-cg-encoder-retention
+#| fig-cap: "How much of a burst k days before the end of a seven day window reaches the embedding. Left: the carry weight of the burst under constant gates, from @eq-cg-lstm-retention and @eq-cg-gru-retention, for PyTorch's default gates near one half (the LSTM and GRU curves coincide), for a carry bias of one, for an LSTM that writes and keeps everything, and for the best constant update gate a GRU can choose at each k. Right: the measured median norm of the Jacobian of the final hidden state with respect to the scaled input k steps back, over 100 random initializations at width 16, on simulated sparse purchase windows."
+import sympy as sp
+import matplotlib.pyplot as plt
+
+# === SymPy: the unrolled carries of @eq-cg-lstm-retention and @eq-cg-gru-retention, T = 7
+T7 = 7
+fs, i_s, gs = sp.symbols("f1:8"), sp.symbols("i1:8"), sp.symbols("g1:8")
+zs, ns = sp.symbols("z1:8"), sp.symbols("n1:8")
+c_run, h_run = sp.Integer(0), sp.Integer(0)
+for t in range(T7):
+    c_run = fs[t] * c_run + i_s[t] * gs[t]
+    h_run = zs[t] * h_run + (1 - zs[t]) * ns[t]
+c_sum = sum(i_s[s] * sp.prod(fs[s + 1:]) * gs[s] for s in range(T7))
+a_s = [(1 - zs[s]) * sp.prod(zs[s + 1:]) for s in range(T7)]
+print("LSTM: c_7 minus the gated sum of writes        =", sp.expand(c_run - c_sum))
+print("GRU : h_7 minus the weighted sum of candidates  =", sp.expand(h_run - sum(a * n for a, n in zip(a_s, ns))))
+print("GRU : sum of weights minus (1 - prod z)         =", sp.expand(sum(a_s) - (1 - sp.prod(zs))))
+z, k = sp.symbols("z k", positive=True)
+z_star = sp.solve(sp.diff((1 - z) * z ** k, z), z)
+print("GRU : argmax_z (1 - z) z^k =", z_star, "  max =", sp.simplify(((1 - z) * z ** k).subs(z, z_star[0])))
+
+# Numerical: a GRU with a constant update gate and a history-free candidate is an EMA
+enc_W0 = np.zeros((3, 2))
+enc_W0[2, 0] = 0.8                        # candidate n_t = tanh(0.8 x_t + 0.1)
+enc_b0 = np.array([0.0, 0.4, 0.1])        # update gate z = sigmoid(0.4)
+enc_h = cg.gru_embed(scaled.scaled[:, None], enc_W0, enc_b0, np.zeros(3))[0]
+enc_ema = cg.ema_last(np.r_[0.0, np.tanh(0.8 * scaled.scaled + 0.1)], 1 - float(cg.sigmoid(0.4)))
+print(f"constant-gate GRU = {enc_h:.12f}, EMA of its candidates = {enc_ema:.12f}")
+
+# === Carry weight of a burst k steps back under constant gates
+ks = np.arange(7)
+sig = lambda v: 1 / (1 + np.exp(-v))
+theory = pd.DataFrame({
+    "LSTM, i = f = 1": np.ones(len(ks)),
+    "LSTM, i = f = 0.5": 0.5 * 0.5 ** ks,
+    "LSTM, i = 0.5, b_f = 1": 0.5 * sig(1.0) ** ks,
+    "GRU, z = 0.5": 0.5 * 0.5 ** ks,
+    "GRU, b_z = 1": (1 - sig(1.0)) * sig(1.0) ** ks,
+    "GRU, best constant z": ks ** ks / (ks + 1.0) ** (ks + 1),
+}, index=pd.Index(ks, name="k"))
+print("\nCarry weight of a burst k steps before the end (constant gates)")
+print(theory.round(4).to_string())
+
+# === Measured: median ||d h_T / d x_{T-k}|| at initialization, width 16
+enc_rng = np.random.default_rng(7)
+enc_windows = np.stack([cg.robust_median_scale(enc_rng.poisson(3.0, 7)).scaled for _ in range(64)])
+enc_xw = torch.tensor(enc_windows, dtype=torch.float32)[..., None]
+
+
+def enc_jacobian_norms(net, x_in):
+    """Per window and lag, the norm of d h_T / d x_t (columns ordered k = 0, 1, ..., T-1)."""
+    x = x_in.clone().requires_grad_(True)
+    out = net(x)[1]
+    h_T = (out[0] if isinstance(out, tuple) else out)[0]
+    sq = torch.zeros(x.shape[0], x.shape[1])
+    for j in range(h_T.shape[1]):
+        g, = torch.autograd.grad(h_T[:, j].sum(), x, retain_graph=True)
+        sq += g[..., 0] ** 2
+    return sq.sqrt().numpy()[:, ::-1]
+
+
+def enc_make(kind, carry_bias=None, d_in=1, width=16):
+    net = {"RNN": nn.RNN, "LSTM": nn.LSTM, "GRU": nn.GRU}[kind](d_in, width, batch_first=True)
+    if carry_bias is not None:   # rows width:2 width are the LSTM forget gate and the GRU update gate
+        with torch.no_grad():
+            net.bias_ih_l0[width:2 * width].fill_(carry_bias)
+            net.bias_hh_l0[width:2 * width].fill_(0.0)
+    return net
+
+
+ENC_ARMS = {"RNN": ("RNN", None), "LSTM": ("LSTM", None), "LSTM, b_f = 1": ("LSTM", 1.0),
+            "GRU": ("GRU", None), "GRU, b_z = 1": ("GRU", 1.0)}
+measured = {}
+for name, (kind, cb) in ENC_ARMS.items():
+    per_init = []
+    for s in range(100):
+        torch.manual_seed(1000 + s)
+        per_init.append(enc_jacobian_norms(enc_make(kind, cb), enc_xw))
+    measured[name] = np.median(np.concatenate(per_init), axis=0)
+measured = pd.DataFrame(measured, index=pd.Index(ks, name="k"))
+print("\nMedian ||d h_T / d x_{T-k}|| at initialization (100 inits x 64 windows)")
+print(measured.map(lambda v: f"{v:.2e}").to_string())
+print("\nratio k = 6 to k = 0:", (measured.iloc[6] / measured.iloc[0]).round(4).to_dict())
+
+enc_style = {"RNN": ("#555555", "-"), "LSTM": ("#c0392b", "--"), "LSTM, b_f = 1": ("#c0392b", "-"),
+             "GRU": ("#2471a3", "--"), "GRU, b_z = 1": ("#2471a3", "-")}
+theory_style = {"LSTM, i = f = 1": ("#c0392b", ":"), "LSTM, i = f = 0.5": ("#c0392b", "--"),
+                "LSTM, i = 0.5, b_f = 1": ("#c0392b", "-"),
+                "GRU, z = 0.5": ("#2471a3", ":"), "GRU, b_z = 1": ("#2471a3", "-"),
+                "GRU, best constant z": ("#2471a3", "-.")}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for name, (col, ls) in theory_style.items():
+    axes[0].semilogy(ks, theory[name], ls, color=col, marker="o", ms=4, label=name)
+for name, (col, ls) in enc_style.items():
+    axes[1].semilogy(ks, measured[name], ls, color=col, marker="o", ms=4, label=name)
+axes[0].set(xlabel="days between the burst and the end of the window, k", ylabel="carry weight",
+            title="Constant gates, from the unrolled carry")
+axes[1].set(xlabel="days between the input and the end of the window, k",
+            ylabel=r"median $\|\partial h_T / \partial \tilde{x}_{T-k}\|$", title="Measured at initialization, width 16")
+for ax in axes:
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+The library encoders agree with PyTorch to about $10^{-16}$, and the formula $G(dm + d^2 + 2d)$ matches PyTorch's own parameter count in all six cases of @tbl-cg-encoder-params. SymPy returns zero for both unrolled carries and for the telescoping sum, and solves @eq-cg-gru-tradeoff to $z^\ast = k/(k+1)$ with maximum $k^k (k+1)^{-(k+1)}$. A constant-gate GRU and the library's `ema_last` of its candidates agree to twelve digits ($0.696550832826$), which is the EMA reading of @eq-cg-gru-retention made numerical.
+
+The right panel of @fig-cg-encoder-retention is the measurement. At initialization every encoder depends most on the last day of the window and less on each earlier one. The ratio of the sensitivity to the first day ($k = 6$) to that to the last day ($k = 0$) is $0.017$ for the vanilla RNN, $0.035$ for the default LSTM and $0.036$ for the default GRU, against $0.5^6 \approx 0.016$ from the carry alone; the gated cells sit a little above the direct path prediction because the Jacobian also collects the indirect paths through the gates. A carry bias of one raises the ratio to $0.21$ for the LSTM and $0.18$ for the GRU, close to the $0.731^6 \approx 0.15$ that the direct path predicts. So an untrained encoder with default initialization sees the first day of a window at about three and a half percent of the weight it gives the last, and a vanilla RNN at under two percent. Whether training removes that handicap, and whether the choice of cell then matters for the forecast, are empirical questions, and @sec-cg-encoder-ablation answers them inside the forecaster.
 
 ## Burstiness: Early Warning from Related Nodes {#sec-cg-burst}
 
@@ -856,6 +1068,177 @@ pd.DataFrame(rows).set_index("neighbor type").round(3)
 
 Read the table with care, because it does not show what the paper's phrasing might lead you to expect. With five neighbors a uniform attention would be $0.2$ for each, and the learned weights stay close to that: every neighbor type sits between about $0.10$ and $0.22$. The own cart node, which holds more than $60$ percent of the normalized edge weight, receives the *smallest* attention, and the attention hardly moves between quiet and promotion windows. In this small model, trained for 25 epochs, the attention weights do not reproduce the transition share and should not be read as estimated conversion rates. The weights say how the layer mixes the value vectors, and a neighbor whose value vector is already highly informative does not need a large weight to matter; we did not investigate which of several explanations applies (a diffuse softmax from a small edge term, redundancy among the neighbors, or the gate absorbing most of the work). The practical lesson matches the caveat of @sec-cg-alternatives: if you need conversion rates, compute them from transitions with @eq-cg-attention-conversion, and treat attention as a learned mixing rule that happens to be trained for forecast accuracy. Inspecting an attention layer is still worth the few lines of code, because it tells you what the model is *not* doing.
 
+### Swapping the recurrent encoder {#sec-cg-encoder-ablation}
+
+@sec-cg-encoder-choice made two predictions about the encoder at initialization: with default gates it keeps only a few percent of the first day of a window, and a positive carry bias keeps about a fifth. It also showed that the GRU and the vanilla RNN do the same job with three quarters and one quarter of the LSTM's encoder parameters. The experiment below asks whether any of this reaches the forecast. It swaps the shared encoder of the full graph model and keeps everything else fixed: the same five simulations, held-out products, windows, minibatch order, Adam settings and 25 epochs. There are five arms: a vanilla RNN, the LSTM with PyTorch's default initialization (the chapter's model, whose results are reused from the five-seed run above), the LSTM with forget bias $b_f = 1$, the GRU with default initialization, and the GRU with update bias $b_z = 1$. `ClickNet` builds its encoder before its heads, so replacing the encoder after construction leaves every other initial weight identical across arms, and the first line of output checks that the harness reproduces the chapter's model exactly. The cell trains twenty new models and takes about three minutes on a laptop CPU.
+
+Beside the chapter's metrics, the cell reports three diagnostics of the trained encoders for seed 0, on the test windows. The first is the AUC of a linear probe for an approaching burst, fit on the embedding of the product's own purchase series exactly as in @fig-cg-probe. The second is the ratio of that embedding's sensitivity to the first day of the window and to the last, the trained counterpart of the right panel of @fig-cg-encoder-retention. The third, for the gated cells, is the mean carry gate and the mean carry weight from day 1 to day 7, $\prod_{t=2}^{7} f_t$ for the LSTM and $\prod_{t=2}^{7} z_t$ for the GRU, which is the product in @eq-cg-lstm-retention and @eq-cg-gru-retention.
+
+```{python}
+#| label: cg-encoder-ablation
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+
+
+class EncoderSwapNet(ClickNet):
+    """The full graph model with its shared recurrent encoder swapped or re-initialized.
+
+    The parent builds the LSTM first and the heads after it, so replacing the encoder
+    afterwards leaves every other initial weight identical across arms.
+    """
+
+    def __init__(self, mode, kind, carry_bias=None):
+        super().__init__(mode)
+        d_in = 3 if mode == "covariate" else 1
+        if kind != "LSTM":
+            self.enc = {"RNN": nn.RNN, "GRU": nn.GRU}[kind](d_in, self.hid, batch_first=True)
+        if carry_bias is not None:   # rows hid:2 hid hold the LSTM forget and the GRU update gate
+            with torch.no_grad():
+                self.enc.bias_ih_l0[self.hid:2 * self.hid].fill_(carry_bias)
+                self.enc.bias_hh_l0[self.hid:2 * self.hid].fill_(0.0)
+
+    def embed(self, x):
+        out = self.enc(x)[1]   # LSTM returns (h_n, c_n); RNN and GRU return h_n
+        return (out[0] if isinstance(out, tuple) else out)[0]
+
+
+def fit_predict_encoder(kind, carry_bias, D, seed, epochs=25):
+    """fit_predict with the encoder swapped; same seeds, batches, optimizer and epochs."""
+    torch.manual_seed(seed)
+    net = EncoderSwapNet("graph", kind, carry_bias)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3)
+    rng = np.random.default_rng(seed)
+    for _ in range(epochs):
+        order = rng.permutation(D["tr"])
+        for s in range(0, len(order), 256):
+            b = make_batch(D["own"], D["nb"], D["nbw"], D["mask"], D["y"], order[s : s + 256])
+            loss = pinball_torch(net(b)[0], b["ys"])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    with torch.no_grad():
+        b = make_batch(D["own"], D["nb"], D["nbw"], D["mask"], D["y"], D["te"])
+        pred, aux = net(b)
+    raw = pred.numpy() * b["dv"][:, None, None] + b["med"][:, None, None]
+    return np.sort(np.maximum(raw, 0.0), axis=2), net, aux
+
+
+# The LSTM arm is the chapter's full graph model; check that the harness reproduces it exactly
+t0 = time.time()
+check_pred = fit_predict_encoder("LSTM", None, D0, 0)[0]
+print("LSTM arm reproduces the full graph model of seed 0 exactly:",
+      bool(np.array_equal(check_pred, keep["graph"][0])))
+
+ENC_SWAPS = {"RNN": ("RNN", None), "LSTM, b_f = 1": ("LSTM", 1.0),
+             "GRU": ("GRU", None), "GRU, b_z = 1": ("GRU", 1.0)}
+enc_results = {"LSTM": results["graph"]}           # reused from the five-seed run above
+enc_results.update({name: [] for name in ENC_SWAPS})
+enc_nets = {"LSTM": keep["graph"][1]}
+for seed in SEEDS:
+    D = D0 if seed == 0 else prepare(seed)
+    for name, (kind, cb) in ENC_SWAPS.items():
+        pred, net_, _ = fit_predict_encoder(kind, cb, D, seed)
+        enc_results[name].append(score(pred, D))
+        if seed == 0:
+            enc_nets[name] = net_
+print(f"encoder ablation training time: {time.time() - t0:.0f} s")
+
+ENC_ORDER = ["RNN", "LSTM", "LSTM, b_f = 1", "GRU", "GRU, b_z = 1"]
+lstm_all = pd.DataFrame(enc_results["LSTM"])["all"]
+rows = []
+for name in ENC_ORDER:
+    arr = pd.DataFrame(enc_results[name])
+    row = {"encoder": name, "encoder parameters": sum(p.numel() for p in enc_nets[name].enc.parameters()),
+           "model parameters": sum(p.numel() for p in enc_nets[name].parameters())}
+    row.update({c: f"{arr[c].mean():.3f} ({arr[c].std():.3f})" for c in cols})
+    row["seeds beating LSTM (of 5)"] = "" if name == "LSTM" else int((arr["all"] < lstm_all).sum())
+    rows.append(row)
+enc_table = pd.DataFrame(rows).set_index("encoder")
+print(enc_table.to_string())
+
+# === Seed 0 diagnostics: what each trained encoder keeps from the window
+cs_ = D0["cs"]
+burst_all = np.zeros(len(D0["y"]), dtype=bool)
+for a, e in enumerate(D0["ends"]):
+    burst_all[a * cs_.n_products:(a + 1) * cs_.n_products] = cs_.burst_day[e + 1:e + 1 + H].max(axis=0) > 0
+tr_sub = D0["tr"][::3]
+b_tr = make_batch(D0["own"], D0["nb"], D0["nbw"], D0["mask"], D0["y"], tr_sub)
+b_te = make_batch(D0["own"], D0["nb"], D0["nbw"], D0["mask"], D0["y"], D0["te"])
+x_tr, x_te = b_tr["own_s"][:, 2, :, None], b_te["own_s"][:, 2, :, None]
+
+
+def carry_gates(enc, x):
+    """Forget (LSTM) or update (GRU) gate values at steps 2..T, shape (windows, T-1, hid)."""
+    hid_ = enc.hidden_size
+    with torch.no_grad():
+        y_seq = enc(x)[0]
+        pre = x[:, 1:] @ enc.weight_ih_l0.T + enc.bias_ih_l0 + y_seq[:, :-1] @ enc.weight_hh_l0.T + enc.bias_hh_l0
+        return torch.sigmoid(pre[..., hid_:2 * hid_]).numpy()
+
+
+diag, sens = [], {}
+for name in ENC_ORDER:
+    net_ = enc_nets[name]
+    with torch.no_grad():
+        h_tr, h_te = net_.embed(x_tr).numpy(), net_.embed(x_te).numpy()
+    clf = LogisticRegression(max_iter=2000).fit(h_tr, burst_all[tr_sub])
+    J = enc_jacobian_norms(net_.enc, x_te)
+    sens[name] = np.median(J, axis=0)
+    row = {"encoder": name, "probe AUC, burst ahead": roc_auc_score(D0["burst"], clf.predict_proba(h_te)[:, 1]),
+           "sensitivity k = 6 / k = 0": sens[name][6] / sens[name][0]}
+    if name == "RNN":
+        row.update({"mean carry gate": np.nan, "carry, day 1 to day 7": np.nan})
+    else:
+        gates = carry_gates(net_.enc, x_te)
+        row.update({"mean carry gate": gates.mean(), "carry, day 1 to day 7": gates.prod(axis=1).mean()})
+    diag.append(row)
+enc_diag = pd.DataFrame(diag).set_index("encoder")
+print("\nSeed 0, test windows: what the trained encoder keeps")
+print(enc_diag.round(3).to_string())
+```
+
+```{python}
+#| label: fig-cg-encoder-ablation
+#| fig-cap: "Swapping the recurrent encoder of the full graph model. Left: the change in weighted quantile loss against the default LSTM, paired by simulation, by test subset; bars are the mean over five simulations and error bars one standard deviation, and negative values mean a lower loss than the LSTM. Right: for seed 0, the median norm of the Jacobian of the trained embedding of a product's own purchase series with respect to the scaled input k days before the end of the window, over all test windows."
+import matplotlib.pyplot as plt
+
+sub = cols[:4]
+lstm_arr = pd.DataFrame(enc_results["LSTM"])[sub]
+paired = {name: 100 * (pd.DataFrame(enc_results[name])[sub] / lstm_arr - 1) for name in ENC_ORDER if name != "LSTM"}
+print("Change in wQL against the default LSTM, percent, paired by seed: mean (sd) over 5 seeds")
+print(pd.DataFrame({name: [f"{d[c].mean():+.2f} ({d[c].std():.2f})" for c in sub] for name, d in paired.items()},
+                   index=sub).T.to_string())
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [1.4, 1]})
+wd = 0.2
+for i, (name, d) in enumerate(paired.items()):
+    col, ls = enc_style[name]
+    axes[0].bar(np.arange(len(sub)) + (i - 1.5) * wd, d.mean(), wd, yerr=d.std(), capsize=2,
+                color=col, alpha=1.0 if ls == "-" else 0.45, edgecolor=col, label=name)
+axes[0].axhline(0, color="black", lw=0.8)
+axes[0].set_xticks(np.arange(len(sub)))
+axes[0].set_xticklabels(sub)
+axes[0].set_ylabel("wQL change vs default LSTM (%)")
+axes[0].set_title("Paired by simulation, five seeds")
+axes[0].legend(frameon=False, fontsize=8, ncol=2)
+axes[0].grid(alpha=0.3, axis="y")
+for name in ENC_ORDER:
+    col, ls = enc_style[name]
+    axes[1].semilogy(np.arange(T), sens[name], ls, color=col, marker="o", ms=4, label=name)
+axes[1].set(xlabel="days between the input and the end of the window, k",
+            ylabel=r"median $\|\partial \mathbf{h}_i / \partial \tilde{x}_{T-k}\|$", title="Trained encoders, seed 0")
+axes[1].grid(alpha=0.3)
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+The result is a clean null, and it is informative. All five encoders reach a weighted quantile loss between $0.288$ and $0.290$ on all test windows, with a standard deviation across simulations of $0.006$ to $0.008$. Paired by simulation (left panel of @fig-cg-encoder-ablation), no swap moves the loss by more than three quarters of a percent on any subset. Only three of the sixteen paired changes exceed their own standard deviation across the five seeds, and none by much: $-0.53$ percent (sd $0.50$) for the GRU with $b_z = 1$ on all windows, $+0.49$ percent (sd $0.38$) for the LSTM with $b_f = 1$ on burst windows, and $+0.75$ percent (sd $0.72$) for the vanilla RNN on sparse products. The default GRU, at $-0.48$ percent (sd $0.58$) on all windows, is inside its noise. For scale, the graph model's gain over the covariate model is $4.4$ percent and over the univariate model $16.8$ percent. The GRU arms beat the LSTM in four seeds of five, which a fair coin does about one time in five, so we do not read it as a GRU advantage. Interval coverage stays between $0.804$ and $0.812$ in every arm. The vanilla RNN matches the LSTM with a quarter of its encoder parameters ($304$ against $1{,}216$), which brings the whole model from $5{,}092$ parameters to $4{,}180$.
+
+The diagnostics say why. Training removed the handicap that @fig-cg-encoder-retention measured at initialization. The ratio of the trained embedding's sensitivity to the first day of the window and to the last is $0.38$ to $0.56$ for every arm, against $0.017$ to $0.21$ before training, and the vanilla RNN, whose carry has no gate at all, reaches $0.45$. The bound @eq-cg-rnn-retention decays geometrically, but six steps of geometric decay are not enough to hide the first day from a network that is trained to use it. The gates moved the way @eq-cg-lstm-retention and @eq-cg-gru-retention describe: the mean forget gate of the default LSTM is $0.552$ and its carry weight from day 1 to day 7 is $0.043$, while with $b_f = 1$ they are $0.740$ and $0.199$; for the GRU the update gate averages $0.437$ (carry $0.036$) by default and $0.585$ (carry $0.095$) with $b_z = 1$. So the bias still shapes what the trained cell keeps, but the forecast loss is indifferent to it. The linear probe tells the same story from the other side. Its AUC for an approaching burst is between $0.757$ and $0.766$ for every encoder, against $0.829$ for the neighbor burstiness embedding of @fig-cg-probe: whatever recurrent cell embeds the product's own purchases, the early warning of a promotion comes mainly from the neighbors.
+
+The practical reading for this kind of data is that the choice of recurrent cell is a cost decision, not an accuracy decision, as long as the windows are a week or so long. A GRU gives the same forecast with three quarters of the LSTM's encoder parameters and FLOPs, and even a vanilla RNN is adequate. The analysis of @sec-cg-encoder-choice says where that stops being true: when the window is long enough that $f^k$ or $z^k$ at the initial gate values falls to about a percent or less, which on the delayed recall task of @sec-road-to-transformers happens by 20 steps for default gates and by 100 steps for an LSTM with $b_f = 3$, the gated carry and a positive carry bias become decisive. Daily windows of a month or more, or hourly data, are in that regime. The caveats of @sec-cg-departures apply here as well: one width, one window length, 25 epochs and a simulated generator.
+
 ## Where the Simulation Departs from the Paper {#sec-cg-departures}
 
 ::: {.callout-warning appearance="simple"}
@@ -884,7 +1267,7 @@ Read the table with care, because it does not show what the paper's phrasing mig
 
 ## Reference Implementation {#sec-cg-reference-implementation}
 
-The numeric core of `aiinaction.ch_clickgraph` is implemented in all three of the book's languages with identical names and semantics, and the three test suites assert the same fixtures (for example, the paper's series $(9, 14, 17)$ has burstiness $(-0.1083, 0.0167, 0.0917)$, and a forecast of $8$ against an actual of $10$ at $q = 0.75$ costs $1.5$). The seeded simulator `simulate_clickstream` and the PyTorch experiment are Python only. Node ids are 0-based in Python and Rust and 1-based in Julia.
+The numeric core of `aiinaction.ch_clickgraph` is implemented in all three of the book's languages with identical names and semantics, and the three test suites assert the same fixtures (for example, the paper's series $(9, 14, 17)$ has burstiness $(-0.1083, 0.0167, 0.0917)$, a forecast of $8$ against an actual of $10$ at $q = 0.75$ costs $1.5$, and on the input $(1, 2, 0.5)$ with the `det_matrix` weights below the three encoders return $(-0.007359, -0.324784)$ for the LSTM, $(0.732792, 0.204020)$ for the RNN and $(-0.182479, -0.651264)$ for the GRU). The seeded simulator `simulate_clickstream` and the PyTorch experiment are Python only. Node ids are 0-based in Python and Rust and 1-based in Julia.
 
 ::: {.panel-tabset}
 
@@ -894,7 +1277,7 @@ The numeric core of `aiinaction.ch_clickgraph` is implemented in all three of th
 #| code-fold: false
 from aiinaction.ch_clickgraph import (
     attention_neighbor_embedding, burstiness, det_matrix, ema_last, gated_forecast,
-    lstm_embed, neighbor_burstiness, pinball_loss, robust_median_scale,
+    gru_embed, lstm_embed, neighbor_burstiness, pinball_loss, rnn_embed, robust_median_scale,
     session_graph, total_quantile_loss, upstream_neighbors, weighted_quantile_loss,
 )
 
@@ -905,8 +1288,12 @@ print("upstream of node 1:", upstream_neighbors(W, 1))
 B = np.array([burstiness(r) for r in ([9, 14, 17], [2, 4, 4])])
 print("neighbor burstiness:", np.round(neighbor_burstiness(B, [0, 1]), 4))
 print("EMA trend:", ema_last([1, 2, 3], 0.7))
-h = lstm_embed([[1.0], [2.0], [0.5]], det_matrix(8, 3), det_matrix(1, 8, 0.3)[0])
+x3 = [[1.0], [2.0], [0.5]]
+h = lstm_embed(x3, det_matrix(8, 3), det_matrix(1, 8, 0.3)[0])
 print("LSTM embedding:", np.round(h, 6))
+print("RNN embedding:", np.round(rnn_embed(x3, det_matrix(2, 3), det_matrix(1, 2, 0.3)[0]), 6))
+hg = gru_embed(x3, det_matrix(6, 3), det_matrix(1, 6, 0.3)[0], det_matrix(1, 6, 0.6)[0])
+print("GRU embedding:", np.round(hg, 6))
 z, a = attention_neighbor_embedding([0.5, -0.2, 0.1, 0.8], det_matrix(3, 4, 0.5), [0.2, 1.0, 0.5],
                                     det_matrix(3, 4, 0.1), det_matrix(3, 4, 0.2),
                                     det_matrix(2, 4, 0.3), det_matrix(1, 3, 0.4)[0])
@@ -929,8 +1316,12 @@ println("upstream of node 2: ", upstream_neighbors(W, 2))
 B = hcat(burstiness([9, 14, 17]), burstiness([2, 4, 4]))'
 println("neighbor burstiness: ", round.(neighbor_burstiness(B, [1, 2]), digits=4))
 println("EMA trend: ", ema_last([1, 2, 3], 0.7))
-h = lstm_embed([1.0; 2.0; 0.5;;], det_matrix(8, 3), vec(det_matrix(1, 8, 0.3)))
+x3 = [1.0; 2.0; 0.5;;]
+h = lstm_embed(x3, det_matrix(8, 3), vec(det_matrix(1, 8, 0.3)))
 println("LSTM embedding: ", round.(h, digits=6))
+println("RNN embedding: ", round.(rnn_embed(x3, det_matrix(2, 3), vec(det_matrix(1, 2, 0.3))), digits=6))
+hg = gru_embed(x3, det_matrix(6, 3), vec(det_matrix(1, 6, 0.3)), vec(det_matrix(1, 6, 0.6)))
+println("GRU embedding: ", round.(hg, digits=6))
 z, a = attention_neighbor_embedding([0.5, -0.2, 0.1, 0.8], det_matrix(3, 4, 0.5), [0.2, 1.0, 0.5],
                                     det_matrix(3, 4, 0.1), det_matrix(3, 4, 0.2),
                                     det_matrix(2, 4, 0.3), vec(det_matrix(1, 3, 0.4)))
@@ -954,8 +1345,12 @@ fn main() -> Result<(), String> {
     let b = vec![burstiness(&[9.0, 14.0, 17.0])?, burstiness(&[2.0, 4.0, 4.0])?];
     println!("neighbor burstiness: {:?}", neighbor_burstiness(&b, &[0, 1])?);
     println!("EMA trend: {}", ema_last(&[1.0, 2.0, 3.0], 0.7)?);
-    let h = lstm_embed(&vec![vec![1.0], vec![2.0], vec![0.5]], &det_matrix(8, 3, 0.0), &det_matrix(1, 8, 0.3)[0])?;
+    let x3 = vec![vec![1.0], vec![2.0], vec![0.5]];
+    let h = lstm_embed(&x3, &det_matrix(8, 3, 0.0), &det_matrix(1, 8, 0.3)[0])?;
     println!("LSTM embedding: {:?}", h);
+    println!("RNN embedding: {:?}", rnn_embed(&x3, &det_matrix(2, 3, 0.0), &det_matrix(1, 2, 0.3)[0])?);
+    let hg = gru_embed(&x3, &det_matrix(6, 3, 0.0), &det_matrix(1, 6, 0.3)[0], &det_matrix(1, 6, 0.6)[0])?;
+    println!("GRU embedding: {:?}", hg);
     let (_z, a) = attention_neighbor_embedding(
         &[0.5, -0.2, 0.1, 0.8], &det_matrix(3, 4, 0.5), &[0.2, 1.0, 0.5],
         &det_matrix(3, 4, 0.1), &det_matrix(3, 4, 0.2), &det_matrix(2, 4, 0.3),
@@ -979,7 +1374,7 @@ fn main() -> Result<(), String> {
 
 A forecaster that sees only sales history is blind to the part of the shopping journey that comes first. Treating each product-stage as a node whose attribute is a count series, and each day as a graph with transition weighted edges, turns the clickstream into a structure a model can use. The chapter followed the paper's use of embeddings at three levels: an LSTM embeds a scaled series into a vector that lives in one shared space for all products (@eq-cg-node-embedding), a graph attention layer embeds a node's neighborhood with weights that generalize the empirical conversion share (@eq-cg-attention-conversion), and a bounded, scale free burstiness summary of neighbors gives an early warning that is multiplied by a trend to become a forecast (@eq-cg-burst-forecast). A sigmoid gate controls how much of the neighbor forecast survives (@eq-cg-final), and the pinball loss (@eq-cg-pinball), whose minimizer is the conditional quantile (@eq-cg-risk-derivative), makes the output a calibrated range rather than a single number.
 
-Our simulated experiment showed the qualitative ordering the paper's argument predicts, with most of the gain coming from the product's own funnel and a smaller but consistent further gain from the graph, largest on promotion bursts. It also showed that the burstiness embedding carries more information about an approaching burst than the purchase only embedding does, that the learned attention weights in our small model did not behave like conversion rates, and that the shrinkage logic behind cross learning is strongest where history is shortest. The honest reading is that graph structure is an additional source of demand information to be tested against strong covariate baselines, not a replacement for them.
+Our simulated experiment showed the qualitative ordering the paper's argument predicts, with most of the gain coming from the product's own funnel and a smaller but consistent further gain from the graph, largest on promotion bursts. Swapping the LSTM for a GRU or a vanilla RNN moved the loss by less than one percent, because on seven day windows training removes the decay of early days that the unrolled carries @eq-cg-lstm-retention and @eq-cg-gru-retention predict at initialization; the cheaper cells are a sound choice until the windows grow long. It also showed that the burstiness embedding carries more information about an approaching burst than the purchase only embedding does, that the learned attention weights in our small model did not behave like conversion rates, and that the shrinkage logic behind cross learning is strongest where history is shortest. The honest reading is that graph structure is an additional source of demand information to be tested against strong covariate baselines, not a replacement for them.
 
 ## Exercises {#sec-cg-exercises}
 
@@ -991,25 +1386,33 @@ Our simulated experiment showed the qualitative ordering the paper's argument pr
 6. **Gate behavior.** In the trained graph model, extract the gate values `gate` on test windows. Do they differ between promotion windows and quiet windows, and between sparse and dense products? What would a gate near zero everywhere imply?
 7. **Longer horizon.** Change $H$ from $3$ to $7$ in the experiment. Does the graph model's margin over the covariate baseline grow or shrink? Explain in terms of the lag from attention to purchases.
 8. **A fairer baseline.** Add a model that feeds the covariate LSTM the *mean* of the neighbors' view series as a fourth channel, without attention or burstiness. How much of the graph model's gain does this recover?
+9. **A longer window.** Set $T = 28$ in the experiment and rerun the encoder ablation of @sec-cg-encoder-ablation. Before running it, use @eq-cg-lstm-retention to predict the carry weight of the first day for default gates ($f = 0.5$) and for $b_f = 1$. Do the encoders separate once the window is four times longer?
+10. **The GRU at parameter parity.** Give the GRU a hidden width of $19$, so that its $1{,}254$ encoder parameters are close to the LSTM's $1{,}216$ in @tbl-cg-encoder-params. Note that the heads, attention maps and gate grow with the width too. Does the wider GRU change the loss, and what does the answer say about where this model's capacity limit lies?
+11. **Two events in one window.** A seven day window has a dip on day 2 and a burst on day 6. With constant gates, compute from @eq-cg-lstm-retention and @eq-cg-gru-retention the weights with which the two days reach the final state, for an LSTM with $i = f = 1$ and for a GRU with the update gate that @eq-cg-gru-tradeoff gives for the earlier event. Which cell needs input-dependent gates to keep both events at full size?
 
 ## References {#sec-cg-references}
 
 1. Bengio, Y., Courville, A., and Vincent, P. (2013). Representation learning: A review and new perspectives. *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 35(8), 1798-1828. https://doi.org/10.1109/TPAMI.2013.50
 2. Challu, C., Olivares, K. G., Oreshkin, B. N., Garza Ramirez, F., et al. (2023). NHITS: Neural hierarchical interpolation for time series forecasting. *Proceedings of the AAAI Conference on Artificial Intelligence*, 37(6), 6989-6997. https://doi.org/10.1609/aaai.v37i6.25854
-3. Efron, B., and Morris, C. (1973). Stein's estimation rule and its competitors: An empirical Bayes approach. *Journal of the American Statistical Association*, 68(341), 117-130. https://doi.org/10.1080/01621459.1973.10481350
-4. Efron, B., and Morris, C. (1975). Data analysis using Stein's estimator and its generalizations. *Journal of the American Statistical Association*, 70(350), 311-319. https://doi.org/10.1080/01621459.1975.10479864
-5. Gilmer, J., Schoenholz, S. S., Riley, P. F., Vinyals, O., and Dahl, G. E. (2017). Neural message passing for quantum chemistry. *Proceedings of the 34th International Conference on Machine Learning*. arXiv:1704.01212. https://doi.org/10.48550/arXiv.1704.01212
-6. Gneiting, T. (2011). Quantiles as optimal point forecasts. *International Journal of Forecasting*, 27(2), 197-207. https://doi.org/10.1016/j.ijforecast.2009.12.015
-7. Gneiting, T., and Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *Journal of the American Statistical Association*, 102(477), 359-378. https://doi.org/10.1198/016214506000001437
-8. Grover, A., and Leskovec, J. (2016). node2vec: Scalable feature learning for networks. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 855-864. https://doi.org/10.1145/2939672.2939754
-9. Hochreiter, S., and Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735-1780. https://doi.org/10.1162/neco.1997.9.8.1735
-10. Kechinov, M. (2020). eCommerce behavior data from multi category store. Kaggle dataset (no DOI assigned). https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store
-11. Kipf, T. N., and Welling, M. (2017). Semi-supervised classification with graph convolutional networks. *International Conference on Learning Representations*. arXiv:1609.02907. https://doi.org/10.48550/arXiv.1609.02907
-12. Koenker, R., and Bassett, G. (1978). Regression quantiles. *Econometrica*, 46(1), 33-50. https://doi.org/10.2307/1913643
-13. Lappas, T., Arai, B., Platakis, M., Kotsakos, D., and Gunopulos, D. (2009). On burstiness-aware search for document sequences. *Proceedings of the 15th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 477-486. https://doi.org/10.1145/1557019.1557075
-14. Liu, R., Chen, Z., Zhang, D., Mai, F., and Zhao, X. (2026). Let clickstream talk: A graph neural network approach to sales forecasting. *Production and Operations Management*. Published online 16 September 2026. https://doi.org/10.1177/10591478261490953
-15. Perozzi, B., Al-Rfou, R., and Skiena, S. (2014). DeepWalk: Online learning of social representations. *Proceedings of the 20th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 701-710. https://doi.org/10.1145/2623330.2623732
-16. Rousseeuw, P. J., and Croux, C. (1993). Alternatives to the median absolute deviation. *Journal of the American Statistical Association*, 88(424), 1273-1283. https://doi.org/10.1080/01621459.1993.10476408
-17. Salinas, D., Flunkert, V., Gasthaus, J., and Januschowski, T. (2020). DeepAR: Probabilistic forecasting with autoregressive recurrent networks. *International Journal of Forecasting*, 36(3), 1181-1191. https://doi.org/10.1016/j.ijforecast.2019.07.001
-18. Shi, Y., Huang, Z., Feng, S., Zhong, H., Wang, W., and Sun, Y. (2021). Masked label prediction: Unified message passing model for semi-supervised classification. *Proceedings of the Thirtieth International Joint Conference on Artificial Intelligence*, 1548-1554. https://doi.org/10.24963/ijcai.2021/214
-19. Wen, R., Torkkola, K., Narayanaswamy, B., and Madeka, D. (2017). A multi-horizon quantile recurrent forecaster. arXiv preprint arXiv:1711.11053. https://doi.org/10.48550/arXiv.1711.11053
+3. Cho, K., van Merrienboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., and Bengio, Y. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation. *Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing (EMNLP)*, 1724-1734. https://doi.org/10.3115/v1/D14-1179
+4. Efron, B., and Morris, C. (1973). Stein's estimation rule and its competitors: An empirical Bayes approach. *Journal of the American Statistical Association*, 68(341), 117-130. https://doi.org/10.1080/01621459.1973.10481350
+5. Efron, B., and Morris, C. (1975). Data analysis using Stein's estimator and its generalizations. *Journal of the American Statistical Association*, 70(350), 311-319. https://doi.org/10.1080/01621459.1975.10479864
+6. Elman, J. L. (1990). Finding structure in time. *Cognitive Science*, 14(2), 179-211. https://doi.org/10.1207/s15516709cog1402_1
+7. Gers, F. A., Schmidhuber, J., and Cummins, F. (2000). Learning to forget: Continual prediction with LSTM. *Neural Computation*, 12(10), 2451-2471. https://doi.org/10.1162/089976600300015015
+8. Gilmer, J., Schoenholz, S. S., Riley, P. F., Vinyals, O., and Dahl, G. E. (2017). Neural message passing for quantum chemistry. *Proceedings of the 34th International Conference on Machine Learning*. arXiv:1704.01212. https://doi.org/10.48550/arXiv.1704.01212
+9. Gneiting, T. (2011). Quantiles as optimal point forecasts. *International Journal of Forecasting*, 27(2), 197-207. https://doi.org/10.1016/j.ijforecast.2009.12.015
+10. Gneiting, T., and Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *Journal of the American Statistical Association*, 102(477), 359-378. https://doi.org/10.1198/016214506000001437
+11. Grover, A., and Leskovec, J. (2016). node2vec: Scalable feature learning for networks. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 855-864. https://doi.org/10.1145/2939672.2939754
+12. Hochreiter, S., and Schmidhuber, J. (1997). Long short-term memory. *Neural Computation*, 9(8), 1735-1780. https://doi.org/10.1162/neco.1997.9.8.1735
+13. Jozefowicz, R., Zaremba, W., and Sutskever, I. (2015). An empirical exploration of recurrent network architectures. *Proceedings of the 32nd International Conference on Machine Learning*, PMLR 37, 2342-2350 (no DOI assigned). https://proceedings.mlr.press/v37/jozefowicz15.html
+14. Kechinov, M. (2020). eCommerce behavior data from multi category store. Kaggle dataset (no DOI assigned). https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store
+15. Kipf, T. N., and Welling, M. (2017). Semi-supervised classification with graph convolutional networks. *International Conference on Learning Representations*. arXiv:1609.02907. https://doi.org/10.48550/arXiv.1609.02907
+16. Koenker, R., and Bassett, G. (1978). Regression quantiles. *Econometrica*, 46(1), 33-50. https://doi.org/10.2307/1913643
+17. Lappas, T., Arai, B., Platakis, M., Kotsakos, D., and Gunopulos, D. (2009). On burstiness-aware search for document sequences. *Proceedings of the 15th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 477-486. https://doi.org/10.1145/1557019.1557075
+18. Liu, R., Chen, Z., Zhang, D., Mai, F., and Zhao, X. (2026). Let clickstream talk: A graph neural network approach to sales forecasting. *Production and Operations Management*. Published online 16 September 2026. https://doi.org/10.1177/10591478261490953
+19. Perozzi, B., Al-Rfou, R., and Skiena, S. (2014). DeepWalk: Online learning of social representations. *Proceedings of the 20th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 701-710. https://doi.org/10.1145/2623330.2623732
+20. Rousseeuw, P. J., and Croux, C. (1993). Alternatives to the median absolute deviation. *Journal of the American Statistical Association*, 88(424), 1273-1283. https://doi.org/10.1080/01621459.1993.10476408
+21. Salinas, D., Flunkert, V., Gasthaus, J., and Januschowski, T. (2020). DeepAR: Probabilistic forecasting with autoregressive recurrent networks. *International Journal of Forecasting*, 36(3), 1181-1191. https://doi.org/10.1016/j.ijforecast.2019.07.001
+22. Shi, Y., Huang, Z., Feng, S., Zhong, H., Wang, W., and Sun, Y. (2021). Masked label prediction: Unified message passing model for semi-supervised classification. *Proceedings of the Thirtieth International Joint Conference on Artificial Intelligence*, 1548-1554. https://doi.org/10.24963/ijcai.2021/214
+23. Weiss, G., Goldberg, Y., and Yahav, E. (2018). On the practical computational power of finite precision RNNs for language recognition. *Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers)*, 740-745. https://doi.org/10.18653/v1/P18-2117
+24. Wen, R., Torkkola, K., Narayanaswamy, B., and Madeka, D. (2017). A multi-horizon quantile recurrent forecaster. arXiv preprint arXiv:1711.11053. https://doi.org/10.48550/arXiv.1711.11053
